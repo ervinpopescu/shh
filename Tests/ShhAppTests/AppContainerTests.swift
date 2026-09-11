@@ -822,7 +822,7 @@ private actor Gate {
     }
 }
 
-private final class MockSSHConnection: SSHConnection, @unchecked Sendable {
+final class MockSSHConnection: SSHConnection, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
     private(set) var sentData: [Data] = []
@@ -863,7 +863,7 @@ private final class MockSSHConnection: SSHConnection, @unchecked Sendable {
     }
 }
 
-private final class ControllableTransport: SSHTransport, @unchecked Sendable {
+final class ControllableTransport: SSHTransport, @unchecked Sendable {
     var onConnect: (@Sendable (Host) async throws -> any SSHConnection)?
 
     func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection {

@@ -4,6 +4,7 @@ import SwiftUI
 
 @main
 struct ShhApp: App {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var container: AppContainer
 
     init() {
@@ -16,7 +17,13 @@ struct ShhApp: App {
     }
 
     var body: some Scene {
-        WindowGroup { RootView().environmentObject(container) }
+        WindowGroup {
+            RootView()
+                .environmentObject(container)
+                .onChange(of: scenePhase) { _, newPhase in
+                    container.handleScenePhaseChange(newPhase)
+                }
+        }
     }
 }
 
@@ -172,18 +179,74 @@ struct HostEditorView: View {
     @State private var username: String
     @State private var port: String
     @State private var identityID: UUID?
+    @State private var defaultTmuxSession: String
+    @State private var autoAttachTmux: Bool
     @State private var identities: [IdentityDescriptor] = []
-    init(existing: Host? = nil) { self.existing = existing; _name = State(initialValue: existing?.name ?? ""); _hostname = State(initialValue: existing?.hostname ?? ""); _username = State(initialValue: existing?.username ?? ""); _port = State(initialValue: String(existing?.port ?? 22)); _identityID = State(initialValue: existing?.identityID) }
+
+    init(existing: Host? = nil) {
+        self.existing = existing
+        _name = State(initialValue: existing?.name ?? "")
+        _hostname = State(initialValue: existing?.hostname ?? "")
+        _username = State(initialValue: existing?.username ?? "")
+        _port = State(initialValue: String(existing?.port ?? 22))
+        _identityID = State(initialValue: existing?.identityID)
+        _defaultTmuxSession = State(initialValue: existing?.defaultTmuxSession ?? "")
+        _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
+    }
+
     var body: some View {
         NavigationStack {
-            Form { Section("Host metadata") { TextField("Name", text: $name); TextField("Hostname", text: $hostname); TextField("Username", text: $username); TextField("Port", text: $port).keyboardType(.numberPad); Picker("Identity", selection: $identityID) { Text("None").tag(UUID?.none); ForEach(identities) { identity in Text(identity.name).tag(Optional(identity.id)) } } }; Section { Text("Passwords and private keys are selected through Keychain identities and never stored in this form.").font(.caption).foregroundStyle(.secondary) } }
-                .navigationTitle(existing == nil ? "New host" : "Edit host")
-                .task { identities = (try? await container.catalog.identities()) ?? [] }
-                .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Save") { save() }.disabled(name.isEmpty || hostname.isEmpty || username.isEmpty) } }
+            Form {
+                Section("Host metadata") {
+                    TextField("Name", text: $name)
+                    TextField("Hostname", text: $hostname)
+                    TextField("Username", text: $username)
+                    TextField("Port", text: $port).keyboardType(.numberPad)
+                    Picker("Identity", selection: $identityID) {
+                        Text("None").tag(UUID?.none)
+                        ForEach(identities) { identity in
+                            Text(identity.name).tag(Optional(identity.id))
+                        }
+                    }
+                }
+                Section("Tmux preferences") {
+                    Toggle("Auto-attach tmux session", isOn: $autoAttachTmux)
+                    TextField("Default session name/ID", text: $defaultTmuxSession)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+                Section {
+                    Text("Passwords and private keys are selected through Keychain identities and never stored in this form.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle(existing == nil ? "New host" : "Edit host")
+            .task { identities = (try? await container.catalog.identities()) ?? [] }
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save() }.disabled(name.isEmpty || hostname.isEmpty || username.isEmpty)
+                }
+            }
         }
     }
+
     private func save() {
-        guard let portNumber = UInt16(port), let host = try? Host(id: existing?.id ?? UUID(), name: name, hostname: hostname, port: portNumber, username: username, identityID: identityID, connection: existing?.connection ?? .ssh(SSHOptions())) else { return }
+        let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
+        guard let portNumber = UInt16(port),
+              let host = try? Host(
+                  id: existing?.id ?? UUID(),
+                  name: name,
+                  hostname: hostname,
+                  port: portNumber,
+                  username: username,
+                  identityID: identityID,
+                  connection: existing?.connection ?? .ssh(SSHOptions()),
+                  defaultTmuxSession: sessionPref,
+                  autoAttachTmux: autoAttachTmux
+              ) else { return }
         Task {
             do {
                 try await container.catalog.save(host)
@@ -221,6 +284,9 @@ struct SessionView: View {
         VStack(spacing: 0) {
             // Header / Status bar
             sessionHeader
+
+            // Reconnect status banner if coordinator is active
+            reconnectBanner
 
             // Search Bar (if presented)
             if isSearchPresented {
@@ -277,6 +343,65 @@ struct SessionView: View {
             container.terminalController.onRiskyPasteRequested = { text in
                 pendingRiskyPaste = text
             }
+        }
+    }
+
+    @ViewBuilder
+    private var reconnectBanner: some View {
+        switch container.reconnectState {
+        case .waiting(let attempt, let delay):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") {
+                    Task { await container.cancelReconnect() }
+                }
+                .font(.caption.bold())
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.yellow.opacity(0.15))
+            Divider()
+        case .connecting(let attempt):
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Cancel") {
+                    Task { await container.cancelReconnect() }
+                }
+                .font(.caption.bold())
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.blue.opacity(0.15))
+            Divider()
+        case .exhausted(let attempts):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text("Reconnection failed after \(attempts) attempts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Retry") {
+                    Task { await container.retryReconnect() }
+                }
+                .font(.caption.bold())
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.15))
+            Divider()
+        default:
+            EmptyView()
         }
     }
 
