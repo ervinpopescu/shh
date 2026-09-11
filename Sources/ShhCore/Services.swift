@@ -226,7 +226,28 @@ public struct ShellQuoting: Sendable {
 }
 public enum MultiplexerAction: Hashable, Sendable { case list; case attach(name: String); case create(name: String); case send(text: String) }
 public protocol MultiplexerAdapter: Sendable { var kind: RemoteMultiplexer { get }; func command(for action: MultiplexerAction) -> String }
-public struct TmuxAdapter: MultiplexerAdapter { public let kind = RemoteMultiplexer.tmux; public init() {}; public func command(for action: MultiplexerAction) -> String { switch action { case .list: "tmux list-sessions"; case .attach(let name): "tmux attach-session -t \(ShellQuoting.quote(name))"; case .create(let name): "tmux new-session -A -s \(ShellQuoting.quote(name))"; case .send(let text): "tmux send-keys -t \"${TMUX_PANE}\" -- \(ShellQuoting.quote(text)) Enter" } } }
+public struct TmuxAdapter: MultiplexerAdapter {
+    public let kind = RemoteMultiplexer.tmux
+    public init() {}
+    public func command(for action: MultiplexerAction) -> String {
+        switch action {
+        case .list:
+            return TmuxCommand.listSessions
+        case .attach(let name):
+            if let sessionID = try? TmuxSessionID(name) {
+                return TmuxCommand.attachSession(id: sessionID)
+            }
+            return "env -u TMUX tmux attach-session -d -t \(ShellQuoting.quote(name))"
+        case .create(let name):
+            if let sessionName = try? TmuxSessionName(name) {
+                return TmuxCommand.newSession(name: sessionName)
+            }
+            return "tmux new-session -A -D -s \(ShellQuoting.quote(name))"
+        case .send(let text):
+            return "tmux send-keys -t \"${TMUX_PANE}\" -- \(ShellQuoting.quote(text)) Enter"
+        }
+    }
+}
 public struct UnavailableMultiplexerAdapter: MultiplexerAdapter { public let kind: RemoteMultiplexer; public init(kind: RemoteMultiplexer) { self.kind = kind }; public func command(for action: MultiplexerAction) -> String { "# \(kind.rawValue) is not enabled in this build" } }
 
 public enum HerdrCommand: Hashable, Sendable { case remoteLaunch(workbox: String); case workspaceCreate(name: String); case tabCreate(name: String); case paneSplit(direction: String); case paneRun(command: String); case paneRead; case waitAgentStatus }
@@ -586,6 +607,14 @@ public struct CommandPolicy: Sendable {
         if Self.shellInterpreters.contains(executable) {
             return interpreterRisk(arguments)
         }
+        if executable == "tmux" {
+            let risk = tmuxRisk(arguments)
+            if risk == .blocked { return .blocked }
+            if words.prefix(executableIndex).contains(where: { commandName($0) == "sudo" }) {
+                return .reviewRequired
+            }
+            return risk
+        }
         if executable == "python" || executable == "python3" || executable == "perl" || executable == "ruby" || executable == "node" {
             return .reviewRequired
         }
@@ -602,7 +631,6 @@ public struct CommandPolicy: Sendable {
         }
         if !Self.safeCommands.contains(executable) { return .reviewRequired }
         if executable == "git" { return gitRisk(arguments) }
-        if executable == "tmux" { return tmuxRisk(arguments) }
 
         // Redirection is intentionally never considered safe, even for a normally read-only tool.
         if segment.contains(where: { $0.isOperator && [">", ">>", "<", "<<", "&>"].contains($0.value) }) {
@@ -722,16 +750,77 @@ public struct CommandPolicy: Sendable {
     }
 
     private func tmuxRisk(_ arguments: [String]) -> CommandRisk {
-        guard let action = arguments.first(where: { !$0.hasPrefix("-") }) else { return .reviewRequired }
-        guard ["list-sessions", "list-windows", "ls", "display-message"].contains(action) else { return .reviewRequired }
-
         let formatCommands = arguments.flatMap(ShellTokenizer.tmuxFormatCommands(in:))
         if !formatCommands.isEmpty {
             let formatRisk = commandSubstitutionRisk(formatCommands)
             if formatRisk == .blocked { return .blocked }
+        }
+
+        // Global destructive actions are always blocked even after approval
+        if arguments.contains("kill-server") {
+            return .blocked
+        }
+
+        if arguments.contains(where: { $0 == "kill-session" || $0 == "kill-sess" }) {
+            let hasGlobalKillFlag = arguments.contains { arg in
+                if arg == "--all" { return true }
+                if arg.hasPrefix("-") && !arg.hasPrefix("--") {
+                    let flags = arg.dropFirst()
+                    return flags.contains("a") || flags.contains("g")
+                }
+                return false
+            }
+            if hasGlobalKillFlag {
+                return .blocked
+            }
             return .reviewRequired
         }
-        return .safe
+
+        if let runShellIndex = arguments.firstIndex(where: { $0 == "run-shell" || $0 == "if-shell" }),
+           runShellIndex + 1 < arguments.count {
+            let nestedCmd = arguments[runShellIndex + 1]
+            if classify(nestedCmd) == .blocked {
+                return .blocked
+            }
+            return .reviewRequired
+        }
+
+        // Exact probe form: tmux -V (with optional global flags like -u, but no subcommand)
+        let isProbe = arguments.contains("-V") && arguments.allSatisfy { $0.hasPrefix("-") }
+        if isProbe {
+            return formatCommands.isEmpty ? .safe : .reviewRequired
+        }
+
+        let (subcommand, _) = parseTmuxSubcommand(arguments: arguments)
+        guard let action = subcommand else {
+            return .reviewRequired
+        }
+
+        let isReadOnlyList = ["list-sessions", "ls", "list-windows", "lsw"].contains(action)
+        let isHasSession = ["has-session", "has"].contains(action)
+
+        if isReadOnlyList || isHasSession {
+            return formatCommands.isEmpty ? .safe : .reviewRequired
+        }
+
+        return .reviewRequired
+    }
+
+    private func parseTmuxSubcommand(arguments: [String]) -> (subcommand: String?, remaining: [String]) {
+        var index = 0
+        while index < arguments.count {
+            let arg = arguments[index]
+            if ["-c", "-f", "-L", "-S"].contains(arg) {
+                index += 2
+                continue
+            }
+            if arg.hasPrefix("-") {
+                index += 1
+                continue
+            }
+            return (arg, Array(arguments.dropFirst(index + 1)))
+        }
+        return (nil, [])
     }
 
     private func commandSubstitutionRisk(_ substitutions: [String]) -> CommandRisk {
