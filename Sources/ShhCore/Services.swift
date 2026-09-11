@@ -16,10 +16,21 @@ public struct HostKeyChallenge: Sendable, Equatable, Identifiable {
 }
 public enum TrustStatus: Equatable, Sendable { case unknown; case trusted; case changed(oldFingerprint: String) }
 public enum TrustDecision: Sendable, Equatable { case trustOnce; case trustPermanently; case reject }
-public protocol HostTrustEvaluator: Sendable { func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision }
+public protocol HostTrustEvaluator: Sendable {
+    func status(for challenge: HostKeyChallenge) async -> TrustStatus
+    func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision
+}
 public enum TerminalEvent: Sendable, Equatable { case bytes(Data); case closed; case error(TransportError) }
 public protocol SSHConnection: Sendable { func events() async -> AsyncThrowingStream<TerminalEvent, Error>; func send(_ data: Data) async throws; func resize(_ size: TerminalSize) async throws; func close() async }
-public protocol SSHTransport: Sendable { func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator) async throws -> any SSHConnection }
+public protocol SSHTransport: Sendable {
+    func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection
+}
+
+public extension SSHTransport {
+    func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24)) async throws -> any SSHConnection {
+        try await connect(host: host, identity: identity, trustEvaluator: trustEvaluator, initialSize: initialSize)
+    }
+}
 
 public actor DemoSSHConnection: SSHConnection {
     private var continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
@@ -41,21 +52,19 @@ public actor DemoSSHConnection: SSHConnection {
 }
 public struct DemoSSHTransport: SSHTransport {
     public init() {}
-    public func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator) async throws -> any SSHConnection {
+    public func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24)) async throws -> any SSHConnection {
         let challenge = HostKeyChallenge(hostname: host.hostname, port: host.port, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
         guard await trustEvaluator.evaluate(challenge) != .reject else {
-            if let store = trustEvaluator as? InMemoryTrustStore {
-                switch await store.status(for: challenge) {
-                case .unknown:
-                    if case .ssh(let options) = host.connection, options.strictHostKeyChecking == .trustedOnly {
-                        throw TransportError.remoteFailure("Host key is not trusted")
-                    }
-                    throw TransportError.hostKeyApprovalRequired(challenge)
-                case .changed(let oldFingerprint):
-                    throw TransportError.hostKeyChanged(old: oldFingerprint, new: challenge.fingerprint)
-                case .trusted:
-                    break
+            switch await trustEvaluator.status(for: challenge) {
+            case .unknown:
+                if case .ssh(let options) = host.connection, options.strictHostKeyChecking == .trustedOnly {
+                    throw TransportError.remoteFailure("Host key is not trusted")
                 }
+                throw TransportError.hostKeyApprovalRequired(challenge)
+            case .changed(let oldFingerprint):
+                throw TransportError.hostKeyChanged(old: oldFingerprint, new: challenge.fingerprint)
+            case .trusted:
+                break
             }
             throw TransportError.remoteFailure("Host key was rejected")
         }

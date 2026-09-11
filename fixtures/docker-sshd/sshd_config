@@ -1,0 +1,6 @@
+Port 2222
+PasswordAuthentication yes
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+StrictModes no
+LogLevel DEBUG
