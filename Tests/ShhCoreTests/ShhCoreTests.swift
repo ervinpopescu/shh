@@ -122,9 +122,9 @@ final class ShhCoreTests: XCTestCase {
     func testStoreRoundTripContainsNoSecretBytes() async throws {
         let store = InMemoryCatalog(seedDemoData: false)
         let identity = try IdentityDescriptor(name: "Demo key", kind: .privateKey, publicFingerprint: "SHA256:test", keychainReference: "kc-demo")
-        await store.save(identity)
+        try await store.save(identity)
         let host = try Host(name: "Demo", hostname: "demo.invalid", username: "dev", identityID: identity.id)
-        await store.save(host)
+        try await store.save(host)
         let loaded = try await store.listHosts()
         XCTAssertEqual(loaded.first?.identityID, identity.id)
         XCTAssertFalse(String(describing: loaded).contains("private key material"))

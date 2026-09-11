@@ -26,7 +26,7 @@ public actor DemoSSHConnection: SSHConnection {
     public init() {}
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task { await self.install(continuation) }
+            Task { self.install(continuation) }
         }
     }
     private func install(_ continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation) {
