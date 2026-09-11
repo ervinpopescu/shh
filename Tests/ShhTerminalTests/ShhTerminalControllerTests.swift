@@ -304,4 +304,106 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertNil(controller.getSelection())
         XCTAssertEqual(controller.title, "")
     }
+
+    func testHandlePasteRequest_SafeVersusRisky() {
+        let controller = ShhTerminalController()
+
+        var outbound: [Data] = []
+        controller.onOutput = { outbound.append($0) }
+
+        var requestedRisky: [String] = []
+        controller.onRiskyPasteRequested = { requestedRisky.append($0) }
+
+        // 1. Single-line: not risky, immediately dispatched
+        controller.handlePasteRequest("echo safe")
+        XCTAssertEqual(requestedRisky.count, 0)
+        XCTAssertEqual(outbound.count, 1)
+        XCTAssertEqual(outbound.last, Data("echo safe".utf8))
+
+        // 2. Multi-line unbracketed: risky, requests confirmation and does NOT dispatch to output
+        controller.handlePasteRequest("git status\nrm -rf /")
+        XCTAssertEqual(requestedRisky.count, 1)
+        XCTAssertEqual(requestedRisky.last, "git status\nrm -rf /")
+        XCTAssertEqual(outbound.count, 1, "Risky unbracketed paste must not be sent directly to onOutput")
+
+        // 3. Multi-line bracketed: safe, immediately dispatched wrapped in bracketed paste markers
+        controller.feed("\u{1b}[?2004h")
+        XCTAssertTrue(controller.bracketedPasteMode)
+        controller.handlePasteRequest("echo line 1\necho line 2")
+        XCTAssertEqual(requestedRisky.count, 1)
+        XCTAssertEqual(outbound.count, 2)
+        XCTAssertEqual(outbound.last, Data("\u{1b}[200~echo line 1\necho line 2\u{1b}[201~".utf8))
+    }
+
+    func testResetCancelsDebouncedResize() {
+        let config = ShhTerminalConfiguration(
+            resizeDebounceInterval: 0.050,
+            initialSize: TerminalSize(columns: 80, rows: 24)
+        )
+        let controller = ShhTerminalController(configuration: config)
+
+        var resizeCalled = false
+        controller.onResize = { _ in
+            resizeCalled = true
+        }
+
+        controller.handleResize(columns: 100, rows: 40)
+        // Reset immediately cancels debounced timer
+        controller.reset()
+
+        let exp = expectation(description: "Wait after reset")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.080) {
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 1.0)
+
+        XCTAssertFalse(resizeCalled, "Pending resize must be cancelled on reset")
+    }
+
+    func testUpdateFirstResponderClearsPendingRequest() {
+        let controller = ShhTerminalController()
+
+        controller.requestFirstResponder()
+        XCTAssertTrue(controller.hasPendingFirstResponderRequest)
+        XCTAssertFalse(controller.isFirstResponder)
+
+        controller.updateFirstResponder(true)
+        XCTAssertFalse(controller.hasPendingFirstResponderRequest, "Acquiring first responder must clear pending request")
+        XCTAssertTrue(controller.isFirstResponder)
+    }
+
+    func testDetachEngineIdentityProtection() {
+        final class TestEngine: TerminalEngineBridge {
+            var bracketedPasteMode: Bool = false
+            var isAlternateScreenActive: Bool = false
+            var currentSize: TerminalSize = TerminalSize(columns: 80, rows: 24)
+            func feed(data: Data) {}
+            func feed(text: String) {}
+            func resize(size: TerminalSize) {}
+            func changeScrollback(_ limit: Int) {}
+            func findNext(_ term: String) -> Bool { true }
+            func findPrevious(_ term: String) -> Bool { true }
+            func searchMatchSummary(_ term: String) -> (index: Int, total: Int) { (0, 0) }
+            func clearSearch() {}
+            func selectAll() {}
+            func selectNone() {}
+            func getSelection() -> String? { nil }
+            func currentTranscript(limit: Int) -> String { "" }
+        }
+
+        let controller = ShhTerminalController()
+        let engine1 = TestEngine()
+        let engine2 = TestEngine()
+
+        controller.attachEngine(engine1, firstResponder: nil)
+        XCTAssertTrue(controller.attachedBridge === engine1)
+
+        // Detaching a different engine must NOT sever the current attached engine
+        controller.detachEngine(engine2)
+        XCTAssertTrue(controller.attachedBridge === engine1, "Detaching non-matching bridge must not nil active bridge")
+
+        // Detaching the active engine severs it
+        controller.detachEngine(engine1)
+        XCTAssertNil(controller.attachedBridge)
+    }
 }

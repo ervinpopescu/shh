@@ -12,6 +12,13 @@ public struct ShhTerminalView: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> ShhInternalTerminalHostView {
+        if let existing = controller.persistentHostView {
+            existing.controller = controller
+            existing.terminalDelegate = context.coordinator
+            controller.attachEngine(existing, firstResponder: existing)
+            return existing
+        }
+
         var options = TerminalOptions.default
         options.cols = controller.configuration.initialSize.columns
         options.rows = controller.configuration.initialSize.rows
@@ -27,17 +34,23 @@ public struct ShhTerminalView: UIViewRepresentable {
         try? view.setUseMetal(false)
 
         view.terminalDelegate = context.coordinator
+        controller.persistentHostView = view
         controller.attachEngine(view, firstResponder: view)
 
         return view
     }
 
     public func updateUIView(_ uiView: ShhInternalTerminalHostView, context: Context) {
+        context.coordinator.controller = controller
+        uiView.controller = controller
         uiView.updateSizeIfNeeded()
     }
 
     public static func dismantleUIView(_ uiView: ShhInternalTerminalHostView, coordinator: Coordinator) {
-        uiView.controller?.detachEngine()
+        _ = uiView.resignFirstResponder()
+        if uiView.controller?.persistentHostView !== uiView {
+            uiView.controller?.detachEngine(uiView)
+        }
     }
 
     public func makeCoordinator() -> Coordinator {
@@ -67,8 +80,14 @@ public struct ShhTerminalView: UIViewRepresentable {
 
         public func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let payload = Data(data)
-            Task { @MainActor [weak self] in
-                self?.controller?.handleOutput(payload)
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    controller?.handleOutput(payload)
+                }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    self?.controller?.handleOutput(payload)
+                }
             }
         }
 
@@ -157,7 +176,20 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     public override func didMoveToWindow() {
         super.didMoveToWindow()
         if window != nil && controller?.hasPendingFirstResponderRequest == true {
-            _ = becomeFirstResponder()
+            if becomeFirstResponder() {
+                controller?.updateFirstResponder(true)
+            }
+        }
+    }
+
+    // MARK: - Paste Handling
+
+    public override func paste(_ sender: Any?) {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+        if let controller {
+            controller.handlePasteRequest(text)
+        } else {
+            super.paste(sender)
         }
     }
 
@@ -202,7 +234,8 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     func currentTranscript(limit: Int) -> String {
         if let pageContent = accessibilityPageContent(), !pageContent.isEmpty {
-            return pageContent
+            let lines = pageContent.components(separatedBy: "\n")
+            return lines.suffix(limit).joined(separator: "\n")
         }
         let terminal = getTerminal()
         let dims = terminal.getDims()
