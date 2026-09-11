@@ -1,0 +1,9 @@
+.pi/
+.worktrees/
+.DS_Store
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+.swiftpm/
+Package.resolved
