@@ -396,6 +396,34 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .disconnected)
         XCTAssertNotEqual(container.terminalText, "Connection timed out.")
     }
+
+    func testHostDetailViewAndSessionScoping() async throws {
+        let container = AppContainer.demo()
+        let hostA = try Host(name: "Host A", hostname: "a.invalid", username: "user")
+        let hostB = try Host(name: "Host B", hostname: "b.invalid", username: "user")
+
+        // Pre-approve host A's key
+        let challengeA = HostKeyChallenge(hostname: "a.invalid", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        await container.trustStore.save(challengeA)
+
+        // Connect to host A
+        await container.connect(to: hostA)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.activeSession?.hostID, hostA.id)
+
+        // Verify active session matches host A but NOT host B
+        XCTAssertEqual(container.activeSession?.hostID, hostA.id)
+        XCTAssertNotEqual(container.activeSession?.hostID, hostB.id)
+
+        // Verify SwiftUI view instantiation
+        let rootView = RootView().environmentObject(container)
+        let detailViewA = HostDetailView(host: hostA).environmentObject(container)
+        let detailViewB = HostDetailView(host: hostB).environmentObject(container)
+
+        _ = rootView
+        _ = detailViewA
+        _ = detailViewB
+    }
 }
 
 private actor Gate {
