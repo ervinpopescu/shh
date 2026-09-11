@@ -69,6 +69,16 @@ public enum HealthState: Codable, Hashable, Sendable {
     }
 }
 
+public struct HostTmuxPreferences: Codable, Hashable, Sendable {
+    public var defaultSession: String?
+    public var autoAttach: Bool
+
+    public init(defaultSession: String? = nil, autoAttach: Bool = false) {
+        self.defaultSession = defaultSession
+        self.autoAttach = autoAttach
+    }
+}
+
 public struct Host: Identifiable, Codable, Hashable, Sendable {
     public let id: UUID
     public var name: String
@@ -81,7 +91,34 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     public var connection: ConnectionProfile
     public var health: HealthState
     public var lastUsedAt: Date?
-    public init(id: UUID = UUID(), name: String, hostname: String, port: UInt16 = 22, username: String, groupID: UUID? = nil, tagIDs: Set<UUID> = [], identityID: UUID? = nil, connection: ConnectionProfile = .ssh(SSHOptions()), health: HealthState = .unknown, lastUsedAt: Date? = nil) throws {
+    public var tmuxPreferences: HostTmuxPreferences
+
+    public var defaultTmuxSession: String? {
+        get { tmuxPreferences.defaultSession }
+        set { tmuxPreferences.defaultSession = newValue }
+    }
+
+    public var autoAttachTmux: Bool {
+        get { tmuxPreferences.autoAttach }
+        set { tmuxPreferences.autoAttach = newValue }
+    }
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        hostname: String,
+        port: UInt16 = 22,
+        username: String,
+        groupID: UUID? = nil,
+        tagIDs: Set<UUID> = [],
+        identityID: UUID? = nil,
+        connection: ConnectionProfile = .ssh(SSHOptions()),
+        health: HealthState = .unknown,
+        lastUsedAt: Date? = nil,
+        tmuxPreferences: HostTmuxPreferences = HostTmuxPreferences(),
+        defaultTmuxSession: String? = nil,
+        autoAttachTmux: Bool = false
+    ) throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "host name") }
         guard !hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "hostname") }
         guard !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "username") }
@@ -89,8 +126,65 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.id = id; self.name = name; self.hostname = hostname; self.port = port; self.username = username
         self.groupID = groupID; self.tagIDs = tagIDs; self.identityID = identityID; self.connection = connection
         self.health = health; self.lastUsedAt = lastUsedAt
+        if defaultTmuxSession != nil || autoAttachTmux {
+            self.tmuxPreferences = HostTmuxPreferences(
+                defaultSession: defaultTmuxSession ?? tmuxPreferences.defaultSession,
+                autoAttach: autoAttachTmux || tmuxPreferences.autoAttach
+            )
+        } else {
+            self.tmuxPreferences = tmuxPreferences
+        }
     }
+
     public var address: String { "\(username)@\(hostname):\(port)" }
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, hostname, port, username, groupID, tagIDs, identityID, connection, health, lastUsedAt
+        case tmuxPreferences, defaultTmuxSession, autoAttachTmux, autoAttach
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.name = try container.decode(String.self, forKey: .name)
+        self.hostname = try container.decode(String.self, forKey: .hostname)
+        self.port = try container.decode(UInt16.self, forKey: .port)
+        self.username = try container.decode(String.self, forKey: .username)
+        self.groupID = try container.decodeIfPresent(UUID.self, forKey: .groupID)
+        self.tagIDs = try container.decodeIfPresent(Set<UUID>.self, forKey: .tagIDs) ?? []
+        self.identityID = try container.decodeIfPresent(UUID.self, forKey: .identityID)
+        self.connection = try container.decodeIfPresent(ConnectionProfile.self, forKey: .connection) ?? .ssh(SSHOptions())
+        self.health = try container.decodeIfPresent(HealthState.self, forKey: .health) ?? .unknown
+        self.lastUsedAt = try container.decodeIfPresent(Date.self, forKey: .lastUsedAt)
+
+        if let prefs = try container.decodeIfPresent(HostTmuxPreferences.self, forKey: .tmuxPreferences) {
+            self.tmuxPreferences = prefs
+        } else {
+            let session = try container.decodeIfPresent(String.self, forKey: .defaultTmuxSession)
+            let auto = try container.decodeIfPresent(Bool.self, forKey: .autoAttachTmux)
+                ?? (try? container.decodeIfPresent(Bool.self, forKey: .autoAttach))
+                ?? false
+            self.tmuxPreferences = HostTmuxPreferences(defaultSession: session, autoAttach: auto)
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(hostname, forKey: .hostname)
+        try container.encode(port, forKey: .port)
+        try container.encode(username, forKey: .username)
+        try container.encodeIfPresent(groupID, forKey: .groupID)
+        try container.encode(tagIDs, forKey: .tagIDs)
+        try container.encodeIfPresent(identityID, forKey: .identityID)
+        try container.encode(connection, forKey: .connection)
+        try container.encode(health, forKey: .health)
+        try container.encodeIfPresent(lastUsedAt, forKey: .lastUsedAt)
+        try container.encode(tmuxPreferences, forKey: .tmuxPreferences)
+        try container.encodeIfPresent(defaultTmuxSession, forKey: .defaultTmuxSession)
+        try container.encode(autoAttachTmux, forKey: .autoAttachTmux)
+    }
 }
 
 public struct TrustRecord: Codable, Hashable, Sendable {
@@ -162,3 +256,49 @@ public struct CapabilityMatrix: Codable, Hashable, Sendable {
     public var tmux: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
     public init() {}
 }
+
+public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable {
+    public var hostID: UUID
+    public var sessionID: UUID
+    public var tmuxSessionID: String?
+    public var timestamp: Date
+
+    public init(
+        hostID: UUID,
+        sessionID: UUID = UUID(),
+        tmuxSessionID: String? = nil,
+        timestamp: Date = Date()
+    ) {
+        self.hostID = hostID
+        self.sessionID = sessionID
+        self.tmuxSessionID = tmuxSessionID
+        self.timestamp = timestamp
+    }
+}
+
+public protocol SessionRestorationStore: Sendable {
+    func save(_ metadata: SessionRestorationMetadata) async throws
+    func load() async throws -> SessionRestorationMetadata?
+    func clear() async throws
+}
+
+public actor InMemorySessionRestorationStore: SessionRestorationStore {
+    private var record: SessionRestorationMetadata?
+
+    public init(initial: SessionRestorationMetadata? = nil) {
+        self.record = initial
+    }
+
+    public func save(_ metadata: SessionRestorationMetadata) async throws {
+        self.record = metadata
+    }
+
+    public func load() async throws -> SessionRestorationMetadata? {
+        return record
+    }
+
+    public func clear() async throws {
+        self.record = nil
+    }
+}
+
