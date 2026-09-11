@@ -76,17 +76,19 @@ final class TestServerSessionChannelHandler: ChannelDuplexHandler, @unchecked Se
     var onShell: (@Sendable () -> Void)?
     var onResize: (@Sendable (Int, Int) -> Void)?
     var onData: (@Sendable (Data) -> Void)?
+    var suppressPTYReply = false
+    var suppressShellReply = false
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         switch event {
         case let pty as SSHChannelRequestEvent.PseudoTerminalRequest:
             onPTY?(pty.terminalCharacterWidth, pty.terminalRowHeight)
-            if pty.wantReply {
+            if pty.wantReply && !suppressPTYReply {
                 context.channel.triggerUserOutboundEvent(ChannelSuccessEvent(), promise: nil)
             }
         case let shell as SSHChannelRequestEvent.ShellRequest:
             onShell?()
-            if shell.wantReply {
+            if shell.wantReply && !suppressShellReply {
                 context.channel.triggerUserOutboundEvent(ChannelSuccessEvent(), promise: nil)
             }
             var buffer = context.channel.allocator.buffer(capacity: 32)

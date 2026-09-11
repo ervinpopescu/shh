@@ -391,4 +391,109 @@ final class ShhSSHTests: XCTestCase {
         XCTAssertGreaterThan(credStore.loadCallCount, 0, "Credentials should be loaded after host key accepted")
         await connection.close()
     }
+
+    func testNoIdentityDoesNotTransmitPasswordOffer() async throws {
+        let server = SSHTestServer()
+        server.authDelegate.expectedUsername = "testuser"
+        let port = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let trustStore = InMemoryTrustStore()
+        await trustStore.save(HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: server.fingerprint))
+
+        let transport = LiveSSHTransport(credentialStore: InMemoryCredentialStore())
+        let host = try ShhCore.Host(
+            name: "No Identity Host",
+            hostname: "127.0.0.1",
+            port: port,
+            username: "testuser",
+            identityID: nil,
+            connection: .ssh(SSHOptions(connectTimeoutSeconds: 5))
+        )
+
+        do {
+            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: trustStore)
+            XCTFail("Connect without identity should fail")
+        } catch TransportError.authenticationRequired {
+            // Expected
+        }
+
+        XCTAssertEqual(server.authDelegate.authAttemptsCount, 0, "No password offer must be transmitted when identity is nil")
+    }
+
+    func testPTYCancellationClosesChannel() async throws {
+        let server = SSHTestServer()
+        server.sessionHandler.suppressPTYReply = true
+        let port = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
+        let identity = try IdentityDescriptor(name: "Pass", kind: .password, keychainReference: "ref-pass")
+
+        let trustStore = InMemoryTrustStore()
+        await trustStore.save(HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: server.fingerprint))
+
+        let transport = LiveSSHTransport(credentialStore: credStore)
+        let host = try ShhCore.Host(
+            name: "PTY Suppressed Host",
+            hostname: "127.0.0.1",
+            port: port,
+            username: "testuser",
+            identityID: identity.id,
+            connection: .ssh(SSHOptions(connectTimeoutSeconds: 5))
+        )
+
+        let connectTask = Task {
+            try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
+        }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        connectTask.cancel()
+
+        do {
+            _ = try await connectTask.value
+            XCTFail("Cancelled connect should throw")
+        } catch TransportError.cancelled {
+            // Expected
+        }
+    }
+
+    func testShellCancellationClosesChannel() async throws {
+        let server = SSHTestServer()
+        server.sessionHandler.suppressShellReply = true
+        let port = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
+        let identity = try IdentityDescriptor(name: "Pass", kind: .password, keychainReference: "ref-pass")
+
+        let trustStore = InMemoryTrustStore()
+        await trustStore.save(HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: server.fingerprint))
+
+        let transport = LiveSSHTransport(credentialStore: credStore)
+        let host = try ShhCore.Host(
+            name: "Shell Suppressed Host",
+            hostname: "127.0.0.1",
+            port: port,
+            username: "testuser",
+            identityID: identity.id,
+            connection: .ssh(SSHOptions(connectTimeoutSeconds: 5))
+        )
+
+        let connectTask = Task {
+            try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
+        }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        connectTask.cancel()
+
+        do {
+            _ = try await connectTask.value
+            XCTFail("Cancelled connect should throw")
+        } catch TransportError.cancelled {
+            // Expected
+        }
+    }
 }
