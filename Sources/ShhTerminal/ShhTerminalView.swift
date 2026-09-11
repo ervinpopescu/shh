@@ -12,9 +12,13 @@ public struct ShhTerminalView: UIViewRepresentable {
     }
 
     public func makeUIView(context: Context) -> ShhInternalTerminalHostView {
+        makeUIView(coordinator: context.coordinator)
+    }
+
+    internal func makeUIView(coordinator: Coordinator) -> ShhInternalTerminalHostView {
         if let existing = controller.persistentHostView {
             existing.controller = controller
-            existing.terminalDelegate = context.coordinator
+            existing.terminalDelegate = coordinator
             controller.attachEngine(existing, firstResponder: existing)
             return existing
         }
@@ -33,7 +37,7 @@ public struct ShhTerminalView: UIViewRepresentable {
         // CoreGraphics / CoreText rendering by default (Metal disabled)
         try? view.setUseMetal(false)
 
-        view.terminalDelegate = context.coordinator
+        view.terminalDelegate = coordinator
         controller.persistentHostView = view
         controller.attachEngine(view, firstResponder: view)
 
@@ -41,8 +45,17 @@ public struct ShhTerminalView: UIViewRepresentable {
     }
 
     public func updateUIView(_ uiView: ShhInternalTerminalHostView, context: Context) {
-        context.coordinator.controller = controller
+        updateUIView(uiView, coordinator: context.coordinator)
+    }
+
+    internal func updateUIView(_ uiView: ShhInternalTerminalHostView, coordinator: Coordinator) {
+        coordinator.controller = controller
         uiView.controller = controller
+        if controller.attachedBridge == nil || controller.persistentHostView !== uiView {
+            controller.persistentHostView = uiView
+            uiView.terminalDelegate = coordinator
+            controller.attachEngine(uiView, firstResponder: uiView)
+        }
         uiView.updateSizeIfNeeded()
     }
 
