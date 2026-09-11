@@ -13,6 +13,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - App
+      - path: Resources/Assets.xcassets
+        buildPhase: resources
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
     dependencies:

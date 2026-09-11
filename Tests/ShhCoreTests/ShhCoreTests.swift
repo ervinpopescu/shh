@@ -43,12 +43,14 @@ final class ShhCoreTests: XCTestCase {
             "rm --recursive --force -- /",
             "rm -R\t-f /",
             "sudo rm -rf /",
+            "exec -a harmless-name rm -rf /",
             "bash -c 'rm -rf /'",
             "dd if=/dev/zero of=/dev/sda",
             "mkfs.ext4 /dev/nvme0n1",
             "find / -delete",
             "find / -exec rm -rf / \\;",
-            "find / -execdir rm -rf / \\;"
+            "find / -execdir rm -rf / \\;",
+            "find / -exec sh -c 'rm -rf /' \\;"
         ]
         for command in blocked {
             XCTAssertEqual(policy.classify(command), .blocked, command)
@@ -113,6 +115,19 @@ final class ShhCoreTests: XCTestCase {
         await store.save(challenge)
         let permanentDecision = await store.evaluate(challenge)
         XCTAssertEqual(permanentDecision, .trustPermanently)
+    }
+
+    func testTrustOnceApprovalDoesNotTransferToChangedFingerprint() async {
+        let store = InMemoryTrustStore()
+        let original = HostKeyChallenge(hostname: "example.com", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:original")
+        let changed = HostKeyChallenge(hostname: "example.com", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:changed")
+
+        await store.trustOnce(original)
+
+        let changedDecision = await store.evaluate(changed)
+        let originalDecision = await store.evaluate(original)
+        XCTAssertEqual(changedDecision, .reject)
+        XCTAssertEqual(originalDecision, .trustOnce)
     }
 
     func testRemotePathNormalizesTraversal() {
