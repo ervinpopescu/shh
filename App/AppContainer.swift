@@ -12,12 +12,18 @@ final class AppContainer: ObservableObject {
     let credentialStore: any CredentialStore
     let transcriber: any LocalTranscriber
     let terminalController: ShhTerminalController
+    let restorationStore: any SessionRestorationStore
+    let reachabilityMonitor: any ReachabilityMonitoring
+    let reconnectCoordinator: ReconnectCoordinator
 
     @Published var useLegacyTerminalFallback: Bool
     @Published var activeSession: TerminalSession?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
+    @Published var reconnectState: ReconnectState = .idle
+    private(set) var activeHost: Host?
+    private(set) var isExplicitDisconnect = false
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
@@ -47,7 +53,10 @@ final class AppContainer: ObservableObject {
         credentialStore: (any CredentialStore)? = nil,
         transport: (any SSHTransport)? = nil,
         transcriber: any LocalTranscriber = UnavailableTranscriber(),
-        useLegacyTerminalFallback: Bool = false
+        useLegacyTerminalFallback: Bool = false,
+        restorationStore: (any SessionRestorationStore)? = nil,
+        reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
+        reconnectCoordinator: ReconnectCoordinator? = nil
     ) {
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
@@ -59,6 +68,26 @@ final class AppContainer: ObservableObject {
         self.transcriber = transcriber
         self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
         self.terminalController = ShhTerminalController()
+        self.restorationStore = restorationStore ?? UserDefaultsSessionRestorationStore()
+        let monitor = reachabilityMonitor ?? NetworkPathReachabilityMonitor()
+        self.reachabilityMonitor = monitor
+        let coordinator = reconnectCoordinator ?? ReconnectCoordinator()
+        self.reconnectCoordinator = coordinator
+
+        Task { [weak self] in
+            await coordinator.setStateChangeHandler { [weak self] newState in
+                Task { @MainActor [weak self] in
+                    self?.reconnectState = newState
+                }
+            }
+        }
+
+        monitor.onReachabilityChange = { [weak self] reachable in
+            Task { @MainActor [weak self] in
+                self?.handleReachabilityChange(reachable)
+            }
+        }
+        monitor.start()
     }
 
     static func demo(
@@ -66,7 +95,10 @@ final class AppContainer: ObservableObject {
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: any CredentialStore = InMemoryCredentialStore(),
         transcriber: any LocalTranscriber = UnavailableTranscriber(),
-        useLegacyTerminalFallback: Bool = false
+        useLegacyTerminalFallback: Bool = false,
+        restorationStore: (any SessionRestorationStore)? = nil,
+        reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
+        reconnectCoordinator: ReconnectCoordinator? = nil
     ) -> AppContainer {
         AppContainer(
             catalog: catalog,
@@ -74,7 +106,13 @@ final class AppContainer: ObservableObject {
             credentialStore: credentialStore,
             transport: DemoSSHTransport(),
             transcriber: transcriber,
-            useLegacyTerminalFallback: useLegacyTerminalFallback
+            useLegacyTerminalFallback: useLegacyTerminalFallback,
+            restorationStore: restorationStore ?? InMemorySessionRestorationStore(),
+            reachabilityMonitor: reachabilityMonitor ?? MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: reconnectCoordinator ?? ReconnectCoordinator(
+                clock: { _ in },
+                jitter: ReconnectCoordinator.zeroJitter
+            )
         )
     }
 
@@ -104,6 +142,10 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host) async {
         guard activeSession?.state != .connecting else { return }
+        isExplicitDisconnect = false
+        activeHost = host
+        await reconnectCoordinator.cancel()
+        reconnectState = .idle
         eventTask?.cancel()
         detachCallbacks()
         await connection?.close()
@@ -136,6 +178,14 @@ final class AppContainer: ObservableObject {
             (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
 
+            // Save restoration metadata
+            let metadata = SessionRestorationMetadata(
+                hostID: host.id,
+                sessionID: session.id,
+                tmuxSessionID: host.defaultTmuxSession
+            )
+            try? await restorationStore.save(metadata)
+
             // Wire debounced resize callback to active connection
             terminalController.onResize = { [weak self, sessionID = session.id] newSize in
                 Task { @MainActor [weak self] in
@@ -155,50 +205,22 @@ final class AppContainer: ObservableObject {
                 self.enqueueRawInteractive(data, sessionID: sessionID)
             }
 
-            let events = await connection.events()
-            eventTask = Task { @MainActor [weak self] in
-                do {
-                    for try await event in events {
-                        guard let self, self.activeSession?.id == session.id else { return }
-                        switch event {
-                        case .bytes(let data):
-                            let redactedData = self.redacted(data)
-                            if self.useLegacyTerminalFallback {
-                                self.ansiParser.consume(redactedData, into: &self.terminalGrid)
-                                self.terminalText = self.terminalGrid.transcriptText
-                            } else {
-                                self.terminalController.feed(redactedData)
-                            }
-                        case .closed:
-                            self.activeSession?.state = .disconnected
-                            self.detachCallbacks()
-                            if !self.useLegacyTerminalFallback {
-                                self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
-                            }
-                            self.redactor = Redactor()
-                        case .error(let error):
-                            self.activeSession?.state = .failed
-                            self.detachCallbacks()
-                            let message = Self.statusMessage(for: error)
-                            self.terminalText += "\n" + message
-                            if !self.useLegacyTerminalFallback {
-                                self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                            }
-                            self.redactor = Redactor()
-                        }
-                    }
-                } catch {
-                    guard let self, self.activeSession?.id == session.id else { return }
-                    self.activeSession?.state = .failed
-                    self.detachCallbacks()
-                    let message = Self.statusMessage(for: error)
-                    self.terminalText += "\n" + message
-                    if !self.useLegacyTerminalFallback {
-                        self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                    }
-                    self.redactor = Redactor()
+            // Auto-attach tmux session if requested by host preferences
+            if host.autoAttachTmux {
+                let target = host.defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let attachCmd: String
+                if target.isEmpty {
+                    attachCmd = TmuxAdapter().command(for: .create(name: "default"))
+                } else if target.hasPrefix("$") {
+                    attachCmd = TmuxAdapter().command(for: .attach(name: target))
+                } else {
+                    attachCmd = TmuxAdapter().command(for: .create(name: target))
                 }
+                try? await connection.send(Data((attachCmd + "\n").utf8))
             }
+
+            let events = await connection.events()
+            startEventMonitoring(for: connection, events: events, session: session, host: host)
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
@@ -227,6 +249,214 @@ final class AppContainer: ObservableObject {
                 terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
             }
         }
+    }
+
+    private func startEventMonitoring(
+        for connection: any SSHConnection,
+        events: AsyncThrowingStream<TerminalEvent, Error>,
+        session: TerminalSession,
+        host: Host
+    ) {
+        eventTask?.cancel()
+        eventTask = Task { @MainActor [weak self] in
+            do {
+                for try await event in events {
+                    guard let self, self.activeSession?.id == session.id else { return }
+                    switch event {
+                    case .bytes(let data):
+                        let redactedData = self.redacted(data)
+                        if self.useLegacyTerminalFallback {
+                            self.ansiParser.consume(redactedData, into: &self.terminalGrid)
+                            self.terminalText = self.terminalGrid.transcriptText
+                        } else {
+                            self.terminalController.feed(redactedData)
+                        }
+                    case .closed:
+                        self.activeSession?.state = .disconnected
+                        self.detachCallbacks()
+                        if !self.useLegacyTerminalFallback {
+                            self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
+                        }
+                        self.redactor = Redactor()
+                        self.handleConnectionDrop(host: host)
+                    case .error(let error):
+                        self.activeSession?.state = .failed
+                        self.detachCallbacks()
+                        let message = Self.statusMessage(for: error)
+                        self.terminalText += "\n" + message
+                        if !self.useLegacyTerminalFallback {
+                            self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+                        }
+                        self.redactor = Redactor()
+                        self.handleConnectionDrop(host: host)
+                    }
+                }
+            } catch {
+                guard let self, self.activeSession?.id == session.id else { return }
+                self.activeSession?.state = .failed
+                self.detachCallbacks()
+                let message = Self.statusMessage(for: error)
+                self.terminalText += "\n" + message
+                if !self.useLegacyTerminalFallback {
+                    self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+                }
+                self.redactor = Redactor()
+                self.handleConnectionDrop(host: host)
+            }
+        }
+    }
+
+    private func handleConnectionDrop(host: Host) {
+        guard !isExplicitDisconnect else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.reconnectCoordinator.start { [weak self] attempt in
+                guard let self else { return }
+                try await self.performReconnect(to: host, attempt: attempt)
+            }
+        }
+    }
+
+    func performReconnect(to host: Host, attempt: Int) async throws {
+        guard !isExplicitDisconnect else {
+            throw TransportError.cancelled
+        }
+        guard reachabilityMonitor.isReachable else {
+            throw TransportError.networkUnavailable
+        }
+
+        let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
+        activeSession = session
+
+        let initialSize = terminalController.size
+        let connection = try await transport.connect(
+            host: host,
+            identity: await identity(for: host),
+            trustEvaluator: trustStore,
+            initialSize: initialSize
+        )
+
+        guard activeSession?.id == session.id, !isExplicitDisconnect else {
+            await connection.close()
+            throw TransportError.cancelled
+        }
+
+        await loadRedactionSecret(for: host)
+        self.connection = connection
+        (connection as? LiveSSHConnection)?.setRedactor(redactor)
+        activeSession?.state = .connected
+
+        terminalController.onResize = { [weak self, sessionID = session.id] newSize in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.activeSession?.id == sessionID,
+                      self.activeSession?.state == .connected,
+                      let activeConnection = self.connection else { return }
+                try? await activeConnection.resize(newSize)
+            }
+        }
+
+        terminalController.onOutput = { [weak self, sessionID = session.id] data in
+            guard let self,
+                  self.activeSession?.id == sessionID,
+                  self.activeSession?.state == .connected else { return }
+            self.enqueueRawInteractive(data, sessionID: sessionID)
+        }
+
+        let metadata = SessionRestorationMetadata(
+            hostID: host.id,
+            sessionID: session.id,
+            tmuxSessionID: host.defaultTmuxSession
+        )
+        try? await restorationStore.save(metadata)
+
+        if host.autoAttachTmux {
+            let target = host.defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let attachCmd: String
+            if target.isEmpty {
+                attachCmd = TmuxAdapter().command(for: .create(name: "default"))
+            } else if target.hasPrefix("$") {
+                attachCmd = TmuxAdapter().command(for: .attach(name: target))
+            } else {
+                attachCmd = TmuxAdapter().command(for: .create(name: target))
+            }
+            try? await connection.send(Data((attachCmd + "\n").utf8))
+        }
+
+        let events = await connection.events()
+        startEventMonitoring(for: connection, events: events, session: session, host: host)
+    }
+
+    func cancelReconnect() async {
+        isExplicitDisconnect = true
+        await reconnectCoordinator.cancel()
+        reconnectState = .cancelled
+    }
+
+    func retryReconnect() async {
+        guard let host = activeHost else { return }
+        isExplicitDisconnect = false
+        await reconnectCoordinator.start { [weak self] attempt in
+            guard let self else { return }
+            try await self.performReconnect(to: host, attempt: attempt)
+        }
+    }
+
+    func handleReachabilityChange(_ isReachable: Bool) {
+        guard !isExplicitDisconnect else { return }
+        if isReachable {
+            if reconnectState.isReconnecting {
+                Task { [weak self] in
+                    guard let self, let host = self.activeHost else { return }
+                    await self.reconnectCoordinator.retryNow { [weak self] attempt in
+                        guard let self else { return }
+                        try await self.performReconnect(to: host, attempt: attempt)
+                    }
+                }
+            } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
+                handleConnectionDrop(host: host)
+            }
+        }
+    }
+
+    func handleScenePhaseChange(_ phase: ScenePhase) {
+        guard !isExplicitDisconnect else { return }
+        switch phase {
+        case .active:
+            if reconnectState.isReconnecting {
+                Task { [weak self] in
+                    guard let self, let host = self.activeHost else { return }
+                    await self.reconnectCoordinator.retryNow { [weak self] attempt in
+                        guard let self else { return }
+                        try await self.performReconnect(to: host, attempt: attempt)
+                    }
+                }
+            } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
+                handleConnectionDrop(host: host)
+            }
+        case .background:
+            if let session = activeSession, let host = activeHost, session.state == .connected {
+                let metadata = SessionRestorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    tmuxSessionID: host.defaultTmuxSession
+                )
+                Task { [weak self] in
+                    try? await self?.restorationStore.save(metadata)
+                }
+            }
+        default:
+            break
+        }
+    }
+
+    func restoreLastSession() async {
+        guard let metadata = try? await restorationStore.load(),
+              let hosts = try? await catalog.listHosts(),
+              let host = hosts.first(where: { $0.id == metadata.hostID }) else {
+            return
+        }
+        await connect(to: host)
     }
 
     func approvePendingHostKey(permanently: Bool) async {
@@ -280,6 +510,11 @@ final class AppContainer: ObservableObject {
     }
 
     func disconnect() async {
+        isExplicitDisconnect = true
+        activeHost = nil
+        await reconnectCoordinator.cancel()
+        reconnectState = .idle
+        try? await restorationStore.clear()
         detachCallbacks()
         eventTask?.cancel()
         eventTask = nil

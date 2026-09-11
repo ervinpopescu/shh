@@ -1,0 +1,337 @@
+import SwiftUI
+import XCTest
+@testable import Shh
+import ShhCore
+import ShhTerminal
+
+@MainActor
+final class RestorationAndReachabilityTests: XCTestCase {
+
+    // MARK: - Persistence & No Secrets Stored
+
+    func testUserDefaultsSessionRestorationStoreRoundTrip() async throws {
+        let suiteName = "com.ervinpopescu.shh.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsSessionRestorationStore(userDefaults: defaults, storageKey: "test.restoration")
+
+        let initial = try await store.load()
+        XCTAssertNil(initial, "Empty store must return nil")
+
+        let hostID = UUID()
+        let sessionID = UUID()
+        let timestamp = Date(timeIntervalSince1970: 1700000000)
+
+        let metadata = SessionRestorationMetadata(
+            hostID: hostID,
+            sessionID: sessionID,
+            tmuxSessionID: "$3",
+            timestamp: timestamp
+        )
+
+        try await store.save(metadata)
+
+        let loaded = try await store.load()
+        let unwrapped = try XCTUnwrap(loaded)
+        XCTAssertEqual(unwrapped.hostID, hostID)
+        XCTAssertEqual(unwrapped.sessionID, sessionID)
+        XCTAssertEqual(unwrapped.tmuxSessionID, "$3")
+        XCTAssertEqual(unwrapped.timestamp, timestamp)
+
+        try await store.clear()
+        let afterClear = try await store.load()
+        XCTAssertNil(afterClear, "Cleared store must return nil")
+    }
+
+    func testUserDefaultsStoresNoSecretsOrTerminalBytes() async throws {
+        let suiteName = "com.ervinpopescu.shh.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsSessionRestorationStore(userDefaults: defaults, storageKey: "test.restoration")
+
+        let hostID = UUID()
+        let sessionID = UUID()
+        let timestamp = Date()
+
+        let metadata = SessionRestorationMetadata(
+            hostID: hostID,
+            sessionID: sessionID,
+            tmuxSessionID: "$0",
+            timestamp: timestamp
+        )
+
+        try await store.save(metadata)
+
+        // Inspect raw stored dictionary representation in UserDefaults
+        let dictionary = defaults.dictionaryRepresentation()
+        let rawData = defaults.data(forKey: "test.restoration")
+        let dataString = try XCTUnwrap(rawData.flatMap { String(data: $0, encoding: .utf8) })
+
+        // 1. Verify expected keys are present
+        XCTAssertTrue(dataString.contains("hostID"))
+        XCTAssertTrue(dataString.contains("sessionID"))
+        XCTAssertTrue(dataString.contains("tmuxSessionID"))
+
+        // 2. Strict verification: ensure NO secrets, terminal bytes, or host keys are in UserDefaults
+        let forbiddenPatterns = [
+            "password",
+            "privateKey",
+            "BEGIN OPENSSH PRIVATE KEY",
+            "BEGIN RSA PRIVATE KEY",
+            "BEGIN EC PRIVATE KEY",
+            "fingerprint",
+            "SHA256:",
+            "terminalText",
+            "scrollback",
+            "transcriptText",
+            "grid"
+        ]
+
+        for pattern in forbiddenPatterns {
+            XCTAssertFalse(
+                dataString.localizedCaseInsensitiveContains(pattern),
+                "Restoration store must never persist '\(pattern)' in UserDefaults"
+            )
+        }
+
+        // Verify across entire UserDefaults dictionary
+        for (key, value) in dictionary where key.contains("test.restoration") {
+            let stringValue = String(describing: value)
+            for pattern in forbiddenPatterns {
+                XCTAssertFalse(
+                    stringValue.localizedCaseInsensitiveContains(pattern),
+                    "UserDefaults representation must not contain '\(pattern)'"
+                )
+            }
+        }
+    }
+
+    // MARK: - Auto-Attach Tmux on Connect
+
+    func testAppContainerAutoAttachTmuxOnConnect() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in mockConnection }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(
+            name: "TmuxHost",
+            hostname: "tmux.invalid",
+            username: "dev",
+            defaultTmuxSession: "$1",
+            autoAttachTmux: true
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // Verify auto-attach command was sent through connection
+        let sentStrings = mockConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
+        let hasAttach = sentStrings.contains { $0.contains("attach-session") && $0.contains("'$1'") }
+        XCTAssertTrue(hasAttach, "When autoAttachTmux is true with session ID, attach-session command must be sent")
+    }
+
+    func testAppContainerAutoAttachTmuxCreatesNewSessionIfNameProvided() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in mockConnection }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(
+            name: "TmuxCreateHost",
+            hostname: "tmux.invalid",
+            username: "dev",
+            defaultTmuxSession: "my-work",
+            autoAttachTmux: true
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        let sentStrings = mockConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
+        let hasNewSession = sentStrings.contains { $0.contains("new-session") && $0.contains("'my-work'") }
+        XCTAssertTrue(hasNewSession, "When autoAttachTmux is true with session name, new-session command must be sent")
+    }
+
+    // MARK: - Network Reachability & Foreground Triggers
+
+    func testAppContainerNetworkReachabilityTriggerReconnect() async throws {
+        let mockConnection1 = MockSSHConnection()
+        let mockConnection2 = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in
+            connectCount += 1
+            return connectCount == 1 ? mockConnection1 : mockConnection2
+        }
+
+        let reachability = MockReachabilityMonitor(isReachable: true)
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in },
+            jitter: ReconnectCoordinator.zeroJitter
+        )
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: coordinator
+        )
+
+        let host = try Host(name: "NetHost", hostname: "net.invalid", username: "dev")
+
+        // 1. Initial connect
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(connectCount, 1)
+
+        // 2. Mid-session network drop
+        mockConnection1.emit(TerminalEvent.error(TransportError.networkUnavailable))
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // Network is offline
+        reachability.setReachable(false)
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        // 3. Network comes back online!
+        reachability.setReachable(true)
+
+        // Allow reconnect attempt to complete
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        XCTAssertEqual(container.activeSession?.state, .connected, "Network recovery must trigger reconnect and succeed")
+        XCTAssertEqual(connectCount, 2, "A second connection attempt must have been performed")
+    }
+
+    func testAppContainerScenePhaseForegroundTriggerReconnect() async throws {
+        let mockConnection1 = MockSSHConnection()
+        let mockConnection2 = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in
+            connectCount += 1
+            return connectCount == 1 ? mockConnection1 : mockConnection2
+        }
+
+        let reachability = MockReachabilityMonitor(isReachable: true)
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in },
+            jitter: ReconnectCoordinator.zeroJitter
+        )
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: coordinator
+        )
+
+        let host = try Host(name: "ForeHost", hostname: "fore.invalid", username: "dev")
+
+        // 1. Connect
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(connectCount, 1)
+
+        // 2. Connection drops unexpectedly
+        mockConnection1.emit(TerminalEvent.closed)
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // 3. App enters foreground (.active)
+        container.handleScenePhaseChange(ScenePhase.active)
+
+        // Allow reconnect attempt to complete
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        XCTAssertEqual(container.activeSession?.state, .connected, "Foregrounding scene phase must trigger reconnect and succeed")
+        XCTAssertEqual(connectCount, 2)
+    }
+
+    func testAppContainerExplicitDisconnectDoesNotAutoReconnect() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in
+            connectCount += 1
+            return mockConnection
+        }
+
+        let reachability = MockReachabilityMonitor(isReachable: true)
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in },
+            jitter: ReconnectCoordinator.zeroJitter
+        )
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: coordinator
+        )
+
+        let host = try Host(name: "ExplicitHost", hostname: "explicit.invalid", username: "dev")
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(connectCount, 1)
+
+        // User explicitly disconnects
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(container.isExplicitDisconnect)
+
+        // Network changes and scene enters active
+        reachability.setReachable(false)
+        reachability.setReachable(true)
+        container.handleScenePhaseChange(ScenePhase.active)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // No new connection attempt must have occurred
+        XCTAssertEqual(connectCount, 1, "Explicit disconnect must prevent automatic reconnect triggers")
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+    }
+
+    func testAppContainerScenePhaseBackgroundSavesRestorationMetadata() async throws {
+        let suiteName = "com.ervinpopescu.shh.tests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let store = UserDefaultsSessionRestorationStore(userDefaults: defaults, storageKey: "test.bg.restoration")
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { (_: Host) async throws -> any SSHConnection in mockConnection }
+
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+
+        let host = try Host(
+            name: "BgHost",
+            hostname: "bg.invalid",
+            username: "dev",
+            defaultTmuxSession: "$0"
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        container.handleScenePhaseChange(ScenePhase.background)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let metadata = try await store.load()
+        let loaded = try XCTUnwrap(metadata)
+        XCTAssertEqual(loaded.hostID, host.id)
+        XCTAssertEqual(loaded.tmuxSessionID, "$0")
+    }
+}
