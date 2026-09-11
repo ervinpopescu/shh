@@ -395,6 +395,11 @@ final class TmuxAppTests: XCTestCase {
         let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
         let hasAttach = sentStrings.contains { $0.contains("attach-session") && $0.contains("'$99'") }
         XCTAssertFalse(hasAttach, "Missing session must not send failing attach command to PTY")
+
+        // Finding 3: activeTmuxSessionID cleared and restoration metadata persisted with nil tmuxSessionID
+        XCTAssertNil(container.activeTmuxSessionID)
+        let savedMetadata = try await container.restorationStore.load()
+        XCTAssertNil(savedMetadata?.tmuxSessionID)
     }
 
     // MARK: - 8. Reconnect Cancellation & Disconnect Races
@@ -415,7 +420,7 @@ final class TmuxAppTests: XCTestCase {
 
         // Drop reachability
         mockMonitor.setReachable(false)
-        await container.handleReachabilityChange(false)
+        container.handleReachabilityChange(false)
 
         // User cancels
         await container.cancelReconnect()
@@ -424,7 +429,7 @@ final class TmuxAppTests: XCTestCase {
 
         // Reachability restored afterwards does NOT trigger reconnect
         mockMonitor.setReachable(true)
-        await container.handleReachabilityChange(true)
+        container.handleReachabilityChange(true)
         XCTAssertEqual(container.reconnectState, .cancelled)
     }
 
@@ -503,13 +508,14 @@ final class TmuxAppTests: XCTestCase {
         let host = try Host(name: "UI Host", hostname: "demo.local", username: "dev")
         await container.connect(to: host)
 
-        // Pre-populate tmux sessions in container
+        let longSessionName = "a-very-long-tmux-session-name-that-tests-truncation-behavior-across-compact-and-regular-size-classes"
         container.tmuxAvailability = .available(version: "tmux 3.4")
         container.isTmuxServerRunning = true
+        container.activeTmuxSessionID = "$0"
         container.tmuxSessions = [
             TmuxSessionInfo(
                 sessionID: "$0",
-                name: "main",
+                name: longSessionName,
                 windowsCount: 2,
                 createdAt: Date(timeIntervalSince1970: 1700000000),
                 lastActivityAt: Date(),
@@ -526,12 +532,24 @@ final class TmuxAppTests: XCTestCase {
         ]
 
         let picker = MultiplexerPicker().environmentObject(container)
-        _ = picker
+        let hostingController = UIHostingController(rootView: picker)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
 
-        // Verify VoiceOver label formatting
+        XCTAssertGreaterThan(hostingController.view.bounds.width, 0)
+        XCTAssertGreaterThan(hostingController.view.bounds.height, 0)
+        XCTAssertGreaterThan(hostingController.view.subviews.count, 0)
+
+        // Verify active session check recognizes session by ID
+        XCTAssertTrue(container.isTmuxSessionActive(container.tmuxSessions[0]))
+        XCTAssertFalse(container.isTmuxSessionActive(container.tmuxSessions[1]))
+
+        // Verify VoiceOver accessibility metadata
         let session0 = container.tmuxSessions[0]
         XCTAssertEqual(session0.sessionID, "$0")
-        XCTAssertEqual(session0.name, "main")
+        XCTAssertEqual(session0.name, longSessionName)
         XCTAssertTrue(session0.isAttached)
 
         let session1 = container.tmuxSessions[1]
@@ -547,16 +565,369 @@ final class TmuxAppTests: XCTestCase {
         let host = try Host(name: "Layout Host", hostname: "demo.local", username: "dev")
         await container.connect(to: host)
 
+        let longName = String(repeating: "long-name-", count: 8)
+        container.tmuxAvailability = .available(version: "tmux 3.4")
+        container.isTmuxServerRunning = true
+        container.tmuxSessions = [
+            TmuxSessionInfo(
+                sessionID: "$0",
+                name: longName,
+                windowsCount: 5,
+                createdAt: Date(),
+                lastActivityAt: Date(),
+                attachedClients: 1
+            )
+        ]
+
         // Compact size class (iPhone portrait)
         let compactView = MultiplexerPicker()
             .environmentObject(container)
             .environment(\.horizontalSizeClass, .compact)
-        _ = compactView
+        let compactController = UIHostingController(rootView: compactView)
+        let compactWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        compactWindow.rootViewController = compactController
+        compactWindow.makeKeyAndVisible()
+        compactController.view.layoutIfNeeded()
 
-        // Regular size class (iPad landscape / full)
+        XCTAssertEqual(compactController.view.bounds.width, 393)
+        XCTAssertEqual(compactController.view.bounds.height, 852)
+        XCTAssertGreaterThan(compactController.view.subviews.count, 0)
+
+        // Regular size class (iPad landscape)
         let regularView = MultiplexerPicker()
             .environmentObject(container)
             .environment(\.horizontalSizeClass, .regular)
-        _ = regularView
+        let regularController = UIHostingController(rootView: regularView)
+        let regularWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 1024, height: 768))
+        regularWindow.rootViewController = regularController
+        regularWindow.makeKeyAndVisible()
+        regularController.view.layoutIfNeeded()
+
+        XCTAssertEqual(regularController.view.bounds.width, 1024)
+        XCTAssertEqual(regularController.view.bounds.height, 768)
+        XCTAssertGreaterThan(regularController.view.subviews.count, 0)
+    }
+
+    // MARK: - 12. Regression Tests (Findings 1 - 8)
+
+    func testStaleProbeAndListResultsDoNotOverwriteNewOrDisconnectedSession() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(name: "Stale Host", hostname: "stale.test", username: "user")
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        let gate = AsyncGate()
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe {
+                await gate.wait()
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 0, stdout: "$0\tmain\t1\t1700000000\t1700000500\t1\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        // Start refreshTmuxState asynchronously while probe is blocked at gate
+        let refreshTask = Task {
+            await container.refreshTmuxState()
+        }
+
+        // Wait slightly for refresh to enter probe await
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        // Disconnect before probe returns
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertEqual(container.tmuxAvailability, .unavailable(reason: "Not connected"))
+        XCTAssertTrue(container.tmuxSessions.isEmpty)
+        XCTAssertFalse(container.isTmuxServerRunning)
+
+        // Now open the gate so the probe completes
+        await gate.open()
+        await refreshTask.value
+
+        // Verify that stale probe/list results did NOT overwrite the disconnected state
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertEqual(container.tmuxAvailability, .unavailable(reason: "Not connected"))
+        XCTAssertTrue(container.tmuxSessions.isEmpty)
+        XCTAssertFalse(container.isTmuxServerRunning)
+    }
+
+    func testStaleHasSessionDoesNotMutateStateAfterDisconnect() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let gate = AsyncGate()
+        mock.onExecuteCommand = { cmd in
+            if cmd.contains("has-session") {
+                await gate.wait()
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no session")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let host = try Host(name: "Slow Host", hostname: "slow.test", username: "user", defaultTmuxSession: "$99", autoAttachTmux: true)
+
+        let connectTask = Task {
+            await container.connect(to: host)
+        }
+
+        try await Task.sleep(nanoseconds: 20_000_000)
+        await container.disconnect()
+
+        await gate.open()
+        await connectTask.value
+
+        // Error should not be assigned to disconnected session
+        XCTAssertNil(container.tmuxError)
+        XCTAssertNil(container.activeTmuxSessionID)
+    }
+
+    func testCreatedSessionResolvesToSessionIDAfterListAndUIRecognizesActive() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(name: "Create Host", hostname: "create.test", username: "user")
+        await container.connect(to: host)
+
+        var sessionsOutput = "$0\tother\t1\t1700000000\t1700000500\t0\n"
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 0, stdout: sessionsOutput)
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let created = await container.createTmuxSession(name: "project-work")
+        XCTAssertTrue(created)
+        XCTAssertEqual(container.activeTmuxSessionID, "project-work")
+
+        let candidateSession = TmuxSessionInfo(
+            sessionID: "$5",
+            name: "project-work",
+            windowsCount: 1,
+            createdAt: Date(),
+            lastActivityAt: Date(),
+            attachedClients: 1
+        )
+
+        // UI recognizes active by transitional name
+        XCTAssertTrue(container.isTmuxSessionActive(candidateSession))
+
+        // Now remote list updates with the new session
+        sessionsOutput = "$0\tother\t1\t1700000000\t1700000500\t0\n$5\tproject-work\t1\t1700000000\t1700000500\t1\n"
+        let sessions = await container.listTmuxSessions()
+        XCTAssertEqual(sessions.count, 2)
+        XCTAssertEqual(container.activeTmuxSessionID, "$5")
+
+        // Restoration store updated with resolved ID
+        let metadata = try await container.restorationStore.load()
+        XCTAssertEqual(metadata?.tmuxSessionID, "$5")
+
+        // UI recognizes active by canonical ID
+        XCTAssertFalse(container.isTmuxSessionActive(sessions[0]))
+        XCTAssertTrue(container.isTmuxSessionActive(sessions[1]))
+    }
+
+    func testPreferenceValidationAndAtomicHostSync() async throws {
+        let container = AppContainer.demo()
+        let host = try Host(name: "Sync Host", hostname: "sync.test", username: "user")
+        try await container.catalog.save(host)
+        await container.connect(to: host)
+
+        XCTAssertEqual(container.activeHost?.autoAttachTmux, false)
+        XCTAssertNil(container.activeHost?.defaultTmuxSession)
+
+        // Valid session name
+        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "my-session")
+        XCTAssertEqual(container.activeHost?.autoAttachTmux, true)
+        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "my-session")
+        let reloadedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
+        XCTAssertEqual(reloadedHost?.defaultTmuxSession, "my-session")
+        XCTAssertEqual(reloadedHost?.autoAttachTmux, true)
+
+        // Valid session ID
+        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "$3")
+        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3")
+
+        // Invalid session name with colon
+        do {
+            try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "invalid:name")
+            XCTFail("Should throw for colon in session name")
+        } catch {
+            XCTAssertTrue(error is TmuxSessionNameError)
+        }
+        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3", "Invalid preference must not mutate activeHost")
+
+        // Invalid session ID format
+        do {
+            try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "$notdigits")
+            XCTFail("Should throw for invalid session ID")
+        } catch {
+            XCTAssertTrue(error is TmuxSessionIDError)
+        }
+        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3", "Invalid session ID must not mutate activeHost")
+
+        // Clearing default session with empty string
+        try await container.updateActiveHostPreferences(autoAttachTmux: false, defaultTmuxSession: "   ")
+        XCTAssertEqual(container.activeHost?.autoAttachTmux, false)
+        XCTAssertNil(container.activeHost?.defaultTmuxSession)
+    }
+
+    func testListSessionsParserFailureSurfacesSafeUserVisibleError() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(name: "Parse Host", hostname: "parse.test", username: "user")
+        await container.connect(to: host)
+
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 0, stdout: "invalid line without tabs\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let sessions = await container.listTmuxSessions()
+        XCTAssertTrue(sessions.isEmpty)
+        XCTAssertTrue(container.tmuxSessions.isEmpty)
+        XCTAssertTrue(container.isTmuxServerRunning)
+        XCTAssertNotNil(container.tmuxError)
+        XCTAssertTrue(container.tmuxError?.contains("Failed to parse tmux sessions") ?? false)
+    }
+
+    func testServerStopAndSessionDisappearanceClearsActiveSessionAndRestoration() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+
+        let host = try Host(name: "Lifecycle Host", hostname: "life.test", username: "user")
+        await container.connect(to: host)
+
+        await container.attachTmuxSession(id: "$0")
+        XCTAssertEqual(container.activeTmuxSessionID, "$0")
+
+        // 1. Session disappears from successful list
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000500\t1\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        _ = await container.listTmuxSessions()
+        XCTAssertNil(container.activeTmuxSessionID, "Disappeared session must be cleared")
+        var metadata = try await container.restorationStore.load()
+        XCTAssertNil(metadata?.tmuxSessionID)
+
+        // 2. Server stops
+        await container.attachTmuxSession(id: "$1")
+        XCTAssertEqual(container.activeTmuxSessionID, "$1")
+
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        _ = await container.listTmuxSessions()
+        XCTAssertNil(container.activeTmuxSessionID, "Stopped server must clear activeTmuxSessionID")
+        XCTAssertFalse(container.isTmuxServerRunning)
+        metadata = try await container.restorationStore.load()
+        XCTAssertNil(metadata?.tmuxSessionID)
+    }
+
+    func testValidatedCommandSendFailureFedToProductionTerminalSurface() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        mock.onSend = { _ in
+            throw TransportError.remoteFailure("channel error")
+        }
+
+        let container = AppContainer(
+            transport: transport,
+            useLegacyTerminalFallback: false
+        )
+
+        let host = try Host(name: "Send Fail Host", hostname: "sendfail.test", username: "user")
+        await container.connect(to: host)
+
+        let success = await container.sendValidatedCommand("echo hello\n", approved: true)
+        XCTAssertFalse(success)
+        XCTAssertTrue(container.terminalText.contains("Send failed"))
+        let transcript = container.terminalController.currentTranscript(limit: 10)
+        XCTAssertTrue(transcript.contains("[Send failed:"), "Send failure must be fed to production terminal surface")
+    }
+}
+
+private actor AsyncGate {
+    private var isOpen = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        for cont in continuations {
+            cont.resume()
+        }
+        continuations.removeAll()
     }
 }

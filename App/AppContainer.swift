@@ -37,6 +37,7 @@ final class AppContainer: ObservableObject {
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
+    private var tmuxRefreshGeneration: Int = 0
 
     var isDemo: Bool {
         transport is DemoSSHTransport
@@ -148,6 +149,7 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        tmuxRefreshGeneration += 1
         isExplicitDisconnect = false
         activeHost = host
         activeTmuxSessionID = nil
@@ -155,6 +157,7 @@ final class AppContainer: ObservableObject {
         isTmuxServerRunning = false
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
+        isProbingTmux = false
         await reconnectCoordinator.cancel()
         reconnectState = .idle
         eventTask?.cancel()
@@ -278,6 +281,8 @@ final class AppContainer: ObservableObject {
                             self.terminalController.feed(redactedData)
                         }
                     case .closed:
+                        self.tmuxRefreshGeneration += 1
+                        self.isProbingTmux = false
                         self.activeSession?.state = .disconnected
                         self.detachCallbacks()
                         if !self.useLegacyTerminalFallback {
@@ -286,6 +291,8 @@ final class AppContainer: ObservableObject {
                         self.redactor = Redactor()
                         self.handleConnectionDrop(host: host)
                     case .error(let error):
+                        self.tmuxRefreshGeneration += 1
+                        self.isProbingTmux = false
                         self.activeSession?.state = .failed
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
@@ -299,6 +306,8 @@ final class AppContainer: ObservableObject {
                 }
             } catch {
                 guard let self, self.activeSession?.id == session.id else { return }
+                self.tmuxRefreshGeneration += 1
+                self.isProbingTmux = false
                 self.activeSession?.state = .failed
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
@@ -330,6 +339,8 @@ final class AppContainer: ObservableObject {
         guard reachabilityMonitor.isReachable else {
             throw TransportError.networkUnavailable
         }
+        tmuxRefreshGeneration += 1
+        isProbingTmux = false
 
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
@@ -391,6 +402,8 @@ final class AppContainer: ObservableObject {
 
     func cancelReconnect() async {
         isExplicitDisconnect = true
+        tmuxRefreshGeneration += 1
+        isProbingTmux = false
         await reconnectCoordinator.cancel()
         reconnectState = .cancelled
     }
@@ -501,7 +514,11 @@ final class AppContainer: ObservableObject {
             try await connection.send(Data(command.utf8))
             return true
         } catch {
-            terminalText += "\nSend failed."
+            let message = "Send failed: \(error.localizedDescription)"
+            terminalText += "\n" + message
+            if !useLegacyTerminalFallback {
+                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            }
             return false
         }
     }
@@ -513,6 +530,7 @@ final class AppContainer: ObservableObject {
 
     func disconnect() async {
         isExplicitDisconnect = true
+        tmuxRefreshGeneration += 1
         activeHost = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
@@ -527,6 +545,7 @@ final class AppContainer: ObservableObject {
         activeTmuxSessionID = nil
         tmuxSessions = []
         isTmuxServerRunning = false
+        isProbingTmux = false
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
     }
@@ -572,43 +591,142 @@ final class AppContainer: ObservableObject {
 
     // MARK: - Live Tmux Management
 
+    func isTmuxSessionActive(_ session: TmuxSessionInfo) -> Bool {
+        guard let activeID = activeTmuxSessionID else { return false }
+        return activeID == session.sessionID || activeID == session.name
+    }
+
+    func updateActiveHostPreferences(autoAttachTmux: Bool, defaultTmuxSession: String?) async throws {
+        guard let host = activeHost else { return }
+        let validatedSession: String?
+        if let session = defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines), !session.isEmpty {
+            if session.hasPrefix("$") {
+                _ = try TmuxSessionID(session)
+            } else {
+                _ = try TmuxSessionName(session)
+            }
+            validatedSession = session
+        } else {
+            validatedSession = nil
+        }
+
+        let updatedHost = try Host(
+            id: host.id,
+            name: host.name,
+            hostname: host.hostname,
+            port: host.port,
+            username: host.username,
+            groupID: host.groupID,
+            tagIDs: host.tagIDs,
+            identityID: host.identityID,
+            connection: host.connection,
+            health: host.health,
+            lastUsedAt: host.lastUsedAt,
+            tmuxPreferences: HostTmuxPreferences(
+                defaultSession: validatedSession,
+                autoAttach: autoAttachTmux
+            )
+        )
+
+        activeHost = updatedHost
+        try await catalog.save(updatedHost)
+    }
+
     private func handleTmuxTarget(_ target: String, on connection: any SSHConnection, host: Host, session: TerminalSession) async {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("$") {
             if let executor = connection as? SSHCommandExecuting {
-                let check = try? await executor.executeCommand(TmuxCommand.hasSession(id: trimmed), timeout: 5.0)
-                if let check, !check.isSuccess {
-                    self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
+                do {
+                    let check = try await executor.executeCommand(TmuxCommand.hasSession(id: trimmed), timeout: 5.0)
+                    guard activeSession?.id == session.id,
+                          activeSession?.state == .connected,
+                          !isExplicitDisconnect,
+                          (self.connection as AnyObject) === (connection as AnyObject) else {
+                        return
+                    }
+                    if !check.isSuccess {
+                        self.activeTmuxSessionID = nil
+                        let metadata = SessionRestorationMetadata(
+                            hostID: host.id,
+                            sessionID: session.id,
+                            tmuxSessionID: nil
+                        )
+                        try? await restorationStore.save(metadata)
+                        self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
+                        return
+                    }
+                } catch {
+                    guard activeSession?.id == session.id,
+                          activeSession?.state == .connected,
+                          !isExplicitDisconnect,
+                          (self.connection as AnyObject) === (connection as AnyObject) else {
+                        return
+                    }
+                    self.activeTmuxSessionID = nil
+                    let metadata = SessionRestorationMetadata(
+                        hostID: host.id,
+                        sessionID: session.id,
+                        tmuxSessionID: nil
+                    )
+                    try? await restorationStore.save(metadata)
+                    self.tmuxError = "Failed to verify tmux session \(trimmed): \(error.localizedDescription)"
                     return
                 }
             }
+            guard activeSession?.id == session.id,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (self.connection as AnyObject) === (connection as AnyObject) else {
+                return
+            }
             _ = await attachTmuxSession(id: trimmed)
         } else if !trimmed.isEmpty {
+            guard activeSession?.id == session.id,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (self.connection as AnyObject) === (connection as AnyObject) else {
+                return
+            }
             _ = await createTmuxSession(name: trimmed)
         } else {
+            guard activeSession?.id == session.id,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (self.connection as AnyObject) === (connection as AnyObject) else {
+                return
+            }
             _ = await createTmuxSession(name: "default")
         }
     }
 
     @discardableResult
     func probeTmux() async -> TmuxAvailability {
-        guard activeSession?.state == .connected,
+        guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             let avail = TmuxAvailability.unavailable(reason: "Not connected")
-            tmuxAvailability = avail
+            if activeSession == nil || activeSession?.state != .connected {
+                tmuxAvailability = avail
+            }
             return avail
         }
-        let sessionID = activeSession?.id
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
         do {
             let result = try await executor.executeCommand(TmuxCommand.probe, timeout: 5.0)
-            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = TmuxAvailability.parse(result: result)
             tmuxAvailability = avail
             return avail
         } catch {
-            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = TmuxAvailability.unavailable(reason: error.localizedDescription)
@@ -619,34 +737,95 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func listTmuxSessions() async -> [TmuxSessionInfo] {
-        guard activeSession?.state == .connected,
+        guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             tmuxSessions = []
             isTmuxServerRunning = false
             return []
         }
-        let sessionID = activeSession?.id
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
         do {
             let result = try await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
-            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return []
             }
             if result.isSuccess {
-                let parsed = (try? TmuxListSessionsParser.parse(result.stdout)) ?? []
-                tmuxSessions = parsed
-                isTmuxServerRunning = true
-                tmuxError = nil
-                return parsed
+                do {
+                    let parsed = try TmuxListSessionsParser.parse(result.stdout)
+                    tmuxSessions = parsed
+                    isTmuxServerRunning = true
+                    tmuxError = nil
+
+                    if let active = activeTmuxSessionID {
+                        if let matched = parsed.first(where: { $0.sessionID == active || $0.name == active }) {
+                            if active != matched.sessionID {
+                                activeTmuxSessionID = matched.sessionID
+                                if let host = activeHost {
+                                    let metadata = SessionRestorationMetadata(
+                                        hostID: host.id,
+                                        sessionID: sessionID,
+                                        tmuxSessionID: matched.sessionID
+                                    )
+                                    try? await restorationStore.save(metadata)
+                                }
+                            }
+                        } else {
+                            activeTmuxSessionID = nil
+                            if let host = activeHost {
+                                let metadata = SessionRestorationMetadata(
+                                    hostID: host.id,
+                                    sessionID: sessionID,
+                                    tmuxSessionID: nil
+                                )
+                                try? await restorationStore.save(metadata)
+                            }
+                        }
+                    }
+
+                    return parsed
+                } catch {
+                    tmuxSessions = []
+                    isTmuxServerRunning = true
+                    let parseMessage = "Failed to parse tmux sessions: \(error.localizedDescription)"
+                    tmuxError = parseMessage
+                    return []
+                }
             } else {
                 let combinedErr = (result.stderr + " " + result.stdout).lowercased()
                 if combinedErr.contains("no server running") {
                     tmuxSessions = []
                     isTmuxServerRunning = false
                     tmuxError = nil
+                    if activeTmuxSessionID != nil {
+                        activeTmuxSessionID = nil
+                        if let host = activeHost {
+                            let metadata = SessionRestorationMetadata(
+                                hostID: host.id,
+                                sessionID: sessionID,
+                                tmuxSessionID: nil
+                            )
+                            try? await restorationStore.save(metadata)
+                        }
+                    }
                 } else if combinedErr.contains("no sessions") {
                     tmuxSessions = []
                     isTmuxServerRunning = true
                     tmuxError = nil
+                    if activeTmuxSessionID != nil {
+                        activeTmuxSessionID = nil
+                        if let host = activeHost {
+                            let metadata = SessionRestorationMetadata(
+                                hostID: host.id,
+                                sessionID: sessionID,
+                                tmuxSessionID: nil
+                            )
+                            try? await restorationStore.save(metadata)
+                        }
+                    }
                 } else {
                     tmuxSessions = []
                     isTmuxServerRunning = false
@@ -656,7 +835,10 @@ final class AppContainer: ObservableObject {
                 return []
             }
         } catch {
-            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return []
             }
             tmuxSessions = []
@@ -667,31 +849,67 @@ final class AppContainer: ObservableObject {
     }
 
     func refreshTmuxState() async {
-        guard activeSession?.state == .connected,
-              connection is SSHCommandExecuting else {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let currentConnection = connection, currentConnection is SSHCommandExecuting else {
             tmuxAvailability = .unavailable(reason: "Not connected")
             tmuxSessions = []
             isTmuxServerRunning = false
             return
         }
+        let sessionID = currentSession.id
+        let connObj = currentConnection as AnyObject
+        tmuxRefreshGeneration += 1
+        let generation = tmuxRefreshGeneration
         isProbingTmux = true
-        defer { isProbingTmux = false }
+        defer {
+            if tmuxRefreshGeneration == generation {
+                isProbingTmux = false
+            }
+        }
 
         let availability = await probeTmux()
+        guard tmuxRefreshGeneration == generation,
+              activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            return
+        }
+
         if availability.isAvailable {
             _ = await listTmuxSessions()
+            guard tmuxRefreshGeneration == generation,
+                  activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return
+            }
         } else {
             tmuxSessions = []
             isTmuxServerRunning = false
+            if activeTmuxSessionID != nil {
+                activeTmuxSessionID = nil
+                if let host = activeHost {
+                    let metadata = SessionRestorationMetadata(
+                        hostID: host.id,
+                        sessionID: sessionID,
+                        tmuxSessionID: nil
+                    )
+                    try? await restorationStore.save(metadata)
+                }
+            }
         }
     }
 
     @discardableResult
     func attachTmuxSession(id: String) async -> Bool {
-        guard activeSession?.state == .connected, connection != nil else {
+        guard activeSession?.state == .connected, let conn = connection else {
             tmuxError = "Not connected."
             return false
         }
+        let sessionID = activeSession?.id
+        let connObj = conn as AnyObject
         let validatedID: TmuxSessionID
         do {
             validatedID = try TmuxSessionID(id)
@@ -707,7 +925,14 @@ final class AppContainer: ObservableObject {
         }
 
         let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            return false
+        }
         if sent {
+            tmuxRefreshGeneration += 1
             activeTmuxSessionID = validatedID.value
             tmuxError = nil
             if let host = activeHost, let session = activeSession {
@@ -727,10 +952,12 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func createTmuxSession(name: String) async -> Bool {
-        guard activeSession?.state == .connected, connection != nil else {
+        guard activeSession?.state == .connected, let conn = connection else {
             tmuxError = "Not connected."
             return false
         }
+        let sessionID = activeSession?.id
+        let connObj = conn as AnyObject
         let validatedName: TmuxSessionName
         do {
             validatedName = try TmuxSessionName(name)
@@ -746,7 +973,14 @@ final class AppContainer: ObservableObject {
         }
 
         let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            return false
+        }
         if sent {
+            tmuxRefreshGeneration += 1
             activeTmuxSessionID = validatedName.value
             tmuxError = nil
             if let host = activeHost, let session = activeSession {
