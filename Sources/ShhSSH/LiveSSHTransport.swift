@@ -179,40 +179,47 @@ public struct LiveSSHTransport: SSHTransport {
             throw TransportError.unsupported
         }
 
-        if options.connectTimeoutSeconds > 0 {
-            return try await withThrowingTaskGroup(of: (any SSHConnection).self) { group in
-                group.addTask {
-                    try await self.performConnect(
-                        host: host,
-                        identity: identity,
-                        trustEvaluator: trustEvaluator,
-                        initialSize: initialSize,
-                        options: options
-                    )
-                }
-                group.addTask {
-                    let nanos = UInt64(max(0.001, options.connectTimeoutSeconds) * 1_000_000_000)
-                    try await Task.sleep(nanoseconds: nanos)
-                    throw TransportError.timeout
-                }
+        do {
+            if options.connectTimeoutSeconds > 0 {
+                return try await withThrowingTaskGroup(of: (any SSHConnection).self) { group in
+                    group.addTask {
+                        try await self.performConnect(
+                            host: host,
+                            identity: identity,
+                            trustEvaluator: trustEvaluator,
+                            initialSize: initialSize,
+                            options: options
+                        )
+                    }
+                    group.addTask {
+                        let nanos = UInt64(max(0.001, options.connectTimeoutSeconds) * 1_000_000_000)
+                        try await Task.sleep(nanoseconds: nanos)
+                        throw TransportError.timeout
+                    }
 
-                do {
-                    let connection = try await group.next()!
-                    group.cancelAll()
-                    return connection
-                } catch {
-                    group.cancelAll()
-                    throw error
+                    do {
+                        let connection = try await group.next()!
+                        group.cancelAll()
+                        return connection
+                    } catch {
+                        group.cancelAll()
+                        throw error
+                    }
                 }
+            } else {
+                return try await performConnect(
+                    host: host,
+                    identity: identity,
+                    trustEvaluator: trustEvaluator,
+                    initialSize: initialSize,
+                    options: options
+                )
             }
-        } else {
-            return try await performConnect(
-                host: host,
-                identity: identity,
-                trustEvaluator: trustEvaluator,
-                initialSize: initialSize,
-                options: options
-            )
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw TransportError.cancelled
+            }
+            throw error
         }
     }
 
@@ -249,6 +256,7 @@ public struct LiveSSHTransport: SSHTransport {
         )
 
         var rawChannel: Channel?
+        var createdConnection: LiveSSHConnection?
 
         do {
             var bootstrap = ClientBootstrap(group: eventLoopGroup)
@@ -324,6 +332,7 @@ public struct LiveSSHTransport: SSHTransport {
                 eventLoopGroup: eventLoopGroup,
                 ownsGroup: ownsGroup
             )
+            createdConnection = connection
             router.setConnection(connection)
 
             let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
@@ -338,7 +347,11 @@ public struct LiveSSHTransport: SSHTransport {
             let ptyPromise = childChannel.eventLoop.makePromise(of: Void.self)
             childHandler.addPendingReplyPromise(ptyPromise)
             try await childChannel.triggerUserOutboundEvent(ptyRequest).get()
-            try await ptyPromise.futureResult.get()
+            try await withTaskCancellationHandler {
+                try await ptyPromise.futureResult.get()
+            } onCancel: {
+                channel.close(promise: nil)
+            }
 
             if Task.isCancelled { throw TransportError.cancelled }
 
@@ -346,11 +359,19 @@ public struct LiveSSHTransport: SSHTransport {
             let shellPromise = childChannel.eventLoop.makePromise(of: Void.self)
             childHandler.addPendingReplyPromise(shellPromise)
             try await childChannel.triggerUserOutboundEvent(shellRequest).get()
-            try await shellPromise.futureResult.get()
+            try await withTaskCancellationHandler {
+                try await shellPromise.futureResult.get()
+            } onCancel: {
+                channel.close(promise: nil)
+            }
 
             return connection
         } catch {
-            await cleanup(channel: rawChannel, group: ownsGroup ? eventLoopGroup : nil)
+            if let createdConnection {
+                await createdConnection.close()
+            } else {
+                await cleanup(channel: rawChannel, group: ownsGroup ? eventLoopGroup : nil)
+            }
             if let captured = validator.capturedError {
                 throw captured
             }
@@ -363,7 +384,7 @@ public struct LiveSSHTransport: SSHTransport {
         credentialStore: any CredentialStore
     ) async throws -> LiveSSHUserAuthDelegate.Credential {
         guard let identity else {
-            return .password("")
+            return .none
         }
 
         switch identity.kind {
