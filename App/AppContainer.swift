@@ -42,7 +42,12 @@ final class AppContainer: ObservableObject {
         activeSession = session
         await loadRedactionSecret(for: host)
         do {
-            let connection = try await transport.connect(host: host, identity: await identity(for: host), trustEvaluator: trustStore)
+            let connection = try await transport.connect(
+                host: host,
+                identity: await identity(for: host),
+                trustEvaluator: trustStore,
+                initialSize: terminalGrid.size
+            )
             guard activeSession?.id == session.id else {
                 await connection.close()
                 return

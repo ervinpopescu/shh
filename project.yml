@@ -41,3 +41,20 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.tests
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES
+  ShhSSHTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Tests/ShhSSHTests]
+    dependencies:
+      - target: Shh
+      - package: ShhCore
+        product: ShhSSH
+      - package: ShhCore
+        product: ShhCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.ssh.tests
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+
