@@ -1,4 +1,5 @@
 import ShhCore
+import ShhTerminal
 import SwiftUI
 
 @main
@@ -64,7 +65,9 @@ struct RootView: View {
     private var capabilityFooter: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
-            Text(container.isDemo ? "SSH, SFTP, Mosh and Whisper adapters are replaceable capabilities." : "Live SSH transport active. SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
+            Text(container.isDemo
+                ? "SSH adapter active in offline demo mode. SwiftTerm production terminal surface active\(container.useLegacyTerminalFallback ? " (legacy fallback enabled)" : ""). SFTP, Mosh, and Whisper are not enabled in this build."
+                : "Live SSH transport active. SwiftTerm production terminal surface active\(container.useLegacyTerminalFallback ? " (legacy fallback enabled)" : ""). SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -205,28 +208,511 @@ struct SessionView: View {
     @State private var blockedCommand = ""
     @State private var showMultiplexer = false
     @State private var showVoice = false
+    @State private var isCommandDrawerExpanded = false
+    @State private var isSearchPresented = false
+    @State private var searchQuery = ""
+    @State private var pendingRiskyPaste: String?
     private let policy = CommandPolicy()
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack { Label(container.activeSession?.state.rawValue.capitalized ?? "Disconnected", systemImage: "circle.fill").foregroundStyle(container.activeSession?.state == .connected ? .green : .secondary); Spacer(); Menu("Tools", systemImage: "ellipsis.circle") { Button("Multiplexer", systemImage: "rectangle.3.group") { showMultiplexer = true }; Button("Disconnect", role: .destructive) { Task { await container.disconnect() } } } }.padding(.horizontal)
-            ScrollView { Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText).font(.system(.body, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).padding() }.background(Color.black).foregroundStyle(Color.green).accessibilityLabel("Terminal output").accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
-            HStack { TextField("Command or paste", text: $command, axis: .vertical).textFieldStyle(.roundedBorder); Button("Send") { submit(command); command = "" }.disabled(command.isEmpty || container.activeSession?.state != .connected); Button("Speak", systemImage: "mic") { container.speechState = .idle; showVoice = true }.accessibilityLabel("Push to talk") }.padding()
+            // Header / Status bar
+            sessionHeader
+
+            // Search Bar (if presented)
+            if isSearchPresented {
+                TerminalSearchBar(
+                    controller: container.terminalController,
+                    query: $searchQuery,
+                    onClose: {
+                        isSearchPresented = false
+                        searchQuery = ""
+                        container.terminalController.clearSearch()
+                    }
+                )
+                Divider()
+            }
+
+            // Terminal Surface (Production SwiftTerm or Legacy Fallback)
+            terminalSurfaceArea
+
+            // Extra-key accessory bar (always accessible above drawer)
+            TerminalAccessoryBar(controller: container.terminalController)
+            Divider()
+
+            // Collapsible Validated-Command Drawer
+            commandDrawer
         }
-        .navigationTitle("Terminal")
+        .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().presentationDetents([.medium]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium]) }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
-        .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) { Button("OK", role: .cancel) { blockedCommand = "" } } message: { Text("This command is not permitted by the safety policy.") }
+        .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
+            Button("OK", role: .cancel) { blockedCommand = "" }
+        } message: {
+            Text("This command is not permitted by the safety policy.")
+        }
+        .confirmationDialog(
+            "Confirm Multi-Line Paste",
+            isPresented: Binding(get: { pendingRiskyPaste != nil }, set: { if !$0 { pendingRiskyPaste = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Paste Anyway", role: .destructive) {
+                if let text = pendingRiskyPaste {
+                    container.terminalController.paste(text)
+                }
+                pendingRiskyPaste = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRiskyPaste = nil
+            }
+        } message: {
+            Text("The remote session does not have bracketed paste enabled. Pasting multiple lines may execute commands immediately without confirmation.")
+        }
     }
+
+    private var sessionHeader: some View {
+        HStack(spacing: 8) {
+            Label(
+                container.activeSession?.state.rawValue.capitalized ?? "Disconnected",
+                systemImage: "circle.fill"
+            )
+            .font(.subheadline)
+            .foregroundStyle(container.activeSession?.state == .connected ? .green : .secondary)
+
+            if !container.terminalController.title.isEmpty {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                Text(container.terminalController.title)
+                    .font(.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            // Search Toggle
+            Button(action: {
+                isSearchPresented.toggle()
+                if !isSearchPresented {
+                    searchQuery = ""
+                    container.terminalController.clearSearch()
+                }
+            }) {
+                Image(systemName: "magnifyingglass")
+                    .font(.subheadline)
+            }
+            .accessibilityLabel(isSearchPresented ? "Close search" : "Search terminal")
+
+            // Keyboard Focus Recovery Button
+            Button(action: {
+                container.terminalController.recoverFirstResponder()
+            }) {
+                Image(systemName: "keyboard")
+                    .font(.subheadline)
+                    .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
+            }
+            .accessibilityLabel("Recover keyboard focus")
+
+            // Tools Menu
+            Menu {
+                Button(action: {
+                    if let selection = container.terminalController.getSelection(), !selection.isEmpty {
+                        UIPasteboard.general.string = selection
+                    }
+                }) {
+                    Label("Copy Selection", systemImage: "doc.on.doc")
+                }
+
+                Button(action: {
+                    container.terminalController.selectAll()
+                }) {
+                    Label("Select All", systemImage: "selection.pin.in.out")
+                }
+
+                Button(action: {
+                    container.terminalController.selectNone()
+                }) {
+                    Label("Clear Selection", systemImage: "xmark.circle")
+                }
+
+                Button(action: handlePasteFromClipboard) {
+                    Label("Paste from Clipboard", systemImage: "doc.on.clipboard")
+                }
+
+                Divider()
+
+                Button("Multiplexer", systemImage: "rectangle.3.group") {
+                    showMultiplexer = true
+                }
+
+                Button(action: {
+                    container.useLegacyTerminalFallback.toggle()
+                }) {
+                    Label(
+                        container.useLegacyTerminalFallback ? "Use SwiftTerm Surface" : "Use Legacy Fallback Surface",
+                        systemImage: "arrow.triangle.2.circlepath"
+                    )
+                }
+
+                Divider()
+
+                Button("Disconnect", role: .destructive) {
+                    Task { await container.disconnect() }
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.subheadline)
+            }
+            .accessibilityLabel("Session tools")
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 6)
+        .background(Color(.systemBackground))
+    }
+
+    @ViewBuilder
+    private var terminalSurfaceArea: some View {
+        if container.useLegacyTerminalFallback {
+            ScrollView {
+                Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                    .padding()
+            }
+            .background(Color.black)
+            .foregroundStyle(Color.green)
+            .accessibilityLabel("Fallback terminal output")
+            .accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
+        } else {
+            ShhTerminalView(controller: container.terminalController)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Terminal surface")
+                .accessibilityValue(Text(container.accessibilityTerminalText))
+        }
+    }
+
+    private var commandDrawer: some View {
+        VStack(spacing: 6) {
+            // Drawer toggle handle
+            Button(action: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isCommandDrawerExpanded.toggle()
+                }
+            }) {
+                HStack {
+                    Image(systemName: "checkmark.shield")
+                        .font(.caption2)
+                    Text("Validated Command Drawer")
+                        .font(.caption.weight(.medium))
+                    Spacer()
+                    Image(systemName: isCommandDrawerExpanded ? "chevron.down" : "chevron.up")
+                        .font(.caption2)
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color(.secondarySystemBackground))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(isCommandDrawerExpanded ? "Collapse command drawer" : "Expand command drawer")
+
+            if isCommandDrawerExpanded {
+                VStack(spacing: 8) {
+                    HStack {
+                        TextField("Command to validate and send", text: $command, axis: .vertical)
+                            .lineLimit(1...3)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Send") {
+                            submit(command)
+                            command = ""
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || container.activeSession?.state != .connected)
+
+                        Button("Speak", systemImage: "mic") {
+                            container.speechState = .idle
+                            showVoice = true
+                        }
+                        .accessibilityLabel("Push to talk")
+                    }
+                    Text("Composed commands pass through CommandPolicy. Blocked commands are rejected.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .background(Color(.systemBackground))
+    }
+
+    private func handlePasteFromClipboard() {
+        guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
+        if container.terminalController.isRiskyUnbracketedPaste(text) {
+            pendingRiskyPaste = text
+        } else {
+            container.terminalController.paste(text)
+        }
+    }
+
     private func submit(_ text: String) {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         switch policy.classify(value) {
-        case .safe: Task { _ = await container.send(value + "\n") }
-        case .reviewRequired: pendingApproval = PendingCommand(command: value)
-        case .blocked: blockedCommand = value
+        case .safe:
+            Task { _ = await container.sendValidatedCommand(value + "\n") }
+        case .reviewRequired:
+            pendingApproval = PendingCommand(command: value)
+        case .blocked:
+            blockedCommand = value
         }
+    }
+}
+
+struct TerminalSearchBar: View {
+    @ObservedObject var controller: ShhTerminalController
+    @Binding var query: String
+    let onClose: () -> Void
+
+    @State private var matchText = ""
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search terminal", text: $query)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+                .onSubmit {
+                    next()
+                }
+                .onChange(of: query) { _, newQuery in
+                    updateSummary(for: newQuery)
+                }
+            if !matchText.isEmpty {
+                Text(matchText)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Button(action: previous) {
+                Image(systemName: "chevron.up")
+                    .padding(4)
+            }
+            .disabled(query.isEmpty)
+            Button(action: next) {
+                Image(systemName: "chevron.down")
+                    .padding(4)
+            }
+            .disabled(query.isEmpty)
+            Button(action: onClose) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .padding(4)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color(.secondarySystemBackground))
+    }
+
+    private func next() {
+        controller.findNext(query)
+        updateSummary(for: query)
+    }
+
+    private func previous() {
+        controller.findPrevious(query)
+        updateSummary(for: query)
+    }
+
+    private func updateSummary(for term: String) {
+        guard !term.isEmpty else {
+            matchText = ""
+            controller.clearSearch()
+            return
+        }
+        let (idx, count) = controller.searchMatchSummary(term)
+        if count == 0 {
+            matchText = "0 / 0"
+        } else {
+            matchText = "\(idx) / \(count)"
+        }
+    }
+}
+
+struct TerminalAccessoryBar: View {
+    @ObservedObject var controller: ShhTerminalController
+    @State private var isCtrlActive = false
+    @State private var isAltActive = false
+    @State private var isShiftActive = false
+
+    private var activeModifiers: KeyModifiers {
+        var mods: KeyModifiers = []
+        if isCtrlActive { mods.insert(.control) }
+        if isAltActive { mods.insert(.option) }
+        if isShiftActive { mods.insert(.shift) }
+        return mods
+    }
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                // Esc
+                AccessoryKeyButton(title: "Esc") {
+                    sendKey(.escape)
+                }
+
+                // Tab
+                AccessoryKeyButton(title: isShiftActive ? "⇧Tab" : "Tab") {
+                    sendKey(.tab(shift: isShiftActive))
+                    isShiftActive = false
+                }
+
+                // Sticky Ctrl Toggle
+                AccessoryToggleKeyButton(title: "Ctrl", isActive: isCtrlActive) {
+                    isCtrlActive.toggle()
+                }
+
+                // Sticky Alt/Meta Toggle
+                AccessoryToggleKeyButton(title: "Alt", isActive: isAltActive) {
+                    isAltActive.toggle()
+                }
+
+                // Ctrl-C
+                AccessoryKeyButton(title: "^C", role: .destructive) {
+                    sendKey(.ctrlC)
+                }
+
+                // Ctrl-D
+                AccessoryKeyButton(title: "^D") {
+                    sendKey(.ctrlD)
+                }
+
+                // Arrow keys
+                HStack(spacing: 3) {
+                    AccessoryIconButton(systemImage: "arrow.left") {
+                        sendKey(.arrow(.left, modifiers: activeModifiers))
+                    }
+                    AccessoryIconButton(systemImage: "arrow.up") {
+                        sendKey(.arrow(.up, modifiers: activeModifiers))
+                    }
+                    AccessoryIconButton(systemImage: "arrow.down") {
+                        sendKey(.arrow(.down, modifiers: activeModifiers))
+                    }
+                    AccessoryIconButton(systemImage: "arrow.right") {
+                        sendKey(.arrow(.right, modifiers: activeModifiers))
+                    }
+                }
+
+                // Function keys Menu (F1 - F12)
+                Menu {
+                    ForEach(1...12, id: \.self) { fn in
+                        Button("F\(fn)") {
+                            sendKey(.functionKey(fn))
+                        }
+                    }
+                } label: {
+                    Text("Fn")
+                        .font(.system(.subheadline, design: .monospaced).bold())
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                }
+
+                // Quick Ctrl+ shortcuts Menu
+                Menu {
+                    Button("Ctrl-A (Beginning of line)") { sendControl("a") }
+                    Button("Ctrl-E (End of line)") { sendControl("e") }
+                    Button("Ctrl-K (Kill to end)") { sendControl("k") }
+                    Button("Ctrl-U (Kill to start)") { sendControl("u") }
+                    Button("Ctrl-W (Kill word back)") { sendControl("w") }
+                    Button("Ctrl-L (Clear screen)") { sendControl("l") }
+                    Button("Ctrl-R (Reverse search)") { sendControl("r") }
+                    Button("Ctrl-Z (Suspend)") { sendControl("z") }
+                    Button("Ctrl-\\ (Quit)") { sendControl("\\") }
+                } label: {
+                    Text("Ctrl+")
+                        .font(.system(.subheadline, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 6)
+                        .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+        .background(Color(.systemGray6))
+    }
+
+    private func sendKey(_ key: TerminalKey) {
+        controller.send(key: key)
+        if isCtrlActive { isCtrlActive = false }
+        if isAltActive { isAltActive = false }
+    }
+
+    private func sendControl(_ char: Character) {
+        if let data = TerminalKeyEncoder.control(char) {
+            controller.send(raw: data)
+        }
+        isCtrlActive = false
+    }
+}
+
+struct AccessoryKeyButton: View {
+    let title: String
+    var role: ButtonRole? = nil
+    let action: () -> Void
+
+    var body: some View {
+        Button(role: role, action: action) {
+            Text(title)
+                .font(.system(.subheadline, design: .monospaced).weight(.medium))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(role == .destructive ? Color.red.opacity(0.15) : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct AccessoryToggleKeyButton: View {
+    let title: String
+    let isActive: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(.subheadline, design: .monospaced).weight(.bold))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .foregroundStyle(isActive ? Color.white : Color.primary)
+                .background(isActive ? Color.accentColor : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct AccessoryIconButton: View {
+    let systemImage: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.subheadline)
+                .frame(width: 28, height: 28)
+                .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -243,7 +729,7 @@ struct ApprovalSheet: View {
                 Toggle("I approve sending this command", isOn: $approved)
             }
             .navigationTitle("Confirm command")
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { if await container.send(command + "\n", approved: true) { dismiss() } } }.disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected) } }
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { if await container.sendValidatedCommand(command + "\n", approved: true) { dismiss() } } }.disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected) } }
         }
     }
 }
@@ -311,7 +797,7 @@ struct VoiceComposer: View {
         let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return }
         switch policy.classify(value) {
-        case .safe: Task { if await container.send(value + "\n") { dismiss() } }
+        case .safe: Task { if await container.sendValidatedCommand(value + "\n") { dismiss() } }
         case .reviewRequired: pendingApproval = PendingCommand(command: value)
         case .blocked: blocked = true
         }
