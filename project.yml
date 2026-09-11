@@ -20,6 +20,8 @@ targets:
     dependencies:
       - package: ShhCore
         product: ShhCore
+      - package: ShhCore
+        product: ShhSSH
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh
@@ -34,8 +36,6 @@ targets:
     sources: [Tests/ShhCoreTests]
     dependencies:
       - target: Shh
-      - package: ShhCore
-        product: ShhCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.tests
@@ -48,13 +48,21 @@ targets:
     sources: [Tests/ShhSSHTests]
     dependencies:
       - target: Shh
-      - package: ShhCore
-        product: ShhSSH
-      - package: ShhCore
-        product: ShhCore
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.ssh.tests
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+  ShhAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Tests/ShhAppTests]
+    dependencies:
+      - target: Shh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.app.tests
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES
 

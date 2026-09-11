@@ -13,13 +13,13 @@ final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @un
     }
 
     private let username: String
-    private let credential: Credential
+    private let resolveCredential: @Sendable () async throws -> Credential
     private let lock = NSLock()
     private var hasAttempted = false
 
-    init(username: String, credential: Credential) {
+    init(username: String, resolveCredential: @escaping @Sendable () async throws -> Credential) {
         self.username = username
-        self.credential = credential
+        self.resolveCredential = resolveCredential
     }
 
     func nextAuthenticationType(
@@ -37,34 +37,41 @@ final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @un
             return
         }
 
-        switch credential {
-        case .password(let password):
-            guard availableMethods.contains(.password) else {
-                nextChallengePromise.fail(TransportError.authenticationRequired)
-                return
-            }
-            let offer = NIOSSHUserAuthenticationOffer(
-                username: username,
-                serviceName: "ssh-connection",
-                offer: .password(.init(password: password))
-            )
-            nextChallengePromise.succeed(offer)
+        Task {
+            do {
+                let credential = try await resolveCredential()
+                switch credential {
+                case .password(let password):
+                    guard availableMethods.contains(.password) else {
+                        nextChallengePromise.fail(TransportError.authenticationRequired)
+                        return
+                    }
+                    let offer = NIOSSHUserAuthenticationOffer(
+                        username: username,
+                        serviceName: "ssh-connection",
+                        offer: .password(.init(password: password))
+                    )
+                    nextChallengePromise.succeed(offer)
 
-        case .privateKey(let key):
-            guard availableMethods.contains(.publicKey) else {
-                nextChallengePromise.fail(TransportError.authenticationRequired)
-                return
-            }
-            let nioKey = NIOSSHPrivateKey(ed25519Key: key)
-            let offer = NIOSSHUserAuthenticationOffer(
-                username: username,
-                serviceName: "ssh-connection",
-                offer: .privateKey(.init(privateKey: nioKey))
-            )
-            nextChallengePromise.succeed(offer)
+                case .privateKey(let key):
+                    guard availableMethods.contains(.publicKey) else {
+                        nextChallengePromise.fail(TransportError.authenticationRequired)
+                        return
+                    }
+                    let nioKey = NIOSSHPrivateKey(ed25519Key: key)
+                    let offer = NIOSSHUserAuthenticationOffer(
+                        username: username,
+                        serviceName: "ssh-connection",
+                        offer: .privateKey(.init(privateKey: nioKey))
+                    )
+                    nextChallengePromise.succeed(offer)
 
-        case .none:
-            nextChallengePromise.fail(TransportError.authenticationRequired)
+                case .none:
+                    nextChallengePromise.fail(TransportError.authenticationRequired)
+                }
+            } catch {
+                nextChallengePromise.fail(error)
+            }
         }
     }
 }
@@ -149,7 +156,7 @@ private final class InboundEventRouter: @unchecked Sendable {
 }
 
 public struct LiveSSHTransport: SSHTransport {
-    private let credentialStore: any CredentialStore
+    public let credentialStore: any CredentialStore
     private let customGroup: EventLoopGroup?
 
     public init(credentialStore: any CredentialStore = KeychainCredentialStore()) {
@@ -218,8 +225,6 @@ public struct LiveSSHTransport: SSHTransport {
     ) async throws -> any SSHConnection {
         if Task.isCancelled { throw TransportError.cancelled }
 
-        let authCredential = try await resolveAuthenticationCredential(identity: identity)
-
         let ownsGroup = (customGroup == nil)
         let eventLoopGroup = customGroup ?? MultiThreadedEventLoopGroup(numberOfThreads: 1)
 
@@ -230,9 +235,12 @@ public struct LiveSSHTransport: SSHTransport {
             trustEvaluator: trustEvaluator
         )
 
+        let credStore = self.credentialStore
         let userAuthDelegate = LiveSSHUserAuthDelegate(
             username: host.username,
-            credential: authCredential
+            resolveCredential: {
+                try await Self.resolveAuthenticationCredential(identity: identity, credentialStore: credStore)
+            }
         )
 
         let clientConfig = SSHClientConfiguration(
@@ -350,7 +358,10 @@ public struct LiveSSHTransport: SSHTransport {
         }
     }
 
-    private func resolveAuthenticationCredential(identity: IdentityDescriptor?) async throws -> LiveSSHUserAuthDelegate.Credential {
+    private static func resolveAuthenticationCredential(
+        identity: IdentityDescriptor?,
+        credentialStore: any CredentialStore
+    ) async throws -> LiveSSHUserAuthDelegate.Credential {
         guard let identity else {
             return .password("")
         }
