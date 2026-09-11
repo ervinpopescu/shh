@@ -21,6 +21,7 @@ final class AppContainer: ObservableObject {
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
+    private var outboundTask: Task<Void, Never>?
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
@@ -147,12 +148,10 @@ final class AppContainer: ObservableObject {
 
             // Wire interactive terminal output to raw outbound path
             terminalController.onOutput = { [weak self, sessionID = session.id] data in
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          self.activeSession?.id == sessionID,
-                          self.activeSession?.state == .connected else { return }
-                    _ = await self.sendRawInteractive(data)
-                }
+                guard let self,
+                      self.activeSession?.id == sessionID,
+                      self.activeSession?.state == .connected else { return }
+                self.enqueueRawInteractive(data, sessionID: sessionID)
             }
 
             let events = await connection.events()
@@ -172,11 +171,18 @@ final class AppContainer: ObservableObject {
                         case .closed:
                             self.activeSession?.state = .disconnected
                             self.detachCallbacks()
+                            if !self.useLegacyTerminalFallback {
+                                self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
+                            }
                             self.redactor = Redactor()
                         case .error(let error):
                             self.activeSession?.state = .failed
                             self.detachCallbacks()
-                            self.terminalText += "\n" + Self.statusMessage(for: error)
+                            let message = Self.statusMessage(for: error)
+                            self.terminalText += "\n" + message
+                            if !self.useLegacyTerminalFallback {
+                                self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+                            }
                             self.redactor = Redactor()
                         }
                     }
@@ -184,13 +190,22 @@ final class AppContainer: ObservableObject {
                     guard let self, self.activeSession?.id == session.id else { return }
                     self.activeSession?.state = .failed
                     self.detachCallbacks()
-                    self.terminalText += "\n" + Self.statusMessage(for: error)
+                    let message = Self.statusMessage(for: error)
+                    self.terminalText += "\n" + message
+                    if !self.useLegacyTerminalFallback {
+                        self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+                    }
                     self.redactor = Redactor()
                 }
             }
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
+            let message = Self.statusMessage(for: error)
+            terminalText = message
+            if !useLegacyTerminalFallback {
+                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            }
             switch error {
             case .hostKeyApprovalRequired(let challenge):
                 pendingTrustChallenge = challenge
@@ -198,16 +213,18 @@ final class AppContainer: ObservableObject {
                 activeSession?.state = .disconnected
             case .cancelled:
                 activeSession?.state = .disconnected
-                terminalText = Self.statusMessage(for: error)
             default:
                 activeSession?.state = .failed
-                terminalText = Self.statusMessage(for: error)
             }
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
+            let message = "Connection unavailable."
             activeSession?.state = .failed
-            terminalText = "Connection unavailable."
+            terminalText = message
+            if !useLegacyTerminalFallback {
+                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            }
         }
     }
 
@@ -274,6 +291,19 @@ final class AppContainer: ObservableObject {
     private func detachCallbacks() {
         terminalController.onResize = nil
         terminalController.onOutput = nil
+        outboundTask?.cancel()
+        outboundTask = nil
+    }
+
+    private func enqueueRawInteractive(_ data: Data, sessionID: UUID) {
+        let previousTask = outboundTask
+        outboundTask = Task { @MainActor [weak self] in
+            _ = await previousTask?.value
+            guard let self,
+                  self.activeSession?.id == sessionID,
+                  self.activeSession?.state == .connected else { return }
+            _ = await self.sendRawInteractive(data)
+        }
     }
 
     private func identity(for host: Host) async -> IdentityDescriptor? {
@@ -292,7 +322,8 @@ final class AppContainer: ObservableObject {
         redactor = Redactor(secrets: [value])
     }
 
-    private func redacted(_ data: Data) -> Data {
-        Data(redactor.redact(String(decoding: data, as: UTF8.self)).utf8)
+    internal func redacted(_ data: Data) -> Data {
+        guard !redactor.secrets.isEmpty else { return data }
+        return Data(redactor.redact(String(decoding: data, as: UTF8.self)).utf8)
     }
 }

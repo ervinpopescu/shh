@@ -63,11 +63,14 @@ struct RootView: View {
         }
     }
     private var capabilityFooter: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        let surfaceDescription = container.useLegacyTerminalFallback
+            ? "Legacy terminal fallback surface active."
+            : "SwiftTerm production terminal surface active."
+        return VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
             Text(container.isDemo
-                ? "SSH adapter active in offline demo mode. SwiftTerm production terminal surface active\(container.useLegacyTerminalFallback ? " (legacy fallback enabled)" : ""). SFTP, Mosh, and Whisper are not enabled in this build."
-                : "Live SSH transport active. SwiftTerm production terminal surface active\(container.useLegacyTerminalFallback ? " (legacy fallback enabled)" : ""). SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
+                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP, Mosh, and Whisper are not enabled in this build."
+                : "Live SSH transport active. \(surfaceDescription) SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -270,6 +273,11 @@ struct SessionView: View {
         } message: {
             Text("The remote session does not have bracketed paste enabled. Pasting multiple lines may execute commands immediately without confirmation.")
         }
+        .onAppear {
+            container.terminalController.onRiskyPasteRequested = { text in
+                pendingRiskyPaste = text
+            }
+        }
     }
 
     private var sessionHeader: some View {
@@ -392,7 +400,6 @@ struct SessionView: View {
                 .background(Color.black)
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Terminal surface")
-                .accessibilityValue(Text(container.accessibilityTerminalText))
         }
     }
 
@@ -455,11 +462,7 @@ struct SessionView: View {
 
     private func handlePasteFromClipboard() {
         guard let text = UIPasteboard.general.string, !text.isEmpty else { return }
-        if container.terminalController.isRiskyUnbracketedPaste(text) {
-            pendingRiskyPaste = text
-        } else {
-            container.terminalController.paste(text)
-        }
+        container.terminalController.handlePasteRequest(text)
     }
 
     private func submit(_ text: String) {
@@ -586,6 +589,11 @@ struct TerminalAccessoryBar: View {
                     isAltActive.toggle()
                 }
 
+                // Sticky Shift Toggle
+                AccessoryToggleKeyButton(title: "⇧", isActive: isShiftActive) {
+                    isShiftActive.toggle()
+                }
+
                 // Ctrl-C
                 AccessoryKeyButton(title: "^C", role: .destructive) {
                     sendKey(.ctrlC)
@@ -623,8 +631,9 @@ struct TerminalAccessoryBar: View {
                     Text("Fn")
                         .font(.system(.subheadline, design: .monospaced).bold())
                         .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        .frame(minHeight: 36)
                         .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
                 }
 
                 // Quick Ctrl+ shortcuts Menu
@@ -642,8 +651,9 @@ struct TerminalAccessoryBar: View {
                     Text("Ctrl+")
                         .font(.system(.subheadline, design: .monospaced))
                         .padding(.horizontal, 8)
-                        .padding(.vertical, 6)
+                        .frame(minHeight: 36)
                         .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                        .contentShape(Rectangle())
                 }
             }
             .padding(.horizontal, 8)
@@ -656,6 +666,7 @@ struct TerminalAccessoryBar: View {
         controller.send(key: key)
         if isCtrlActive { isCtrlActive = false }
         if isAltActive { isAltActive = false }
+        if isShiftActive { isShiftActive = false }
     }
 
     private func sendControl(_ char: Character) {
@@ -676,8 +687,9 @@ struct AccessoryKeyButton: View {
             Text(title)
                 .font(.system(.subheadline, design: .monospaced).weight(.medium))
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .frame(minHeight: 36)
                 .background(role == .destructive ? Color.red.opacity(0.15) : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -693,9 +705,10 @@ struct AccessoryToggleKeyButton: View {
             Text(title)
                 .font(.system(.subheadline, design: .monospaced).weight(.bold))
                 .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .frame(minHeight: 36)
                 .foregroundStyle(isActive ? Color.white : Color.primary)
                 .background(isActive ? Color.accentColor : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -709,8 +722,9 @@ struct AccessoryIconButton: View {
         Button(action: action) {
             Image(systemName: systemImage)
                 .font(.subheadline)
-                .frame(width: 28, height: 28)
+                .frame(minWidth: 36, minHeight: 36)
                 .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }

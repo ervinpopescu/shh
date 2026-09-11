@@ -712,6 +712,80 @@ final class AppContainerTests: XCTestCase {
         XCTAssertTrue(container.accessibilityTerminalText.contains("Accessibility Line 1"))
     }
 
+    func testRedactedPreservesDataWhenSecretsEmpty() {
+        let container = AppContainer()
+        XCTAssertTrue(container.redactor.secrets.isEmpty)
+
+        // Incomplete multi-byte UTF-8 sequence (e.g. first 2 bytes of 4-byte emoji 0xF0 0x9F 0x90 0x8D)
+        let splitUtf8Bytes = Data([0xF0, 0x9F])
+        let result = container.redacted(splitUtf8Bytes)
+        XCTAssertEqual(result, splitUtf8Bytes, "Split UTF-8 bytes must not be corrupted or replaced with U+FFFD when secrets are empty")
+
+        // Arbitrary binary data with non-UTF-8 bytes
+        let arbitraryBinary = Data([0xFF, 0xFE, 0x00, 0x01, 0x80, 0xBF])
+        let binaryResult = container.redacted(arbitraryBinary)
+        XCTAssertEqual(binaryResult, arbitraryBinary, "Binary data must pass through unchanged when secrets are empty")
+    }
+
+    func testMidSessionErrorAndClosedMessageFedToProductionTerminalController() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(transport: transport, useLegacyTerminalFallback: false)
+        let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
+
+        // 1. Connect and verify connected
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // 2. Emit mid-session error
+        mockConnection.emit(.error(TransportError.networkUnavailable))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(container.activeSession?.state, .failed)
+        XCTAssertTrue(container.terminalText.contains("Network unavailable."))
+        let transcript = container.terminalController.currentTranscript(limit: 10)
+        XCTAssertTrue(transcript.contains("[Network unavailable.]"), "Error message must be visible in production terminal surface")
+
+        // 3. Reconnect and emit stream closed
+        let mockConnection2 = MockSSHConnection()
+        transport.onConnect = { _ in mockConnection2 }
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        mockConnection2.emit(.closed)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        let transcript2 = container.terminalController.currentTranscript(limit: 10)
+        XCTAssertTrue(transcript2.contains("[Connection closed]"), "Closure notice must be visible in production terminal surface")
+    }
+
+    func testSerializedOutboundInteractiveKeystrokeOrdering() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // Simulate rapid keystrokes arriving via terminalController.onOutput
+        let inputChars = ["a", "b", "c", "d", "e", "\r"]
+        for char in inputChars {
+            container.terminalController.onOutput?(Data(char.utf8))
+        }
+
+        // Allow async serialized task queue to drain
+        try await Task.sleep(nanoseconds: 80_000_000)
+
+        let sentStrings = mockConnection.sentData.map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertEqual(sentStrings, inputChars, "Rapid interactive keystrokes must be delivered in strict FIFO order")
+    }
+
     func testSessionViewComponentsAndAffordances() {
         let container = AppContainer.demo()
 
