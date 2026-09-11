@@ -1,0 +1,288 @@
+import Foundation
+import Combine
+import ShhCore
+import SwiftTerm
+
+public struct ShhTerminalConfiguration: Sendable {
+    public var scrollbackLimit: Int
+    public var resizeDebounceInterval: TimeInterval
+    public var initialSize: TerminalSize
+
+    public init(
+        scrollbackLimit: Int = 5000,
+        resizeDebounceInterval: TimeInterval = 0.150,
+        initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24)
+    ) {
+        self.scrollbackLimit = max(0, scrollbackLimit)
+        self.resizeDebounceInterval = max(0, resizeDebounceInterval)
+        self.initialSize = initialSize
+    }
+}
+
+internal protocol TerminalEngineBridge: AnyObject {
+    var bracketedPasteMode: Bool { get }
+    var isAlternateScreenActive: Bool { get }
+    var currentSize: TerminalSize { get }
+    func feed(data: Data)
+    func feed(text: String)
+    func resize(size: TerminalSize)
+    func changeScrollback(_ limit: Int)
+}
+
+internal protocol TerminalFirstResponderBridge: AnyObject {
+    var isFirstResponder: Bool { get }
+    func requestFirstResponder() -> Bool
+    func resignFirstResponder() -> Bool
+}
+
+@MainActor
+public final class ShhTerminalController: ObservableObject {
+    public static let defaultScrollbackLines = 5000
+    public static let defaultResizeDebounceInterval: TimeInterval = 0.150
+
+    public let configuration: ShhTerminalConfiguration
+
+    @Published public private(set) var size: TerminalSize
+    @Published public private(set) var title: String = ""
+    @Published public private(set) var isFirstResponder: Bool = false
+
+    public var onOutput: ((Data) -> Void)?
+    public var onResize: ((TerminalSize) -> Void)?
+    public var onTitleChanged: ((String) -> Void)?
+    public var onBell: (() -> Void)?
+    public var onFirstResponderChange: ((Bool) -> Void)?
+
+    public var isMetalEnabled: Bool { false }
+
+    public var bracketedPasteMode: Bool {
+        if let attachedBridge {
+            return attachedBridge.bracketedPasteMode
+        }
+        return headlessTerminal?.bracketedPasteMode ?? false
+    }
+
+    public var isAlternateScreenActive: Bool {
+        if let attachedBridge {
+            return attachedBridge.isAlternateScreenActive
+        }
+        return headlessTerminal?.isCurrentBufferAlternate ?? false
+    }
+
+    private var resizeDebouncer: ResizeDebouncer!
+    private var headlessTerminal: SwiftTerm.Terminal?
+    private var headlessDelegate: HeadlessBridgeDelegate?
+    internal weak var attachedBridge: TerminalEngineBridge?
+    internal weak var firstResponderBridge: TerminalFirstResponderBridge?
+    internal var hasPendingFirstResponderRequest: Bool = false
+
+    public init(configuration: ShhTerminalConfiguration = ShhTerminalConfiguration()) {
+        self.configuration = configuration
+        self.size = configuration.initialSize
+
+        self.resizeDebouncer = ResizeDebouncer(
+            delay: configuration.resizeDebounceInterval,
+            queue: .main
+        ) { [weak self] debouncedSize in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.size = debouncedSize
+                self.onResize?(debouncedSize)
+            }
+        }
+
+        setupHeadlessTerminal()
+    }
+
+    private func setupHeadlessTerminal() {
+        let delegate = HeadlessBridgeDelegate(controller: self)
+        self.headlessDelegate = delegate
+
+        let options = TerminalOptions(
+            cols: configuration.initialSize.columns,
+            rows: configuration.initialSize.rows,
+            scrollback: configuration.scrollbackLimit
+        )
+        self.headlessTerminal = SwiftTerm.Terminal(delegate: delegate, options: options)
+    }
+
+    // MARK: - Inbound Feeding
+
+    public func feed(_ data: Data) {
+        guard !data.isEmpty else { return }
+        if let attachedBridge {
+            attachedBridge.feed(data: data)
+        } else if let headlessTerminal {
+            let bytes = Array(data)
+            headlessTerminal.feed(buffer: bytes[...])
+        }
+    }
+
+    public func feed(_ text: String) {
+        guard !text.isEmpty else { return }
+        if let attachedBridge {
+            attachedBridge.feed(text: text)
+        } else if let headlessTerminal {
+            headlessTerminal.feed(text: text)
+        }
+    }
+
+    // MARK: - Outbound Sending
+
+    public func send(raw data: Data) {
+        guard !data.isEmpty else { return }
+        onOutput?(data)
+    }
+
+    public func send(text: String) {
+        send(raw: Data(text.utf8))
+    }
+
+    public func send(key: TerminalKey) {
+        let data = TerminalKeyEncoder.encode(key)
+        send(raw: data)
+    }
+
+    public func paste(_ text: String) {
+        let isBracketed = bracketedPasteMode
+        let data = TerminalKeyEncoder.encodePaste(text, bracketed: isBracketed)
+        send(raw: data)
+    }
+
+    // MARK: - Resize
+
+    public func handleResize(columns: Int, rows: Int) {
+        let newSize = TerminalSize(columns: columns, rows: rows)
+        resizeDebouncer.receive(size: newSize)
+    }
+
+    public func flushResize() {
+        resizeDebouncer.flush()
+    }
+
+    // MARK: - First Responder Recovery Hooks
+
+    public func requestFirstResponder() {
+        hasPendingFirstResponderRequest = true
+        if let bridge = firstResponderBridge {
+            let success = bridge.requestFirstResponder()
+            if success {
+                hasPendingFirstResponderRequest = false
+                updateFirstResponder(true)
+            }
+        }
+    }
+
+    public func recoverFirstResponder() {
+        requestFirstResponder()
+    }
+
+    public func resignFirstResponder() {
+        hasPendingFirstResponderRequest = false
+        if let bridge = firstResponderBridge {
+            _ = bridge.resignFirstResponder()
+        }
+        updateFirstResponder(false)
+    }
+
+    internal func updateFirstResponder(_ active: Bool) {
+        guard isFirstResponder != active else { return }
+        isFirstResponder = active
+        onFirstResponderChange?(active)
+    }
+
+    // MARK: - Internal Engine Bridge Handling
+
+    internal func handleOutput(_ data: Data) {
+        send(raw: data)
+    }
+
+    internal func handleTitle(_ newTitle: String) {
+        guard self.title != newTitle else { return }
+        self.title = newTitle
+        self.onTitleChanged?(newTitle)
+    }
+
+    internal func handleBell() {
+        self.onBell?()
+    }
+
+    internal func attachEngine(
+        _ bridge: TerminalEngineBridge,
+        firstResponder: TerminalFirstResponderBridge?
+    ) {
+        self.attachedBridge = bridge
+        self.firstResponderBridge = firstResponder
+        bridge.changeScrollback(configuration.scrollbackLimit)
+
+        if hasPendingFirstResponderRequest {
+            if firstResponder?.requestFirstResponder() == true {
+                hasPendingFirstResponderRequest = false
+                updateFirstResponder(true)
+            }
+        }
+    }
+
+    internal func detachEngine() {
+        self.attachedBridge = nil
+        self.firstResponderBridge = nil
+    }
+
+    // MARK: - Access to Headless Terminal (Internal for Tests)
+
+    internal var internalHeadlessTerminal: SwiftTerm.Terminal? {
+        headlessTerminal
+    }
+}
+
+private final class HeadlessBridgeDelegate: TerminalDelegate {
+    weak var controller: ShhTerminalController?
+
+    init(controller: ShhTerminalController) {
+        self.controller = controller
+    }
+
+    func showCursor(source: SwiftTerm.Terminal) {}
+    func hideCursor(source: SwiftTerm.Terminal) {}
+
+    func setTerminalTitle(source: SwiftTerm.Terminal, title: String) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleTitle(title)
+        }
+    }
+
+    func setTerminalIconTitle(source: SwiftTerm.Terminal, title: String) {}
+
+    func windowCommand(source: SwiftTerm.Terminal, command: SwiftTerm.Terminal.WindowManipulationCommand) -> [UInt8]? {
+        nil
+    }
+
+    func sizeChanged(source: SwiftTerm.Terminal) {
+        let cols = source.cols
+        let rows = source.rows
+        Task { @MainActor [weak self] in
+            self?.controller?.handleResize(columns: cols, rows: rows)
+        }
+    }
+
+    func send(source: SwiftTerm.Terminal, data: ArraySlice<UInt8>) {
+        let payload = Data(data)
+        Task { @MainActor [weak self] in
+            self?.controller?.handleOutput(payload)
+        }
+    }
+
+    func scrolled(source: SwiftTerm.Terminal, yDisp: Int) {}
+    func linefeed(source: SwiftTerm.Terminal) {}
+    func bufferActivated(source: SwiftTerm.Terminal) {}
+    func synchronizedOutputChanged(source: SwiftTerm.Terminal, active: Bool) {}
+
+    func bell(source: SwiftTerm.Terminal) {
+        Task { @MainActor [weak self] in
+            self?.controller?.handleBell()
+        }
+    }
+
+    func selectionChanged(source: SwiftTerm.Terminal) {}
+    func isProcessTrusted(source: SwiftTerm.Terminal) -> Bool { true }
+    func cellSizeInPixels(source: SwiftTerm.Terminal) -> (width: Int, height: Int)? { nil }
+}
