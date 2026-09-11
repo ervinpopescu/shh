@@ -11,6 +11,7 @@ final class ShhCoreTests: XCTestCase {
     func testTrustLookupCanonicalizesHostAndAlgorithm() {
         let record = TrustRecord(hostname: " EXAMPLE.COM ", port: 22, keyAlgorithm: "ED25519", sha256Fingerprint: "SHA256:a")
         XCTAssertEqual(record.lookupKey, "example.com:22:ed25519")
+        XCTAssertEqual(TrustRecord.canonicalHost("Example.com."), "example.com")
     }
 
     func testShellQuotingDoesNotAllowArgumentInjection() {
@@ -29,6 +30,8 @@ final class ShhCoreTests: XCTestCase {
         XCTAssertEqual(policy.classify("rm -rf /"), .blocked)
         XCTAssertFalse(policy.canSend("shutdown now", approved: false))
         XCTAssertTrue(policy.canSend("shutdown now", approved: true))
+        XCTAssertFalse(policy.canSend("rm -rf /", approved: true))
+        XCTAssertEqual(policy.classify("rm\t-rf /"), .blocked)
         XCTAssertTrue(policy.canSend("printf hello", approved: false))
     }
 
@@ -38,6 +41,29 @@ final class ShhCoreTests: XCTestCase {
         parser.consume(Data("hello\nworld".utf8), into: &grid)
         XCTAssertEqual(grid.rows[1].map(\.character), Array("world"))
         XCTAssertEqual(grid.scrollback.first?.map(\.character), Array("hello"))
+    }
+
+    func testANSIParserStreamsCSIAndMovesCursor() {
+        var grid = TerminalGrid(size: TerminalSize(columns: 5, rows: 2))
+        var parser = ANSIParser()
+        parser.consume(Data("ab\u{1B}".utf8), into: &grid)
+        parser.consume(Data("[2;3Hcd".utf8), into: &grid)
+        XCTAssertEqual(grid.rows[1].map(\.character), Array("  cd "))
+    }
+
+    func testUnknownTrustRequiresExplicitApproval() async {
+        let store = InMemoryTrustStore()
+        let challenge = HostKeyChallenge(hostname: "EXAMPLE.COM.", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:test")
+        let initialDecision = await store.evaluate(challenge)
+        XCTAssertEqual(initialDecision, .reject)
+        await store.trustOnce(challenge)
+        let oneTimeDecision = await store.evaluate(challenge)
+        XCTAssertEqual(oneTimeDecision, .trustOnce)
+        let afterOneTimeDecision = await store.evaluate(challenge)
+        XCTAssertEqual(afterOneTimeDecision, .reject)
+        await store.save(challenge)
+        let permanentDecision = await store.evaluate(challenge)
+        XCTAssertEqual(permanentDecision, .trustPermanently)
     }
 
     func testRemotePathNormalizesTraversal() {

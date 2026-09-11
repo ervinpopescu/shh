@@ -106,7 +106,11 @@ public struct TrustRecord: Codable, Hashable, Sendable {
         self.hostname = Self.canonicalHost(hostname); self.port = port; self.keyAlgorithm = keyAlgorithm; self.sha256Fingerprint = sha256Fingerprint
         self.decision = decision; self.firstSeen = firstSeen; self.lastSeen = lastSeen
     }
-    public static func canonicalHost(_ value: String) -> String { value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+    public static func canonicalHost(_ value: String) -> String {
+        var host = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while host.hasSuffix(".") { host.removeLast() }
+        return host
+    }
     public var lookupKey: String { "\(Self.canonicalHost(hostname)):\(port):\(keyAlgorithm.lowercased())" }
 }
 

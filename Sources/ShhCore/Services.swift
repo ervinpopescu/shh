@@ -3,8 +3,18 @@ import Foundation
 import Security
 #endif
 
-public enum TransportError: Error, Equatable, Sendable { case invalidConfiguration, authenticationRequired, hostKeyChanged(old: String, new: String), timeout, networkUnavailable, unsupported, cancelled, remoteFailure(String) }
-public struct HostKeyChallenge: Sendable, Equatable { public var hostname: String; public var port: UInt16; public var algorithm: String; public var fingerprint: String; public init(hostname: String, port: UInt16, algorithm: String, fingerprint: String) { self.hostname = hostname; self.port = port; self.algorithm = algorithm; self.fingerprint = fingerprint } }
+public enum TransportError: Error, Equatable, Sendable { case invalidConfiguration, authenticationRequired, hostKeyChanged(old: String, new: String), hostKeyApprovalRequired(HostKeyChallenge), timeout, networkUnavailable, unsupported, cancelled, remoteFailure(String) }
+public struct HostKeyChallenge: Sendable, Equatable, Identifiable {
+    public var hostname: String
+    public var port: UInt16
+    public var algorithm: String
+    public var fingerprint: String
+    public init(hostname: String, port: UInt16, algorithm: String, fingerprint: String) {
+        self.hostname = TrustRecord.canonicalHost(hostname); self.port = port; self.algorithm = algorithm; self.fingerprint = fingerprint
+    }
+    public var id: String { "\(hostname):\(port):\(algorithm.lowercased())" }
+}
+public enum TrustStatus: Equatable, Sendable { case unknown; case trusted; case changed(oldFingerprint: String) }
 public enum TrustDecision: Sendable, Equatable { case trustOnce; case trustPermanently; case reject }
 public protocol HostTrustEvaluator: Sendable { func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision }
 public enum TerminalEvent: Sendable, Equatable { case bytes(Data); case closed; case error(TransportError) }
@@ -21,10 +31,10 @@ public actor DemoSSHConnection: SSHConnection {
     }
     private func install(_ continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation) {
         self.continuation = continuation
-        continuation.yield(.bytes(Data("Shh demo session ready. Type a command below.\\r\\n$ ".utf8)))
+        continuation.yield(.bytes(Data("Shh demo session ready. Type a command below.\r\n$ ".utf8)))
     }
     public func send(_ data: Data) async throws {
-        continuation?.yield(.bytes(Data("\\r\\n[demo] ".utf8) + data + Data("\\r\\n$ ".utf8)))
+        continuation?.yield(.bytes(Data("\r\n[demo] ".utf8) + data + Data("\r\n$ ".utf8)))
     }
     public func resize(_ size: TerminalSize) async throws {}
     public func close() async { continuation?.yield(.closed); continuation?.finish() }
@@ -33,7 +43,22 @@ public struct DemoSSHTransport: SSHTransport {
     public init() {}
     public func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator) async throws -> any SSHConnection {
         let challenge = HostKeyChallenge(hostname: host.hostname, port: host.port, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
-        guard await trustEvaluator.evaluate(challenge) != .reject else { throw TransportError.remoteFailure("Host key was rejected") }
+        guard await trustEvaluator.evaluate(challenge) != .reject else {
+            if let store = trustEvaluator as? InMemoryTrustStore {
+                switch await store.status(for: challenge) {
+                case .unknown:
+                    if case .ssh(let options) = host.connection, options.strictHostKeyChecking == .trustedOnly {
+                        throw TransportError.remoteFailure("Host key is not trusted")
+                    }
+                    throw TransportError.hostKeyApprovalRequired(challenge)
+                case .changed(let oldFingerprint):
+                    throw TransportError.hostKeyChanged(old: oldFingerprint, new: challenge.fingerprint)
+                case .trusted:
+                    break
+                }
+            }
+            throw TransportError.remoteFailure("Host key was rejected")
+        }
         return DemoSSHConnection()
     }
 }
@@ -80,16 +105,28 @@ public actor InMemoryCredentialStore: CredentialStore {
 
 public actor InMemoryTrustStore: HostTrustEvaluator {
     private var records: [String: TrustRecord] = [:]
+    private var oneTimeRecords: Set<String> = []
     public init() {}
     public func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision {
-        let record = TrustRecord(hostname: challenge.hostname, port: challenge.port, keyAlgorithm: challenge.algorithm, sha256Fingerprint: challenge.fingerprint)
-        if let old = records[record.lookupKey] {
-            guard old.sha256Fingerprint == challenge.fingerprint else { return .reject }
-            return .trustPermanently
+        switch status(for: challenge) {
+        case .trusted: return .trustPermanently
+        case .changed: return .reject
+        case .unknown:
+            guard oneTimeRecords.remove(challenge.id) != nil else { return .reject }
+            return .trustOnce
         }
-        return .trustOnce
     }
-    public func save(_ challenge: HostKeyChallenge) { let record = TrustRecord(hostname: challenge.hostname, port: challenge.port, keyAlgorithm: challenge.algorithm, sha256Fingerprint: challenge.fingerprint); records[record.lookupKey] = record }
+    public func status(for challenge: HostKeyChallenge) -> TrustStatus {
+        let record = TrustRecord(hostname: challenge.hostname, port: challenge.port, keyAlgorithm: challenge.algorithm, sha256Fingerprint: challenge.fingerprint)
+        guard let old = records[record.lookupKey] else { return .unknown }
+        return old.sha256Fingerprint == challenge.fingerprint ? .trusted : .changed(oldFingerprint: old.sha256Fingerprint)
+    }
+    public func trustOnce(_ challenge: HostKeyChallenge) { oneTimeRecords.insert(challenge.id) }
+    public func save(_ challenge: HostKeyChallenge) {
+        let record = TrustRecord(hostname: challenge.hostname, port: challenge.port, keyAlgorithm: challenge.algorithm, sha256Fingerprint: challenge.fingerprint)
+        records[record.lookupKey] = record
+        oneTimeRecords.remove(challenge.id)
+    }
     public func allRecords() -> [TrustRecord] { Array(records.values) }
 }
 
@@ -133,25 +170,41 @@ public struct TerminalGrid: Sendable {
     public mutating func put(_ character: Character) { guard character != "\n" && character != "\r" else { return }; if cursorColumn >= size.columns { newline() }; rows[cursorRow][cursorColumn] = TerminalCell(character: character); cursorColumn += 1 }
     public mutating func newline() { scrollback.append(rows.removeFirst()); if scrollback.count > scrollbackLimit { scrollback.removeFirst() }; rows.append(Array(repeating: TerminalCell(), count: size.columns)); cursorColumn = 0; cursorRow = min(cursorRow + 1, size.rows - 1) }
     public mutating func carriageReturn() { cursorColumn = 0 }
+    public mutating func moveCursor(row: Int, column: Int) {
+        cursorRow = min(max(0, row), size.rows - 1)
+        cursorColumn = min(max(0, column), size.columns - 1)
+    }
     public mutating func backspace() { cursorColumn = max(0, cursorColumn - 1) }
     public mutating func clear() { rows = Array(repeating: Array(repeating: TerminalCell(), count: size.columns), count: size.rows); cursorColumn = 0; cursorRow = 0 }
     public var plainText: String { rows.map { String($0.map(\.character)) }.joined(separator: "\n") }
+    public var transcriptText: String { (scrollback + rows).map { String($0.map(\.character)) }.joined(separator: "\n") }
 }
 
 public struct ANSIParser: Sendable {
+    private var escape = false
+    private var bracket = false
+    private var parameter = ""
     public init() {}
     public mutating func consume(_ data: Data, into grid: inout TerminalGrid) {
-        let text = String(decoding: data, as: UTF8.self); var iterator = text.makeIterator(); var escape = false; var bracket = false; var parameter = ""
-        while let character = iterator.next() {
+        let text = String(decoding: data, as: UTF8.self)
+        for character in text {
             if escape {
                 if character == "[" { bracket = true; parameter = ""; continue }
                 if bracket {
                     if character.isNumber || character == ";" { parameter.append(character); continue }
-                    if character == "H" || character == "f" { grid.carriageReturn(); continue }
-                    if character == "J" { grid.clear(); escape = false; bracket = false; continue }
-                    escape = false; bracket = false; continue
+                    let values = parameter.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+                    switch character {
+                    case "H", "f":
+                        let row = max(1, values.first ?? 1) - 1
+                        let column = max(1, values.dropFirst().first ?? 1) - 1
+                        grid.moveCursor(row: row, column: column)
+                    case "J": grid.clear()
+                    default: break
+                    }
+                    escape = false; bracket = false; parameter = ""; continue
                 }
-                escape = false; continue
+                escape = false
+                continue
             }
             if character == "\u{1B}" { escape = true; continue }
             switch character { case "\n": grid.newline(); case "\r": grid.carriageReturn(); case "\u{08}": grid.backspace(); default: grid.put(character) }
@@ -174,12 +227,18 @@ public enum CommandRisk: String, Equatable, Sendable { case safe, reviewRequired
 public struct CommandPolicy: Sendable {
     public init() {}
     public func classify(_ command: String) -> CommandRisk {
-        let lower = command.lowercased().replacingOccurrences(of: " ", with: "")
+        let lower = command.lowercased().filter { !$0.isWhitespace }
         if lower.contains("rm-rf/") || lower.contains(":(){:|:&};:") { return .blocked }
         if ["shutdown", "reboot", "mkfs", "ddif=", "curl|sh", "wget|sh"].contains(where: { lower.contains($0) }) { return .reviewRequired }
         return .safe
     }
-    public func canSend(_ command: String, approved: Bool) -> Bool { classify(command) == .safe || approved }
+    public func canSend(_ command: String, approved: Bool) -> Bool {
+        switch classify(command) {
+        case .safe: return true
+        case .reviewRequired: return approved
+        case .blocked: return false
+        }
+    }
 }
 
 public struct RemotePath: Hashable, Codable, Sendable, CustomStringConvertible {

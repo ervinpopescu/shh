@@ -65,14 +65,17 @@ struct HostListView: View {
                 }
                 .onDelete { offsets in
                     let ids = offsets.map { filtered[$0].id }
-                    Task { for id in ids { await container.catalog.delete(id: id) }; await reload() }
+                    Task {
+                        for id in ids { try? await container.catalog.delete(id: id) }
+                        await reload()
+                    }
                 }
             }
         }
         .navigationTitle("Hosts")
         .searchable(text: $search, prompt: "Search hosts, groups, tags")
         .toolbar { Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") { Toggle("Healthy only", isOn: $healthyOnly) }; Button("Add", systemImage: "plus") { showingEditor = true } }
-        .sheet(isPresented: $showingEditor) { HostEditorView().environmentObject(container) }
+        .sheet(isPresented: $showingEditor, onDismiss: { Task { await reload() } }) { HostEditorView().environmentObject(container) }
         .task { await reload() }
     }
     private func reload() async { hosts = (try? await container.catalog.listHosts()) ?? [] }
@@ -99,7 +102,7 @@ struct HostDetailView: View {
             Section("Endpoint") { LabeledContent("Address", value: host.address); LabeledContent("Profile", value: profileName) }
             Section("Safety") {
                 Label("Secrets stay in Keychain references", systemImage: "lock.shield")
-                Label("Host-key approval is explicit", systemImage: "checkmark.shield")
+                Label("Unknown host keys require approval", systemImage: "checkmark.shield")
             }
             Section {
                 Button("Connect", systemImage: "bolt.horizontal") { Task { await container.connect(to: host) } }
@@ -109,6 +112,15 @@ struct HostDetailView: View {
         }
         .navigationTitle(host.name)
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
+        .confirmationDialog("Approve host key?", isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }), titleVisibility: .visible) {
+            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
+            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
+            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
+        } message: {
+            if let challenge = container.pendingTrustChallenge {
+                Text("\(challenge.hostname):\(challenge.port)\n\(challenge.algorithm)\n\(challenge.fingerprint)")
+            }
+        }
         .safeAreaInset(edge: .bottom) { if container.activeSession != nil { NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding() } }
     }
     private var profileName: String { if case .ssh = host.connection { return "SSH (demo adapter)" }; return "Capability unavailable" }
@@ -135,7 +147,12 @@ struct HostEditorView: View {
     }
     private func save() {
         guard let portNumber = UInt16(port), let host = try? Host(id: existing?.id ?? UUID(), name: name, hostname: hostname, port: portNumber, username: username, identityID: identityID, connection: existing?.connection ?? .ssh(SSHOptions())) else { return }
-        Task { await container.catalog.save(host); dismiss() }
+        Task {
+            do {
+                try await container.catalog.save(host)
+                dismiss()
+            } catch { }
+        }
     }
 }
 
@@ -144,22 +161,41 @@ struct SessionDashboardView: View {
     var body: some View { Group { if container.activeSession != nil { SessionView() } else { ContentUnavailableView("No active sessions", systemImage: "rectangle.split.2x1", description: Text("Connect a host to create a foreground session.")) } }.navigationTitle("Sessions") }
 }
 
+struct PendingCommand: Identifiable {
+    let id = UUID()
+    let command: String
+}
+
 struct SessionView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var command = ""
     @State private var pendingSnippet: Snippet?
+    @State private var pendingApproval: PendingCommand?
+    @State private var blockedCommand = ""
     @State private var showMultiplexer = false
     @State private var showVoice = false
+    private let policy = CommandPolicy()
     var body: some View {
         VStack(spacing: 0) {
             HStack { Label(container.activeSession?.state.rawValue.capitalized ?? "Disconnected", systemImage: "circle.fill").foregroundStyle(container.activeSession?.state == .connected ? .green : .secondary); Spacer(); Menu("Tools", systemImage: "ellipsis.circle") { Button("Multiplexer", systemImage: "rectangle.3.group") { showMultiplexer = true }; Button("Disconnect", role: .destructive) { Task { await container.disconnect() } } } }.padding(.horizontal)
-            ScrollView { Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText).font(.system(.body, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).padding() }.background(Color.black).foregroundStyle(Color.green).accessibilityLabel("Terminal output")
-            HStack { TextField("Command or paste", text: $command, axis: .vertical).textFieldStyle(.roundedBorder); Button("Send") { let text = command; command = ""; Task { await container.send(text + "\n") } }.disabled(command.isEmpty || container.activeSession?.state != .connected); Button("Speak", systemImage: "mic") { container.speechState = .idle; showVoice = true }.accessibilityLabel("Push to talk") }.padding()
+            ScrollView { Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText).font(.system(.body, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading).textSelection(.enabled).padding() }.background(Color.black).foregroundStyle(Color.green).accessibilityLabel("Terminal output").accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
+            HStack { TextField("Command or paste", text: $command, axis: .vertical).textFieldStyle(.roundedBorder); Button("Send") { submit(command); command = "" }.disabled(command.isEmpty || container.activeSession?.state != .connected); Button("Speak", systemImage: "mic") { container.speechState = .idle; showVoice = true }.accessibilityLabel("Push to talk") }.padding()
         }
         .navigationTitle("Terminal")
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().presentationDetents([.medium]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium]) }
-        .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body) }
+        .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
+        .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
+        .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) { Button("OK", role: .cancel) { blockedCommand = "" } } message: { Text("This command is not permitted by the safety policy.") }
+    }
+    private func submit(_ text: String) {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        switch policy.classify(value) {
+        case .safe: Task { _ = await container.send(value + "\n") }
+        case .reviewRequired: pendingApproval = PendingCommand(command: value)
+        case .blocked: blockedCommand = value
+        }
     }
 }
 
@@ -168,12 +204,37 @@ struct ApprovalSheet: View {
     @Environment(\.dismiss) private var dismiss
     let command: String
     @State private var approved = false
-    var body: some View { NavigationStack { Form { Section("Exact command") { Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled) }; Toggle("I approve sending this command", isOn: $approved) }.navigationTitle("Confirm command").toolbar { ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { await container.send(command + "\n"); dismiss() } }.disabled(!approved) } } } }
+    private let policy = CommandPolicy()
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Exact command") { Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
+                Toggle("I approve sending this command", isOn: $approved)
+            }
+            .navigationTitle("Confirm command")
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { if await container.send(command + "\n", approved: true) { dismiss() } } }.disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected) } }
+        }
+    }
 }
 
 struct MultiplexerPicker: View {
     @State private var selected = RemoteMultiplexer.tmux
-    var body: some View { NavigationStack { Form { Picker("Adapter", selection: $selected) { ForEach(RemoteMultiplexer.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) } }; Text(selected == .tmux ? "tmux command preview is available in demo mode." : "Not enabled in this build.").foregroundStyle(.secondary) }.navigationTitle("Multiplexer") } }
+    private var preview: String {
+        switch selected {
+        case .tmux: return TmuxAdapter().command(for: .list)
+        default: return UnavailableMultiplexerAdapter(kind: selected).command(for: .list)
+        }
+    }
+    var body: some View {
+        NavigationStack {
+            Form {
+                Picker("Adapter", selection: $selected) { ForEach(RemoteMultiplexer.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) } }
+                Section("Command preview") { Text(preview).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
+                Text("Selection only; no multiplexer command is executed in demo mode.").foregroundStyle(.secondary)
+            }
+            .navigationTitle("Multiplexer")
+        }
+    }
 }
 
 struct SnippetsView: View {
@@ -193,8 +254,37 @@ struct VoiceComposer: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
     @State private var text = ""
-    @State private var recording = false
-    var body: some View { NavigationStack { Form { Section("Push to talk") { Button(recording ? "Stop recording" : "Record locally", systemImage: recording ? "stop.fill" : "mic.fill") { recording.toggle() }; Text(recording ? "Recording locally…" : "Hold/tap to record. Nothing is sent automatically.").font(.caption).foregroundStyle(.secondary) }; Section("Editable preview") { TextEditor(text: $text).frame(minHeight: 100); if text.isEmpty { Text("Local Whisper is not enabled in this build. You can type a command here.").font(.caption).foregroundStyle(.secondary) } } }.navigationTitle("Voice command").toolbar { ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }; ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { await container.send(text + "\n"); dismiss() } }.disabled(text.isEmpty || container.activeSession?.state != .connected) } } } }
+    @State private var pendingApproval: PendingCommand?
+    @State private var blocked = false
+    private let policy = CommandPolicy()
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Push to talk") {
+                    Button("Recording unavailable", systemImage: "mic.slash") { }
+                        .disabled(true)
+                    Text("Audio recording and local transcription are not enabled in this build. Type an editable command below.").font(.caption).foregroundStyle(.secondary)
+                }
+                Section("Editable preview") { TextEditor(text: $text).frame(minHeight: 100) }
+            }
+            .navigationTitle("Voice command")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) { Button("Send") { submit() }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || container.activeSession?.state != .connected) }
+            }
+            .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
+            .alert("Command blocked", isPresented: $blocked) { Button("OK", role: .cancel) { blocked = false } } message: { Text("This command is not permitted by the safety policy.") }
+        }
+    }
+    private func submit() {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        switch policy.classify(value) {
+        case .safe: Task { if await container.send(value + "\n") { dismiss() } }
+        case .reviewRequired: pendingApproval = PendingCommand(command: value)
+        case .blocked: blocked = true
+        }
+    }
 }
 struct FilesView: View { var body: some View { ContentUnavailableView("Files unavailable", systemImage: "folder", description: Text("SFTP is modeled behind RemoteFileRepository and is not enabled in this build.")) .navigationTitle("Files") } }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
