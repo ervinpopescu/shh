@@ -822,12 +822,13 @@ private actor Gate {
     }
 }
 
-final class MockSSHConnection: SSHConnection, @unchecked Sendable {
+final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
     private(set) var sentData: [Data] = []
     private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
+    var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
 
     func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -860,6 +861,27 @@ final class MockSSHConnection: SSHConnection, @unchecked Sendable {
         _ = lock.withLock {
             streamContinuation?.yield(event)
         }
+    }
+
+    func executeCommand(_ command: String) async throws -> SSHCommandResult {
+        try await executeCommand(command, timeout: nil, maxOutputBytes: nil)
+    }
+
+    func executeCommand(_ command: String, timeout: TimeInterval?, maxOutputBytes: Int?) async throws -> SSHCommandResult {
+        if let onExecuteCommand {
+            return try await onExecuteCommand(command)
+        }
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+            return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n", stderr: "")
+        }
+        if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
+            return SSHCommandResult(exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n", stderr: "")
+        }
+        if trimmed.contains("has-session") {
+            return SSHCommandResult(exitCode: 0, stdout: "", stderr: "")
+        }
+        return SSHCommandResult(exitCode: 0, stdout: "", stderr: "")
     }
 }
 

@@ -211,9 +211,17 @@ struct HostEditorView: View {
                 }
                 Section("Tmux preferences") {
                     Toggle("Auto-attach tmux session", isOn: $autoAttachTmux)
+                        .accessibilityIdentifier("host-editor-auto-attach-toggle")
                     TextField("Default session name/ID", text: $defaultTmuxSession)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .accessibilityIdentifier("host-editor-default-session-field")
+                    if let hint = tmuxPreferenceHint {
+                        Text(hint.message)
+                            .font(.caption)
+                            .foregroundStyle(hint.isValid ? Color.secondary : Color.red)
+                            .accessibilityIdentifier("host-editor-session-validation-hint")
+                    }
                 }
                 Section {
                     Text("Passwords and private keys are selected through Keychain identities and never stored in this form.")
@@ -226,13 +234,45 @@ struct HostEditorView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { save() }.disabled(name.isEmpty || hostname.isEmpty || username.isEmpty)
+                    Button("Save") { save() }.disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid)
                 }
             }
         }
     }
 
+    private var isTmuxPreferenceValid: Bool {
+        let trimmed = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        if trimmed.hasPrefix("$") {
+            return (try? TmuxSessionID(trimmed)) != nil
+        } else {
+            return (try? TmuxSessionName(trimmed)) != nil
+        }
+    }
+
+    private var tmuxPreferenceHint: (message: String, isValid: Bool)? {
+        let trimmed = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if trimmed.hasPrefix("$") {
+            if (try? TmuxSessionID(trimmed)) != nil {
+                return ("Valid tmux session ID", true)
+            } else {
+                return ("Invalid session ID: must start with '$' followed by digits (e.g. '$0')", false)
+            }
+        } else {
+            do {
+                _ = try TmuxSessionName(trimmed)
+                return ("Valid tmux session name", true)
+            } catch let error as TmuxSessionNameError {
+                return (error.localizedDescription, false)
+            } catch {
+                return ("Invalid session name", false)
+            }
+        }
+    }
+
     private func save() {
+        guard isTmuxPreferenceValid else { return }
         let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
         guard let portNumber = UInt16(port),
@@ -313,7 +353,7 @@ struct SessionView: View {
             commandDrawer
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
-        .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().presentationDetents([.medium]) }
+        .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium]) }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
@@ -423,6 +463,16 @@ struct SessionView: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let activeTmux = container.activeTmuxSessionID {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                Label(activeTmux, systemImage: "rectangle.3.group")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Tmux session \(activeTmux)")
+                    .accessibilityIdentifier("active-tmux-indicator")
+            }
+
             Spacer()
 
             // Search Toggle
@@ -476,9 +526,13 @@ struct SessionView: View {
 
                 Divider()
 
-                Button("Multiplexer", systemImage: "rectangle.3.group") {
+                Button(action: {
                     showMultiplexer = true
+                }) {
+                    Label("Multiplexer", systemImage: "rectangle.3.group")
                 }
+                .accessibilityIdentifier("open-multiplexer-button")
+                .accessibilityLabel("Open remote multiplexer sheet")
 
                 Button(action: {
                     container.useLegacyTerminalFallback.toggle()
@@ -874,21 +928,334 @@ struct ApprovalSheet: View {
 }
 
 struct MultiplexerPicker: View {
+    @EnvironmentObject private var container: AppContainer
+    @Environment(\.dismiss) private var dismiss
     @State private var selected = RemoteMultiplexer.tmux
-    private var preview: String {
-        switch selected {
-        case .tmux: return TmuxAdapter().command(for: .list)
-        default: return UnavailableMultiplexerAdapter(kind: selected).command(for: .list)
-        }
-    }
+    @State private var newSessionName = ""
+    @State private var autoAttach = false
+    @State private var defaultSession = ""
+    @State private var hasLoadedPreferences = false
+
     var body: some View {
         NavigationStack {
             Form {
-                Picker("Adapter", selection: $selected) { ForEach(RemoteMultiplexer.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) } }
-                Section("Command preview") { Text(preview).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
-                Text("Selection only; multiplexer integration is not enabled in this build.").foregroundStyle(.secondary)
+                Section {
+                    Picker("Multiplexer", selection: $selected) {
+                        ForEach(RemoteMultiplexer.allCases, id: \.self) { multiplexer in
+                            Text(multiplexer.rawValue.capitalized).tag(multiplexer)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityLabel("Select multiplexer adapter")
+                    .accessibilityIdentifier("multiplexer-adapter-picker")
+                }
+
+                if selected == .tmux {
+                    tmuxContent
+                } else {
+                    deferredMultiplexerContent
+                }
             }
-            .navigationTitle("Multiplexer")
+            .navigationTitle("Remote Multiplexer")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                        .accessibilityLabel("Close multiplexer sheet")
+                        .accessibilityIdentifier("multiplexer-done-button")
+                }
+                if selected == .tmux && container.activeSession?.state == .connected {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button(action: {
+                            Task { await container.refreshTmuxState() }
+                        }) {
+                            if container.isProbingTmux {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(systemName: "arrow.clockwise")
+                            }
+                        }
+                        .disabled(container.isProbingTmux)
+                        .accessibilityLabel("Refresh tmux sessions")
+                        .accessibilityIdentifier("refresh-tmux-button")
+                    }
+                }
+            }
+            .task {
+                loadHostPreferences()
+                if container.activeSession?.state == .connected {
+                    await container.refreshTmuxState()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var tmuxContent: some View {
+        // Reconnect banner if reconnecting
+        if container.reconnectState.isReconnecting {
+            Section {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reconnecting to remote host...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
+                }
+            }
+        }
+
+        // Live Status & Version
+        Section("Tmux Status") {
+            HStack {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        switch container.tmuxAvailability {
+                        case .available(let version):
+                            Text(version)
+                                .font(.body.weight(.medium))
+                            Text(container.isTmuxServerRunning ? "Server running" : "No server running")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        case .unavailable(let reason):
+                            Text("Unavailable")
+                                .font(.body.weight(.medium))
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } icon: {
+                    if container.tmuxAvailability.isAvailable {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Spacer()
+
+                if let activeID = container.activeTmuxSessionID {
+                    Text("Active: \(activeID)")
+                        .font(.caption.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.accentColor.opacity(0.15))
+                        .cornerRadius(6)
+                        .accessibilityLabel("Currently attached to session \(activeID)")
+                        .accessibilityIdentifier("current-active-tmux-session")
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(tmuxStatusAccessibilityLabel)
+            .accessibilityIdentifier("tmux-status-row")
+
+            if let error = container.tmuxError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Tmux error: \(error)")
+                    .accessibilityIdentifier("tmux-error-message")
+            }
+        }
+
+        // Sessions List
+        if container.tmuxAvailability.isAvailable {
+            Section("Sessions") {
+                if container.tmuxSessions.isEmpty {
+                    Text(container.isTmuxServerRunning ? "No active tmux sessions found. Create a session below to start." : "No tmux server running. Create a session below to start.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("tmux-empty-sessions-label")
+                } else {
+                    ForEach(container.tmuxSessions) { session in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 4) {
+                                HStack(spacing: 6) {
+                                    Text(session.name)
+                                        .font(.headline)
+                                    Text(session.sessionID)
+                                        .font(.subheadline.monospaced())
+                                        .foregroundStyle(.secondary)
+                                }
+                                HStack(spacing: 8) {
+                                    Label("\(session.windowsCount) win", systemImage: "macwindow")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text("•")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(session.isAttached ? "Attached (\(session.attachedClients))" : "Detached")
+                                        .font(.caption)
+                                        .foregroundStyle(session.isAttached ? .orange : .secondary)
+                                    Text("•")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Text(formatActivityDate(session.lastActivityAt))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if container.activeTmuxSessionID == session.sessionID {
+                                Label("Attached", systemImage: "checkmark")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.green)
+                                    .accessibilityLabel("Session \(session.name) is currently attached")
+                            } else {
+                                Button(session.isAttached ? "Takeover" : "Attach") {
+                                    Task {
+                                        let success = await container.attachTmuxSession(id: session.sessionID)
+                                        if success { dismiss() }
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .accessibilityLabel("\(session.isAttached ? "Take over" : "Attach to") session \(session.name), ID \(session.sessionID)")
+                                .accessibilityIdentifier("attach-session-\(session.sessionID)")
+                            }
+                        }
+                        .padding(.vertical, 2)
+                        .accessibilityElement(children: .contain)
+                    }
+                }
+            }
+
+            // Validated Create Form
+            Section("New Session") {
+                TextField("Session name", text: $newSessionName)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .accessibilityLabel("New session name")
+                    .accessibilityIdentifier("new-session-name-field")
+
+                if let hint = createValidationHint {
+                    Text(hint.message)
+                        .font(.caption)
+                        .foregroundStyle(hint.isValid ? Color.secondary : Color.red)
+                        .accessibilityIdentifier("create-session-hint")
+                }
+
+                Button("Create & Attach") {
+                    Task {
+                        let success = await container.createTmuxSession(name: newSessionName)
+                        if success {
+                            newSessionName = ""
+                            dismiss()
+                        }
+                    }
+                }
+                .disabled(!isSessionNameValid || container.activeSession?.state != .connected)
+                .accessibilityLabel("Create and attach session \(newSessionName)")
+                .accessibilityIdentifier("create-session-button")
+            }
+        }
+
+        // Host Auto-Attach Preference
+        if container.activeHost != nil {
+            Section("Host Preference") {
+                Toggle("Auto-attach on connect", isOn: $autoAttach)
+                    .onChange(of: autoAttach) { _, _ in
+                        savePreferences()
+                    }
+                    .accessibilityLabel("Auto-attach to tmux on connect")
+                    .accessibilityIdentifier("sheet-auto-attach-toggle")
+
+                TextField("Default session name/ID", text: $defaultSession)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .onChange(of: defaultSession) { _, _ in
+                        savePreferences()
+                    }
+                    .accessibilityLabel("Default session name or ID")
+                    .accessibilityIdentifier("sheet-default-session-field")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var deferredMultiplexerContent: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("\(selected.rawValue.capitalized) is not enabled", systemImage: "clock.arrow.circlepath")
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
+                Text("Multiplexer adapter \(selected.rawValue.capitalized) is visibly unavailable and deferred in this build. Tmux is the supported remote multiplexer.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                Text("Zellij, Byobu, Screen, and Herdr remain deferred pending terminal multiplexing contracts.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.vertical, 4)
+            .accessibilityIdentifier("deferred-multiplexer-notice")
+        }
+    }
+
+    private var tmuxStatusAccessibilityLabel: String {
+        switch container.tmuxAvailability {
+        case .available(let version):
+            return "Tmux \(version), \(container.isTmuxServerRunning ? "server running" : "no server running")"
+        case .unavailable(let reason):
+            return "Tmux unavailable: \(reason)"
+        }
+    }
+
+    private func formatActivityDate(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    private var isSessionNameValid: Bool {
+        let trimmed = newSessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return (try? TmuxSessionName(trimmed)) != nil
+    }
+
+    private var createValidationHint: (message: String, isValid: Bool)? {
+        let trimmed = newSessionName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        do {
+            _ = try TmuxSessionName(trimmed)
+            return ("Valid session name", true)
+        } catch let error as TmuxSessionNameError {
+            return (error.localizedDescription, false)
+        } catch {
+            return ("Invalid session name", false)
+        }
+    }
+
+    private func loadHostPreferences() {
+        guard !hasLoadedPreferences, let host = container.activeHost else { return }
+        autoAttach = host.autoAttachTmux
+        defaultSession = host.defaultTmuxSession ?? ""
+        hasLoadedPreferences = true
+    }
+
+    private func savePreferences() {
+        guard let host = container.activeHost else { return }
+        let trimmed = defaultSession.trimmingCharacters(in: .whitespacesAndNewlines)
+        let sessionPref = trimmed.isEmpty ? nil : trimmed
+        guard let updatedHost = try? Host(
+            id: host.id,
+            name: host.name,
+            hostname: host.hostname,
+            port: host.port,
+            username: host.username,
+            identityID: host.identityID,
+            connection: host.connection,
+            defaultTmuxSession: sessionPref,
+            autoAttachTmux: autoAttach
+        ) else { return }
+        Task {
+            try? await container.catalog.save(updatedHost)
         }
     }
 }
