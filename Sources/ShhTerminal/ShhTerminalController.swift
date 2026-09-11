@@ -2,6 +2,10 @@ import Foundation
 import Combine
 import ShhCore
 import SwiftTerm
+#if canImport(UIKit) && canImport(SwiftUI)
+import UIKit
+import SwiftUI
+#endif
 
 public struct ShhTerminalConfiguration: Sendable {
     public var scrollbackLimit: Int
@@ -59,6 +63,7 @@ public final class ShhTerminalController: ObservableObject {
     public var onTitleChanged: ((String) -> Void)?
     public var onBell: (() -> Void)?
     public var onFirstResponderChange: ((Bool) -> Void)?
+    public var onRiskyPasteRequested: ((String) -> Void)?
 
     public var isMetalEnabled: Bool { false }
 
@@ -85,6 +90,9 @@ public final class ShhTerminalController: ObservableObject {
     internal weak var attachedBridge: TerminalEngineBridge?
     internal weak var firstResponderBridge: TerminalFirstResponderBridge?
     public private(set) var hasPendingFirstResponderRequest: Bool = false
+    #if canImport(UIKit) && canImport(SwiftUI)
+    internal var persistentHostView: ShhInternalTerminalHostView?
+    #endif
 
     public init(configuration: ShhTerminalConfiguration = ShhTerminalConfiguration()) {
         self.configuration = configuration
@@ -159,6 +167,14 @@ public final class ShhTerminalController: ObservableObject {
         send(raw: data)
     }
 
+    public func handlePasteRequest(_ text: String) {
+        if isRiskyUnbracketedPaste(text) {
+            onRiskyPasteRequested?(text)
+        } else {
+            paste(text)
+        }
+    }
+
     public func isRiskyUnbracketedPaste(_ text: String) -> Bool {
         guard !bracketedPasteMode else { return false }
         let normalized = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
@@ -166,11 +182,16 @@ public final class ShhTerminalController: ObservableObject {
     }
 
     public func reset() {
+        resizeDebouncer.cancel()
         hasPendingFirstResponderRequest = false
         title = ""
         clearSearch()
         selectNone()
         feed("\u{1b}c")
+        #if canImport(UIKit) && canImport(SwiftUI)
+        persistentHostView = nil
+        detachEngine()
+        #endif
     }
 
     // MARK: - Search Affordances
@@ -339,6 +360,9 @@ public final class ShhTerminalController: ObservableObject {
     }
 
     internal func updateFirstResponder(_ active: Bool) {
+        if active {
+            hasPendingFirstResponderRequest = false
+        }
         guard isFirstResponder != active else { return }
         isFirstResponder = active
         onFirstResponderChange?(active)
@@ -376,9 +400,16 @@ public final class ShhTerminalController: ObservableObject {
         }
     }
 
-    internal func detachEngine() {
-        self.attachedBridge = nil
-        self.firstResponderBridge = nil
+    internal func detachEngine(_ bridge: (any TerminalEngineBridge)? = nil) {
+        if let bridge {
+            if self.attachedBridge === bridge {
+                self.attachedBridge = nil
+                self.firstResponderBridge = nil
+            }
+        } else {
+            self.attachedBridge = nil
+            self.firstResponderBridge = nil
+        }
     }
 
     // MARK: - Access to Headless Terminal (Internal for Tests)
