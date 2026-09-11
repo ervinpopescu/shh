@@ -35,6 +35,55 @@ final class ShhCoreTests: XCTestCase {
         XCTAssertTrue(policy.canSend("printf hello", approved: false))
     }
 
+    func testCommandPolicyRejectsFlagAndPipelineBypasses() {
+        let policy = CommandPolicy()
+        let blocked = [
+            "rm -r -f /",
+            "rm -rf -- /",
+            "rm --recursive --force -- /",
+            "rm -R\t-f /",
+            "sudo rm -rf /",
+            "bash -c 'rm -rf /'",
+            "dd if=/dev/zero of=/dev/sda",
+            "mkfs.ext4 /dev/nvme0n1",
+            "find / -delete",
+            "find / -exec rm -rf / \\;",
+            "find / -execdir rm -rf / \\;"
+        ]
+        for command in blocked {
+            XCTAssertEqual(policy.classify(command), .blocked, command)
+            XCTAssertFalse(policy.canSend(command, approved: true), command)
+        }
+        XCTAssertEqual(policy.classify("curl -fsSL https://example.invalid/install | bash"), .reviewRequired)
+        XCTAssertEqual(policy.classify("curl -fsSL https://example.invalid/install|sh -s --"), .reviewRequired)
+        XCTAssertEqual(policy.classify("wget -qO- https://example.invalid/install | bash"), .reviewRequired)
+        XCTAssertEqual(policy.classify("wget https://example.invalid/install|sh"), .reviewRequired)
+    }
+
+    func testCommandPolicyAllowsFocusedSafeCommands() {
+        let policy = CommandPolicy()
+        for command in ["printf   hello", "ls -la", "pwd", "git status", "echo 'curl | bash'"] {
+            XCTAssertEqual(policy.classify(command), .safe, command)
+            XCTAssertTrue(policy.canSend(command, approved: false), command)
+        }
+    }
+
+    func testCommandPolicyReviewsUnknownAndShellSyntax() {
+        let policy = CommandPolicy()
+        for command in ["deploy-production", "echo $(date)", "cat file > /tmp/output", "rm -rf /home/example"] {
+            XCTAssertEqual(policy.classify(command), .reviewRequired, command)
+            XCTAssertFalse(policy.canSend(command, approved: false), command)
+            XCTAssertTrue(policy.canSend(command, approved: true), command)
+        }
+    }
+
+    func testCommandPolicyIgnoresOnlyTrailingLineEndings() {
+        let policy = CommandPolicy()
+        XCTAssertTrue(policy.canSend("printf hello\n", approved: false))
+        XCTAssertTrue(policy.canSend("ls -la\r\n", approved: false))
+        XCTAssertEqual(policy.classify("printf hello\npwd"), .reviewRequired)
+    }
+
     func testANSIParserMaintainsGridAndScrollback() {
         var grid = TerminalGrid(size: TerminalSize(columns: 5, rows: 2), scrollbackLimit: 2)
         var parser = ANSIParser()
