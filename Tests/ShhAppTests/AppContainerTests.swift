@@ -829,6 +829,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
+    var onSend: (@Sendable (Data) async throws -> Void)?
 
     func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -839,6 +840,10 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     }
 
     func send(_ data: Data) async throws {
+        if let onSend {
+            try await onSend(data)
+            return
+        }
         lock.withLock {
             sentData.append(data)
         }

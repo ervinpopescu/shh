@@ -457,6 +457,7 @@ struct SessionView: View {
             if !container.terminalController.title.isEmpty {
                 Text("•")
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 Text(container.terminalController.title)
                     .font(.caption)
                     .lineLimit(1)
@@ -466,8 +467,11 @@ struct SessionView: View {
             if let activeTmux = container.activeTmuxSessionID {
                 Text("•")
                     .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
                 Label(activeTmux, systemImage: "rectangle.3.group")
                     .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Tmux session \(activeTmux)")
                     .accessibilityIdentifier("active-tmux-indicator")
@@ -935,6 +939,7 @@ struct MultiplexerPicker: View {
     @State private var autoAttach = false
     @State private var defaultSession = ""
     @State private var hasLoadedPreferences = false
+    @State private var preferenceError: String? = nil
 
     var body: some View {
         NavigationStack {
@@ -1045,6 +1050,8 @@ struct MultiplexerPicker: View {
                 if let activeID = container.activeTmuxSessionID {
                     Text("Active: \(activeID)")
                         .font(.caption.bold())
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
                         .background(Color.accentColor.opacity(0.15))
@@ -1081,9 +1088,12 @@ struct MultiplexerPicker: View {
                                 HStack(spacing: 6) {
                                     Text(session.name)
                                         .font(.headline)
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
                                     Text(session.sessionID)
                                         .font(.subheadline.monospaced())
                                         .foregroundStyle(.secondary)
+                                        .lineLimit(1)
                                 }
                                 HStack(spacing: 8) {
                                     Label("\(session.windowsCount) win", systemImage: "macwindow")
@@ -1092,19 +1102,21 @@ struct MultiplexerPicker: View {
                                     Text("•")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                        .accessibilityHidden(true)
                                     Text(session.isAttached ? "Attached (\(session.attachedClients))" : "Detached")
                                         .font(.caption)
                                         .foregroundStyle(session.isAttached ? .orange : .secondary)
                                     Text("•")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                        .accessibilityHidden(true)
                                     Text(formatActivityDate(session.lastActivityAt))
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                             Spacer()
-                            if container.activeTmuxSessionID == session.sessionID {
+                            if container.isTmuxSessionActive(session) {
                                 Label("Attached", systemImage: "checkmark")
                                     .font(.caption.bold())
                                     .foregroundStyle(.green)
@@ -1175,6 +1187,14 @@ struct MultiplexerPicker: View {
                     }
                     .accessibilityLabel("Default session name or ID")
                     .accessibilityIdentifier("sheet-default-session-field")
+
+                if let err = preferenceError {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityLabel("Default session error: \(err)")
+                        .accessibilityIdentifier("default-session-error")
+                }
             }
         }
     }
@@ -1240,22 +1260,29 @@ struct MultiplexerPicker: View {
     }
 
     private func savePreferences() {
-        guard let host = container.activeHost else { return }
+        guard hasLoadedPreferences, container.activeHost != nil else { return }
         let trimmed = defaultSession.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sessionPref = trimmed.isEmpty ? nil : trimmed
-        guard let updatedHost = try? Host(
-            id: host.id,
-            name: host.name,
-            hostname: host.hostname,
-            port: host.port,
-            username: host.username,
-            identityID: host.identityID,
-            connection: host.connection,
-            defaultTmuxSession: sessionPref,
-            autoAttachTmux: autoAttach
-        ) else { return }
+        if !trimmed.isEmpty {
+            if trimmed.hasPrefix("$") {
+                if (try? TmuxSessionID(trimmed)) == nil {
+                    preferenceError = "Invalid session ID format. Must begin with $ followed by digits."
+                    return
+                }
+            } else {
+                do {
+                    _ = try TmuxSessionName(trimmed)
+                } catch {
+                    preferenceError = error.localizedDescription
+                    return
+                }
+            }
+        }
+        preferenceError = nil
         Task {
-            try? await container.catalog.save(updatedHost)
+            try? await container.updateActiveHostPreferences(
+                autoAttachTmux: autoAttach,
+                defaultTmuxSession: trimmed.isEmpty ? nil : trimmed
+            )
         }
     }
 }
