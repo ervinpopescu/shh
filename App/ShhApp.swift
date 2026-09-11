@@ -51,6 +51,15 @@ struct RootView: View {
             case .settings: SettingsView()
             }
         }
+        .confirmationDialog("Approve host key?", isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }), titleVisibility: .visible) {
+            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
+            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
+            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
+        } message: {
+            if let challenge = container.pendingTrustChallenge {
+                Text("\(challenge.hostname):\(challenge.port)\n\(challenge.algorithm)\n\(challenge.fingerprint)")
+            }
+        }
     }
     private var capabilityFooter: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -116,22 +125,29 @@ struct HostDetailView: View {
             }
             Section {
                 Button("Connect", systemImage: "bolt.horizontal") { Task { await container.connect(to: host) } }
-                    .disabled(container.activeSession?.state == .connected)
+                    .disabled(isConnectDisabled)
                 Button("Edit", systemImage: "pencil") { showEditor = true }
+                if isFailedForThisHost && !container.terminalText.isEmpty {
+                    Label(container.terminalText, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
             }
         }
         .navigationTitle(host.name)
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
-        .confirmationDialog("Approve host key?", isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }), titleVisibility: .visible) {
-            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
-            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
-            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
-        } message: {
-            if let challenge = container.pendingTrustChallenge {
-                Text("\(challenge.hostname):\(challenge.port)\n\(challenge.algorithm)\n\(challenge.fingerprint)")
+        .safeAreaInset(edge: .bottom) {
+            if let session = container.activeSession, session.hostID == host.id {
+                NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding()
             }
         }
-        .safeAreaInset(edge: .bottom) { if container.activeSession != nil { NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding() } }
+    }
+    private var isConnectDisabled: Bool {
+        container.activeSession?.state == .connecting ||
+            (container.activeSession?.hostID == host.id && container.activeSession?.state == .connected)
+    }
+    private var isFailedForThisHost: Bool {
+        container.activeSession?.hostID == host.id && container.activeSession?.state == .failed
     }
     private var profileName: String {
         if case .ssh = host.connection {
