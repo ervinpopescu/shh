@@ -22,6 +22,8 @@ targets:
         product: ShhCore
       - package: ShhCore
         product: ShhSSH
+      - package: ShhCore
+        product: ShhTerminal
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh
@@ -51,6 +53,18 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.ssh.tests
+        SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
+  ShhTerminalTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Tests/ShhTerminalTests]
+    dependencies:
+      - target: Shh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.terminal.tests
         SWIFT_VERSION: "5.9"
         GENERATE_INFOPLIST_FILE: YES
   ShhAppTests:

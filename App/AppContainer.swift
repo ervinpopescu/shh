@@ -1,6 +1,7 @@
 import Foundation
 import ShhCore
 import ShhSSH
+import ShhTerminal
 import SwiftUI
 
 @MainActor
@@ -10,6 +11,9 @@ final class AppContainer: ObservableObject {
     let trustStore: InMemoryTrustStore
     let credentialStore: any CredentialStore
     let transcriber: any LocalTranscriber
+    let terminalController: ShhTerminalController
+
+    @Published var useLegacyTerminalFallback: Bool
     @Published var activeSession: TerminalSession?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
@@ -25,33 +29,51 @@ final class AppContainer: ObservableObject {
         transport is DemoSSHTransport
     }
 
+    var accessibilityTerminalText: String {
+        if useLegacyTerminalFallback {
+            return terminalText.isEmpty ? "No terminal output" : terminalText
+        }
+        let transcript = terminalController.currentTranscript(limit: 50)
+        if transcript.isEmpty {
+            return terminalText.isEmpty ? "No terminal output" : terminalText
+        }
+        return transcript
+    }
+
     init(
         catalog: InMemoryCatalog = InMemoryCatalog(),
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: (any CredentialStore)? = nil,
         transport: (any SSHTransport)? = nil,
-        transcriber: any LocalTranscriber = UnavailableTranscriber()
+        transcriber: any LocalTranscriber = UnavailableTranscriber(),
+        useLegacyTerminalFallback: Bool = false
     ) {
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
+        let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
+            ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
         self.catalog = catalog
         self.trustStore = trustStore
         self.credentialStore = resolvedCredentialStore
         self.transport = transport ?? LiveSSHTransport(credentialStore: resolvedCredentialStore)
         self.transcriber = transcriber
+        self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
+        self.terminalController = ShhTerminalController()
     }
 
     static func demo(
         catalog: InMemoryCatalog = InMemoryCatalog(),
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: any CredentialStore = InMemoryCredentialStore(),
-        transcriber: any LocalTranscriber = UnavailableTranscriber()
+        transcriber: any LocalTranscriber = UnavailableTranscriber(),
+        useLegacyTerminalFallback: Bool = false
     ) -> AppContainer {
         AppContainer(
             catalog: catalog,
             trustStore: trustStore,
             credentialStore: credentialStore,
             transport: DemoSSHTransport(),
-            transcriber: transcriber
+            transcriber: transcriber,
+            useLegacyTerminalFallback: useLegacyTerminalFallback
         )
     }
 
@@ -82,6 +104,7 @@ final class AppContainer: ObservableObject {
     func connect(to host: Host) async {
         guard activeSession?.state != .connecting else { return }
         eventTask?.cancel()
+        detachCallbacks()
         await connection?.close()
         connection = nil
         pendingTrustChallenge = nil
@@ -90,14 +113,17 @@ final class AppContainer: ObservableObject {
         ansiParser = ANSIParser()
         terminalText = ""
         redactor = Redactor()
+        terminalController.reset()
+
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
+        let initialSize = terminalController.size
         do {
             let connection = try await transport.connect(
                 host: host,
                 identity: await identity(for: host),
                 trustEvaluator: trustStore,
-                initialSize: terminalGrid.size
+                initialSize: initialSize
             )
             guard activeSession?.id == session.id, activeSession?.state == .connecting else {
                 await connection.close()
@@ -107,6 +133,28 @@ final class AppContainer: ObservableObject {
             await loadRedactionSecret(for: host)
             self.connection = connection
             activeSession?.state = .connected
+
+            // Wire debounced resize callback to active connection
+            terminalController.onResize = { [weak self, sessionID = session.id] newSize in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.activeSession?.id == sessionID,
+                          self.activeSession?.state == .connected,
+                          let activeConnection = self.connection else { return }
+                    try? await activeConnection.resize(newSize)
+                }
+            }
+
+            // Wire interactive terminal output to raw outbound path
+            terminalController.onOutput = { [weak self, sessionID = session.id] data in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.activeSession?.id == sessionID,
+                          self.activeSession?.state == .connected else { return }
+                    _ = await self.sendRawInteractive(data)
+                }
+            }
+
             let events = await connection.events()
             eventTask = Task { @MainActor [weak self] in
                 do {
@@ -114,26 +162,35 @@ final class AppContainer: ObservableObject {
                         guard let self, self.activeSession?.id == session.id else { return }
                         switch event {
                         case .bytes(let data):
-                            self.ansiParser.consume(self.redacted(data), into: &self.terminalGrid)
-                            self.terminalText = self.terminalGrid.transcriptText
+                            let redactedData = self.redacted(data)
+                            if self.useLegacyTerminalFallback {
+                                self.ansiParser.consume(redactedData, into: &self.terminalGrid)
+                                self.terminalText = self.terminalGrid.transcriptText
+                            } else {
+                                self.terminalController.feed(redactedData)
+                            }
                         case .closed:
                             self.activeSession?.state = .disconnected
+                            self.detachCallbacks()
                             self.redactor = Redactor()
                         case .error(let error):
                             self.activeSession?.state = .failed
+                            self.detachCallbacks()
                             self.terminalText += "\n" + Self.statusMessage(for: error)
                             self.redactor = Redactor()
                         }
                     }
                 } catch {
-                    guard self?.activeSession?.id == session.id else { return }
-                    self?.activeSession?.state = .failed
-                    self?.terminalText += "\n" + Self.statusMessage(for: error)
-                    self?.redactor = Redactor()
+                    guard let self, self.activeSession?.id == session.id else { return }
+                    self.activeSession?.state = .failed
+                    self.detachCallbacks()
+                    self.terminalText += "\n" + Self.statusMessage(for: error)
+                    self.redactor = Redactor()
                 }
             }
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
+            detachCallbacks()
             switch error {
             case .hostKeyApprovalRequired(let challenge):
                 pendingTrustChallenge = challenge
@@ -148,6 +205,7 @@ final class AppContainer: ObservableObject {
             }
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
+            detachCallbacks()
             activeSession?.state = .failed
             terminalText = "Connection unavailable."
         }
@@ -172,7 +230,20 @@ final class AppContainer: ObservableObject {
         redactor = Redactor()
     }
 
-    func send(_ command: String, approved: Bool = false) async -> Bool {
+    @discardableResult
+    func sendRawInteractive(_ data: Data) async -> Bool {
+        guard activeSession?.state == .connected,
+              let connection else { return false }
+        do {
+            try await connection.send(data)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    @discardableResult
+    func sendValidatedCommand(_ command: String, approved: Bool = false) async -> Bool {
         guard CommandPolicy().canSend(command, approved: approved),
               activeSession?.state == .connected,
               let connection else { return false }
@@ -185,12 +256,24 @@ final class AppContainer: ObservableObject {
         }
     }
 
+    @discardableResult
+    func send(_ command: String, approved: Bool = false) async -> Bool {
+        await sendValidatedCommand(command, approved: approved)
+    }
+
     func disconnect() async {
+        detachCallbacks()
         eventTask?.cancel()
+        eventTask = nil
         await connection?.close()
         connection = nil
         activeSession?.state = .disconnected
         redactor = Redactor()
+    }
+
+    private func detachCallbacks() {
+        terminalController.onResize = nil
+        terminalController.onOutput = nil
     }
 
     private func identity(for host: Host) async -> IdentityDescriptor? {

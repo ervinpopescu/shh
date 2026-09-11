@@ -187,5 +187,35 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     func changeScrollback(_ limit: Int) {
         getTerminal().changeScrollback(limit)
     }
+
+    func findNext(_ term: String) -> Bool {
+        findNext(term, options: SearchOptions(), scrollToResult: true)
+    }
+
+    func findPrevious(_ term: String) -> Bool {
+        findPrevious(term, options: SearchOptions(), scrollToResult: true)
+    }
+
+    func searchMatchSummary(_ term: String) -> (index: Int, total: Int) {
+        searchMatchSummary(term, options: SearchOptions(), limit: 1000)
+    }
+
+    func currentTranscript(limit: Int) -> String {
+        if let pageContent = accessibilityPageContent(), !pageContent.isEmpty {
+            return pageContent
+        }
+        let terminal = getTerminal()
+        let dims = terminal.getDims()
+        var lines: [String] = []
+        for r in 0..<dims.rows {
+            if let line = terminal.getLine(row: r) {
+                lines.append(line.translateToString(trimRight: true))
+            }
+        }
+        while lines.last?.isEmpty == true {
+            lines.removeLast()
+        }
+        return lines.suffix(limit).joined(separator: "\n")
+    }
 }
 #endif

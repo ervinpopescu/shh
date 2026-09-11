@@ -2,6 +2,7 @@ import XCTest
 @testable import Shh
 import ShhCore
 import ShhSSH
+import ShhTerminal
 
 final class CountingCredentialStore: CredentialStore, @unchecked Sendable {
     private let inner = InMemoryCredentialStore()
@@ -424,6 +425,307 @@ final class AppContainerTests: XCTestCase {
         _ = detailViewA
         _ = detailViewB
     }
+
+    // MARK: - Stage 2 Milestone 3 Tests
+
+    func testDualPathSafety_RawInteractiveBypassesPolicy_ValidatedCommandEnforcesPolicy() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "DualPathHost", hostname: "dualpath.invalid", username: "user")
+
+        // 1. Before connection, neither path sends
+        let rawBefore = await container.sendRawInteractive(Data("pwd\n".utf8))
+        XCTAssertFalse(rawBefore)
+        let validatedBefore = await container.sendValidatedCommand("pwd\n", approved: false)
+        XCTAssertFalse(validatedBefore)
+
+        // Connect
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // 2. sendRawInteractive: raw interactive keystrokes bypass CommandPolicy
+        // Destructive command string sent as raw bytes directly to connection
+        let dangerousBytes = Data("rm -rf /\n".utf8)
+        let rawDangerousResult = await container.sendRawInteractive(dangerousBytes)
+        XCTAssertTrue(rawDangerousResult, "sendRawInteractive must transmit without CommandPolicy gating")
+        XCTAssertEqual(mockConnection.sentData.last, dangerousBytes)
+
+        // Control characters (e.g. Ctrl-C 0x03) sent as raw bytes
+        let ctrlCBytes = Data([0x03])
+        let rawCtrlCResult = await container.sendRawInteractive(ctrlCBytes)
+        XCTAssertTrue(rawCtrlCResult, "sendRawInteractive must transmit control characters")
+        XCTAssertEqual(mockConnection.sentData.last, ctrlCBytes)
+
+        // 3. sendValidatedCommand: must strictly enforce CommandPolicy
+        // Safe command: succeeds without explicit approval
+        let safeResult = await container.sendValidatedCommand("ls -la\n", approved: false)
+        XCTAssertTrue(safeResult, "Safe command passes validated path")
+        XCTAssertEqual(mockConnection.sentData.last, Data("ls -la\n".utf8))
+
+        // Review-required command: rejected without approval
+        let preCount = mockConnection.sentData.count
+        let reviewRejected = await container.sendValidatedCommand("shutdown now\n", approved: false)
+        XCTAssertFalse(reviewRejected, "Review-required command rejected without approval")
+        XCTAssertEqual(mockConnection.sentData.count, preCount, "Unapproved command must not be sent")
+
+        // Review-required command: permitted with explicit approval
+        let reviewApproved = await container.sendValidatedCommand("shutdown now\n", approved: true)
+        XCTAssertTrue(reviewApproved, "Review-required command passes when approved")
+        XCTAssertEqual(mockConnection.sentData.last, Data("shutdown now\n".utf8))
+
+        // Blocked command: remains unsendable even when approved: true
+        let blockedResult = await container.sendValidatedCommand("rm -rf /\n", approved: true)
+        XCTAssertFalse(blockedResult, "Blocked command must remain unsendable even after approval")
+
+        // 4. Disconnect closes both paths
+        await container.disconnect()
+        let rawAfter = await container.sendRawInteractive(Data("ls\n".utf8))
+        XCTAssertFalse(rawAfter)
+        let validatedAfter = await container.sendValidatedCommand("ls\n", approved: false)
+        XCTAssertFalse(validatedAfter)
+    }
+
+    func testRawByteFidelityAcrossEncodersAndConnection() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "FidelityHost", hostname: "fidelity.invalid", username: "user")
+        await container.connect(to: host)
+
+        let testCases: [(TerminalKey, Data)] = [
+            (.escape, Data([0x1B])),
+            (.tab(shift: false), Data([0x09])),
+            (.tab(shift: true), Data([0x1B, 0x5B, 0x5A])),
+            (.ctrlC, Data([0x03])),
+            (.ctrlD, Data([0x04])),
+            (.arrow(.up, modifiers: [], applicationCursor: false), Data([0x1B, 0x5B, 0x41])),
+            (.arrow(.down, modifiers: [], applicationCursor: false), Data([0x1B, 0x5B, 0x42])),
+            (.arrow(.right, modifiers: [], applicationCursor: false), Data([0x1B, 0x5B, 0x43])),
+            (.arrow(.left, modifiers: [], applicationCursor: false), Data([0x1B, 0x5B, 0x44])),
+            (.functionKey(1), Data([0x1B, 0x4F, 0x50])),
+            (.functionKey(12), Data([0x1B, 0x5B, 0x32, 0x34, 0x7E]))
+        ]
+
+        for (key, expectedBytes) in testCases {
+            let encoded = TerminalKeyEncoder.encode(key)
+            XCTAssertEqual(encoded, expectedBytes, "Key \(key) encoding mismatch")
+
+            let sent = await container.sendRawInteractive(encoded)
+            XCTAssertTrue(sent)
+            XCTAssertEqual(mockConnection.sentData.last, expectedBytes, "Delivered bytes mismatch for \(key)")
+        }
+
+        // Bracketed paste wrapping fidelity
+        let pastePayload = "git status\nls -la"
+        let bracketedPasteBytes = TerminalKeyEncoder.encodePaste(pastePayload, bracketed: true)
+        let expectedPrefix = Data([0x1B, 0x5B, 0x32, 0x30, 0x30, 0x7E])
+        let expectedSuffix = Data([0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E])
+        XCTAssertTrue(bracketedPasteBytes.starts(with: expectedPrefix))
+        XCTAssertEqual(bracketedPasteBytes.suffix(expectedSuffix.count), expectedSuffix)
+
+        let pasteSent = await container.sendRawInteractive(bracketedPasteBytes)
+        XCTAssertTrue(pasteSent)
+        XCTAssertEqual(mockConnection.sentData.last, bracketedPasteBytes)
+    }
+
+    func testResizeDeliveryThroughAdapterDebounce() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "ResizeHost", hostname: "resize.invalid", username: "user")
+        await container.connect(to: host)
+
+        // Rapidly report multiple sizes (simulating window resize / split drag)
+        container.terminalController.handleResize(columns: 90, rows: 25)
+        container.terminalController.handleResize(columns: 100, rows: 30)
+        container.terminalController.handleResize(columns: 120, rows: 40)
+
+        // Flush immediately delivers final size
+        container.terminalController.flushResize()
+
+        // Wait a small slice for MainActor task
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        // Only the final size should have been delivered
+        XCTAssertEqual(mockConnection.resizeCalls.last, TerminalSize(columns: 120, rows: 40))
+    }
+
+    func testStaleSessionIsolationAndCallbackDetachment() async throws {
+        let mockConnectionA = MockSSHConnection()
+        let mockConnectionB = MockSSHConnection()
+        let transport = ControllableTransport()
+
+        let hostA = try Host(name: "HostA", hostname: "hosta.invalid", username: "user")
+        let hostB = try Host(name: "HostB", hostname: "hostb.invalid", username: "user")
+
+        transport.onConnect = { host in
+            host.id == hostA.id ? mockConnectionA : mockConnectionB
+        }
+
+        let container = AppContainer(transport: transport)
+
+        // 1. Connect to Host A
+        await container.connect(to: hostA)
+        XCTAssertEqual(container.activeSession?.hostID, hostA.id)
+        XCTAssertNotNil(container.terminalController.onResize, "Callbacks must be attached")
+        XCTAssertNotNil(container.terminalController.onOutput, "Callbacks must be attached")
+
+        // 2. Disconnect Host A: callbacks must be detached immediately
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertNil(container.terminalController.onResize, "Resize callback must be detached on disconnect")
+        XCTAssertNil(container.terminalController.onOutput, "Output callback must be detached on disconnect")
+
+        // Triggering controller resize / send after disconnect must NOT deliver to mockConnectionA
+        container.terminalController.handleResize(columns: 100, rows: 30)
+        container.terminalController.flushResize()
+        container.terminalController.send(text: "orphan text")
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertTrue(mockConnectionA.resizeCalls.isEmpty, "Stale connection must not receive resize")
+        XCTAssertTrue(mockConnectionA.sentData.isEmpty, "Stale connection must not receive sends")
+
+        // 3. Connect to Host B
+        await container.connect(to: hostB)
+        XCTAssertEqual(container.activeSession?.hostID, hostB.id)
+
+        // Emit closed / error on old mockConnectionA: must NOT affect Host B's session!
+        mockConnectionA.emit(.error(TransportError.remoteFailure("stale error")))
+        try await Task.sleep(nanoseconds: 20_000_000)
+        XCTAssertEqual(container.activeSession?.state, .connected, "Stale connection error must not mutate active session")
+        XCTAssertEqual(container.activeSession?.hostID, hostB.id)
+    }
+
+    func testRedactionBeforeFeedInProductionAndFallback() async throws {
+        let credStore = InMemoryCredentialStore()
+        let secretValue = "super-secret-ssh-token-42"
+        try await credStore.save(Data(secretValue.utf8), reference: "ref-secret-token")
+        let identity = try IdentityDescriptor(name: "SecretIdent", kind: .password, keychainReference: "ref-secret-token")
+
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        // 1. Production surface mode: bytes fed directly to terminalController
+        let prodContainer = AppContainer(credentialStore: credStore, transport: transport, useLegacyTerminalFallback: false)
+        try await prodContainer.catalog.save(identity)
+        let host = try Host(name: "ProdHost", hostname: "prod.invalid", username: "user", identityID: identity.id)
+
+        await prodContainer.connect(to: host)
+        XCTAssertEqual(prodContainer.activeSession?.state, .connected)
+
+        let secretPayload = "Secret: \(secretValue) in session banner\r\n"
+        mockConnection.emit(.bytes(Data(secretPayload.utf8)))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let prodTranscript = prodContainer.terminalController.currentTranscript(limit: 10)
+        XCTAssertFalse(prodTranscript.contains(secretValue), "Raw secret must never enter terminalController buffer")
+        XCTAssertTrue(prodTranscript.contains("[REDACTED]"), "Secret must be replaced with [REDACTED] before feed")
+
+        // 2. Fallback surface mode: bytes fed to terminalGrid and terminalText
+        let mockConnectionFallback = MockSSHConnection()
+        let fallbackTransport = ControllableTransport()
+        fallbackTransport.onConnect = { _ in mockConnectionFallback }
+
+        let fallbackContainer = AppContainer(credentialStore: credStore, transport: fallbackTransport, useLegacyTerminalFallback: true)
+        try await fallbackContainer.catalog.save(identity)
+        let fallbackHost = try Host(name: "FallbackHost", hostname: "fallback.invalid", username: "user", identityID: identity.id)
+
+        await fallbackContainer.connect(to: fallbackHost)
+        mockConnectionFallback.emit(.bytes(Data(secretPayload.utf8)))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertFalse(fallbackContainer.terminalText.contains(secretValue), "Raw secret must never enter fallback terminalText")
+        XCTAssertTrue(fallbackContainer.terminalText.contains("[REDACTED]"), "Secret must be redacted in fallback terminalText")
+    }
+
+    func testTerminalSurfaceFallbackSelection() async throws {
+        // Defaults: production surface
+        let defaultContainer = AppContainer()
+        XCTAssertFalse(defaultContainer.useLegacyTerminalFallback, "Default container must use production surface")
+
+        let demoContainer = AppContainer.demo()
+        XCTAssertFalse(demoContainer.useLegacyTerminalFallback, "Default demo container must use production surface")
+
+        // Explicit fallback configuration
+        let fallbackContainer = AppContainer(useLegacyTerminalFallback: true)
+        XCTAssertTrue(fallbackContainer.useLegacyTerminalFallback)
+
+        let fallbackDemoContainer = AppContainer.demo(useLegacyTerminalFallback: true)
+        XCTAssertTrue(fallbackDemoContainer.useLegacyTerminalFallback)
+
+        // Runtime toggle
+        fallbackContainer.useLegacyTerminalFallback = false
+        XCTAssertFalse(fallbackContainer.useLegacyTerminalFallback)
+        fallbackContainer.useLegacyTerminalFallback = true
+        XCTAssertTrue(fallbackContainer.useLegacyTerminalFallback)
+    }
+
+    func testPastePolicyBracketedVersusUnbracketed() {
+        let container = AppContainer()
+
+        // 1. Unbracketed mode (default):
+        XCTAssertFalse(container.terminalController.bracketedPasteMode)
+
+        // Single line: not risky
+        XCTAssertFalse(container.terminalController.isRiskyUnbracketedPaste("ls -la"))
+        XCTAssertFalse(container.terminalController.isRiskyUnbracketedPaste("git status"))
+        XCTAssertFalse(container.terminalController.isRiskyUnbracketedPaste(""))
+
+        // Multi-line: risky because unbracketed shells execute newlines as Enter immediately
+        XCTAssertTrue(container.terminalController.isRiskyUnbracketedPaste("command1\ncommand2"))
+        XCTAssertTrue(container.terminalController.isRiskyUnbracketedPaste("command1\r\ncommand2"))
+        XCTAssertTrue(container.terminalController.isRiskyUnbracketedPaste("a\nb\nc"))
+
+        // 2. Bracketed paste mode: ESC [ ? 2004 h
+        container.terminalController.feed("\u{1b}[?2004h")
+        XCTAssertTrue(container.terminalController.bracketedPasteMode)
+
+        // With bracketed paste enabled, multi-line paste is preserved and safe
+        XCTAssertFalse(container.terminalController.isRiskyUnbracketedPaste("command1\ncommand2"))
+    }
+
+    func testFirstResponderRecoveryAndControllerState() {
+        let container = AppContainer()
+
+        XCTAssertFalse(container.terminalController.isFirstResponder)
+
+        container.terminalController.requestFirstResponder()
+        XCTAssertTrue(container.terminalController.hasPendingFirstResponderRequest)
+
+        container.terminalController.recoverFirstResponder()
+        XCTAssertTrue(container.terminalController.hasPendingFirstResponderRequest)
+
+        container.terminalController.resignFirstResponder()
+        XCTAssertFalse(container.terminalController.hasPendingFirstResponderRequest)
+        XCTAssertFalse(container.terminalController.isFirstResponder)
+
+        // Accessibility transcript reflects content or default placeholder
+        XCTAssertEqual(container.accessibilityTerminalText, "No terminal output")
+        container.terminalController.feed("Accessibility Line 1\r\n")
+        XCTAssertTrue(container.accessibilityTerminalText.contains("Accessibility Line 1"))
+    }
+
+    func testSessionViewComponentsAndAffordances() {
+        let container = AppContainer.demo()
+
+        // SwiftUI hierarchy instantiation sanity
+        let sessionView = SessionView().environmentObject(container)
+        _ = sessionView
+
+        let accessoryBar = TerminalAccessoryBar(controller: container.terminalController)
+        _ = accessoryBar
+
+        var query = "test"
+        let searchBar = TerminalSearchBar(controller: container.terminalController, query: .init(get: { query }, set: { query = $0 }), onClose: {})
+        _ = searchBar
+    }
 }
 
 private actor Gate {
@@ -449,6 +751,8 @@ private actor Gate {
 private final class MockSSHConnection: SSHConnection, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
+    private(set) var sentData: [Data] = []
+    private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
 
     func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
@@ -459,8 +763,18 @@ private final class MockSSHConnection: SSHConnection, @unchecked Sendable {
         }
     }
 
-    func send(_ data: Data) async throws {}
-    func resize(_ size: TerminalSize) async throws {}
+    func send(_ data: Data) async throws {
+        lock.withLock {
+            sentData.append(data)
+        }
+    }
+
+    func resize(_ size: TerminalSize) async throws {
+        lock.withLock {
+            resizeCalls.append(size)
+        }
+    }
+
     func close() async {
         lock.withLock {
             isClosed = true
