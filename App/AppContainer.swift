@@ -15,11 +15,11 @@ final class AppContainer: ObservableObject {
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
     private var pendingTrustHost: Host?
-    private var connection: (any SSHConnection)?
+    private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
-    private var redactor = Redactor()
+    private(set) var redactor = Redactor()
 
     var isDemo: Bool {
         transport is DemoSSHTransport
@@ -89,6 +89,7 @@ final class AppContainer: ObservableObject {
         terminalGrid = TerminalGrid()
         ansiParser = ANSIParser()
         terminalText = ""
+        redactor = Redactor()
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
         do {
@@ -98,7 +99,7 @@ final class AppContainer: ObservableObject {
                 trustEvaluator: trustStore,
                 initialSize: terminalGrid.size
             )
-            guard activeSession?.id == session.id else {
+            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
                 await connection.close()
                 return
             }
@@ -117,18 +118,22 @@ final class AppContainer: ObservableObject {
                             self.terminalText = self.terminalGrid.transcriptText
                         case .closed:
                             self.activeSession?.state = .disconnected
+                            self.redactor = Redactor()
                         case .error(let error):
                             self.activeSession?.state = .failed
                             self.terminalText += "\n" + Self.statusMessage(for: error)
+                            self.redactor = Redactor()
                         }
                     }
                 } catch {
                     guard self?.activeSession?.id == session.id else { return }
                     self?.activeSession?.state = .failed
                     self?.terminalText += "\n" + Self.statusMessage(for: error)
+                    self?.redactor = Redactor()
                 }
             }
         } catch let error as TransportError {
+            guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             switch error {
             case .hostKeyApprovalRequired(let challenge):
                 pendingTrustChallenge = challenge
@@ -142,6 +147,7 @@ final class AppContainer: ObservableObject {
                 terminalText = Self.statusMessage(for: error)
             }
         } catch {
+            guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             activeSession?.state = .failed
             terminalText = "Connection unavailable."
         }
@@ -163,6 +169,7 @@ final class AppContainer: ObservableObject {
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         activeSession?.state = .disconnected
+        redactor = Redactor()
     }
 
     func send(_ command: String, approved: Bool = false) async -> Bool {
@@ -183,6 +190,7 @@ final class AppContainer: ObservableObject {
         await connection?.close()
         connection = nil
         activeSession?.state = .disconnected
+        redactor = Redactor()
     }
 
     private func identity(for host: Host) async -> IdentityDescriptor? {
