@@ -3,7 +3,17 @@ import SwiftUI
 
 @main
 struct ShhApp: App {
-    @StateObject private var container = AppContainer()
+    @StateObject private var container: AppContainer
+
+    init() {
+        if ProcessInfo.processInfo.arguments.contains("--demo") ||
+            ProcessInfo.processInfo.environment["SHH_DEMO_MODE"] == "1" {
+            _container = StateObject(wrappedValue: AppContainer.demo())
+        } else {
+            _container = StateObject(wrappedValue: AppContainer())
+        }
+    }
+
     var body: some Scene {
         WindowGroup { RootView().environmentObject(container) }
     }
@@ -44,8 +54,8 @@ struct RootView: View {
     }
     private var capabilityFooter: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Offline demo mode").font(.caption.bold())
-            Text("SSH, SFTP, Mosh and Whisper adapters are replaceable capabilities.").font(.caption2).foregroundStyle(.secondary)
+            Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
+            Text(container.isDemo ? "SSH, SFTP, Mosh and Whisper adapters are replaceable capabilities." : "Live SSH transport active. SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -123,7 +133,12 @@ struct HostDetailView: View {
         }
         .safeAreaInset(edge: .bottom) { if container.activeSession != nil { NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding() } }
     }
-    private var profileName: String { if case .ssh = host.connection { return "SSH (demo adapter)" }; return "Capability unavailable" }
+    private var profileName: String {
+        if case .ssh = host.connection {
+            return container.isDemo ? "SSH (demo adapter)" : "SSH (live adapter)"
+        }
+        return "Capability unavailable"
+    }
 }
 
 struct HostEditorView: View {
@@ -230,7 +245,7 @@ struct MultiplexerPicker: View {
             Form {
                 Picker("Adapter", selection: $selected) { ForEach(RemoteMultiplexer.allCases, id: \.self) { Text($0.rawValue.capitalized).tag($0) } }
                 Section("Command preview") { Text(preview).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
-                Text("Selection only; no multiplexer command is executed in demo mode.").foregroundStyle(.secondary)
+                Text("Selection only; multiplexer integration is not enabled in this build.").foregroundStyle(.secondary)
             }
             .navigationTitle("Multiplexer")
         }

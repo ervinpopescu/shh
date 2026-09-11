@@ -1,5 +1,6 @@
 import Foundation
 import ShhCore
+import ShhSSH
 import SwiftUI
 
 @MainActor
@@ -20,12 +21,62 @@ final class AppContainer: ObservableObject {
     private var ansiParser = ANSIParser()
     private var redactor = Redactor()
 
-    init() {
-        catalog = InMemoryCatalog()
-        transport = DemoSSHTransport()
-        trustStore = InMemoryTrustStore()
-        credentialStore = KeychainCredentialStore()
-        transcriber = UnavailableTranscriber()
+    var isDemo: Bool {
+        transport is DemoSSHTransport
+    }
+
+    init(
+        catalog: InMemoryCatalog = InMemoryCatalog(),
+        trustStore: InMemoryTrustStore = InMemoryTrustStore(),
+        credentialStore: (any CredentialStore)? = nil,
+        transport: (any SSHTransport)? = nil,
+        transcriber: any LocalTranscriber = UnavailableTranscriber()
+    ) {
+        let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
+        self.catalog = catalog
+        self.trustStore = trustStore
+        self.credentialStore = resolvedCredentialStore
+        self.transport = transport ?? LiveSSHTransport(credentialStore: resolvedCredentialStore)
+        self.transcriber = transcriber
+    }
+
+    static func demo(
+        catalog: InMemoryCatalog = InMemoryCatalog(),
+        trustStore: InMemoryTrustStore = InMemoryTrustStore(),
+        credentialStore: any CredentialStore = InMemoryCredentialStore(),
+        transcriber: any LocalTranscriber = UnavailableTranscriber()
+    ) -> AppContainer {
+        AppContainer(
+            catalog: catalog,
+            trustStore: trustStore,
+            credentialStore: credentialStore,
+            transport: DemoSSHTransport(),
+            transcriber: transcriber
+        )
+    }
+
+    static func statusMessage(for error: Error) -> String {
+        guard let transportError = error as? TransportError else {
+            return "Connection unavailable."
+        }
+        switch transportError {
+        case .authenticationRequired:
+            return "Authentication required."
+        case .timeout:
+            return "Connection timed out."
+        case .networkUnavailable:
+            return "Network unavailable."
+        case .unsupported, .invalidConfiguration:
+            return "Unsupported configuration."
+        case .cancelled:
+            return "Connection cancelled."
+        case .hostKeyChanged:
+            return "Connection refused: host key has changed."
+        case .hostKeyApprovalRequired:
+            return "Host key approval required."
+        case .remoteFailure:
+            return "Connection failed."
+        }
     }
 
     func connect(to host: Host) async {
@@ -40,7 +91,6 @@ final class AppContainer: ObservableObject {
         terminalText = ""
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
-        await loadRedactionSecret(for: host)
         do {
             let connection = try await transport.connect(
                 host: host,
@@ -52,6 +102,8 @@ final class AppContainer: ObservableObject {
                 await connection.close()
                 return
             }
+            // Host key is accepted and connection succeeded; load redaction secret if available
+            await loadRedactionSecret(for: host)
             self.connection = connection
             activeSession?.state = .connected
             let events = await connection.events()
@@ -63,14 +115,17 @@ final class AppContainer: ObservableObject {
                         case .bytes(let data):
                             self.ansiParser.consume(self.redacted(data), into: &self.terminalGrid)
                             self.terminalText = self.terminalGrid.transcriptText
-                        case .closed: self.activeSession?.state = .disconnected
-                        case .error: self.activeSession?.state = .failed; self.terminalText += "\nConnection error."
+                        case .closed:
+                            self.activeSession?.state = .disconnected
+                        case .error(let error):
+                            self.activeSession?.state = .failed
+                            self.terminalText += "\n" + Self.statusMessage(for: error)
                         }
                     }
                 } catch {
                     guard self?.activeSession?.id == session.id else { return }
                     self?.activeSession?.state = .failed
-                    self?.terminalText += "\nConnection error."
+                    self?.terminalText += "\n" + Self.statusMessage(for: error)
                 }
             }
         } catch let error as TransportError {
@@ -79,12 +134,12 @@ final class AppContainer: ObservableObject {
                 pendingTrustChallenge = challenge
                 pendingTrustHost = host
                 activeSession?.state = .disconnected
-            case .hostKeyChanged:
-                activeSession?.state = .failed
-                terminalText = "Connection refused: the host key changed."
+            case .cancelled:
+                activeSession?.state = .disconnected
+                terminalText = Self.statusMessage(for: error)
             default:
                 activeSession?.state = .failed
-                terminalText = "Connection unavailable."
+                terminalText = Self.statusMessage(for: error)
             }
         } catch {
             activeSession?.state = .failed
@@ -94,7 +149,11 @@ final class AppContainer: ObservableObject {
 
     func approvePendingHostKey(permanently: Bool) async {
         guard let challenge = pendingTrustChallenge, let host = pendingTrustHost else { return }
-        if permanently { await trustStore.save(challenge) } else { await trustStore.trustOnce(challenge) }
+        if permanently {
+            await trustStore.save(challenge)
+        } else {
+            await trustStore.trustOnce(challenge)
+        }
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         await connect(to: host)
@@ -107,7 +166,9 @@ final class AppContainer: ObservableObject {
     }
 
     func send(_ command: String, approved: Bool = false) async -> Bool {
-        guard CommandPolicy().canSend(command, approved: approved), activeSession?.state == .connected, let connection else { return false }
+        guard CommandPolicy().canSend(command, approved: approved),
+              activeSession?.state == .connected,
+              let connection else { return false }
         do {
             try await connection.send(Data(command.utf8))
             return true

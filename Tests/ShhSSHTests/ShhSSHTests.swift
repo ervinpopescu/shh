@@ -13,6 +13,25 @@ final class AtomicBox<T>: @unchecked Sendable {
     func set(_ value: T) { lock.withLock { self.value = value } }
 }
 
+final class CountingCredentialStore: CredentialStore, @unchecked Sendable {
+    private let inner = InMemoryCredentialStore()
+    private let lock = NSLock()
+    private(set) var loadCallCount = 0
+
+    func save(_ secret: Data, reference: String) async throws {
+        try await inner.save(secret, reference: reference)
+    }
+
+    func load(reference: String) async throws -> Data {
+        lock.withLock { loadCallCount += 1 }
+        return try await inner.load(reference: reference)
+    }
+
+    func delete(reference: String) async throws {
+        try await inner.delete(reference: reference)
+    }
+}
+
 final class ShhSSHTests: XCTestCase {
 
     func testTOFUChallengeReceivedBeforeCredentialsTransmitted() async throws {
@@ -321,5 +340,55 @@ final class ShhSSHTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
+
+    func testCredentialsNotLoadedBeforeHostKeyValidationAccepted() async throws {
+        let server = SSHTestServer()
+        let port = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let credStore = CountingCredentialStore()
+        try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
+        let identity = try IdentityDescriptor(name: "Test Pass", kind: .password, keychainReference: "ref-pass")
+
+        let trustStore = InMemoryTrustStore()
+        let transport = LiveSSHTransport(credentialStore: credStore)
+
+        let host = try ShhCore.Host(
+            name: "Localhost",
+            hostname: "127.0.0.1",
+            port: port,
+            username: "testuser",
+            identityID: identity.id,
+            connection: .ssh(SSHOptions(connectTimeoutSeconds: 5, strictHostKeyChecking: .prompt))
+        )
+
+        // 1. Unknown host key: must NOT load credential from store
+        do {
+            _ = try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
+            XCTFail("Should have thrown hostKeyApprovalRequired")
+        } catch TransportError.hostKeyApprovalRequired {
+            XCTAssertEqual(credStore.loadCallCount, 0, "Credentials must not be loaded when host key is unknown")
+        }
+
+        // 2. Changed host key: must NOT load credential from store
+        let changedTrustStore = InMemoryTrustStore()
+        let mismatchedChallenge = HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: "SHA256:differentOldFingerprint")
+        await changedTrustStore.save(mismatchedChallenge)
+
+        do {
+            _ = try await transport.connect(host: host, identity: identity, trustEvaluator: changedTrustStore)
+            XCTFail("Should have thrown hostKeyChanged")
+        } catch TransportError.hostKeyChanged {
+            XCTAssertEqual(credStore.loadCallCount, 0, "Credentials must not be loaded when host key has changed")
+        }
+
+        // 3. Accepted host key: credential IS loaded from store
+        let challenge = HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: server.fingerprint)
+        await trustStore.save(challenge)
+
+        let connection = try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
+        XCTAssertGreaterThan(credStore.loadCallCount, 0, "Credentials should be loaded after host key accepted")
+        await connection.close()
     }
 }
