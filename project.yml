@@ -11,15 +11,18 @@ targets:
     type: application
     platform: iOS
     deploymentTarget: "17.0"
-    sources: [App]
-    resources: [Resources]
+    sources:
+      - App
+      - path: Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: ShhCore
         product: ShhCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.Shh
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh
         SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "Shh records only while you hold the local push-to-talk control."
   ShhCoreTests:
@@ -33,5 +36,6 @@ targets:
         product: ShhCore
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.example.ShhTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.tests
         SWIFT_VERSION: "5.9"
+        GENERATE_INFOPLIST_FILE: YES
