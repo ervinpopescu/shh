@@ -133,6 +133,7 @@ final class AppContainer: ObservableObject {
             // Host key is accepted and connection succeeded; load redaction secret if available
             await loadRedactionSecret(for: host)
             self.connection = connection
+            (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
 
             // Wire debounced resize callback to active connection

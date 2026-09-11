@@ -326,11 +326,21 @@ public struct LiveSSHTransport: SSHTransport {
                 }
             }.get()
 
+            var redactionSecrets: [String] = []
+            if let identity = identity,
+               let secretData = try? await credentialStore.load(reference: identity.keychainReference),
+               let secretString = String(data: secretData, encoding: .utf8),
+               !secretString.isEmpty {
+                redactionSecrets.append(secretString)
+            }
+            let redactor = Redactor(secrets: redactionSecrets)
+
             let connection = LiveSSHConnection(
                 childChannel: childChannel,
                 parentChannel: channel,
                 eventLoopGroup: eventLoopGroup,
-                ownsGroup: ownsGroup
+                ownsGroup: ownsGroup,
+                redactor: redactor
             )
             createdConnection = connection
             router.setConnection(connection)

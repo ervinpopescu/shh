@@ -20,11 +20,20 @@ public typealias RemoteCommandResult = SSHCommandResult
 
 public protocol SSHCommandExecuting: Sendable {
     func executeCommand(_ command: String) async throws -> SSHCommandResult
+    func executeCommand(_ command: String, timeout: TimeInterval?, maxOutputBytes: Int?) async throws -> SSHCommandResult
 }
 
 public extension SSHCommandExecuting {
     func execute(_ command: String) async throws -> SSHCommandResult {
         try await executeCommand(command)
+    }
+
+    func executeCommand(_ command: String, timeout: TimeInterval?, maxOutputBytes: Int?) async throws -> SSHCommandResult {
+        try await executeCommand(command)
+    }
+
+    func executeCommand(_ command: String, timeout: TimeInterval?) async throws -> SSHCommandResult {
+        try await executeCommand(command, timeout: timeout, maxOutputBytes: nil)
     }
 }
 

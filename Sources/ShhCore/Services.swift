@@ -32,9 +32,18 @@ public extension SSHTransport {
     }
 }
 
-public actor DemoSSHConnection: SSHConnection {
+public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
     private var continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
-    public init() {}
+    private var commandHandler: (@Sendable (String) -> SSHCommandResult)?
+
+    public init(commandHandler: (@Sendable (String) -> SSHCommandResult)? = nil) {
+        self.commandHandler = commandHandler
+    }
+
+    public func setCommandHandler(_ handler: (@Sendable (String) -> SSHCommandResult)?) {
+        self.commandHandler = handler
+    }
+
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
             Task { self.install(continuation) }
@@ -49,6 +58,46 @@ public actor DemoSSHConnection: SSHConnection {
     }
     public func resize(_ size: TerminalSize) async throws {}
     public func close() async { continuation?.yield(.closed); continuation?.finish() }
+
+    public func executeCommand(_ command: String) async throws -> SSHCommandResult {
+        try await executeCommand(command, timeout: nil, maxOutputBytes: nil)
+    }
+
+    public func executeCommand(
+        _ command: String,
+        timeout: TimeInterval?,
+        maxOutputBytes: Int?
+    ) async throws -> SSHCommandResult {
+        if let commandHandler {
+            let res = commandHandler(command)
+            if let maxOutputBytes, res.stdout.utf8.count + res.stderr.utf8.count > maxOutputBytes {
+                throw TransportError.remoteFailure("Command output exceeded maximum allowed size of \(maxOutputBytes) bytes")
+            }
+            return res
+        }
+
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let result: SSHCommandResult
+        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+            result = SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n", stderr: "")
+        } else if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
+            let sample = "$0\tdefault\t1\t1700000000\t1700000000\t1\n"
+            result = SSHCommandResult(exitCode: 0, stdout: sample, stderr: "")
+        } else if trimmed.contains("has-session") {
+            if trimmed.contains("$0") || trimmed.contains("default") {
+                result = SSHCommandResult(exitCode: 0, stdout: "", stderr: "")
+            } else {
+                result = SSHCommandResult(exitCode: 1, stdout: "", stderr: "can't find session\n")
+            }
+        } else {
+            result = SSHCommandResult(exitCode: 0, stdout: "[demo] \(command)\n", stderr: "")
+        }
+
+        if let maxOutputBytes, result.stdout.utf8.count + result.stderr.utf8.count > maxOutputBytes {
+            throw TransportError.remoteFailure("Command output exceeded maximum allowed size of \(maxOutputBytes) bytes")
+        }
+        return result
+    }
 }
 public struct DemoSSHTransport: SSHTransport {
     public init() {}
