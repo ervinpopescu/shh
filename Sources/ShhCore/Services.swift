@@ -12,7 +12,7 @@ public struct HostKeyChallenge: Sendable, Equatable, Identifiable {
     public init(hostname: String, port: UInt16, algorithm: String, fingerprint: String) {
         self.hostname = TrustRecord.canonicalHost(hostname); self.port = port; self.algorithm = algorithm; self.fingerprint = fingerprint
     }
-    public var id: String { "\(hostname):\(port):\(algorithm.lowercased())" }
+    public var id: String { "\(hostname):\(port):\(algorithm.lowercased()):\(fingerprint)" }
 }
 public enum TrustStatus: Equatable, Sendable { case unknown; case trusted; case changed(oldFingerprint: String) }
 public enum TrustDecision: Sendable, Equatable { case trustOnce; case trustPermanently; case reject }
@@ -69,7 +69,7 @@ public enum KeychainError: Error, Equatable, Sendable { case unavailable; case s
 public struct KeychainCredentialStore: CredentialStore {
     private let service: String
     private let accessGroup: String?
-    public init(service: String = "com.example.Shh.secrets", accessGroup: String? = nil) { self.service = service; self.accessGroup = accessGroup }
+    public init(service: String = "com.ervinpopescu.shh.secrets", accessGroup: String? = nil) { self.service = service; self.accessGroup = accessGroup }
     private func baseQuery(reference: String) -> [CFString: Any] {
         var query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: reference]
         if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
@@ -491,6 +491,22 @@ public struct CommandPolicy: Sendable {
             } else if name == "command" {
                 index += 1
                 while index < words.count, words[index].hasPrefix("-") { index += 1 }
+            } else if name == "exec" {
+                index += 1
+                while index < words.count {
+                    let option = words[index]
+                    if option == "--" {
+                        index += 1
+                        break
+                    }
+                    if option == "-a" {
+                        index += min(2, words.count - index)
+                    } else if option.hasPrefix("-") {
+                        index += 1
+                    } else {
+                        break
+                    }
+                }
             } else if name == "nice" {
                 index += 1
                 if index < words.count, ["-n", "--adjustment"].contains(words[index]) { index += min(2, words.count - index) }
@@ -548,7 +564,7 @@ public struct CommandPolicy: Sendable {
         if arguments.contains("-delete"), optionOperands(arguments).contains(where: { isCriticalPath($0) }) { return .blocked }
         guard let execIndex = arguments.firstIndex(where: { $0 == "-exec" || $0 == "-execdir" }) else { return .reviewRequired }
         let nestedArguments = arguments.dropFirst(execIndex + 1).prefix(while: { $0 != ";" && $0 != "+" })
-        let nested = classify(nestedArguments.joined(separator: " "))
+        let nested = classifySegment(nestedArguments.map { ShellToken(value: $0, isOperator: false) })
         return nested == .blocked ? .blocked : .reviewRequired
     }
 
