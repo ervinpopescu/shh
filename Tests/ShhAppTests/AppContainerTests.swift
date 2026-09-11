@@ -236,4 +236,224 @@ final class AppContainerTests: XCTestCase {
         // Must NOT have silently fallen back to DemoSSHTransport
         XCTAssertFalse(container.isDemo, "Failed live connection must not fall back to demo mode")
     }
+
+    func testRedactorMaterialClearedOnDisconnectAndStreamTermination() async throws {
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data("my-secret-password".utf8), reference: "ref-secret-pwd")
+        let identity = try IdentityDescriptor(name: "Secret", kind: .password, keychainReference: "ref-secret-pwd")
+
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+
+        let container = AppContainer(credentialStore: credStore, transport: transport)
+        try await container.catalog.save(identity)
+        let host = try Host(name: "Host", hostname: "host.invalid", username: "user", identityID: identity.id)
+
+        // 1. Successful connection populates redactor
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.redactor.secrets, ["my-secret-password"])
+
+        // 2. Disconnect clears redactor
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(container.redactor.secrets.isEmpty, "Redactor secrets must be cleared on disconnect")
+
+        // 3. Reconnect populates redactor again
+        let mockConnection2 = MockSSHConnection()
+        transport.onConnect = { _ in mockConnection2 }
+        await container.connect(to: host)
+        XCTAssertEqual(container.redactor.secrets, ["my-secret-password"])
+
+        // 4. Stream closed clears redactor
+        mockConnection2.emit(.closed)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(container.redactor.secrets.isEmpty, "Redactor secrets must be cleared on stream closed")
+
+        // 5. Reconnect and stream error clears redactor
+        let mockConnection3 = MockSSHConnection()
+        transport.onConnect = { _ in mockConnection3 }
+        await container.connect(to: host)
+        XCTAssertEqual(container.redactor.secrets, ["my-secret-password"])
+
+        mockConnection3.emit(.error(TransportError.remoteFailure("peer reset")))
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.activeSession?.state, .failed)
+        XCTAssertTrue(container.redactor.secrets.isEmpty, "Redactor secrets must be cleared on stream error")
+    }
+
+    func testInFlightConnectionAttemptDoesNotOverrideExplicitDisconnect() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let resumeGate = Gate()
+
+        transport.onConnect = { _ in
+            await resumeGate.wait()
+            return mockConnection
+        }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
+
+        let connectTask = Task {
+            await container.connect(to: host)
+        }
+
+        // Give task a moment to enter connecting state
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(container.activeSession?.state, .connecting)
+
+        // User explicitly disconnects while connection is in-flight
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        // Let transport connect finish
+        await resumeGate.open()
+        await connectTask.value
+
+        // Session must remain disconnected and connection must be closed
+        XCTAssertEqual(container.activeSession?.state, .disconnected, "In-flight connect must not resurrect disconnected session")
+        XCTAssertNil(container.connection)
+        XCTAssertTrue(mockConnection.isClosed, "Resurrected connection must be closed immediately")
+    }
+
+    func testStaleConnectionFailureDoesNotOverwriteCurrentSessionOrState() async throws {
+        let transport = ControllableTransport()
+        let resumeGate = Gate()
+        let mockB = MockSSHConnection()
+
+        let hostA = try Host(name: "HostA", hostname: "hosta.invalid", username: "user")
+        let hostB = try Host(name: "HostB", hostname: "hostb.invalid", username: "user")
+
+        transport.onConnect = { host in
+            if host.id == hostA.id {
+                await resumeGate.wait()
+                throw TransportError.timeout
+            } else {
+                return mockB
+            }
+        }
+
+        let container = AppContainer(transport: transport)
+
+        let connectTask = Task {
+            await container.connect(to: hostA)
+        }
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(container.activeSession?.state, .connecting)
+        XCTAssertEqual(container.activeSession?.hostID, hostA.id)
+
+        // User disconnects hostA
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        // Now connect to hostB with an immediate successful connection
+        await container.connect(to: hostB)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.activeSession?.hostID, hostB.id)
+
+        // Now let hostA's failing connection finish throwing
+        await resumeGate.open()
+        await connectTask.value
+
+        // Stale failure must not have affected hostB
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.activeSession?.hostID, hostB.id)
+        XCTAssertNotEqual(container.terminalText, "Connection timed out.")
+    }
+
+    func testStaleConnectionFailureAfterDisconnectDoesNotMutateStateToFailed() async throws {
+        let transport = ControllableTransport()
+        let resumeGate = Gate()
+
+        transport.onConnect = { _ in
+            await resumeGate.wait()
+            throw TransportError.timeout
+        }
+
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
+
+        let connectTask = Task {
+            await container.connect(to: host)
+        }
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(container.activeSession?.state, .connecting)
+
+        // User disconnects while in-flight
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        // Transport throws timeout
+        await resumeGate.open()
+        await connectTask.value
+
+        // State must remain disconnected, NOT overwritten with failed or timeout message
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertNotEqual(container.terminalText, "Connection timed out.")
+    }
+}
+
+private actor Gate {
+    private var isOpen = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { cont in
+            continuations.append(cont)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        for cont in continuations {
+            cont.resume()
+        }
+        continuations.removeAll()
+    }
+}
+
+private final class MockSSHConnection: SSHConnection, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var isClosed = false
+    private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
+
+    func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
+        AsyncThrowingStream { continuation in
+            self.lock.withLock {
+                self.streamContinuation = continuation
+            }
+        }
+    }
+
+    func send(_ data: Data) async throws {}
+    func resize(_ size: TerminalSize) async throws {}
+    func close() async {
+        lock.withLock {
+            isClosed = true
+            streamContinuation?.finish()
+        }
+    }
+
+    func emit(_ event: TerminalEvent) {
+        _ = lock.withLock {
+            streamContinuation?.yield(event)
+        }
+    }
+}
+
+private final class ControllableTransport: SSHTransport, @unchecked Sendable {
+    var onConnect: (@Sendable (Host) async throws -> any SSHConnection)?
+
+    func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection {
+        if let onConnect {
+            return try await onConnect(host)
+        }
+        return MockSSHConnection()
+    }
 }
