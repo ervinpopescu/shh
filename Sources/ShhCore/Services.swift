@@ -224,20 +224,392 @@ public enum HerdrCommand: Hashable, Sendable { case remoteLaunch(workbox: String
 public extension HerdrCommand { var renderedCommand: String { switch self { case .remoteLaunch(let workbox): "herdr --remote \(ShellQuoting.quote(workbox))"; case .workspaceCreate(let name): "herdr workspace create \(ShellQuoting.quote(name))"; case .tabCreate(let name): "herdr tab create \(ShellQuoting.quote(name))"; case .paneSplit(let direction): "herdr pane split \(ShellQuoting.quote(direction))"; case .paneRun(let command): "herdr pane run \(ShellQuoting.quote(command))"; case .paneRead: "herdr pane read"; case .waitAgentStatus: "herdr wait agent-status" } } }
 
 public enum CommandRisk: String, Equatable, Sendable { case safe, reviewRequired, blocked }
-public struct CommandPolicy: Sendable {
-    public init() {}
-    public func classify(_ command: String) -> CommandRisk {
-        let lower = command.lowercased().filter { !$0.isWhitespace }
-        if lower.contains("rm-rf/") || lower.contains(":(){:|:&};:") { return .blocked }
-        if ["shutdown", "reboot", "mkfs", "ddif=", "curl|sh", "wget|sh"].contains(where: { lower.contains($0) }) { return .reviewRequired }
-        return .safe
+
+private struct ShellToken {
+    let value: String
+    let isOperator: Bool
+}
+
+private struct ShellLexResult {
+    let tokens: [ShellToken]
+    let hasUnsupportedSyntax: Bool
+    let isBalanced: Bool
+}
+
+/// A deliberately small shell lexer, not a shell interpreter. It understands quoting and
+/// command separators so policy decisions do not depend on whitespace or flag spelling. Shell
+/// expansion, aliases, functions, and platform-specific command behavior remain outside its
+/// model; those cases are sent to review instead of being treated as safe.
+private enum ShellTokenizer {
+    static func tokenize(_ source: String) -> ShellLexResult {
+        let characters = Array(source)
+        var tokens: [ShellToken] = []
+        var word = ""
+        var quote: Character?
+        var unsupported = false
+        var index = 0
+
+        func flushWord() {
+            guard !word.isEmpty else { return }
+            tokens.append(ShellToken(value: word, isOperator: false))
+            word = ""
+        }
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                if character == activeQuote {
+                    quote = nil
+                } else if activeQuote == "'" {
+                    word.append(character)
+                } else if character == "\\" {
+                    guard index + 1 < characters.count else {
+                        unsupported = true
+                        break
+                    }
+                    index += 1
+                    word.append(characters[index])
+                } else {
+                    if character == "$" { unsupported = true }
+                    word.append(character)
+                }
+                index += 1
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                index += 1
+                continue
+            }
+            if character == "\\" {
+                guard index + 1 < characters.count else {
+                    unsupported = true
+                    break
+                }
+                index += 1
+                word.append(characters[index])
+                index += 1
+                continue
+            }
+            if character.isWhitespace {
+                flushWord()
+                // A newline is a command separator, unlike spaces and tabs.
+                if character == "\n" || character == "\r" {
+                    tokens.append(ShellToken(value: ";", isOperator: true))
+                }
+                index += 1
+                continue
+            }
+            if character == "$" {
+                unsupported = true
+                word.append(character)
+                index += 1
+                continue
+            }
+            if character == "`" {
+                flushWord()
+                tokens.append(ShellToken(value: "`", isOperator: true))
+                unsupported = true
+                index += 1
+                continue
+            }
+            if "|;&><(){}".contains(character) {
+                flushWord()
+                var operation = String(character)
+                if index + 1 < characters.count {
+                    let next = characters[index + 1]
+                    if (character == "|" && next == "|") || (character == "&" && next == "&") ||
+                        (character == ">" && next == ">") || (character == "<" && next == "<") ||
+                        (character == "&" && next == ">") {
+                        operation.append(next)
+                        index += 1
+                    }
+                }
+                tokens.append(ShellToken(value: operation, isOperator: true))
+                index += 1
+                continue
+            }
+            if character == "#" && word.isEmpty {
+                unsupported = true
+            }
+            word.append(character)
+            index += 1
+        }
+
+        flushWord()
+        return ShellLexResult(tokens: tokens, hasUnsupportedSyntax: unsupported, isBalanced: quote == nil)
     }
+}
+
+public struct CommandPolicy: Sendable {
+    private static let safeCommands: Set<String> = [
+        "[", "basename", "cat", "cd", "command", "cut", "date", "dirname", "df", "du", "echo",
+        "false", "file", "free", "git", "grep", "groups", "head", "help", "hostname", "id", "less",
+        "ls", "man", "more", "printf", "pwd", "realpath", "readlink", "rg", "sort", "stat", "tail",
+        "test", "tmux", "tree", "true", "tty", "uname", "uniq", "uptime", "whoami", "which", "wc"
+    ]
+    private static let shellInterpreters: Set<String> = ["ash", "bash", "dash", "fish", "ksh", "sh", "zsh"]
+    private static let commandWrappers: Set<String> = ["builtin", "command", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs"]
+    private static let diskCommands: Set<String> = [
+        "blkdiscard", "diskutil", "fdisk", "format", "gdisk", "mkfs", "mkswap", "parted", "sfdisk", "shred", "wipefs"
+    ]
+
+    public init() {}
+
+    public func classify(_ command: String) -> CommandRisk {
+        let lexed = ShellTokenizer.tokenize(commandWithoutTrailingLineEndings(command))
+        guard lexed.isBalanced, !lexed.tokens.isEmpty else { return .reviewRequired }
+
+        if isForkBomb(lexed.tokens) { return .blocked }
+        let segments = splitIntoSegments(lexed.tokens)
+        var sawReview = lexed.hasUnsupportedSyntax
+        var sawCompoundCommand = false
+
+        for token in lexed.tokens where token.isOperator {
+            if ["|", "||", "&&", ";", "&", "`", "(", ")", "{", "}"].contains(token.value) {
+                sawCompoundCommand = true
+            }
+        }
+        sawReview = sawReview || sawCompoundCommand
+
+        for segment in segments {
+            switch classifySegment(segment) {
+            case .blocked: return .blocked
+            case .reviewRequired: sawReview = true
+            case .safe: break
+            }
+        }
+        return sawReview ? .reviewRequired : .safe
+    }
+
     public func canSend(_ command: String, approved: Bool) -> Bool {
         switch classify(command) {
         case .safe: return true
         case .reviewRequired: return approved
         case .blocked: return false
         }
+    }
+
+    private func commandWithoutTrailingLineEndings(_ command: String) -> String {
+        var normalized = command
+        while let last = normalized.last {
+            if last != "\n" && last != "\r" { break }
+            normalized.removeLast()
+        }
+        return normalized
+    }
+
+    private func splitIntoSegments(_ tokens: [ShellToken]) -> [[ShellToken]] {
+        var result: [[ShellToken]] = [[]]
+        for token in tokens {
+            if token.isOperator && ["|", "||", "&&", ";", "&", "`", "(", ")", "{", "}"].contains(token.value) {
+                if !result[result.count - 1].isEmpty { result.append([]) }
+            } else {
+                result[result.count - 1].append(token)
+            }
+        }
+        return result.filter { !$0.isEmpty }
+    }
+
+    private func classifySegment(_ segment: [ShellToken]) -> CommandRisk {
+        let words = segment.filter { !$0.isOperator }.map(\.value)
+        guard let executableIndex = executableIndex(in: words) else { return .reviewRequired }
+        let executable = commandName(words[executableIndex])
+        let arguments = Array(words.dropFirst(executableIndex + 1))
+
+        if executable == "rm" {
+            return rmRisk(arguments)
+        }
+        if executable == "dd" {
+            return ddRisk(arguments)
+        }
+        if Self.diskCommands.contains(executable) || executable.hasPrefix("mkfs.") {
+            return diskRisk(executable: executable, arguments: arguments)
+        }
+        if executable == "chmod" || executable == "chown" {
+            return systemPathRisk(arguments: arguments, recursiveFlag: arguments.contains { $0 == "-R" || $0 == "-r" || $0 == "--recursive" })
+        }
+        if executable == "find" {
+            return findRisk(arguments)
+        }
+        if executable == "shutdown" || executable == "reboot" || executable == "poweroff" || executable == "halt" || executable == "init" || executable == "systemctl" || executable == "kill" {
+            return .reviewRequired
+        }
+        if Self.shellInterpreters.contains(executable) {
+            return interpreterRisk(arguments)
+        }
+        if executable == "python" || executable == "python3" || executable == "perl" || executable == "ruby" || executable == "node" {
+            return .reviewRequired
+        }
+        if executable == "curl" || executable == "wget" {
+            return .reviewRequired
+        }
+        if words.prefix(executableIndex).contains(where: { commandName($0) == "sudo" }) {
+            return .reviewRequired
+        }
+        if executable == "sudo" { return .reviewRequired }
+        if executable == "eval" {
+            let nested = classify(arguments.joined(separator: " "))
+            return nested == .blocked ? .blocked : .reviewRequired
+        }
+        if !Self.safeCommands.contains(executable) { return .reviewRequired }
+        if executable == "git" { return gitRisk(arguments) }
+        if executable == "tmux" { return tmuxRisk(arguments) }
+
+        // Redirection is intentionally never considered safe, even for a normally read-only tool.
+        if segment.contains(where: { $0.isOperator && [">", ">>", "<", "<<", "&>"].contains($0.value) }) {
+            return .reviewRequired
+        }
+        return .safe
+    }
+
+    private func executableIndex(in words: [String]) -> Int? {
+        var index = 0
+        while index < words.count, isAssignment(words[index]) { index += 1 }
+        guard index < words.count else { return nil }
+
+        while index < words.count {
+            let name = commandName(words[index])
+            guard Self.commandWrappers.contains(name) else { return index }
+            if name == "sudo" {
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") {
+                    let option = words[index]
+                    index += 1
+                    if ["-C", "-g", "-p", "-R", "-u", "--chdir", "--group", "--prompt", "--user"].contains(option), index < words.count { index += 1 }
+                }
+                return index < words.count ? index : nil
+            } else if name == "env" {
+                index += 1
+                while index < words.count {
+                    if isAssignment(words[index]) { index += 1; continue }
+                    if ["-u", "--unset"].contains(words[index]), index + 1 < words.count { index += 2; continue }
+                    if words[index].hasPrefix("-") { index += 1; continue }
+                    break
+                }
+            } else if name == "command" {
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") { index += 1 }
+            } else if name == "nice" {
+                index += 1
+                if index < words.count, ["-n", "--adjustment"].contains(words[index]) { index += min(2, words.count - index) }
+            } else if name == "timeout" {
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") { index += 1 }
+                if index < words.count { index += 1 } // duration
+            } else if name == "xargs" {
+                index += 1
+                while index < words.count, words[index].hasPrefix("-") { index += 1 }
+            } else {
+                index += 1
+            }
+        }
+        return nil
+    }
+
+    private func interpreterRisk(_ arguments: [String]) -> CommandRisk {
+        guard let cIndex = arguments.firstIndex(of: "-c"), cIndex + 1 < arguments.count else { return .reviewRequired }
+        let nested = classify(arguments[cIndex + 1])
+        return nested == .blocked ? .blocked : .reviewRequired
+    }
+
+    private func rmRisk(_ arguments: [String]) -> CommandRisk {
+        // A slash embedded in a short-option token is malformed but was historically blocked;
+        // keep that conservative behavior rather than attempting to guess shell/parser recovery.
+        if arguments.contains(where: { $0.hasPrefix("-") && !$0.hasPrefix("--") && $0.contains("/") }) { return .blocked }
+        let operands = optionOperands(arguments)
+        if operands.contains(where: { isCriticalPath($0) }) { return .blocked }
+        return .reviewRequired
+    }
+
+    private func ddRisk(_ arguments: [String]) -> CommandRisk {
+        let output = arguments.compactMap { argument -> String? in
+            guard let separator = argument.firstIndex(of: "=") else { return nil }
+            return argument[..<separator].lowercased() == "of" ? String(argument[argument.index(after: separator)...]) : nil
+        }
+        return output.contains(where: { isDiskPath($0) }) ? .blocked : .reviewRequired
+    }
+
+    private func diskRisk(executable: String, arguments: [String]) -> CommandRisk {
+        if executable == "format" || executable == "mkfs" || executable == "mkswap" {
+            return arguments.contains(where: { isDiskPath($0) }) ? .blocked : .reviewRequired
+        }
+        if executable == "diskutil" && arguments.contains(where: { ["eraseDisk", "eraseVolume", "partitionDisk"].contains($0) }) { return .blocked }
+        return arguments.contains(where: { isDiskPath($0) }) ? .blocked : .reviewRequired
+    }
+
+    private func systemPathRisk(arguments: [String], recursiveFlag: Bool) -> CommandRisk {
+        let operands = optionOperands(arguments)
+        return operands.contains(where: { isCriticalPath($0) }) && recursiveFlag ? .blocked : .reviewRequired
+    }
+
+    private func findRisk(_ arguments: [String]) -> CommandRisk {
+        if arguments.contains("-delete"), optionOperands(arguments).contains(where: { isCriticalPath($0) }) { return .blocked }
+        guard let execIndex = arguments.firstIndex(where: { $0 == "-exec" || $0 == "-execdir" }) else { return .reviewRequired }
+        let nestedArguments = arguments.dropFirst(execIndex + 1).prefix(while: { $0 != ";" && $0 != "+" })
+        let nested = classify(nestedArguments.joined(separator: " "))
+        return nested == .blocked ? .blocked : .reviewRequired
+    }
+
+    private func gitRisk(_ arguments: [String]) -> CommandRisk {
+        let subcommands = arguments.filter { !$0.hasPrefix("-") }
+        guard let subcommand = subcommands.first else { return .reviewRequired }
+        return ["branch", "diff", "log", "ls-files", "show", "status", "rev-parse"].contains(subcommand) ? .safe : .reviewRequired
+    }
+
+    private func tmuxRisk(_ arguments: [String]) -> CommandRisk {
+        guard let action = arguments.first(where: { !$0.hasPrefix("-") }) else { return .reviewRequired }
+        return ["list-sessions", "list-windows", "ls", "display-message"].contains(action) ? .safe : .reviewRequired
+    }
+
+    private func optionOperands(_ arguments: [String]) -> [String] {
+        var operands: [String] = []
+        var optionsEnded = false
+        for argument in arguments {
+            if !optionsEnded && argument == "--" {
+                optionsEnded = true
+            } else if !optionsEnded && argument.hasPrefix("-") && argument != "-" {
+                continue
+            } else {
+                operands.append(argument)
+            }
+        }
+        return operands
+    }
+
+    private func isAssignment(_ value: String) -> Bool {
+        guard let equals = value.firstIndex(of: "=") else { return false }
+        let name = value[..<equals]
+        return !name.isEmpty && name.first?.isLetter == true && name.allSatisfy { $0.isLetter || $0.isNumber || $0 == "_" }
+    }
+
+    private func commandName(_ value: String) -> String {
+        value.split(separator: "/").last.map { String($0).lowercased() } ?? value.lowercased()
+    }
+
+    private func isCriticalPath(_ value: String) -> Bool {
+        let normalized = value.split(separator: "/", omittingEmptySubsequences: true).reduce(into: [Substring]()) { result, component in
+            if component == "." { return }
+            if component == ".." { if !result.isEmpty { result.removeLast() } } else { result.append(component) }
+        }
+        guard value.hasPrefix("/") else { return false }
+        if normalized.isEmpty || normalized.first?.contains(where: { $0 == "*" || $0 == "?" || $0 == "[" || $0 == "{" }) == true { return true }
+        let topLevel = String(normalized[0]).lowercased()
+        return ["bin", "boot", "dev", "etc", "lib", "lib64", "proc", "sbin", "sys", "usr"].contains(topLevel)
+    }
+
+    private func isDiskPath(_ value: String) -> Bool {
+        guard value.hasPrefix("/dev/") else { return false }
+        let device = value.dropFirst(5).lowercased()
+        return !["null", "zero", "random", "urandom", "stdin", "stdout", "stderr"].contains(device) &&
+            ["sd", "hd", "vd", "xvd", "nvme", "mmc", "md", "dm-", "mapper/", "disk", "loop"].contains(where: { device.hasPrefix($0) })
+    }
+
+    private func isForkBomb(_ tokens: [ShellToken]) -> Bool {
+        let words = tokens.filter { !$0.isOperator }.map(\.value)
+        let operators = Set(tokens.filter(\.isOperator).map(\.value))
+        return words.first == ":" && words.filter { $0 == ":" }.count >= 3 && operators.contains("|") && operators.contains("&") && operators.contains("{") && operators.contains("}")
     }
 }
 

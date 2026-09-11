@@ -3,7 +3,8 @@
 - Host rows persist endpoint metadata only. Passwords, passphrases, and private-key bytes are never fields of `Host`; identities carry opaque Keychain references.
 - Production Keychain storage is an explicit port. The package fallback returns `unsupported` instead of pretending to protect secrets.
 - Host-key challenges include canonical hostname, port, algorithm, and SHA-256 fingerprint. A changed fingerprint is a rejection path; trust is never inferred from authentication success.
-- Commands, snippets, macros, multiplexer actions, Herdr templates, and speech text are untrusted. The command policy classifies destructive text and the UI requires a visible approval before sending.
+- Commands, snippets, macros, multiplexer actions, Herdr templates, and speech text are untrusted. The command policy uses a small quote-aware tokenizer and a conservative executable/argument allowlist: obvious root/device destruction is blocked, risky or unknown syntax requires visible approval before sending, and approval never overrides a block.
+- This is not a shell parser or sandbox. It cannot model aliases, functions, expansions, interpreter semantics, remote shell configuration, or every platform-specific destructive command; those limitations are intentionally review-required rather than silently safe. Production execution still needs server-side least privilege and an OS/container boundary.
 - Speech has no automatic send path. A local transcriber returns editable preview text, and only an explicit Send action may call `SSHConnection.send`.
 - Redaction is available for debug output. Do not log credential bytes, transcripts, URLs containing secrets, or terminal snapshots.
 
