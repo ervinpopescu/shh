@@ -1,6 +1,10 @@
 import XCTest
 import ShhCore
 @testable import ShhTerminal
+#if canImport(UIKit) && canImport(SwiftUI)
+import UIKit
+import SwiftUI
+#endif
 
 @MainActor
 final class ShhTerminalControllerTests: XCTestCase {
@@ -406,4 +410,146 @@ final class ShhTerminalControllerTests: XCTestCase {
         controller.detachEngine(engine1)
         XCTAssertNil(controller.attachedBridge)
     }
+
+#if canImport(UIKit) && canImport(SwiftUI)
+    func testResetWhileMountedFollowedByUpdateReattachAndVisibleByteDelivery() async {
+        let controller = ShhTerminalController()
+        let representable = ShhTerminalView(controller: controller)
+        let coordinator = representable.makeCoordinator()
+
+        // 1. Initial makeUIView attaches host view to controller
+        let hostView = representable.makeUIView(coordinator: coordinator)
+        representable.updateUIView(hostView, coordinator: coordinator)
+
+        XCTAssertTrue(controller.persistentHostView === hostView)
+        XCTAssertTrue(controller.attachedBridge === hostView)
+        XCTAssertTrue(hostView.controller === controller)
+
+        // 2. Initial visible byte delivery
+        controller.feed(Data("Initial visible output\r\n".utf8))
+        let initialTranscript = hostView.currentTranscript(limit: 10)
+        XCTAssertTrue(initialTranscript.contains("Initial visible output"))
+
+        // 3. Controller reset while mounted severs persistentHostView and attachedBridge
+        controller.reset()
+        XCTAssertNil(controller.persistentHostView)
+        XCTAssertNil(controller.attachedBridge)
+
+        // While detached, feeds only hit headless terminal, visible view does not receive bytes
+        controller.feed(Data("Detached mid-stream\r\n".utf8))
+        let detachedTranscript = hostView.currentTranscript(limit: 10)
+        XCTAssertFalse(detachedTranscript.contains("Detached mid-stream"))
+
+        // 4. SwiftUI updateUIView while view remains mounted must identity-aware reattach hostView
+        representable.updateUIView(hostView, coordinator: coordinator)
+
+        XCTAssertTrue(controller.persistentHostView === hostView, "updateUIView must reattach persistentHostView")
+        XCTAssertTrue(controller.attachedBridge === hostView, "updateUIView must reattach active UI bridge")
+        XCTAssertTrue(hostView.controller === controller)
+        XCTAssertTrue(hostView.terminalDelegate === coordinator)
+
+        // 5. Subsequent visible-byte delivery must now reach the visible terminal view
+        controller.feed(Data("Visible bytes restored\r\n".utf8))
+        let restoredTranscript = hostView.currentTranscript(limit: 10)
+        XCTAssertTrue(restoredTranscript.contains("Visible bytes restored"), "Subsequent bytes must feed the visible terminal")
+
+        // 6. Ordinary navigation dismantle must NOT sever host view or active engine
+        ShhTerminalView.dismantleUIView(hostView, coordinator: coordinator)
+        XCTAssertTrue(controller.persistentHostView === hostView, "Ordinary navigation dismantle must preserve persistentHostView")
+        XCTAssertTrue(controller.attachedBridge === hostView, "Ordinary navigation dismantle must preserve attachedBridge for buffer streaming")
+
+        controller.feed(Data("Streamed during background dismantle\r\n".utf8))
+        let backgroundTranscript = hostView.currentTranscript(limit: 10)
+        XCTAssertTrue(backgroundTranscript.contains("Streamed during background dismantle"))
+
+        // Returning to view via makeUIView re-uses persistentHostView
+        let returnedView = representable.makeUIView(coordinator: coordinator)
+        XCTAssertTrue(returnedView === hostView)
+
+        // Ordinary updateUIView when already attached remains stable
+        representable.updateUIView(returnedView, coordinator: coordinator)
+        XCTAssertTrue(controller.persistentHostView === hostView)
+        XCTAssertTrue(controller.attachedBridge === hostView)
+
+        // 7. Preserve paste interception through controller
+        var outboundSent: [Data] = []
+        controller.onOutput = { outboundSent.append($0) }
+        var riskyPaste: String?
+        controller.onRiskyPasteRequested = { riskyPaste = $0 }
+
+        UIPasteboard.general.string = "safe paste command"
+        hostView.paste(nil)
+        XCTAssertEqual(outboundSent.last, Data("safe paste command".utf8))
+
+        UIPasteboard.general.string = "risky\nmultiline"
+        hostView.paste(nil)
+        XCTAssertEqual(riskyPaste, "risky\nmultiline")
+
+        // 8. Preserve VoiceOver transcript equivalence
+        let fullTranscript = controller.currentTranscript(limit: 20)
+        let viewTranscript = hostView.currentTranscript(limit: 20)
+        XCTAssertEqual(fullTranscript, viewTranscript, "VoiceOver transcript through controller must match visible host view transcript")
+
+        // 9. Preserve first responder behavior
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 800, height: 600))
+        window.addSubview(hostView)
+        window.makeKeyAndVisible()
+
+        controller.requestFirstResponder()
+        hostView.didMoveToWindow()
+        _ = hostView.becomeFirstResponder()
+        XCTAssertTrue(controller.isFirstResponder)
+
+        _ = hostView.resignFirstResponder()
+        XCTAssertFalse(controller.isFirstResponder)
+        hostView.removeFromSuperview()
+
+        // 10. Preserve resize callbacks
+        var reportedResize: TerminalSize?
+        let resizeExp = expectation(description: "Resize delivered")
+        controller.onResize = { size in
+            reportedResize = size
+            resizeExp.fulfill()
+        }
+        coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        DispatchQueue.main.async {
+            controller.flushResize()
+        }
+
+        await fulfillment(of: [resizeExp], timeout: 1.0)
+        XCTAssertEqual(reportedResize, TerminalSize(columns: 132, rows: 43))
+    }
+
+    func testShhTerminalViewHostingControllerResetAndReattach() {
+        let controller = ShhTerminalController()
+        let representable = ShhTerminalView(controller: controller)
+        let hostingController = UIHostingController(rootView: representable)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
+
+        guard let hostView = controller.persistentHostView else {
+            XCTFail("persistentHostView should be populated after hostingController layout")
+            return
+        }
+        XCTAssertTrue(controller.attachedBridge === hostView)
+
+        // Reset while mounted
+        controller.reset()
+        XCTAssertNil(controller.persistentHostView)
+        XCTAssertNil(controller.attachedBridge)
+
+        // SwiftUI updateUIView triggered via hostingController update
+        hostingController.rootView = ShhTerminalView(controller: controller)
+        hostingController.view.setNeedsLayout()
+        hostingController.view.layoutIfNeeded()
+
+        XCTAssertTrue(controller.persistentHostView === hostView, "Hosting controller update must reattach host view")
+        XCTAssertTrue(controller.attachedBridge === hostView, "Hosting controller update must reattach attachedBridge")
+
+        controller.feed(Data("Hosting Visible Bytes\r\n".utf8))
+        XCTAssertTrue(hostView.currentTranscript(limit: 10).contains("Hosting Visible Bytes"))
+    }
+#endif
 }
