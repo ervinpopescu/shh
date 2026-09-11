@@ -234,6 +234,7 @@ private struct ShellLexResult {
     let tokens: [ShellToken]
     let hasUnsupportedSyntax: Bool
     let isBalanced: Bool
+    let commandSubstitutions: [String]
 }
 
 /// A deliberately small shell lexer, not a shell interpreter. It understands quoting and
@@ -248,6 +249,7 @@ private enum ShellTokenizer {
         var quote: Character?
         var unsupported = false
         var index = 0
+        let commandSubstitutions = commandSubstitutions(in: source)
 
         func flushWord() {
             guard !word.isEmpty else { return }
@@ -270,7 +272,7 @@ private enum ShellTokenizer {
                     index += 1
                     word.append(characters[index])
                 } else {
-                    if character == "$" { unsupported = true }
+                    if character == "$" || (activeQuote == "\"" && character == "`") { unsupported = true }
                     word.append(character)
                 }
                 index += 1
@@ -338,7 +340,141 @@ private enum ShellTokenizer {
         }
 
         flushWord()
-        return ShellLexResult(tokens: tokens, hasUnsupportedSyntax: unsupported, isBalanced: quote == nil)
+        return ShellLexResult(
+            tokens: tokens,
+            hasUnsupportedSyntax: unsupported,
+            isBalanced: quote == nil,
+            commandSubstitutions: commandSubstitutions
+        )
+    }
+
+    static func commandSubstitutions(in source: String) -> [String] {
+        let characters = Array(source)
+        var substitutions: [String] = []
+        var quote: Character?
+        var index = 0
+
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                if character == "\\" && activeQuote == "\"" {
+                    index += 2
+                    continue
+                }
+                if character == activeQuote {
+                    quote = nil
+                    index += 1
+                    continue
+                }
+                if activeQuote == "\"" {
+                    if character == "$", index + 1 < characters.count, characters[index + 1] == "(" {
+                        if let (body, endIndex) = parenthesizedBody(in: characters, openingIndex: index + 1) {
+                            substitutions.append(body)
+                            index = endIndex + 1
+                            continue
+                        }
+                    }
+                    if character == "`", let (body, endIndex) = backtickBody(in: characters, openingIndex: index) {
+                        substitutions.append(body)
+                        index = endIndex + 1
+                        continue
+                    }
+                }
+                index += 1
+                continue
+            }
+
+            if character == "'" || character == "\"" {
+                quote = character
+                index += 1
+                continue
+            }
+            if character == "\\" {
+                index += 2
+                continue
+            }
+            if character == "$", index + 1 < characters.count, characters[index + 1] == "(" {
+                if let (body, endIndex) = parenthesizedBody(in: characters, openingIndex: index + 1) {
+                    substitutions.append(body)
+                    index = endIndex + 1
+                    continue
+                }
+            }
+            if character == "`", let (body, endIndex) = backtickBody(in: characters, openingIndex: index) {
+                substitutions.append(body)
+                index = endIndex + 1
+                continue
+            }
+            index += 1
+        }
+        return substitutions
+    }
+
+    static func tmuxFormatCommands(in source: String) -> [String] {
+        let characters = Array(source)
+        var commands: [String] = []
+        var index = 0
+        while index + 1 < characters.count {
+            guard characters[index] == "#", characters[index + 1] == "(" else {
+                index += 1
+                continue
+            }
+            if let (body, endIndex) = parenthesizedBody(in: characters, openingIndex: index + 1) {
+                commands.append(body)
+                index = endIndex + 1
+            } else {
+                index += 2
+            }
+        }
+        return commands
+    }
+
+    private static func parenthesizedBody(in characters: [Character], openingIndex: Int) -> (String, Int)? {
+        var depth = 1
+        var quote: Character?
+        var index = openingIndex + 1
+        while index < characters.count {
+            let character = characters[index]
+            if let activeQuote = quote {
+                if character == "\\" {
+                    index += 2
+                    continue
+                }
+                if character == activeQuote { quote = nil }
+                index += 1
+                continue
+            }
+            if character == "'" || character == "\"" {
+                quote = character
+            } else if character == "\\" {
+                index += 2
+                continue
+            } else if character == "(" {
+                depth += 1
+            } else if character == ")" {
+                depth -= 1
+                if depth == 0 {
+                    return (String(characters[(openingIndex + 1)..<index]), index)
+                }
+            }
+            index += 1
+        }
+        return nil
+    }
+
+    private static func backtickBody(in characters: [Character], openingIndex: Int) -> (String, Int)? {
+        var index = openingIndex + 1
+        while index < characters.count {
+            if characters[index] == "\\" {
+                index += 2
+                continue
+            }
+            if characters[index] == "`" {
+                return (String(characters[(openingIndex + 1)..<index]), index)
+            }
+            index += 1
+        }
+        return nil
     }
 }
 
@@ -363,7 +499,9 @@ public struct CommandPolicy: Sendable {
 
         if isForkBomb(lexed.tokens) { return .blocked }
         let segments = splitIntoSegments(lexed.tokens)
-        var sawReview = lexed.hasUnsupportedSyntax
+        let substitutionRisk = commandSubstitutionRisk(lexed.commandSubstitutions)
+        if substitutionRisk == .blocked { return .blocked }
+        var sawReview = lexed.hasUnsupportedSyntax || substitutionRisk == .reviewRequired
         var sawCompoundCommand = false
 
         for token in lexed.tokens where token.isOperator {
@@ -576,7 +714,27 @@ public struct CommandPolicy: Sendable {
 
     private func tmuxRisk(_ arguments: [String]) -> CommandRisk {
         guard let action = arguments.first(where: { !$0.hasPrefix("-") }) else { return .reviewRequired }
-        return ["list-sessions", "list-windows", "ls", "display-message"].contains(action) ? .safe : .reviewRequired
+        guard ["list-sessions", "list-windows", "ls", "display-message"].contains(action) else { return .reviewRequired }
+
+        let formatCommands = arguments.flatMap(ShellTokenizer.tmuxFormatCommands(in:))
+        if !formatCommands.isEmpty {
+            let formatRisk = commandSubstitutionRisk(formatCommands)
+            if formatRisk == .blocked { return .blocked }
+            return .reviewRequired
+        }
+        return .safe
+    }
+
+    private func commandSubstitutionRisk(_ substitutions: [String]) -> CommandRisk {
+        var sawReview = false
+        for substitution in substitutions {
+            switch classify(substitution) {
+            case .blocked: return .blocked
+            case .reviewRequired: sawReview = true
+            case .safe: break
+            }
+        }
+        return sawReview ? .reviewRequired : (substitutions.isEmpty ? .safe : .reviewRequired)
     }
 
     private func optionOperands(_ arguments: [String]) -> [String] {

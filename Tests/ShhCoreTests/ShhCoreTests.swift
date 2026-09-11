@@ -79,6 +79,23 @@ final class ShhCoreTests: XCTestCase {
         }
     }
 
+    func testCommandPolicyBlocksDestructiveCommandSubstitutions() {
+        let policy = CommandPolicy()
+        for command in ["echo \"$(rm -rf /etc)\"", "echo \"`rm -rf /etc`\""] {
+            XCTAssertEqual(policy.classify(command), .blocked, command)
+            XCTAssertFalse(policy.canSend(command, approved: true), command)
+        }
+        XCTAssertEqual(policy.classify("echo \"$(date)\""), .reviewRequired)
+    }
+
+    func testCommandPolicyInspectsTmuxFormatCommands() {
+        let policy = CommandPolicy()
+        let destructive = "tmux display-message -p '#(rm -rf /etc)'"
+        XCTAssertEqual(policy.classify(destructive), .blocked)
+        XCTAssertFalse(policy.canSend(destructive, approved: true))
+        XCTAssertEqual(policy.classify("tmux display-message -p '#(date)'"), .reviewRequired)
+    }
+
     func testCommandPolicyIgnoresOnlyTrailingLineEndings() {
         let policy = CommandPolicy()
         XCTAssertTrue(policy.canSend("printf hello\n", approved: false))
