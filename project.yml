@@ -1,0 +1,37 @@
+name: Shh
+options:
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  ShhCore:
+    path: .
+targets:
+  Shh:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [App]
+    resources: [Resources]
+    dependencies:
+      - package: ShhCore
+        product: ShhCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.Shh
+        SWIFT_VERSION: "5.9"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Shh records only while you hold the local push-to-talk control."
+  ShhCoreTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Tests/ShhCoreTests]
+    dependencies:
+      - target: Shh
+      - package: ShhCore
+        product: ShhCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.ShhTests
+        SWIFT_VERSION: "5.9"
