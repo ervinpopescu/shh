@@ -22,6 +22,12 @@ final class AppContainer: ObservableObject {
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
     @Published var reconnectState: ReconnectState = .idle
+    @Published var tmuxAvailability: TmuxAvailability = .unavailable(reason: "Not connected")
+    @Published var tmuxSessions: [TmuxSessionInfo] = []
+    @Published var isProbingTmux: Bool = false
+    @Published var isTmuxServerRunning: Bool = false
+    @Published var tmuxError: String? = nil
+    @Published var activeTmuxSessionID: String? = nil
     private(set) var activeHost: Host?
     private(set) var isExplicitDisconnect = false
     private var pendingTrustHost: Host?
@@ -140,10 +146,15 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    func connect(to host: Host) async {
+    func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
         isExplicitDisconnect = false
         activeHost = host
+        activeTmuxSessionID = nil
+        tmuxSessions = []
+        isTmuxServerRunning = false
+        tmuxAvailability = .unavailable(reason: "Not connected")
+        tmuxError = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
         eventTask?.cancel()
@@ -178,11 +189,11 @@ final class AppContainer: ObservableObject {
             (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
 
-            // Save restoration metadata
+            let targetSession = restoringTmuxSessionID ?? (host.autoAttachTmux ? (host.defaultTmuxSession ?? "default") : nil)
             let metadata = SessionRestorationMetadata(
                 hostID: host.id,
                 sessionID: session.id,
-                tmuxSessionID: host.defaultTmuxSession
+                tmuxSessionID: targetSession
             )
             try? await restorationStore.save(metadata)
 
@@ -205,22 +216,17 @@ final class AppContainer: ObservableObject {
                 self.enqueueRawInteractive(data, sessionID: sessionID)
             }
 
-            // Auto-attach tmux session if requested by host preferences
-            if host.autoAttachTmux {
-                let target = host.defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-                let attachCmd: String
-                if target.isEmpty {
-                    attachCmd = TmuxAdapter().command(for: .create(name: "default"))
-                } else if target.hasPrefix("$") {
-                    attachCmd = TmuxAdapter().command(for: .attach(name: target))
-                } else {
-                    attachCmd = TmuxAdapter().command(for: .create(name: target))
-                }
-                try? await connection.send(Data((attachCmd + "\n").utf8))
+            // Auto-attach tmux session if requested by host preferences or restored
+            if let target = targetSession {
+                await self.handleTmuxTarget(target, on: connection, host: host, session: session)
             }
 
             let events = await connection.events()
             startEventMonitoring(for: connection, events: events, session: session, host: host)
+
+            Task { [weak self] in
+                await self?.refreshTmuxState()
+            }
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
@@ -363,28 +369,24 @@ final class AppContainer: ObservableObject {
             self.enqueueRawInteractive(data, sessionID: sessionID)
         }
 
+        let targetSession = activeTmuxSessionID ?? (host.autoAttachTmux ? (host.defaultTmuxSession ?? "default") : nil)
         let metadata = SessionRestorationMetadata(
             hostID: host.id,
             sessionID: session.id,
-            tmuxSessionID: host.defaultTmuxSession
+            tmuxSessionID: targetSession
         )
         try? await restorationStore.save(metadata)
 
-        if host.autoAttachTmux {
-            let target = host.defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let attachCmd: String
-            if target.isEmpty {
-                attachCmd = TmuxAdapter().command(for: .create(name: "default"))
-            } else if target.hasPrefix("$") {
-                attachCmd = TmuxAdapter().command(for: .attach(name: target))
-            } else {
-                attachCmd = TmuxAdapter().command(for: .create(name: target))
-            }
-            try? await connection.send(Data((attachCmd + "\n").utf8))
+        if let target = targetSession {
+            await self.handleTmuxTarget(target, on: connection, host: host, session: session)
         }
 
         let events = await connection.events()
         startEventMonitoring(for: connection, events: events, session: session, host: host)
+
+        Task { [weak self] in
+            await self?.refreshTmuxState()
+        }
     }
 
     func cancelReconnect() async {
@@ -439,7 +441,7 @@ final class AppContainer: ObservableObject {
                 let metadata = SessionRestorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
-                    tmuxSessionID: host.defaultTmuxSession
+                    tmuxSessionID: activeTmuxSessionID ?? host.defaultTmuxSession
                 )
                 Task { [weak self] in
                     try? await self?.restorationStore.save(metadata)
@@ -456,7 +458,7 @@ final class AppContainer: ObservableObject {
               let host = hosts.first(where: { $0.id == metadata.hostID }) else {
             return
         }
-        await connect(to: host)
+        await connect(to: host, restoringTmuxSessionID: metadata.tmuxSessionID)
     }
 
     func approvePendingHostKey(permanently: Bool) async {
@@ -522,6 +524,11 @@ final class AppContainer: ObservableObject {
         connection = nil
         activeSession?.state = .disconnected
         redactor = Redactor()
+        activeTmuxSessionID = nil
+        tmuxSessions = []
+        isTmuxServerRunning = false
+        tmuxAvailability = .unavailable(reason: "Not connected")
+        tmuxError = nil
     }
 
     private func detachCallbacks() {
@@ -561,5 +568,199 @@ final class AppContainer: ObservableObject {
     internal func redacted(_ data: Data) -> Data {
         guard !redactor.secrets.isEmpty else { return data }
         return Data(redactor.redact(String(decoding: data, as: UTF8.self)).utf8)
+    }
+
+    // MARK: - Live Tmux Management
+
+    private func handleTmuxTarget(_ target: String, on connection: any SSHConnection, host: Host, session: TerminalSession) async {
+        let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.hasPrefix("$") {
+            if let executor = connection as? SSHCommandExecuting {
+                let check = try? await executor.executeCommand(TmuxCommand.hasSession(id: trimmed), timeout: 5.0)
+                if let check, !check.isSuccess {
+                    self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
+                    return
+                }
+            }
+            _ = await attachTmuxSession(id: trimmed)
+        } else if !trimmed.isEmpty {
+            _ = await createTmuxSession(name: trimmed)
+        } else {
+            _ = await createTmuxSession(name: "default")
+        }
+    }
+
+    @discardableResult
+    func probeTmux() async -> TmuxAvailability {
+        guard activeSession?.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            let avail = TmuxAvailability.unavailable(reason: "Not connected")
+            tmuxAvailability = avail
+            return avail
+        }
+        let sessionID = activeSession?.id
+        do {
+            let result = try await executor.executeCommand(TmuxCommand.probe, timeout: 5.0)
+            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+                return .unavailable(reason: "Session disconnected")
+            }
+            let avail = TmuxAvailability.parse(result: result)
+            tmuxAvailability = avail
+            return avail
+        } catch {
+            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+                return .unavailable(reason: "Session disconnected")
+            }
+            let avail = TmuxAvailability.unavailable(reason: error.localizedDescription)
+            tmuxAvailability = avail
+            return avail
+        }
+    }
+
+    @discardableResult
+    func listTmuxSessions() async -> [TmuxSessionInfo] {
+        guard activeSession?.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            return []
+        }
+        let sessionID = activeSession?.id
+        do {
+            let result = try await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
+            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+                return []
+            }
+            if result.isSuccess {
+                let parsed = (try? TmuxListSessionsParser.parse(result.stdout)) ?? []
+                tmuxSessions = parsed
+                isTmuxServerRunning = true
+                tmuxError = nil
+                return parsed
+            } else {
+                let combinedErr = (result.stderr + " " + result.stdout).lowercased()
+                if combinedErr.contains("no server running") {
+                    tmuxSessions = []
+                    isTmuxServerRunning = false
+                    tmuxError = nil
+                } else if combinedErr.contains("no sessions") {
+                    tmuxSessions = []
+                    isTmuxServerRunning = true
+                    tmuxError = nil
+                } else {
+                    tmuxSessions = []
+                    isTmuxServerRunning = false
+                    let msg = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                    tmuxError = msg.isEmpty ? "Failed to list tmux sessions (exit code \(result.exitCode))" : msg
+                }
+                return []
+            }
+        } catch {
+            guard activeSession?.id == sessionID, activeSession?.state == .connected else {
+                return []
+            }
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            tmuxError = error.localizedDescription
+            return []
+        }
+    }
+
+    func refreshTmuxState() async {
+        guard activeSession?.state == .connected,
+              connection is SSHCommandExecuting else {
+            tmuxAvailability = .unavailable(reason: "Not connected")
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            return
+        }
+        isProbingTmux = true
+        defer { isProbingTmux = false }
+
+        let availability = await probeTmux()
+        if availability.isAvailable {
+            _ = await listTmuxSessions()
+        } else {
+            tmuxSessions = []
+            isTmuxServerRunning = false
+        }
+    }
+
+    @discardableResult
+    func attachTmuxSession(id: String) async -> Bool {
+        guard activeSession?.state == .connected, connection != nil else {
+            tmuxError = "Not connected."
+            return false
+        }
+        let validatedID: TmuxSessionID
+        do {
+            validatedID = try TmuxSessionID(id)
+        } catch {
+            tmuxError = error.localizedDescription
+            return false
+        }
+
+        let cmd = TmuxCommand.attachSession(id: validatedID)
+        guard CommandPolicy().canSend(cmd, approved: true) else {
+            tmuxError = "Safety policy rejected command."
+            return false
+        }
+
+        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        if sent {
+            activeTmuxSessionID = validatedID.value
+            tmuxError = nil
+            if let host = activeHost, let session = activeSession {
+                let metadata = SessionRestorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    tmuxSessionID: validatedID.value
+                )
+                try? await restorationStore.save(metadata)
+            }
+            return true
+        } else {
+            tmuxError = "Failed to attach to tmux session \(validatedID.value)."
+            return false
+        }
+    }
+
+    @discardableResult
+    func createTmuxSession(name: String) async -> Bool {
+        guard activeSession?.state == .connected, connection != nil else {
+            tmuxError = "Not connected."
+            return false
+        }
+        let validatedName: TmuxSessionName
+        do {
+            validatedName = try TmuxSessionName(name)
+        } catch {
+            tmuxError = error.localizedDescription
+            return false
+        }
+
+        let cmd = TmuxCommand.newSession(name: validatedName)
+        guard CommandPolicy().canSend(cmd, approved: true) else {
+            tmuxError = "Safety policy rejected command."
+            return false
+        }
+
+        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        if sent {
+            activeTmuxSessionID = validatedName.value
+            tmuxError = nil
+            if let host = activeHost, let session = activeSession {
+                let metadata = SessionRestorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    tmuxSessionID: validatedName.value
+                )
+                try? await restorationStore.save(metadata)
+            }
+            return true
+        } else {
+            tmuxError = "Failed to create tmux session \(validatedName.value)."
+            return false
+        }
     }
 }
