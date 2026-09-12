@@ -2,6 +2,7 @@ import Foundation
 import ShhCore
 import ShhSSH
 import ShhTerminal
+import ShhVoice
 import SwiftUI
 
 @MainActor
@@ -11,6 +12,11 @@ final class AppContainer: ObservableObject {
     let trustStore: InMemoryTrustStore
     let credentialStore: any CredentialStore
     let transcriber: any LocalTranscriber
+    let voiceModelManager: WhisperModelManager
+    let voiceRegistry: VoiceProviderRegistry
+    let voiceRecorder: any AudioRecorder
+    let voiceRouter: VoiceCommandRouter
+    private let customTranscriber: (any LocalTranscriber)?
     let terminalController: ShhTerminalController
     let restorationStore: any SessionRestorationStore
     let reachabilityMonitor: any ReachabilityMonitoring
@@ -28,6 +34,16 @@ final class AppContainer: ObservableObject {
     @Published var isTmuxServerRunning: Bool = false
     @Published var tmuxError: String? = nil
     @Published var activeTmuxSessionID: String? = nil
+    @Published var selectedVoiceProviderID: String
+    @Published var defaultVoiceMode: VoiceInputMode = .shellCommand
+    @Published var voiceModels: [VoiceModelDescriptor] = []
+    @Published var voiceErrorMessage: String? = nil
+    @Published var voiceProgressFraction: Double = 0.0
+    @Published var voiceRecordingDuration: TimeInterval = 0.0
+    @Published var isRecordingVoice: Bool = false
+    @Published var isTranscribingVoice: Bool = false
+    @Published var activeVoicePreview: VoicePreviewState? = nil
+    @Published var isSlideToCancelActive: Bool = false
     private(set) var activeHost: Host?
     private(set) var isExplicitDisconnect = false
     private var pendingTrustHost: Host?
@@ -41,6 +57,21 @@ final class AppContainer: ObservableObject {
 
     var isDemo: Bool {
         transport is DemoSSHTransport
+    }
+
+    public static let whisperProviderID = VoiceProviderRegistry.whisperProviderID
+    public static let appleSpeechProviderID = VoiceProviderRegistry.appleSpeechProviderID
+
+    public var isWhisperSelected: Bool {
+        selectedVoiceProviderID == Self.whisperProviderID
+    }
+
+    public var selectedProviderDisplayName: String {
+        isWhisperSelected ? "WhisperKit" : "Apple Speech"
+    }
+
+    var activeTranscriber: any LocalTranscriber {
+        customTranscriber ?? voiceRegistry.activeTranscriber()
     }
 
     var accessibilityTerminalText: String {
@@ -59,7 +90,11 @@ final class AppContainer: ObservableObject {
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: (any CredentialStore)? = nil,
         transport: (any SSHTransport)? = nil,
-        transcriber: any LocalTranscriber = UnavailableTranscriber(),
+        transcriber: (any LocalTranscriber)? = nil,
+        modelManager: WhisperModelManager? = nil,
+        voiceRegistry: VoiceProviderRegistry? = nil,
+        voiceRecorder: (any AudioRecorder)? = nil,
+        voiceRouter: VoiceCommandRouter = VoiceCommandRouter(),
         useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
@@ -72,7 +107,29 @@ final class AppContainer: ObservableObject {
         self.trustStore = trustStore
         self.credentialStore = resolvedCredentialStore
         self.transport = transport ?? LiveSSHTransport(credentialStore: resolvedCredentialStore)
-        self.transcriber = transcriber
+        self.customTranscriber = transcriber
+
+        let resolvedModelManager = modelManager ?? WhisperModelManager()
+        self.voiceModelManager = resolvedModelManager
+
+        let resolvedRegistry: VoiceProviderRegistry
+        if let registry = voiceRegistry {
+            resolvedRegistry = registry
+        } else {
+            let whisperTranscriber = WhisperKitTranscriber(modelManager: resolvedModelManager)
+            let appleSpeechTranscriber = AppleSpeechTranscriber()
+            resolvedRegistry = VoiceProviderRegistry(
+                whisperTranscriber: whisperTranscriber,
+                appleSpeechTranscriber: appleSpeechTranscriber,
+                initialSelectedID: VoiceProviderRegistry.whisperProviderID
+            )
+        }
+        self.voiceRegistry = resolvedRegistry
+        self.selectedVoiceProviderID = resolvedRegistry.selectedProviderID
+
+        self.voiceRecorder = voiceRecorder ?? AudioCaptureRecorder()
+        self.voiceRouter = voiceRouter
+        self.transcriber = transcriber ?? resolvedRegistry.activeTranscriber()
         self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
         self.terminalController = ShhTerminalController()
         self.restorationStore = restorationStore ?? UserDefaultsSessionRestorationStore()
@@ -95,24 +152,48 @@ final class AppContainer: ObservableObject {
             }
         }
         monitor.start()
+
+        Task { [weak self] in
+            await self?.refreshVoiceModels()
+        }
     }
 
     static func demo(
         catalog: InMemoryCatalog = InMemoryCatalog(),
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: any CredentialStore = InMemoryCredentialStore(),
-        transcriber: any LocalTranscriber = UnavailableTranscriber(),
+        transcriber: (any LocalTranscriber)? = nil,
+        modelManager: WhisperModelManager? = nil,
+        voiceRegistry: VoiceProviderRegistry? = nil,
+        voiceRecorder: (any AudioRecorder)? = nil,
+        voiceRouter: VoiceCommandRouter = VoiceCommandRouter(),
         useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil
     ) -> AppContainer {
-        AppContainer(
+        let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
+        let demoTranscriber = transcriber ?? DemoTranscriber()
+        let demoModelsDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhDemoModels_\(UUID().uuidString)")
+        let demoManager = modelManager ?? WhisperModelManager(
+            modelsDirectory: demoModelsDir,
+            downloader: DemoWhisperDownloader()
+        )
+        let demoRegistry = voiceRegistry ?? VoiceProviderRegistry(
+            whisperTranscriber: demoTranscriber,
+            appleSpeechTranscriber: demoTranscriber,
+            initialSelectedID: VoiceProviderRegistry.whisperProviderID
+        )
+        return AppContainer(
             catalog: catalog,
             trustStore: trustStore,
             credentialStore: credentialStore,
             transport: DemoSSHTransport(),
-            transcriber: transcriber,
+            transcriber: demoTranscriber,
+            modelManager: demoManager,
+            voiceRegistry: demoRegistry,
+            voiceRecorder: demoRecorder,
+            voiceRouter: voiceRouter,
             useLegacyTerminalFallback: useLegacyTerminalFallback,
             restorationStore: restorationStore ?? InMemorySessionRestorationStore(),
             reachabilityMonitor: reachabilityMonitor ?? MockReachabilityMonitor(isReachable: true),
@@ -149,6 +230,8 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        await cancelVoiceRecording()
+        resetVoiceState()
         tmuxRefreshGeneration += 1
         isExplicitDisconnect = false
         activeHost = host
@@ -435,6 +518,11 @@ final class AppContainer: ObservableObject {
     }
 
     func handleScenePhaseChange(_ phase: ScenePhase) {
+        if phase == .background {
+            Task { [weak self] in
+                await self?.cancelVoiceRecording()
+            }
+        }
         guard !isExplicitDisconnect else { return }
         switch phase {
         case .active:
@@ -529,6 +617,8 @@ final class AppContainer: ObservableObject {
     }
 
     func disconnect() async {
+        await cancelVoiceRecording()
+        resetVoiceState()
         isExplicitDisconnect = true
         tmuxRefreshGeneration += 1
         activeHost = nil
@@ -996,5 +1086,239 @@ final class AppContainer: ObservableObject {
             tmuxError = "Failed to create tmux session \(validatedName.value)."
             return false
         }
+    }
+
+    // MARK: - Live Voice & Local AI Management
+
+    func refreshVoiceModels() async {
+        self.voiceModels = await voiceModelManager.listModels()
+    }
+
+    func hasInstalledWhisperModel() async -> Bool {
+        let models = await voiceModelManager.listModels()
+        return models.contains { $0.state.isReady }
+    }
+
+    func selectVoiceProvider(id: String) {
+        do {
+            try voiceRegistry.selectProvider(id: id)
+            self.selectedVoiceProviderID = id
+            self.voiceErrorMessage = nil
+        } catch {
+            self.voiceErrorMessage = error.localizedDescription
+        }
+    }
+
+    func downloadVoiceModel(_ tier: WhisperModelTier) async throws {
+        voiceErrorMessage = nil
+        await refreshVoiceModels()
+        do {
+            _ = try await voiceModelManager.downloadModel(tier) { [weak self] fraction in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    if let index = self.voiceModels.firstIndex(where: { $0.id == tier.defaultModelID }) {
+                        self.voiceModels[index].state = .downloading(fractionCompleted: fraction)
+                    }
+                }
+            }
+            await refreshVoiceModels()
+        } catch {
+            await refreshVoiceModels()
+            voiceErrorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    func cancelVoiceModelDownload(_ tier: WhisperModelTier) async {
+        await voiceModelManager.cancelDownload(tier)
+        await refreshVoiceModels()
+    }
+
+    func deleteVoiceModel(_ tier: WhisperModelTier) async throws {
+        try await voiceModelManager.deleteModel(tier)
+        await refreshVoiceModels()
+    }
+
+    func startVoiceRecording(mode: VoiceInputMode? = nil) async throws {
+        guard let host = activeHost, activeSession?.state == .connected else {
+            let message = "Connect to a host before recording voice commands."
+            voiceErrorMessage = message
+            speechState = .failed(.recorderError(.deviceUnavailable(reason: message)))
+            throw AudioRecorderError.deviceUnavailable(reason: message)
+        }
+        guard host.isVoiceEnabled else {
+            let message = "Voice input is disabled for host '\(host.name)'."
+            voiceErrorMessage = message
+            let err = TranscriptionError.hostPolicyDisabled(hostID: host.id)
+            speechState = .failed(err)
+            throw err
+        }
+        let effectiveMode = mode ?? defaultVoiceMode
+        guard host.voicePolicy.allowedModes.contains(effectiveMode) else {
+            let message = "Voice mode '\(effectiveMode.displayName)' is not permitted by host policy for '\(host.name)'."
+            voiceErrorMessage = message
+            let err = TranscriptionError.transcriptionFailed(reason: message)
+            speechState = .failed(err)
+            throw err
+        }
+        if selectedVoiceProviderID == VoiceProviderRegistry.whisperProviderID {
+            let hasModel = await hasInstalledWhisperModel()
+            guard hasModel else {
+                let message = "Download required: on-device Whisper model is not installed."
+                voiceErrorMessage = message
+                let err = TranscriptionError.modelNotInstalled(modelID: WhisperModelTier.tiny.defaultModelID)
+                speechState = .failed(err)
+                throw err
+            }
+        }
+
+        voiceErrorMessage = nil
+        activeVoicePreview = nil
+        isRecordingVoice = true
+        isSlideToCancelActive = false
+        speechState = .recording
+        voiceProgressFraction = 0.0
+        voiceRecordingDuration = 0.0
+
+        do {
+            try await voiceRecorder.start()
+        } catch {
+            isRecordingVoice = false
+            speechState = .idle
+            voiceErrorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    @discardableResult
+    func stopVoiceRecording(mode: VoiceInputMode? = nil) async throws -> VoicePreviewState {
+        guard isRecordingVoice else {
+            throw AudioRecorderError.notRecording
+        }
+        guard let host = activeHost else {
+            await cancelVoiceRecording()
+            throw AudioRecorderError.deviceUnavailable(reason: "No active host")
+        }
+
+        let effectiveMode = mode ?? defaultVoiceMode
+        isRecordingVoice = false
+        isSlideToCancelActive = false
+        isTranscribingVoice = true
+        speechState = .transcribing
+        voiceProgressFraction = 0.0
+
+        let handle: AudioRecordingHandle
+        do {
+            handle = try await voiceRecorder.stop()
+        } catch {
+            isTranscribingVoice = false
+            speechState = .idle
+            voiceErrorMessage = error.localizedDescription
+            throw error
+        }
+
+        // Guaranteed audio deletion regardless of outcome
+        defer {
+            handle.cleanup()
+        }
+
+        do {
+            try Task.checkCancellation()
+            let transcriber = activeTranscriber
+            let transcript = try await transcriber.transcribe(recording: handle) { [weak self] fraction in
+                Task { @MainActor [weak self] in
+                    self?.voiceProgressFraction = fraction
+                    self?.speechState = .transcribingWithProgress(fractionCompleted: fraction)
+                }
+            }
+            try Task.checkCancellation()
+
+            let preview = VoicePreviewState(
+                originalTranscript: transcript,
+                mode: effectiveMode,
+                duration: handle.duration,
+                router: voiceRouter,
+                hostPolicy: host.voicePolicy
+            )
+
+            // Strict invariant: NO transcription callback may auto-send!
+            self.activeVoicePreview = preview
+            self.speechState = .preview(preview)
+            self.isTranscribingVoice = false
+            return preview
+        } catch is CancellationError {
+            self.isTranscribingVoice = false
+            self.speechState = .cancelled
+            throw TranscriptionError.cancelled
+        } catch let err as TranscriptionError {
+            self.isTranscribingVoice = false
+            self.speechState = (err == .cancelled) ? .cancelled : .failed(err)
+            self.voiceErrorMessage = err.localizedDescription
+            throw err
+        } catch {
+            self.isTranscribingVoice = false
+            let err = TranscriptionError.transcriptionFailed(reason: error.localizedDescription)
+            self.speechState = .failed(err)
+            self.voiceErrorMessage = error.localizedDescription
+            throw err
+        }
+    }
+
+    func cancelVoiceRecording() async {
+        isRecordingVoice = false
+        isSlideToCancelActive = false
+        isTranscribingVoice = false
+        voiceProgressFraction = 0.0
+        await voiceRecorder.cancel()
+        speechState = .cancelled
+    }
+
+    func resetVoiceState() {
+        isRecordingVoice = false
+        isSlideToCancelActive = false
+        isTranscribingVoice = false
+        voiceProgressFraction = 0.0
+        voiceErrorMessage = nil
+        activeVoicePreview = nil
+        speechState = .idle
+    }
+
+    @discardableResult
+    func sendVoiceCommand(preview: VoicePreviewState) async -> Bool {
+        guard preview.mode == .shellCommand else { return false }
+        let value = preview.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        switch CommandPolicy().classify(value) {
+        case .safe:
+            let success = await sendValidatedCommand(value + "\n", approved: true)
+            if success { resetVoiceState() }
+            return success
+        case .reviewRequired, .blocked:
+            return false
+        }
+    }
+
+    @discardableResult
+    func sendAgentMessage(preview: VoicePreviewState, confirmedProduction: Bool = false) async -> Bool {
+        guard preview.mode == .agentMessage else { return false }
+        let value = preview.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return false }
+        if let host = activeHost, host.isProduction && !confirmedProduction {
+            return false
+        }
+        let payload = Data((value + "\n").utf8)
+        let success = await sendRawInteractive(payload)
+        if success { resetVoiceState() }
+        return success
+    }
+
+    @discardableResult
+    func insertVoiceText(preview: VoicePreviewState) async -> Bool {
+        guard preview.mode == .insertOnly else { return false }
+        guard !preview.text.isEmpty else { return false }
+        let bracketed = TerminalKeyEncoder.encodePaste(preview.text, bracketed: true)
+        let success = await sendRawInteractive(bracketed)
+        if success { resetVoiceState() }
+        return success
     }
 }
