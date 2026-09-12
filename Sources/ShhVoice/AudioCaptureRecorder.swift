@@ -233,6 +233,7 @@ public actor AudioCaptureRecorder: AudioRecorder {
     private let engineFactory: any AudioRecordingEngineFactory
     private let lifecycleNotifier: any AudioLifecycleNotifier
     private let tempFileFactory: @Sendable () throws -> AudioRecordingHandle
+    private let onInterruption: (@Sendable () -> Void)?
 
     private var activeEngine: (any AudioRecordingEngine)?
     private var activeHandle: AudioRecordingHandle?
@@ -246,7 +247,8 @@ public actor AudioCaptureRecorder: AudioRecorder {
         sessionManager: any AudioSessionManaging = SystemAudioSessionManager.shared,
         engineFactory: any AudioRecordingEngineFactory = DefaultAudioRecordingEngineFactory(),
         lifecycleNotifier: any AudioLifecycleNotifier = SystemAudioLifecycleNotifier(),
-        tempFileFactory: (@Sendable () throws -> AudioRecordingHandle)? = nil
+        tempFileFactory: (@Sendable () throws -> AudioRecordingHandle)? = nil,
+        onInterruption: (@Sendable () -> Void)? = nil
     ) {
         self.maxDuration = maxDuration
         self.minDuration = minDuration
@@ -256,6 +258,7 @@ public actor AudioCaptureRecorder: AudioRecorder {
         self.tempFileFactory = tempFileFactory ?? {
             try AudioRecordingHandle.createTemporary(fileExtension: VoiceAudioFormat.fileExtension)
         }
+        self.onInterruption = onInterruption
     }
 
     deinit {
@@ -412,20 +415,24 @@ public actor AudioCaptureRecorder: AudioRecorder {
 
     private func handleInterruption() async {
         await cancel()
+        onInterruption?()
     }
 
     private func handleRouteChange() async {
         await cancel()
+        onInterruption?()
     }
 
     private func handleBackground() async {
         // App backgrounding must cancel recording and delete temporary files immediately.
         await cancel()
+        onInterruption?()
     }
 
     private func handleMaxDurationReached() async {
         // Max duration reached: cancel and cleanup
         await cancel()
+        onInterruption?()
     }
 
     private func teardownMonitoring() {
