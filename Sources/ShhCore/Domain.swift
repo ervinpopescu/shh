@@ -58,7 +58,6 @@ public struct SSHOptions: Codable, Hashable, Sendable {
         self.compression = compression; self.strictHostKeyChecking = strictHostKeyChecking
     }
 }
-public struct MoshOptions: Codable, Hashable, Sendable { public init() {} }
 
 public struct ProxyJumpEndpoint: Codable, Hashable, Sendable {
     public var hostname: String
@@ -521,7 +520,7 @@ public struct TerminalSession: Identifiable, Codable, Hashable, Sendable {
 public enum RemoteMultiplexer: String, Codable, CaseIterable, Sendable { case tmux, zellij, byobu, screen, herdr }
 public enum CapabilityAvailability: Codable, Hashable, Sendable { case available; case unavailable(reason: String) }
 public struct CapabilityMatrix: Codable, Hashable, Sendable {
-    public var mosh: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
+    public var mosh: CapabilityAvailability = .available
     public var proxyJump: CapabilityAvailability = .available
     public var forwarding: CapabilityAvailability = .available
     public var sftp: CapabilityAvailability = .available

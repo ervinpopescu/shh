@@ -247,7 +247,13 @@ public struct LiveSSHTransport: SSHTransport {
                 )
             }
         case .mosh:
-            throw TransportError.unsupported
+            let moshTransport: any SSHTransport = LiveMoshTransport(sshTransport: self)
+            return try await moshTransport.connect(
+                host: host,
+                identity: identity,
+                trustEvaluator: trustEvaluator,
+                initialSize: initialSize
+            )
         }
     }
 
