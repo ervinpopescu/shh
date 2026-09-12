@@ -24,17 +24,9 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Cache XcodeGen
-        id: cache-xcodegen
-        uses: actions/cache@v4
-        with:
-          path: /opt/homebrew/bin/xcodegen
-          key: xcodegen-${{ runner.os }}
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install XcodeGen
-        if: steps.cache-xcodegen.outputs.cache-hit != 'true'
         run: |
           if ! command -v xcodegen &> /dev/null; then
             brew install xcodegen
@@ -129,7 +121,7 @@ jobs:
 
       - name: Upload Test Results and Logs on Failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: ci-failure-artifacts
           path: |
