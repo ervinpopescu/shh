@@ -93,7 +93,12 @@ targets:
     type: bundle.unit-test
     platform: iOS
     deploymentTarget: "17.0"
-    sources: [Tests/ShhAppTests]
+    sources:
+      - Tests/ShhAppTests
+      - path: FileProviderExtension
+        excludes:
+          - "Info.plist"
+          - "*.entitlements"
     dependencies:
       - target: Shh
     settings:

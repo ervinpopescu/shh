@@ -38,10 +38,10 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
 
     public init(
         appGroupIdentifier: String = "group.com.ervinpopescu.shh",
-        keychainAccessGroup: String = "group.com.ervinpopescu.shh"
+        keychainAccessGroup: String? = nil
     ) {
         self.appGroupIdentifier = appGroupIdentifier
-        self.keychainAccessGroup = keychainAccessGroup
+        self.keychainAccessGroup = keychainAccessGroup ?? KeychainCredentialStore.defaultSharedAccessGroup ?? "group.com.ervinpopescu.shh"
     }
 
     public func withRepository<T: Sendable>(
@@ -53,7 +53,8 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
         let host = try loadHost(hostID: hostID)
         let identity = try? loadIdentity(identityID: host.identityID ?? UUID())
         let credentialStore = KeychainCredentialStore(accessGroup: keychainAccessGroup)
-        let trustEvaluator = InMemoryTrustStore()
+        let trustRecords = loadSharedTrustRecords()
+        let trustEvaluator = InMemoryTrustStore(records: trustRecords)
 
         var sshOptions = SSHOptions()
         if case .ssh(let opts) = host.connection {
@@ -70,13 +71,14 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
                     credentialStore: credentialStore,
                     options: sshOptions
                 )
-                defer {
-                    Task {
-                        await repo.close()
-                    }
+                do {
+                    let result = try await operation(repo)
+                    await repo.close()
+                    return result
+                } catch {
+                    await repo.close()
+                    throw error
                 }
-
-                return try await operation(repo)
             }
 
             group.addTask {
@@ -103,6 +105,19 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
     private func loadIdentity(identityID: UUID) throws -> IdentityDescriptor? {
         let snapshot = try loadSharedCatalogSnapshot()
         return snapshot.identities.first(where: { $0.id == identityID })
+    }
+
+    private func loadSharedTrustRecords() -> [TrustRecord] {
+        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+            return []
+        }
+        let knownHostsURL = containerURL.appendingPathComponent("catalogs/known_hosts.json")
+        guard let data = try? Data(contentsOf: knownHostsURL) else {
+            return []
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return (try? decoder.decode([TrustRecord].self, from: data)) ?? []
     }
 
     private func loadSharedCatalogSnapshot() throws -> CatalogSnapshot {

@@ -65,6 +65,9 @@ public struct FileProviderItemIdentifier: RawRepresentable, Hashable, Codable, S
         }
 
         let parentPath = path.parent
+        if parentPath.isRoot {
+            return .root
+        }
         return FileProviderItemIdentifier(hostID: hostID, remotePath: parentPath)
     }
 
@@ -193,7 +196,7 @@ public struct FileProviderItemContract: Codable, Hashable, Sendable, Identifiabl
             posixPermissions: nil,
             symlinkTarget: nil,
             contentTypeIdentifier: "public.folder",
-            capabilities: [.allowsReading]
+            capabilities: [.allowsReading, .allowsWriting]
         )
     }
 
@@ -503,11 +506,16 @@ public actor FileProviderMetadataCache {
 
     public func evaluateAndApplyEviction(
         policy: FileProviderEvictionPolicy,
-        now: Date = Date()
+        now: Date = Date(),
+        baseStorageURL: URL? = nil
     ) -> [FileProviderCacheMetadata] {
         let items = Array(metadataStore.values)
         let toEvict = FileProviderEvictionRule.evaluateEviction(items: items, policy: policy, now: now)
         for item in toEvict {
+            if let path = item.localRelativePath, let base = baseStorageURL {
+                let fileURL = base.appendingPathComponent(path)
+                try? FileManager.default.removeItem(at: fileURL)
+            }
             if policy.evictMaterializedOnly {
                 if var current = metadataStore[item.id] {
                     current.isMaterialized = false

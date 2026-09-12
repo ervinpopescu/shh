@@ -14,7 +14,7 @@ public final class FileProviderManagerHelper: Sendable {
     }
 
     /// Exports the current catalog snapshot into the shared App Group directory.
-    public func exportCatalogToSharedContainer(snapshot: CatalogSnapshot) throws {
+    public func exportCatalogToSharedContainer(snapshot: CatalogSnapshot, trustRecords: [TrustRecord] = []) throws {
         guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
             return
         }
@@ -27,6 +27,27 @@ public final class FileProviderManagerHelper: Sendable {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data = try encoder.encode(snapshot)
+        try data.write(to: targetURL, options: .atomic)
+
+        if !trustRecords.isEmpty {
+            try exportTrustedHostKeysToSharedContainer(records: trustRecords)
+        }
+    }
+
+    /// Exports trusted host keys into the shared App Group directory.
+    public func exportTrustedHostKeysToSharedContainer(records: [TrustRecord]) throws {
+        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
+            return
+        }
+
+        let catalogsDirectory = containerURL.appendingPathComponent("catalogs", isDirectory: true)
+        try FileManager.default.createDirectory(at: catalogsDirectory, withIntermediateDirectories: true)
+
+        let targetURL = catalogsDirectory.appendingPathComponent("known_hosts.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data = try encoder.encode(records)
         try data.write(to: targetURL, options: .atomic)
     }
 

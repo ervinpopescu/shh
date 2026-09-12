@@ -13,14 +13,14 @@ public final class FileProviderItem: NSObject, NSFileProviderItem {
     }
 
     public var itemIdentifier: NSFileProviderItemIdentifier {
-        if contract.identifier.isRoot {
+        if contract.identifier.isRoot || contract.identifier.remotePath?.isRoot == true {
             return .rootContainer
         }
         return NSFileProviderItemIdentifier(contract.identifier.rawValue)
     }
 
     public var parentItemIdentifier: NSFileProviderItemIdentifier {
-        if contract.parentIdentifier.isRoot {
+        if contract.parentIdentifier.isRoot || contract.parentIdentifier.remotePath?.isRoot == true {
             return .rootContainer
         }
         return NSFileProviderItemIdentifier(contract.parentIdentifier.rawValue)

@@ -38,6 +38,21 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             return
         }
 
+        if containerItemIdentifier == .workingSet {
+            Task {
+                let materialized = await cache.allMetadata().filter(\.isMaterialized).map { FileProviderItem(contract: $0.item) }
+                observer.didEnumerate(materialized)
+                observer.finishEnumerating(upTo: nil)
+            }
+            return
+        }
+
+        if containerItemIdentifier == .trashContainer {
+            observer.didEnumerate([])
+            observer.finishEnumerating(upTo: nil)
+            return
+        }
+
         let targetPath: RemotePath
         let parentContractID: FileProviderItemIdentifier
 
@@ -80,7 +95,7 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     observer.didEnumerate(items)
                     observer.finishEnumerating(upTo: nil)
                 } else {
-                    observer.finishEnumeratingWithError(error)
+                    observer.finishEnumeratingWithError(Self.translateError(error))
                 }
             }
         }
@@ -97,6 +112,14 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
 
         Task {
             let changeAnchor = FileProviderChangeAnchor.decode(from: anchor.rawValue) ?? FileProviderChangeAnchor(generation: 0)
+            let currentAnchor = await cache.currentAnchor()
+
+            // If anchor generation is in the future, signal expired sync anchor
+            if changeAnchor.generation > currentAnchor.generation {
+                observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+                return
+            }
+
             let changes = await cache.changesSince(anchor: changeAnchor)
 
             var updatedItems: [FileProviderItem] = []
@@ -120,8 +143,7 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 observer.didDeleteItems(withIdentifiers: deletedIDs)
             }
 
-            let newAnchor = await cache.currentAnchor()
-            let newSyncAnchor = NSFileProviderSyncAnchor(newAnchor.encodedData())
+            let newSyncAnchor = NSFileProviderSyncAnchor(currentAnchor.encodedData())
             observer.finishEnumeratingChanges(upTo: newSyncAnchor, moreComing: false)
         }
     }
@@ -131,6 +153,45 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             let anchor = await cache.currentAnchor()
             completionHandler(NSFileProviderSyncAnchor(anchor.encodedData()))
         }
+    }
+
+    private static func translateError(_ error: any Error) -> Error {
+        if let fpError = error as? NSFileProviderError {
+            return fpError
+        }
+        if let sftpError = error as? SFTPRepositoryError {
+            switch sftpError {
+            case .notFound:
+                return NSFileProviderError(.noSuchItem)
+            case .permissionDenied:
+                return NSFileProviderError(.notAuthenticated)
+            case .alreadyExists:
+                return NSFileProviderError(.filenameCollision)
+            case .connectionClosed:
+                return NSFileProviderError(.serverUnreachable)
+            case .invalidPath:
+                return NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil)
+            case .cancelled:
+                return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+            case .isDirectory, .notADirectory, .directoryNotEmpty, .remoteFailure:
+                return NSFileProviderError(.serverUnreachable)
+            }
+        }
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .networkUnavailable, .timeout:
+                return NSFileProviderError(.serverUnreachable)
+            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired:
+                return NSFileProviderError(.notAuthenticated)
+            case .cancelled:
+                return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+            case .invalidConfiguration, .unsupported:
+                return NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError, userInfo: nil)
+            case .remoteFailure:
+                return NSFileProviderError(.serverUnreachable)
+            }
+        }
+        return error
     }
 }
 #endif

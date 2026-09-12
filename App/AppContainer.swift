@@ -184,7 +184,7 @@ final class AppContainer: ObservableObject {
         portForwardingManager: (any PortForwardingManaging)? = nil,
         hostResolver: LiveSSHTransport.HostResolver? = nil
     ) {
-        let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
+        let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
             ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
         self.catalog = catalog
@@ -933,6 +933,10 @@ final class AppContainer: ObservableObject {
         guard let challenge = pendingTrustChallenge, let host = pendingTrustHost else { return }
         if permanently {
             await trustStore.save(challenge)
+            #if canImport(FileProvider)
+            let records = await trustStore.allRecords()
+            try? FileProviderManagerHelper.shared.exportTrustedHostKeysToSharedContainer(records: records)
+            #endif
         } else {
             await trustStore.trustOnce(challenge)
         }
