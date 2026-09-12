@@ -306,6 +306,82 @@ final class SSHTestServer: @unchecked Sendable {
     var execDelay: TimeInterval? = nil
     var execHandler: (@Sendable (String) -> SSHCommandTestResponse)? = nil
 
+    private var herdrWorkspaces: [HerdrWorkspace] = SSHTestServer.defaultHerdrWorkspaces()
+    private var herdrPaneOutputs: [String: String] = SSHTestServer.defaultHerdrOutputs()
+
+    static func defaultHerdrWorkspaces() -> [HerdrWorkspace] {
+        let paneIdle = HerdrPane(
+            id: "pane-idle",
+            label: "worker-idle",
+            agentState: .idle,
+            currentCommand: nil,
+            lastActivity: Date(timeIntervalSince1970: 1700000000)
+        )
+        let paneWorking = HerdrPane(
+            id: "pane-working",
+            label: "builder",
+            agentState: .working,
+            currentCommand: "swift build",
+            lastActivity: Date(timeIntervalSince1970: 1700000100)
+        )
+        let paneBlocked = HerdrPane(
+            id: "pane-blocked",
+            label: "deployer",
+            agentState: .blocked(reason: "Awaiting approval for deployment"),
+            currentCommand: "deploy",
+            lastActivity: Date(timeIntervalSince1970: 1700000200)
+        )
+        let paneCompleted = HerdrPane(
+            id: "pane-completed",
+            label: "tester",
+            agentState: .completed(summary: "Integration tests passed"),
+            currentCommand: "swift test",
+            lastActivity: Date(timeIntervalSince1970: 1700000300)
+        )
+        let workspace = HerdrWorkspace(
+            id: "ws-test",
+            label: "default",
+            cwd: "/tmp/workspace",
+            panes: [paneIdle, paneWorking, paneBlocked, paneCompleted]
+        )
+        return [workspace]
+    }
+
+    static func defaultHerdrOutputs() -> [String: String] {
+        [
+            "pane-idle": "Agent idle. Waiting for task.\n$ \n",
+            "pane-working": "Running build pipeline...\nCompiling Sources/ShhCore/Herdr.swift\n",
+            "pane-blocked": "Deploy target: production.\nApproval required to proceed: [y/N] ",
+            "pane-completed": "All 42 integration tests passed in 1.84s.\n"
+        ]
+    }
+
+    func resetHerdrState() {
+        lock.withLock {
+            self.herdrWorkspaces = SSHTestServer.defaultHerdrWorkspaces()
+            self.herdrPaneOutputs = SSHTestServer.defaultHerdrOutputs()
+        }
+    }
+
+    func transitionHerdrPane(paneID: String, to state: HerdrAgentState, currentCommand: String? = nil) {
+        lock.withLock {
+            for wIndex in 0..<herdrWorkspaces.count {
+                for pIndex in 0..<herdrWorkspaces[wIndex].panes.count {
+                    if herdrWorkspaces[wIndex].panes[pIndex].id == paneID {
+                        let old = herdrWorkspaces[wIndex].panes[pIndex]
+                        herdrWorkspaces[wIndex].panes[pIndex] = HerdrPane(
+                            id: old.id,
+                            label: old.label,
+                            agentState: state,
+                            currentCommand: currentCommand ?? old.currentCommand,
+                            lastActivity: Date()
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     init(hostKey: Curve25519.Signing.PrivateKey = Curve25519.Signing.PrivateKey()) {
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.hostPrivateKey = hostKey
@@ -577,6 +653,97 @@ final class SSHTestServer: @unchecked Sendable {
                 stdout: "tmux 3.4\n",
                 stderr: ""
             )
+        }
+
+        if trimmed == HerdrCommand.probe || trimmed == "herdr --version" || trimmed == "herdr -v" || trimmed == "herdr version" {
+            return SSHCommandTestResponse(exitCode: 0, stdout: "herdr 0.1.0\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr workspace list") || trimmed.contains("herdr status") {
+            let workspaces = lock.withLock { self.herdrWorkspaces }
+            let data = (try? JSONEncoder().encode(workspaces)) ?? Data()
+            return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr workspace create") {
+            let newID = "ws-\(UUID().uuidString.prefix(8).lowercased())"
+            let label: String
+            if let labelRange = trimmed.range(of: "--label ") {
+                let rest = trimmed[labelRange.upperBound...].trimmingCharacters(in: .whitespaces)
+                label = rest.components(separatedBy: .whitespaces).first?.replacingOccurrences(of: "'", with: "") ?? "new-workspace"
+            } else {
+                label = "new-workspace"
+            }
+            let newWS = HerdrWorkspace(id: newID, label: label, cwd: "/tmp/\(label)", panes: [])
+            lock.withLock { self.herdrWorkspaces.append(newWS) }
+            let data = (try? JSONEncoder().encode(newWS)) ?? Data()
+            return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr tab create") {
+            return SSHCommandTestResponse(exitCode: 0, stdout: "Tab created\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr pane split") {
+            let newPaneID = "pane-\(UUID().uuidString.prefix(6).lowercased())"
+            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date())
+            lock.withLock {
+                if !self.herdrWorkspaces.isEmpty {
+                    self.herdrWorkspaces[0] = HerdrWorkspace(
+                        id: self.herdrWorkspaces[0].id,
+                        label: self.herdrWorkspaces[0].label,
+                        cwd: self.herdrWorkspaces[0].cwd,
+                        panes: self.herdrWorkspaces[0].panes + [newPane]
+                    )
+                }
+            }
+            let data = (try? JSONEncoder().encode(newPane)) ?? Data()
+            return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr pane list") {
+            let allPanes = lock.withLock { self.herdrWorkspaces.flatMap(\.panes) }
+            let data = (try? JSONEncoder().encode(allPanes)) ?? Data()
+            return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        }
+
+        if trimmed.contains("herdr pane read") {
+            let out: String = lock.withLock {
+                if trimmed.contains("pane-idle") {
+                    return self.herdrPaneOutputs["pane-idle"] ?? "Agent idle.\n"
+                } else if trimmed.contains("pane-working") {
+                    return self.herdrPaneOutputs["pane-working"] ?? "Running build pipeline...\n"
+                } else if trimmed.contains("pane-blocked") {
+                    return self.herdrPaneOutputs["pane-blocked"] ?? "Approval required.\n"
+                } else if trimmed.contains("pane-completed") {
+                    return self.herdrPaneOutputs["pane-completed"] ?? "Tests passed.\n"
+                } else {
+                    return "Recent output from pane.\n"
+                }
+            }
+            return SSHCommandTestResponse(exitCode: 0, stdout: out, stderr: "")
+        }
+
+        if trimmed.contains("herdr wait agent-status") {
+            let targetPane = ["pane-idle", "pane-working", "pane-blocked", "pane-completed"].first(where: { trimmed.contains($0) }) ?? "pane-working"
+            if trimmed.contains("done") || trimmed.contains("completed") {
+                transitionHerdrPane(paneID: targetPane, to: .completed(summary: "Finished execution successfully"))
+                let state = HerdrAgentState.completed(summary: "Finished execution successfully")
+                let data = (try? JSONEncoder().encode(state)) ?? Data()
+                return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+            } else {
+                let pane = lock.withLock { self.herdrWorkspaces.flatMap(\.panes).first(where: { $0.id == targetPane }) }
+                let state = pane?.agentState ?? .idle
+                let data = (try? JSONEncoder().encode(state)) ?? Data()
+                return SSHCommandTestResponse(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+            }
+        }
+
+        if trimmed.contains("herdr pane run") {
+            let targetPane = ["pane-idle", "pane-working", "pane-blocked", "pane-completed"].first(where: { trimmed.contains($0) }) ?? "pane-idle"
+            transitionHerdrPane(paneID: targetPane, to: .working, currentCommand: "herdr-task")
+            lock.withLock { self.herdrPaneOutputs[targetPane] = "Running task in \(targetPane)...\n" }
+            return SSHCommandTestResponse(exitCode: 0, stdout: "Command started in \(targetPane)\n", stderr: "")
         }
 
         if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
