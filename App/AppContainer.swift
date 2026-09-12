@@ -48,9 +48,21 @@ final class AppContainer: ObservableObject {
     @Published public var isProbingHerdr: Bool = false
     @Published public var isPollingHerdr: Bool = false
     @Published public var herdrError: String? = nil
+    @Published public var activeHerdrWorkspaceID: String? = nil
     private var herdrRefreshGeneration: Int = 0
     private var herdrPollingGeneration: Int = 0
     private var herdrPollingTask: Task<Void, Never>?
+
+    // MARK: - Mosh & Network Roaming State
+    public let moshTransport: any MoshTransport
+    @Published public var moshState: MoshState? = nil
+    @Published public var moshSessionInfo: MoshSessionInfo? = nil
+    @Published public var networkRoamingState: NetworkRoamingState? = nil
+    private var moshStateTask: Task<Void, Never>?
+
+    public var moshSessionPort: UInt16? {
+        moshSessionInfo?.udpPort
+    }
     @Published var selectedVoiceProviderID: String
     @Published var defaultVoiceMode: VoiceInputMode = .shellCommand
     @Published var voiceModels: [VoiceModelDescriptor] = []
@@ -158,6 +170,7 @@ final class AppContainer: ObservableObject {
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: (any CredentialStore)? = nil,
         transport: (any SSHTransport)? = nil,
+        moshTransport: (any MoshTransport)? = nil,
         transcriber: (any LocalTranscriber)? = nil,
         modelManager: WhisperModelManager? = nil,
         voiceRegistry: VoiceProviderRegistry? = nil,
@@ -194,10 +207,12 @@ final class AppContainer: ObservableObject {
             }
             throw TransportError.invalidConfiguration
         }
-        self.transport = transport ?? LiveSSHTransport(
+        let resolvedTransport = transport ?? LiveSSHTransport(
             credentialStore: resolvedCredentialStore,
             hostResolver: resolvedHostResolver
         )
+        self.transport = resolvedTransport
+        self.moshTransport = moshTransport ?? LiveMoshTransport(sshTransport: resolvedTransport)
         self.customTranscriber = transcriber
 
         let resolvedModelManager = modelManager ?? WhisperModelManager()
@@ -278,6 +293,11 @@ final class AppContainer: ObservableObject {
                 self?.handleReachabilityChange(reachable)
             }
         }
+        monitor.onInterfaceChange = { [weak self] newInterface, roamingState in
+            Task { @MainActor [weak self] in
+                await self?.handleNetworkInterfaceChange(newInterface, roamingState: roamingState)
+            }
+        }
         monitor.start()
 
         Task { [weak self] in
@@ -293,6 +313,8 @@ final class AppContainer: ObservableObject {
         catalog: InMemoryCatalog = InMemoryCatalog(),
         trustStore: InMemoryTrustStore = InMemoryTrustStore(),
         credentialStore: any CredentialStore = InMemoryCredentialStore(),
+        transport: (any SSHTransport)? = nil,
+        moshTransport: (any MoshTransport)? = nil,
         transcriber: (any LocalTranscriber)? = nil,
         modelManager: WhisperModelManager? = nil,
         voiceRegistry: VoiceProviderRegistry? = nil,
@@ -321,7 +343,8 @@ final class AppContainer: ObservableObject {
             catalog: catalog,
             trustStore: trustStore,
             credentialStore: credentialStore,
-            transport: DemoSSHTransport(),
+            transport: transport ?? DemoSSHTransport(),
+            moshTransport: moshTransport ?? DemoMoshTransport(),
             transcriber: demoTranscriber,
             modelManager: demoManager,
             voiceRegistry: demoRegistry,
@@ -382,6 +405,12 @@ final class AppContainer: ObservableObject {
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
         isProbingTmux = false
+        moshStateTask?.cancel()
+        moshStateTask = nil
+        moshState = nil
+        moshSessionInfo = nil
+        networkRoamingState = nil
+        activeHerdrWorkspaceID = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
         eventTask?.cancel()
@@ -424,15 +453,34 @@ final class AppContainer: ObservableObject {
         activeSession = session
         let initialSize = terminalController.size
         do {
-            let connection = try await transport.connect(
-                host: host,
-                identity: await identity(for: host),
-                trustEvaluator: trustStore,
-                initialSize: initialSize
-            )
+            let connection: any SSHConnection
+            if case .mosh = host.connection {
+                connection = try await moshTransport.connect(
+                    host: host,
+                    identity: await identity(for: host),
+                    trustEvaluator: trustStore,
+                    initialSize: initialSize
+                )
+            } else {
+                connection = try await transport.connect(
+                    host: host,
+                    identity: await identity(for: host),
+                    trustEvaluator: trustStore,
+                    initialSize: initialSize
+                )
+            }
             guard activeSession?.id == session.id, activeSession?.state == .connecting else {
                 await connection.close()
                 return
+            }
+            if let moshController = connection as? any MoshSessionControlling {
+                let info = await moshController.sessionInfo
+                self.moshSessionInfo = info
+                let st = await moshController.moshState
+                self.moshState = st
+                let roaming = await moshController.roamingState
+                self.networkRoamingState = roaming
+                startMoshMonitoring(for: moshController, session: session)
             }
             // Host key is accepted and connection succeeded; load redaction secret if available
             await loadRedactionSecret(for: host)
@@ -632,20 +680,47 @@ final class AppContainer: ObservableObject {
         isProbingTmux = false
         isProbingHerdr = false
 
+        // Cleanly reset terminal emulator buffer and parser to avoid stream corruption
+        terminalGrid = TerminalGrid()
+        ansiParser = ANSIParser()
+        terminalText = ""
+        redactor = Redactor()
+        terminalController.reset()
+
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
 
         let initialSize = terminalController.size
-        let connection = try await transport.connect(
-            host: host,
-            identity: await identity(for: host),
-            trustEvaluator: trustStore,
-            initialSize: initialSize
-        )
+        let connection: any SSHConnection
+        if case .mosh = host.connection {
+            connection = try await moshTransport.connect(
+                host: host,
+                identity: await identity(for: host),
+                trustEvaluator: trustStore,
+                initialSize: initialSize
+            )
+        } else {
+            connection = try await transport.connect(
+                host: host,
+                identity: await identity(for: host),
+                trustEvaluator: trustStore,
+                initialSize: initialSize
+            )
+        }
 
         guard activeSession?.id == session.id, !isExplicitDisconnect else {
             await connection.close()
             throw TransportError.cancelled
+        }
+
+        if let moshController = connection as? any MoshSessionControlling {
+            let info = await moshController.sessionInfo
+            self.moshSessionInfo = info
+            let st = await moshController.moshState
+            self.moshState = st
+            let roaming = await moshController.roamingState
+            self.networkRoamingState = roaming
+            startMoshMonitoring(for: moshController, session: session)
         }
 
         await loadRedactionSecret(for: host)
@@ -680,6 +755,10 @@ final class AppContainer: ObservableObject {
 
         if let target = targetSession {
             await self.handleTmuxTarget(target, on: connection, host: host, session: session)
+        }
+
+        if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
+            await refreshHerdrState()
         }
 
         let events = await connection.events()
@@ -738,7 +817,78 @@ final class AppContainer: ObservableObject {
                 }
             } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
                 handleConnectionDrop(host: host)
+            } else if let host = activeHost, case .mosh = host.connection {
+                Task { [weak self] in
+                    await self?.performFastSessionRecovery()
+                }
             }
+        }
+    }
+
+    // MARK: - Mosh Network Roaming & Fast Session Recovery
+
+    private func startMoshMonitoring(for controller: any MoshSessionControlling, session: TerminalSession) {
+        moshStateTask?.cancel()
+        moshStateTask = Task { @MainActor [weak self] in
+            let updates = await controller.moshStateUpdates()
+            for await state in updates {
+                guard let self, self.activeSession?.id == session.id else { break }
+                self.moshState = state
+                if case .roaming(let roaming) = state {
+                    self.networkRoamingState = roaming
+                }
+            }
+        }
+    }
+
+    func handleNetworkInterfaceChange(_ newInterface: NetworkInterfaceType, roamingState: NetworkRoamingState) async {
+        guard !isExplicitDisconnect else { return }
+        self.networkRoamingState = roamingState
+
+        if let moshController = connection as? any MoshSessionControlling {
+            do {
+                try await moshController.handleNetworkRoaming(roamingState)
+                self.moshState = await moshController.moshState
+                // Probe/resync Tmux and Herdr without corrupting terminal buffer
+                if activeTmuxSessionID != nil {
+                    _ = await probeTmux()
+                }
+                if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
+                    await refreshHerdrState()
+                }
+            } catch {
+                await performFastSessionRecovery()
+            }
+        }
+    }
+
+    func performFastSessionRecovery() async {
+        guard let host = activeHost, !isExplicitDisconnect else { return }
+        guard reachabilityMonitor.isReachable else {
+            reconnectState = .waiting(attempt: 1, delay: 2.0)
+            return
+        }
+
+        if let moshController = connection as? any MoshSessionControlling {
+            let roaming = networkRoamingState ?? NetworkRoamingState(currentInterface: reachabilityMonitor.currentInterfaceType)
+            do {
+                try await moshController.handleNetworkRoaming(roaming)
+                self.moshState = await moshController.moshState
+                if activeTmuxSessionID != nil {
+                    _ = await probeTmux()
+                }
+                if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
+                    await refreshHerdrState()
+                }
+                return
+            } catch {
+                // In-place recovery probe failed; fall back to reconnect coordinator
+            }
+        }
+
+        await reconnectCoordinator.start { [weak self] attempt in
+            guard let self else { return }
+            try await self.performReconnect(to: host, attempt: attempt)
         }
     }
 
@@ -881,6 +1031,13 @@ final class AppContainer: ObservableObject {
         isProbingHerdr = false
         herdrAvailability = .unavailable(reason: "Not connected")
         herdrError = nil
+        activeHerdrWorkspaceID = nil
+
+        moshStateTask?.cancel()
+        moshStateTask = nil
+        moshState = nil
+        moshSessionInfo = nil
+        networkRoamingState = nil
 
         // Reset SFTP session, preview, editor, and transfer state
         closePreview()
@@ -959,6 +1116,17 @@ final class AppContainer: ObservableObject {
                    let value = String(data: secret, encoding: .utf8), !value.isEmpty {
                     secrets.append(value)
                 }
+            }
+        }
+        if let moshController = connection as? any MoshSessionControlling {
+            let key = await moshController.sessionInfo.sessionKey.base64String
+            if !key.isEmpty {
+                secrets.append(key)
+            }
+        } else if let sessionInfo = self.moshSessionInfo {
+            let key = sessionInfo.sessionKey.base64String
+            if !key.isEmpty {
+                secrets.append(key)
             }
         }
         if !secrets.isEmpty {
@@ -2000,6 +2168,12 @@ final class AppContainer: ObservableObject {
     func setupSFTPForHost(_ host: Host) async {
         guard customSFTPRepository == nil else {
             await loadDirectory(at: currentPath)
+            return
+        }
+        if case .mosh = host.connection {
+            // Mosh connections operate over UDP and do not establish an SFTP subsystem channel
+            self.sftpRepository = nil
+            self.sftpErrorMessage = nil
             return
         }
         if isDemo {
