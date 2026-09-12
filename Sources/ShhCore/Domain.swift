@@ -93,6 +93,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     public var lastUsedAt: Date?
     public var tmuxPreferences: HostTmuxPreferences
     public var voicePolicy: HostVoicePolicy
+    public var isProduction: Bool
 
     public var isVoiceEnabled: Bool {
         voicePolicy.isEnabled
@@ -123,7 +124,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         tmuxPreferences: HostTmuxPreferences = HostTmuxPreferences(),
         defaultTmuxSession: String? = nil,
         autoAttachTmux: Bool = false,
-        voicePolicy: HostVoicePolicy = .disabled
+        voicePolicy: HostVoicePolicy = .disabled,
+        isProduction: Bool? = nil
     ) throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "host name") }
         guard !hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "hostname") }
@@ -133,6 +135,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.groupID = groupID; self.tagIDs = tagIDs; self.identityID = identityID; self.connection = connection
         self.health = health; self.lastUsedAt = lastUsedAt
         self.voicePolicy = voicePolicy
+        let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
+        self.isProduction = isProduction ?? inferredProd
         if defaultTmuxSession != nil || autoAttachTmux {
             self.tmuxPreferences = HostTmuxPreferences(
                 defaultSession: defaultTmuxSession ?? tmuxPreferences.defaultSession,
@@ -148,7 +152,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, hostname, port, username, groupID, tagIDs, identityID, connection, health, lastUsedAt
         case tmuxPreferences, defaultTmuxSession, autoAttachTmux, autoAttach
-        case voicePolicy
+        case voicePolicy, isProduction
     }
 
     public init(from decoder: Decoder) throws {
@@ -165,6 +169,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.health = try container.decodeIfPresent(HealthState.self, forKey: .health) ?? .unknown
         self.lastUsedAt = try container.decodeIfPresent(Date.self, forKey: .lastUsedAt)
         self.voicePolicy = try container.decodeIfPresent(HostVoicePolicy.self, forKey: .voicePolicy) ?? .disabled
+        let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
+        self.isProduction = (try? container.decodeIfPresent(Bool.self, forKey: .isProduction)) ?? inferredProd
 
         if let prefs = try container.decodeIfPresent(HostTmuxPreferences.self, forKey: .tmuxPreferences) {
             self.tmuxPreferences = prefs
@@ -194,6 +200,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(defaultTmuxSession, forKey: .defaultTmuxSession)
         try container.encode(autoAttachTmux, forKey: .autoAttachTmux)
         try container.encode(voicePolicy, forKey: .voicePolicy)
+        try container.encode(isProduction, forKey: .isProduction)
     }
 }
 
