@@ -76,8 +76,8 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
             Text(container.isDemo
-                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP active. Mosh is not enabled in this build. Local voice AI active."
-                : "Live SSH transport active. \(surfaceDescription) SFTP active. Mosh is not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
+                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh is not enabled in this build. Local voice AI active."
+                : "Live SSH transport active. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh is not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -129,9 +129,81 @@ struct HostDetailView: View {
     @EnvironmentObject private var container: AppContainer
     let host: Host
     @State private var showEditor = false
+    @State private var showPortForwarding = false
+    @State private var bastionHops: [String] = []
+
     var body: some View {
         Form {
-            Section("Endpoint") { LabeledContent("Address", value: host.address); LabeledContent("Profile", value: profileName) }
+            Section("Endpoint") {
+                LabeledContent("Address", value: host.address)
+                LabeledContent("Profile", value: profileName)
+            }
+
+            if case .proxyJump(let opts) = host.connection {
+                Section("ProxyJump Bastion Chain") {
+                    if opts.config.hops.isEmpty {
+                        Text("No bastion hops configured")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(opts.config.hops.enumerated()), id: \.offset) { index, hop in
+                            HStack {
+                                Label("Hop \(index + 1)", systemImage: "arrow.triangle.branch")
+                                Spacer()
+                                Text(hopDescription(index: index, hop: hop))
+                                    .foregroundStyle(.secondary)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Hop \(index + 1): \(hopDescription(index: index, hop: hop))")
+                            .accessibilityIdentifier("host-detail-hop-\(index)")
+                        }
+                    }
+                }
+            }
+
+            Section("Port Forwarding") {
+                if host.forwardingRules.isEmpty {
+                    Text("No forwarding rules configured.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(host.forwardingRules) { rule in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                HStack {
+                                    Text(rule.name).font(.subheadline.bold())
+                                    PortForwardingTypeBadge(type: rule.type)
+                                }
+                                Text(portForwardingRuleSummary(rule))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            if isHostActiveSession {
+                                let live = container.forwardingSessions.first(where: { $0.ruleID == rule.id })
+                                ForwardingStatusPill(status: live?.status ?? .stopped)
+                            } else {
+                                Text(rule.enabled ? "Auto-start" : "Disabled")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .accessibilityElement(children: .combine)
+                        .accessibilityIdentifier("host-detail-rule-\(rule.id)")
+                    }
+                }
+
+                if isHostActiveSession {
+                    Button {
+                        showPortForwarding = true
+                    } label: {
+                        Label("Manage Forwarders (\(container.activeForwardersCount) active)", systemImage: "arrow.triangle.swap")
+                    }
+                    .accessibilityIdentifier("host-detail-manage-forwarders-button")
+                    .accessibilityLabel("Manage active port forwarders")
+                }
+            }
+
             Section("Safety") {
                 Label("Secrets stay in Keychain references", systemImage: "lock.shield")
                 Label("Unknown host keys require approval", systemImage: "checkmark.shield")
@@ -152,26 +224,59 @@ struct HostDetailView: View {
             }
         }
         .navigationTitle(host.name)
+        .task {
+            bastionHops = await container.resolveBastionNames(for: host)
+        }
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
+        .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }
         .safeAreaInset(edge: .bottom) {
             if let session = container.activeSession, session.hostID == host.id {
                 NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding()
             }
         }
     }
+
+    private var isHostActiveSession: Bool {
+        container.activeSession?.hostID == host.id && container.activeSession?.state == .connected
+    }
+
     private var isConnectDisabled: Bool {
         container.activeSession?.state == .connecting ||
             (container.activeSession?.hostID == host.id && container.activeSession?.state == .connected)
     }
+
     private var isFailedForThisHost: Bool {
         container.activeSession?.hostID == host.id && container.activeSession?.state == .failed
     }
+
     private var profileName: String {
-        if case .ssh = host.connection {
+        switch host.connection {
+        case .ssh:
             return container.isDemo ? "SSH (demo adapter)" : "SSH (live adapter)"
+        case .proxyJump(let opts):
+            return "ProxyJump (\(opts.config.hops.count) hop\(opts.config.hops.count == 1 ? "" : "s"))"
+        case .mosh:
+            return "Capability unavailable"
         }
-        return "Capability unavailable"
     }
+
+    private func hopDescription(index: Int, hop: ProxyJumpHop) -> String {
+        if bastionHops.indices.contains(index) && !bastionHops[index].isEmpty {
+            return bastionHops[index]
+        }
+        switch hop {
+        case .hostID(let id):
+            return id.uuidString.prefix(8) + "..."
+        case .endpoint(let ep):
+            return "\(ep.username)@\(ep.hostname):\(ep.port)"
+        }
+    }
+}
+
+enum HostConnectionType: String, CaseIterable, Identifiable {
+    case direct = "Direct SSH"
+    case proxyJump = "ProxyJump Bastion"
+    var id: String { rawValue }
 }
 
 struct HostEditorView: View {
@@ -183,6 +288,12 @@ struct HostEditorView: View {
     @State private var username: String
     @State private var port: String
     @State private var identityID: UUID?
+    @State private var connectionType: HostConnectionType
+    @State private var selectedBastionIDs: [UUID]
+    @State private var forwardingRules: [PortForwardingRule]
+    @State private var showingAddRule = false
+    @State private var ruleToEdit: PortForwardingRule? = nil
+    @State private var allHosts: [Host] = []
     @State private var defaultTmuxSession: String
     @State private var autoAttachTmux: Bool
     @State private var enableVoice: Bool
@@ -199,6 +310,20 @@ struct HostEditorView: View {
         _username = State(initialValue: existing?.username ?? "")
         _port = State(initialValue: String(existing?.port ?? 22))
         _identityID = State(initialValue: existing?.identityID)
+
+        let initialType: HostConnectionType
+        let initialBastions: [UUID]
+        if case .proxyJump(let jumpOpts) = existing?.connection {
+            initialType = .proxyJump
+            initialBastions = jumpOpts.config.hostIDs
+        } else {
+            initialType = .direct
+            initialBastions = []
+        }
+        _connectionType = State(initialValue: initialType)
+        _selectedBastionIDs = State(initialValue: initialBastions)
+        _forwardingRules = State(initialValue: existing?.forwardingRules ?? [])
+
         _defaultTmuxSession = State(initialValue: existing?.defaultTmuxSession ?? "")
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
         _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
@@ -209,21 +334,139 @@ struct HostEditorView: View {
         _isProductionHost = State(initialValue: existing?.isProduction ?? false)
     }
 
+    private var availableBastions: [Host] {
+        allHosts.filter { $0.id != existing?.id }
+    }
+
+    private func bastionName(for id: UUID) -> String {
+        if let host = allHosts.first(where: { $0.id == id }) {
+            return "\(host.name) (\(host.address))"
+        }
+        return id.uuidString.prefix(8) + "..."
+    }
+
     var body: some View {
         NavigationStack {
             Form {
                 Section("Host metadata") {
                     TextField("Name", text: $name)
+                        .accessibilityIdentifier("host-editor-name-field")
                     TextField("Hostname", text: $hostname)
+                        .accessibilityIdentifier("host-editor-hostname-field")
                     TextField("Username", text: $username)
+                        .accessibilityIdentifier("host-editor-username-field")
                     TextField("Port", text: $port).keyboardType(.numberPad)
+                        .accessibilityIdentifier("host-editor-port-field")
                     Picker("Identity", selection: $identityID) {
                         Text("None").tag(UUID?.none)
                         ForEach(identities) { identity in
                             Text(identity.name).tag(Optional(identity.id))
                         }
                     }
+                    .accessibilityIdentifier("host-editor-identity-picker")
                 }
+
+                Section("Connection & ProxyJump") {
+                    Picker("Connection Type", selection: $connectionType) {
+                        ForEach(HostConnectionType.allCases) { type in
+                            Text(type.rawValue).tag(type)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("host-editor-connection-type-picker")
+                    .accessibilityLabel("Connection type picker")
+
+                    if connectionType == .proxyJump {
+                        if selectedBastionIDs.isEmpty {
+                            Text("No jump bastions selected. Add one or more hops from saved hosts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(Array(selectedBastionIDs.enumerated()), id: \.offset) { index, bastionID in
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Hop \(index + 1)")
+                                            .font(.caption2.bold())
+                                            .foregroundStyle(.secondary)
+                                        Text(bastionName(for: bastionID))
+                                            .font(.subheadline)
+                                    }
+                                    Spacer()
+                                    Button(role: .destructive) {
+                                        selectedBastionIDs.remove(at: index)
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .foregroundStyle(.red)
+                                    }
+                                    .buttonStyle(.borderless)
+                                    .accessibilityLabel("Remove hop \(index + 1)")
+                                    .accessibilityIdentifier("remove-hop-\(index)")
+                                }
+                            }
+                        }
+
+                        if !availableBastions.isEmpty {
+                            Menu {
+                                ForEach(availableBastions) { bastion in
+                                    Button(bastion.name) {
+                                        selectedBastionIDs.append(bastion.id)
+                                    }
+                                }
+                            } label: {
+                                Label("Add Jump Bastion", systemImage: "plus.circle")
+                            }
+                            .accessibilityIdentifier("add-bastion-hop-button")
+                            .accessibilityLabel("Add jump bastion hop")
+                        } else {
+                            Text("No other saved hosts available to use as a bastion.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                Section("Port Forwarding Rules") {
+                    if forwardingRules.isEmpty {
+                        Text("No forwarding rules configured.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach($forwardingRules) { $rule in
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    HStack {
+                                        Text(rule.name).font(.subheadline.bold())
+                                        PortForwardingTypeBadge(type: rule.type)
+                                    }
+                                    Text(portForwardingRuleSummary(rule))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Toggle("", isOn: $rule.enabled)
+                                    .labelsHidden()
+                                    .accessibilityLabel("Enable \(rule.name)")
+                                    .accessibilityIdentifier("toggle-rule-\(rule.id)")
+                            }
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                ruleToEdit = rule
+                            }
+                        }
+                        .onDelete { indices in
+                            forwardingRules.remove(atOffsets: indices)
+                        }
+                    }
+
+                    Button {
+                        showingAddRule = true
+                    } label: {
+                        Label("Add Forwarding Rule", systemImage: "plus.circle")
+                    }
+                    .accessibilityIdentifier("host-editor-add-rule-button")
+                    .accessibilityLabel("Add port forwarding rule")
+                }
+
                 Section("Tmux preferences") {
                     Toggle("Auto-attach tmux session", isOn: $autoAttachTmux)
                         .accessibilityIdentifier("host-editor-auto-attach-toggle")
@@ -261,11 +504,28 @@ struct HostEditorView: View {
                 }
             }
             .navigationTitle(existing == nil ? "New host" : "Edit host")
-            .task { identities = (try? await container.catalog.identities()) ?? [] }
+            .task {
+                identities = (try? await container.catalog.identities()) ?? []
+                allHosts = (try? await container.catalog.listHosts()) ?? []
+            }
+            .sheet(isPresented: $showingAddRule) {
+                PortForwardingRuleEditorSheet { newRule in
+                    forwardingRules.append(newRule)
+                }
+            }
+            .sheet(item: $ruleToEdit) { rule in
+                PortForwardingRuleEditorSheet(existingRule: rule) { updatedRule in
+                    if let idx = forwardingRules.firstIndex(where: { $0.id == updatedRule.id }) {
+                        forwardingRules[idx] = updatedRule
+                    }
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { save() }.disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid)
+                    Button("Save") { save() }
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && selectedBastionIDs.isEmpty))
+                        .accessibilityIdentifier("host-editor-save-button")
                 }
             }
         }
@@ -304,6 +564,7 @@ struct HostEditorView: View {
 
     private func save() {
         guard isTmuxPreferenceValid else { return }
+        if connectionType == .proxyJump && selectedBastionIDs.isEmpty { return }
         let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
         var allowedModes: Set<VoiceInputMode> = []
@@ -311,6 +572,22 @@ struct HostEditorView: View {
         if allowAgentMessage { allowedModes.insert(.agentMessage) }
         if allowInsertOnly { allowedModes.insert(.insertOnly) }
         let voicePolicy = HostVoicePolicy(isEnabled: enableVoice, allowedModes: allowedModes)
+
+        let profile: ConnectionProfile
+        let existingSSH: SSHOptions
+        if case .ssh(let opts) = existing?.connection {
+            existingSSH = opts
+        } else if case .proxyJump(let opts) = existing?.connection {
+            existingSSH = opts.sshOptions
+        } else {
+            existingSSH = SSHOptions()
+        }
+
+        if connectionType == .proxyJump && !selectedBastionIDs.isEmpty {
+            profile = .proxyJump(ProxyJumpOptions(hopHostIDs: selectedBastionIDs, sshOptions: existingSSH))
+        } else {
+            profile = .ssh(existingSSH)
+        }
 
         guard let portNumber = UInt16(port),
               let host = try? Host(
@@ -320,11 +597,12 @@ struct HostEditorView: View {
                   port: portNumber,
                   username: username,
                   identityID: identityID,
-                  connection: existing?.connection ?? .ssh(SSHOptions()),
+                  connection: profile,
                   defaultTmuxSession: sessionPref,
                   autoAttachTmux: autoAttachTmux,
                   voicePolicy: voicePolicy,
-                  isProduction: isProductionHost
+                  isProduction: isProductionHost,
+                  forwardingRules: forwardingRules
               ) else { return }
         Task {
             do {
@@ -357,6 +635,7 @@ struct SessionView: View {
     @State private var isSearchPresented = false
     @State private var searchQuery = ""
     @State private var pendingRiskyPaste: String?
+    @State private var showPortForwarding = false
     private let policy = CommandPolicy()
 
     var body: some View {
@@ -394,6 +673,7 @@ struct SessionView: View {
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
+        .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
         .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
@@ -516,6 +796,35 @@ struct SessionView: View {
                     .accessibilityIdentifier("active-tmux-indicator")
             }
 
+            if let activeHost = container.activeHost,
+               case .proxyJump(let opts) = activeHost.connection,
+               !opts.config.hops.isEmpty {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Label("\(opts.config.hops.count) Hop\(opts.config.hops.count == 1 ? "" : "s")", systemImage: "arrow.triangle.branch")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("\(opts.config.hops.count) jump bastion hop\(opts.config.hops.count == 1 ? "" : "s")")
+                    .accessibilityIdentifier("session-jump-hops-indicator")
+            }
+
+            if container.activeForwardersCount > 0 {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Button(action: {
+                    showPortForwarding = true
+                }) {
+                    Label("\(container.activeForwardersCount)", systemImage: "arrow.triangle.swap")
+                        .font(.caption.bold())
+                        .foregroundStyle(Color.accentColor)
+                }
+                .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
+                .accessibilityIdentifier("session-forwarders-indicator")
+            }
+
             Spacer()
 
             // Voice Command Button
@@ -589,6 +898,14 @@ struct SessionView: View {
                 }
                 .accessibilityIdentifier("open-multiplexer-button")
                 .accessibilityLabel("Open remote multiplexer sheet")
+
+                Button(action: {
+                    showPortForwarding = true
+                }) {
+                    Label("Port Forwarding (\(container.activeForwardersCount))", systemImage: "arrow.triangle.swap")
+                }
+                .accessibilityIdentifier("open-port-forwarding-button")
+                .accessibilityLabel("Open port forwarding sheet")
 
                 Button(action: {
                     container.useLegacyTerminalFallback.toggle()
@@ -1391,7 +1708,7 @@ struct SettingsView: View {
                 Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill")
             }
             Section("Capabilities") {
-                Text("Mosh, ProxyJump, forwarding, SFTP, and non-tmux adapters: not enabled in this build. WhisperKit and Apple Speech voice transcription: active.")
+                Text("ProxyJump, forwarding, SFTP, and live SSH active. Mosh and non-tmux multiplexers: not enabled in this build. WhisperKit and Apple Speech voice transcription: active.")
                     .font(.caption)
             }
             Section("Privacy") {

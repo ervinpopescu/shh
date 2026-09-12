@@ -52,6 +52,17 @@ final class AppContainer: ObservableObject {
     @Published var activeVoicePreview: VoicePreviewState? = nil
     @Published var isSlideToCancelActive: Bool = false
 
+    // MARK: - Port Forwarding & ProxyJump
+    public let customPortForwardingManager: (any PortForwardingManaging)?
+    @Published public var portForwardingManager: (any PortForwardingManaging)?
+    @Published public var forwardingSessions: [ForwardingSessionState] = []
+    @Published public var forwardingErrorMessage: String? = nil
+    private var forwardingStreamTask: Task<Void, Never>?
+
+    public var activeForwardersCount: Int {
+        forwardingSessions.filter { $0.status == .active }.count
+    }
+
     // MARK: - SFTP & File Management
     public let customSFTPRepository: (any SFTPRepository)?
     @Published public var sftpRepository: (any SFTPRepository)?
@@ -146,7 +157,9 @@ final class AppContainer: ObservableObject {
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil,
-        sftpRepository: (any SFTPRepository)? = nil
+        sftpRepository: (any SFTPRepository)? = nil,
+        portForwardingManager: (any PortForwardingManaging)? = nil,
+        hostResolver: LiveSSHTransport.HostResolver? = nil
     ) {
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
@@ -154,7 +167,27 @@ final class AppContainer: ObservableObject {
         self.catalog = catalog
         self.trustStore = trustStore
         self.credentialStore = resolvedCredentialStore
-        self.transport = transport ?? LiveSSHTransport(credentialStore: resolvedCredentialStore)
+        let resolvedHostResolver: LiveSSHTransport.HostResolver = hostResolver ?? { [catalog] (hostID: UUID) async throws -> (Host, IdentityDescriptor?) in
+            let hosts = try await catalog.listHosts()
+            if let bastion = hosts.first(where: { $0.id == hostID }) {
+                var ident: IdentityDescriptor? = nil
+                if let identityID = bastion.identityID {
+                    let idents = try await catalog.identities()
+                    ident = idents.first(where: { $0.id == identityID })
+                }
+                return (bastion, ident)
+            }
+            let idents = try await catalog.identities()
+            if let ident = idents.first(where: { $0.id == hostID }) {
+                let placeholder = try Host(name: ident.name, hostname: "localhost", username: "unknown")
+                return (placeholder, ident)
+            }
+            throw TransportError.invalidConfiguration
+        }
+        self.transport = transport ?? LiveSSHTransport(
+            credentialStore: resolvedCredentialStore,
+            hostResolver: resolvedHostResolver
+        )
         self.customTranscriber = transcriber
 
         let resolvedModelManager = modelManager ?? WhisperModelManager()
@@ -204,6 +237,18 @@ final class AppContainer: ObservableObject {
             self.sftpRepository = nil
         }
 
+        self.customPortForwardingManager = portForwardingManager
+        if let portForwardingManager {
+            self.portForwardingManager = portForwardingManager
+            self.startForwardingMonitoring(manager: portForwardingManager)
+        } else if self.transport is DemoSSHTransport {
+            let demoPF = DemoPortForwardingManager()
+            self.portForwardingManager = demoPF
+            self.startForwardingMonitoring(manager: demoPF)
+        } else {
+            self.portForwardingManager = nil
+        }
+
         bridge.onInterruption = { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.cancelVoiceRecording()
@@ -247,7 +292,8 @@ final class AppContainer: ObservableObject {
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil,
-        sftpRepository: (any SFTPRepository)? = nil
+        sftpRepository: (any SFTPRepository)? = nil,
+        portForwardingManager: (any PortForwardingManaging)? = nil
     ) -> AppContainer {
         let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
         let demoTranscriber = transcriber ?? DemoTranscriber()
@@ -278,7 +324,8 @@ final class AppContainer: ObservableObject {
                 clock: { _ in },
                 jitter: ReconnectCoordinator.zeroJitter
             ),
-            sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true)
+            sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true),
+            portForwardingManager: portForwardingManager ?? DemoPortForwardingManager()
         )
     }
 
@@ -347,6 +394,16 @@ final class AppContainer: ObservableObject {
         drainPendingConflicts()
         directoryCache.removeAll()
 
+        // Reset port forwarding state
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        await portForwardingManager?.stopAll()
+        if !isDemo {
+            portForwardingManager = nil
+        }
+        forwardingSessions = []
+        forwardingErrorMessage = nil
+
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
         let initialSize = terminalController.size
@@ -401,6 +458,21 @@ final class AppContainer: ObservableObject {
 
             let events = await connection.events()
             startEventMonitoring(for: connection, events: events, session: session, host: host)
+
+            // Wire port forwarding manager and auto-start enabled rules
+            let pfManager: any PortForwardingManaging
+            if let custom = self.customPortForwardingManager {
+                pfManager = custom
+            } else if self.isDemo {
+                pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
+            } else if let live = connection as? LiveSSHConnection {
+                pfManager = PortForwardingManager(connection: live)
+            } else {
+                pfManager = UnavailablePortForwardingManager()
+            }
+            self.portForwardingManager = pfManager
+            self.startForwardingMonitoring(manager: pfManager)
+            await self.autoStartForwardingRules(for: host, manager: pfManager)
 
             Task { [weak self] in
                 await self?.refreshTmuxState()
@@ -467,6 +539,10 @@ final class AppContainer: ObservableObject {
                             self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
                         }
                         self.redactor = Redactor()
+                        self.forwardingStreamTask?.cancel()
+                        self.forwardingStreamTask = nil
+                        await self.portForwardingManager?.stopAll()
+                        self.forwardingSessions = []
                         self.handleConnectionDrop(host: host)
                     case .error(let error):
                         self.tmuxRefreshGeneration += 1
@@ -479,6 +555,10 @@ final class AppContainer: ObservableObject {
                             self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
                         }
                         self.redactor = Redactor()
+                        self.forwardingStreamTask?.cancel()
+                        self.forwardingStreamTask = nil
+                        await self.portForwardingManager?.stopAll()
+                        self.forwardingSessions = []
                         self.handleConnectionDrop(host: host)
                     }
                 }
@@ -494,6 +574,10 @@ final class AppContainer: ObservableObject {
                     self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
                 }
                 self.redactor = Redactor()
+                self.forwardingStreamTask?.cancel()
+                self.forwardingStreamTask = nil
+                await self.portForwardingManager?.stopAll()
+                self.forwardingSessions = []
                 self.handleConnectionDrop(host: host)
             }
         }
@@ -572,6 +656,20 @@ final class AppContainer: ObservableObject {
 
         let events = await connection.events()
         startEventMonitoring(for: connection, events: events, session: session, host: host)
+
+        let pfManager: any PortForwardingManaging
+        if let custom = self.customPortForwardingManager {
+            pfManager = custom
+        } else if self.isDemo {
+            pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
+        } else if let live = connection as? LiveSSHConnection {
+            pfManager = PortForwardingManager(connection: live)
+        } else {
+            pfManager = UnavailablePortForwardingManager()
+        }
+        self.portForwardingManager = pfManager
+        self.startForwardingMonitoring(manager: pfManager)
+        await self.autoStartForwardingRules(for: host, manager: pfManager)
 
         Task { [weak self] in
             await self?.refreshTmuxState()
@@ -760,6 +858,16 @@ final class AppContainer: ObservableObject {
         }
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
+
+        // Reset port forwarding state
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        await portForwardingManager?.stopAll()
+        if !isDemo {
+            portForwardingManager = nil
+        }
+        forwardingSessions = []
+        forwardingErrorMessage = nil
     }
 
     private func detachCallbacks() {
@@ -788,12 +896,35 @@ final class AppContainer: ObservableObject {
 
     private func loadRedactionSecret(for host: Host) async {
         redactor = Redactor()
-        guard let identityID = host.identityID,
-              let identities = try? await catalog.identities(),
-              let identity = identities.first(where: { $0.id == identityID }),
-              let secret = try? await credentialStore.load(reference: identity.keychainReference),
-              let value = String(data: secret, encoding: .utf8), !value.isEmpty else { return }
-        redactor = Redactor(secrets: [value])
+        var secrets: [String] = []
+        let identities = (try? await catalog.identities()) ?? []
+        if let identityID = host.identityID,
+           let identity = identities.first(where: { $0.id == identityID }),
+           let secret = try? await credentialStore.load(reference: identity.keychainReference),
+           let value = String(data: secret, encoding: .utf8), !value.isEmpty {
+            secrets.append(value)
+        }
+        if case .proxyJump(let jumpOpts) = host.connection {
+            let hosts = (try? await catalog.listHosts()) ?? []
+            for hop in jumpOpts.config.hops {
+                let idID: UUID?
+                switch hop {
+                case .hostID(let hid):
+                    idID = hosts.first(where: { $0.id == hid })?.identityID
+                case .endpoint(let ep):
+                    idID = ep.identityID
+                }
+                if let idID,
+                   let ident = identities.first(where: { $0.id == idID }),
+                   let secret = try? await credentialStore.load(reference: ident.keychainReference),
+                   let value = String(data: secret, encoding: .utf8), !value.isEmpty {
+                    secrets.append(value)
+                }
+            }
+        }
+        if !secrets.isEmpty {
+            redactor = Redactor(secrets: secrets)
+        }
     }
 
     internal func redacted(_ data: Data) -> Data {
@@ -2077,5 +2208,112 @@ final class AppContainer: ObservableObject {
             editorErrorMessage = error.localizedDescription
             throw error
         }
+    }
+
+    // MARK: - Port Forwarding Management
+
+    private func startForwardingMonitoring(manager: any PortForwardingManaging) {
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = Task { @MainActor [weak self] in
+            let stream = await manager.sessionStatesStream()
+            for await states in stream {
+                guard let self else { return }
+                self.forwardingSessions = states
+            }
+        }
+    }
+
+    private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async {
+        for rule in host.forwardingRules where rule.enabled {
+            do {
+                _ = try await manager.startForwarding(rule: rule)
+            } catch {
+                forwardingErrorMessage = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    @discardableResult
+    public func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState {
+        guard let manager = portForwardingManager else {
+            throw TransportError.unsupported
+        }
+        forwardingErrorMessage = nil
+        do {
+            let session = try await manager.startForwarding(rule: rule)
+            return session
+        } catch {
+            forwardingErrorMessage = error.localizedDescription
+            throw error
+        }
+    }
+
+    public func stopForwarding(ruleID: UUID) async {
+        guard let manager = portForwardingManager else { return }
+        do {
+            try await manager.stopForwarding(ruleID: ruleID)
+        } catch {
+            forwardingErrorMessage = error.localizedDescription
+        }
+    }
+
+    public func stopAllForwarding() async {
+        guard let manager = portForwardingManager else { return }
+        await manager.stopAll()
+    }
+
+    public func addForwardingRule(_ rule: PortForwardingRule, for host: Host, autoStartIfConnected: Bool = true) async throws {
+        var updatedHost = host
+        if let idx = updatedHost.forwardingRules.firstIndex(where: { $0.id == rule.id }) {
+            updatedHost.forwardingRules[idx] = rule
+        } else {
+            updatedHost.forwardingRules.append(rule)
+        }
+        try await catalog.save(updatedHost)
+        if activeHost?.id == host.id {
+            activeHost = updatedHost
+            if autoStartIfConnected && rule.enabled {
+                _ = try? await startForwarding(rule: rule)
+            }
+        }
+    }
+
+    public func removeForwardingRule(ruleID: UUID, for host: Host) async throws {
+        await stopForwarding(ruleID: ruleID)
+        var updatedHost = host
+        updatedHost.forwardingRules.removeAll { $0.id == ruleID }
+        try await catalog.save(updatedHost)
+        if activeHost?.id == host.id {
+            activeHost = updatedHost
+        }
+    }
+
+    // MARK: - ProxyJump Bastion Resolution
+
+    public func resolveBastionHops(for host: Host) async -> [(Host, IdentityDescriptor?)] {
+        guard case .proxyJump(let jumpOpts) = host.connection else { return [] }
+        var result: [(Host, IdentityDescriptor?)] = []
+        let hosts = (try? await catalog.listHosts()) ?? []
+        let idents = (try? await catalog.identities()) ?? []
+        for hop in jumpOpts.config.hops {
+            switch hop {
+            case .hostID(let id):
+                if let bastion = hosts.first(where: { $0.id == id }) {
+                    let ident = bastion.identityID.flatMap { identID in idents.first(where: { $0.id == identID }) }
+                    result.append((bastion, ident))
+                }
+            case .endpoint(let ep):
+                if let epHost = try? Host(name: ep.hostname, hostname: ep.hostname, port: ep.port, username: ep.username, identityID: ep.identityID) {
+                    let ident = ep.identityID.flatMap { identID in idents.first(where: { $0.id == identID }) }
+                    result.append((epHost, ident))
+                }
+            }
+        }
+        return result
+    }
+
+    public func resolveBastionNames(for host: Host) async -> [String] {
+        let hops = await resolveBastionHops(for: host)
+        return hops.map { $0.0.name }
     }
 }
