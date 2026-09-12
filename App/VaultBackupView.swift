@@ -2,28 +2,14 @@ import SwiftUI
 import UniformTypeIdentifiers
 import ShhCore
 
-#if canImport(UIKit)
-import UIKit
-
-struct ActivityViewController: UIViewControllerRepresentable {
-    let activityItems: [Any]
-    let applicationActivities: [UIActivity]? = nil
-
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(
-            activityItems: activityItems,
-            applicationActivities: applicationActivities
-        )
-        return controller
-    }
-
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
-}
-#endif
-
 /// Settings view providing zero-knowledge encrypted vault backup export, import, preview, and restore.
 struct VaultBackupView: View {
     @EnvironmentObject private var container: AppContainer
+
+    private enum ImportStep {
+        case passphrase
+        case preview(VaultPayload)
+    }
 
     // MARK: - Export State
     @State private var exportPassphrase = ""
@@ -32,18 +18,17 @@ struct VaultBackupView: View {
     @State private var exportSuccessMessage: String? = nil
     @State private var isExporting = false
     @State private var exportedFileURL: URL? = nil
-    @State private var showExportShareSheet = false
 
     // MARK: - Import State
     @State private var showFileImporter = false
     @State private var stagedImportURL: URL? = nil
     @State private var stagedImportData: Data? = nil
-    @State private var showPassphrasePrompt = false
+    @State private var showImportModal = false
+    @State private var importStep: ImportStep = .passphrase
     @State private var importPassphrase = ""
     @State private var importErrorMessage: String? = nil
     @State private var isDecrypting = false
     @State private var previewPayload: VaultPayload? = nil
-    @State private var showPreviewSheet = false
     @State private var showReplaceConfirmation = false
     @State private var importSuccessMessage: String? = nil
 
@@ -146,25 +131,15 @@ struct VaultBackupView: View {
         ) { result in
             handleFileImport(result: result)
         }
-        .sheet(isPresented: $showPassphrasePrompt, onDismiss: {
+        .sheet(isPresented: $showImportModal, onDismiss: {
             clearImportState()
         }) {
-            passphrasePromptSheet
+            importModalSheet
         }
-        .sheet(isPresented: $showPreviewSheet, onDismiss: {
+        .onDisappear {
+            clearExportedFile()
             clearImportState()
-        }) {
-            if let payload = previewPayload {
-                backupPreviewSheet(payload: payload)
-            }
         }
-        #if canImport(UIKit)
-        .sheet(isPresented: $showExportShareSheet) {
-            if let fileURL = exportedFileURL {
-                ActivityViewController(activityItems: [fileURL])
-            }
-        }
-        #endif
     }
 
     // MARK: - Export Logic
@@ -172,6 +147,7 @@ struct VaultBackupView: View {
     private func performExport() {
         exportErrorMessage = nil
         exportSuccessMessage = nil
+        clearExportedFile()
 
         let pass = exportPassphrase
         let confirm = exportConfirmPassphrase
@@ -207,10 +183,16 @@ struct VaultBackupView: View {
                 try data.write(to: tempURL, options: .atomic)
                 self.exportedFileURL = tempURL
                 self.exportSuccessMessage = "Encrypted backup created successfully (\(data.count) bytes)."
-                self.showExportShareSheet = true
             } catch {
                 self.exportErrorMessage = error.localizedDescription
             }
+        }
+    }
+
+    private func clearExportedFile() {
+        if let url = exportedFileURL {
+            try? FileManager.default.removeItem(at: url)
+            exportedFileURL = nil
         }
     }
 
@@ -244,7 +226,9 @@ struct VaultBackupView: View {
                 self.stagedImportURL = stagedFile
                 self.stagedImportData = data
                 self.importPassphrase = ""
-                self.showPassphrasePrompt = true
+                self.importErrorMessage = nil
+                self.importStep = .passphrase
+                self.showImportModal = true
             } catch {
                 self.importErrorMessage = "Failed to stage import file: \(error.localizedDescription)"
                 clearImportState()
@@ -259,7 +243,7 @@ struct VaultBackupView: View {
     private func decryptAndPreview() {
         guard let data = stagedImportData else {
             importErrorMessage = "Staged backup file data is missing."
-            showPassphrasePrompt = false
+            showImportModal = false
             return
         }
 
@@ -282,8 +266,7 @@ struct VaultBackupView: View {
             do {
                 let payload = try container.previewVaultBackup(data: data, passphrase: pass)
                 self.previewPayload = payload
-                self.showPassphrasePrompt = false
-                self.showPreviewSheet = true
+                self.importStep = .preview(payload)
             } catch let vaultErr as VaultBackupError {
                 self.importErrorMessage = vaultErr.errorDescription
             } catch {
@@ -296,11 +279,15 @@ struct VaultBackupView: View {
         guard let payload = previewPayload else { return }
 
         Task {
-            await container.restoreCatalog(from: payload.catalog, mode: mode)
-            let modeName = mode == .merge ? "merged" : "replaced"
-            self.importSuccessMessage = "Successfully \(modeName) catalog (\(payload.catalog.hosts.count) hosts restored)."
-            self.showPreviewSheet = false
-            clearImportState()
+            do {
+                try await container.restoreCatalog(from: payload.catalog, mode: mode)
+                let modeName = mode == .merge ? "merged" : "replaced"
+                self.importSuccessMessage = "Successfully \(modeName) catalog (\(payload.catalog.hosts.count) hosts restored)."
+                self.showImportModal = false
+                clearImportState()
+            } catch {
+                self.importErrorMessage = "Failed to restore catalog: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -314,53 +301,64 @@ struct VaultBackupView: View {
         previewPayload = nil
     }
 
+    // MARK: - Import Modal Sheet
+
+    private var importModalSheet: some View {
+        NavigationStack {
+            switch importStep {
+            case .passphrase:
+                passphrasePromptSheet
+            case .preview(let payload):
+                backupPreviewSheet(payload: payload)
+            }
+        }
+    }
+
     // MARK: - Passphrase Prompt Sheet
 
     private var passphrasePromptSheet: some View {
-        NavigationStack {
-            Form {
-                Section {
-                    Text("Enter the passphrase used to encrypt this backup file.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    SecureField("Backup Passphrase", text: $importPassphrase)
-                        .accessibilityIdentifier("vault-import-passphrase-field")
-                } header: {
-                    Text("Enter Passphrase")
-                }
+        Form {
+            Section {
+                Text("Enter the passphrase used to encrypt this backup file.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                SecureField("Backup Passphrase", text: $importPassphrase)
+                    .accessibilityIdentifier("vault-import-passphrase-field")
+            } header: {
+                Text("Enter Passphrase")
+            }
 
-                if let err = importErrorMessage {
-                    Section {
-                        Text(err)
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .accessibilityIdentifier("vault-import-decrypt-error")
-                    }
-                }
-
+            if let err = importErrorMessage {
                 Section {
-                    Button {
-                        decryptAndPreview()
-                    } label: {
-                        HStack {
-                            Text("Decrypt & Preview")
-                            if isDecrypting {
-                                Spacer()
-                                ProgressView()
-                            }
-                        }
-                    }
-                    .disabled(importPassphrase.isEmpty || isDecrypting)
-                    .accessibilityIdentifier("vault-import-decrypt-button")
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .accessibilityIdentifier("vault-import-decrypt-error")
                 }
             }
-            .navigationTitle("Decrypt Backup")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        showPassphrasePrompt = false
-                        clearImportState()
+
+            Section {
+                Button {
+                    decryptAndPreview()
+                } label: {
+                    HStack {
+                        Text("Decrypt & Preview")
+                        if isDecrypting {
+                            Spacer()
+                            ProgressView()
+                        }
                     }
+                }
+                .disabled(importPassphrase.isEmpty || isDecrypting)
+                .accessibilityIdentifier("vault-import-decrypt-button")
+            }
+        }
+        .navigationTitle("Decrypt Backup")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") {
+                    showImportModal = false
+                    clearImportState()
                 }
             }
         }
@@ -369,62 +367,60 @@ struct VaultBackupView: View {
     // MARK: - Preview Sheet
 
     private func backupPreviewSheet(payload: VaultPayload) -> some View {
-        NavigationStack {
-            Form {
-                Section {
-                    LabeledContent("Schema Version", value: "v\(payload.catalog.metadata.schemaVersion)")
-                    LabeledContent("Exported Date", value: formattedDate(payload.exportedAt))
-                } header: {
-                    Text("Backup Envelope")
+        Form {
+            Section {
+                LabeledContent("Schema Version", value: "v\(payload.catalog.metadata.schemaVersion)")
+                LabeledContent("Exported Date", value: formattedDate(payload.exportedAt))
+            } header: {
+                Text("Backup Envelope")
+            }
+
+            Section {
+                LabeledContent("Hosts", value: "\(payload.catalog.hosts.count)")
+                LabeledContent("Identities", value: "\(payload.catalog.identities.count)")
+                LabeledContent("Snippets", value: "\(payload.catalog.snippets.count)")
+                LabeledContent("Groups", value: "\(payload.catalog.groups.count)")
+                LabeledContent("Tags", value: "\(payload.catalog.tags.count)")
+            } header: {
+                Text("Catalog Contents")
+            }
+
+            Section {
+                Button {
+                    performRestore(mode: .merge)
+                } label: {
+                    Label("Merge into Existing Catalog", systemImage: "arrow.triangle.merge")
                 }
+                .accessibilityIdentifier("vault-restore-merge-button")
 
-                Section {
-                    LabeledContent("Hosts", value: "\(payload.catalog.hosts.count)")
-                    LabeledContent("Identities", value: "\(payload.catalog.identities.count)")
-                    LabeledContent("Snippets", value: "\(payload.catalog.snippets.count)")
-                    LabeledContent("Groups", value: "\(payload.catalog.groups.count)")
-                    LabeledContent("Tags", value: "\(payload.catalog.tags.count)")
-                } header: {
-                    Text("Catalog Contents")
+                Button(role: .destructive) {
+                    showReplaceConfirmation = true
+                } label: {
+                    Label("Replace Entire Catalog", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
                 }
-
-                Section {
-                    Button {
-                        performRestore(mode: .merge)
-                    } label: {
-                        Label("Merge into Existing Catalog", systemImage: "arrow.triangle.merge")
-                    }
-                    .accessibilityIdentifier("vault-restore-merge-button")
-
-                    Button(role: .destructive) {
-                        showReplaceConfirmation = true
-                    } label: {
-                        Label("Replace Entire Catalog", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
-                    }
-                    .accessibilityIdentifier("vault-restore-replace-button")
-                } header: {
-                    Text("Restore Options")
-                } footer: {
-                    Text("• Merge adds new records and updates matching records while preserving other existing items.\n• Replace completely overwrites your existing catalog with the backup.")
+                .accessibilityIdentifier("vault-restore-replace-button")
+            } header: {
+                Text("Restore Options")
+            } footer: {
+                Text("• Merge adds new records and updates matching records while preserving other existing items.\n• Replace completely overwrites your existing catalog with the backup.")
+            }
+        }
+        .navigationTitle("Backup Preview")
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") {
+                    showImportModal = false
+                    clearImportState()
                 }
             }
-            .navigationTitle("Backup Preview")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        showPreviewSheet = false
-                        clearImportState()
-                    }
-                }
+        }
+        .alert("Confirm Catalog Replacement", isPresented: $showReplaceConfirmation) {
+            Button("Replace Entire Catalog", role: .destructive) {
+                performRestore(mode: .replace)
             }
-            .alert("Confirm Catalog Replacement", isPresented: $showReplaceConfirmation) {
-                Button("Replace Entire Catalog", role: .destructive) {
-                    performRestore(mode: .replace)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("This action is destructive and will replace all current hosts, identities, groups, tags, and snippets with the contents of this backup.")
-            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This action is destructive and will replace all current hosts, identities, groups, tags, and snippets with the contents of this backup.")
         }
     }
 
