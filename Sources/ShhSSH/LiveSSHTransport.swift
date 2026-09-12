@@ -76,7 +76,7 @@ final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @un
     }
 }
 
-private final class LiveSSHHandshakeHandler: ChannelInboundHandler, @unchecked Sendable {
+final class LiveSSHHandshakeHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = Any
 
     private let promise: EventLoopPromise<Void>
@@ -85,6 +85,19 @@ private final class LiveSSHHandshakeHandler: ChannelInboundHandler, @unchecked S
 
     init(promise: EventLoopPromise<Void>) {
         self.promise = promise
+    }
+
+    deinit {
+        let shouldFail = lock.withLock {
+            if !completed {
+                completed = true
+                return true
+            }
+            return false
+        }
+        if shouldFail {
+            promise.fail(TransportError.cancelled)
+        }
     }
 
     func succeed() {
@@ -446,6 +459,9 @@ public struct LiveSSHTransport: SSHTransport {
 
             let handshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
             let handshakeHandler = LiveSSHHandshakeHandler(promise: handshakePromise)
+            defer {
+                handshakeHandler.fail(TransportError.cancelled)
+            }
 
             let inboundRouter = InboundChildChannelRouter()
             bootstrap = bootstrap.channelInitializer { channel in
@@ -489,8 +505,12 @@ public struct LiveSSHTransport: SSHTransport {
                 channel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
                     let childPromise = channel.eventLoop.makePromise(of: Channel.self)
                     let handlerPromise = channel.eventLoop.makePromise(of: LiveSSHChildChannelHandler.self)
+                    childPromise.futureResult.whenFailure { error in
+                        handlerPromise.fail(error)
+                    }
                     sshHandler.createChannel(childPromise, channelType: .session) { newChildChannel, channelType in
                         guard channelType == .session else {
+                            handlerPromise.fail(TransportError.remoteFailure("Unexpected channel type: \(channelType)"))
                             return newChildChannel.close()
                         }
                         let handler = LiveSSHChildChannelHandler(
@@ -628,6 +648,9 @@ public struct LiveSSHTransport: SSHTransport {
 
             let b1HandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
             let b1HandshakeHandler = LiveSSHHandshakeHandler(promise: b1HandshakePromise)
+            defer {
+                b1HandshakeHandler.fail(TransportError.cancelled)
+            }
 
             bootstrap = bootstrap.channelInitializer { channel in
                 let sshHandler = NIOSSHHandler(
@@ -697,6 +720,9 @@ public struct LiveSSHTransport: SSHTransport {
 
                     let hopHandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
                     let hopHandshakeHandler = LiveSSHHandshakeHandler(promise: hopHandshakePromise)
+                    defer {
+                        hopHandshakeHandler.fail(TransportError.cancelled)
+                    }
 
                     let defaultOrigin = try? SocketAddress(ipAddress: "127.0.0.1", port: 0)
                     let localOrigin = currentChannel.localAddress ?? defaultOrigin!
@@ -779,6 +805,9 @@ public struct LiveSSHTransport: SSHTransport {
 
             let targetHandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
             let targetHandshakeHandler = LiveSSHHandshakeHandler(promise: targetHandshakePromise)
+            defer {
+                targetHandshakeHandler.fail(TransportError.cancelled)
+            }
 
             let targetInboundRouter = InboundChildChannelRouter()
             let defaultOrigin = try? SocketAddress(ipAddress: "127.0.0.1", port: 0)
@@ -842,8 +871,12 @@ public struct LiveSSHTransport: SSHTransport {
                 targetTransportChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { targetSSHHandler in
                     let childPromise = targetTransportChannel.eventLoop.makePromise(of: Channel.self)
                     let handlerPromise = targetTransportChannel.eventLoop.makePromise(of: LiveSSHChildChannelHandler.self)
+                    childPromise.futureResult.whenFailure { error in
+                        handlerPromise.fail(error)
+                    }
                     targetSSHHandler.createChannel(childPromise, channelType: .session) { newChildChannel, channelType in
                         guard channelType == .session else {
+                            handlerPromise.fail(TransportError.remoteFailure("Unexpected channel type: \(channelType)"))
                             return newChildChannel.close()
                         }
                         let handler = LiveSSHChildChannelHandler(

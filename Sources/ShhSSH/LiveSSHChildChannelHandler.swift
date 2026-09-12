@@ -25,6 +25,17 @@ final class LiveSSHChildChannelHandler: ChannelDuplexHandler, @unchecked Sendabl
         self.onError = onError
     }
 
+    deinit {
+        let promises: [EventLoopPromise<Void>] = lock.withLock {
+            let list = pendingSuccessPromises
+            pendingSuccessPromises.removeAll()
+            return list
+        }
+        for promise in promises {
+            promise.fail(TransportError.cancelled)
+        }
+    }
+
     func addPendingReplyPromise(_ promise: EventLoopPromise<Void>) {
         lock.withLock {
             pendingSuccessPromises.append(promise)
