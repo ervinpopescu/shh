@@ -1,9 +1,41 @@
 # Roadmap
 
-1. **Foundation (this branch):** package seams, adaptive shell, domain validation, demo session, terminal primitives, command approval, and unavailable capability states.
-2. **Data/security:** versioned SwiftData/SQLite store, real Keychain and trust UI, identity editor, health checks, and accessibility/UI tests.
-3. **Transport:** select and pin a vetted iOS SSH implementation with PTY, keyboard-interactive auth, host-key callbacks, cancellation, and resize tests.
-4. **Automation/files/speech:** tmux adapter, SFTP, local Whisper model management, forwarding, then additional multiplexer adapters.
-5. **Hardening:** privacy manifest review, localization, device Keychain/microphone smoke tests, redacted diagnostics, bounded scrollback performance, and TestFlight validation.
+## Completed Milestones (Feature Branch)
 
-Mosh, ProxyJump, background persistence, sync, file transfers, agent installation, and rich Herdr orchestration remain explicitly disabled until their protocols and platform constraints are reviewed.
+1. **Foundation & Architecture:** Package seams, adaptive SwiftUI shell,
+   ANSI terminal primitives, command safety policies, and unavailable
+   states.
+2. **Data & Security:** Versioned models, Keychain abstraction seams,
+   opaque identity records, and session restoration.
+3. **Live SSH Transport:** Citadel and SwiftNIO SSH integration, PTY
+   allocation, TOFU host-key verification, cancellation, and resize
+   handling.
+4. **Multiplexer Integration:** First-class Tmux control adapter,
+   session listing, creation, attach, and command approval flows.
+5. **On-Device Voice AI:** WhisperKit CoreML and Apple Speech
+   transcription, push-to-talk recording, preview editing, and zero
+   auto-execution policy.
+6. **Remote File Management:** SFTP subsystem repository, directory
+   navigation, streamed upload/download, in-app text editor, and conflict
+   resolution.
+7. **ProxyJump & Port Forwarding:** Recursive multi-hop bastions, local
+   port forwarding, remote port forwarding, and dynamic SOCKS5 proxying.
+8. **Herdr Orchestration:** Multi-agent workspace supervisor, pane
+   splitting, command execution, and status monitoring.
+9. **Mosh Roaming Transport:** UDP datagram transport with automatic
+   network roaming recovery across Wi-Fi and Cellular interfaces.
+10. **File Provider, Vault Backup & CI:** Native iOS Files app integration
+    via `ShhFileProvider` extension with atomic catalog/known-hosts sync,
+    zero-knowledge encrypted vault backup (`.shhbackup` AES-GCM +
+    PBKDF2), privacy manifest audit, GitHub Actions CI workflow, and
+    simulator test suites.
+
+## Future Milestones (Physical Device & Distribution)
+
+11. **Physical Device & Provisioning:** Apple Developer portal App Group
+    and File Provider entitlement provisioning, device Keychain smoke
+    testing, and physical microphone validation.
+12. **Mosh SSP Hardening:** Full State Synchronization Protocol (SSP)
+    cryptographic packet encryption and speculative local echo.
+13. **TestFlight Beta & App Store:** Build automation, TestFlight
+    internal and external beta testing, and App Store Connect metadata.

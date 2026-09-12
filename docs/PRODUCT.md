@@ -1,16 +1,57 @@
-# Shh product slice
+# Shh Product Specification
 
-Shh is a native iOS/iPadOS 17 SSH client foundation. This checkout ships an offline/demo vertical slice so navigation and safety workflows can be reviewed without credentials or a server.
+Shh is a native iOS/iPadOS 17+ SSH client designed for engineers who
+require security, terminal fidelity, automation, and platform
+integration without third-party cloud servers or subscription telemetry.
 
-## Implemented
+## Implemented & Validated Features (Simulator)
 
-- Adaptive `NavigationSplitView` host/session/files/snippets/monitoring/settings shell.
-- Host create/edit/delete metadata; group/tag/identity/trust models; identity records contain only opaque Keychain references.
-- Demo SSH transport, foreground session lifecycle, ANSI-oriented terminal text, command composer, and explicit disconnect.
-- Snippet display and exact-command approval workflow.
-- Multiplexer picker with tmux command model and honest unavailable states.
-- Files/SFTP and local Whisper boundaries with unavailable UI.
+- **Adaptive Navigation Shell:** Three-column `NavigationSplitView` on
+  iPad and tabbed layout on iPhone, with dark mode and Dynamic Type
+  support.
+- **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
+  buffer support (vim, htop, tmux), ANSI color parser, search drawers,
+  and debounced resize handling.
+- **Host & Identity Management:** Host configurations, grouping, tags,
+  health status, and opaque Keychain references. Private keys are never
+  exposed as raw fields of `Host`.
+- **Tmux Multiplexer:** First-class tmux integration with session
+  listing, creation, attach, and exact-command approval sheets.
+- **On-Device Voice AI:** WhisperKit local CoreML models and Apple
+  Speech recognition. Local push-to-talk recording, non-secret
+  transcripts, editable preview drawers, and strict prohibition against
+  automatic execution.
+- **ProxyJump & Forwarding:** Multi-hop bastions, local port forwarding,
+  remote port forwarding, and dynamic SOCKS5 proxying.
+- **Herdr Agent Orchestration:** Workspace creation, pane splitting,
+  command dispatch, agent state monitoring, and output inspection.
+- **Mosh Roaming Recovery:** UDP transport foundation with automatic
+  reconnection across Wi-Fi and Cellular interface transitions.
+- **Files App Integration:** File Provider extension exposing remote
+  SFTP files directly in Apple's Files app. Domain registration and
+  removal from Settings. Mosh-only hosts are explicitly rejected with
+  clear guidance.
+- **Encrypted Vault Backup & Sync:** Zero-knowledge `.shhbackup` export
+  and import with passphrase confirmation, schema and count preview,
+  explicit merge versus replace restore choices, wrong-passphrase and
+  tamper detection, security-scoped file staging, and deterministic
+  passphrase clearing. No Keychain secret bytes are included in backups.
+- **Privacy Manifest:** Audited `PrivacyInfo.xcprivacy` declaring
+  `UserDefaults`, file timestamps, and disk space checks. Zero tracking
+  and zero user data collection.
 
-## Planned behind the same seams
+## Pending Hardware & Release Requirements
 
-Vetted iOS SSH/PTY implementation, real Keychain implementation, SFTP, health service, tmux execution, local Whisper model management, forwarding, Mosh, ProxyJump, and UI test/device validation. Background sessions, sync, transfers, and rich Herdr orchestration are post-release work.
+The following capabilities require physical device access, paid Apple
+Developer account provisioning, or future protocol engineering:
+
+- **App Group & Extension Provisioning:** Production code signing with
+  `com.apple.developer.fileprovider` entitlements and App Group
+  sharing (`group.com.ervinpopescu.shh`) for out-of-process File Provider
+  execution on physical devices.
+- **Hardware Microphone & Audio:** Physical device microphone latency
+  and background audio interruption validation.
+- **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
+  cryptographic packet encryption and speculative local echo.
+- **TestFlight Distribution:** TestFlight beta build pipeline and App
+  Store Connect release records.
