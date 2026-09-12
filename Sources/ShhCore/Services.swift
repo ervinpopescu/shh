@@ -464,6 +464,26 @@ public actor InMemoryCatalog: CatalogRepository {
     public func save(_ identity: IdentityDescriptor) async throws { identityValues[identity.id] = identity }
     public func save(_ snippet: Snippet) async throws { snippetValues[snippet.id] = snippet }
     public func snapshot() -> CatalogSnapshot { CatalogSnapshot(hosts: Array(hostValues.values), groups: Array(groupValues.values), tags: Array(tagValues.values), identities: Array(identityValues.values), snippets: Array(snippetValues.values)) }
+    public func replace(with snapshot: CatalogSnapshot) {
+        hostValues.removeAll()
+        groupValues.removeAll()
+        tagValues.removeAll()
+        identityValues.removeAll()
+        snippetValues.removeAll()
+
+        for host in snapshot.hosts { hostValues[host.id] = host }
+        for group in snapshot.groups { groupValues[group.id] = group }
+        for tag in snapshot.tags { tagValues[tag.id] = tag }
+        for identity in snapshot.identities { identityValues[identity.id] = identity }
+        for snippet in snapshot.snippets { snippetValues[snippet.id] = snippet }
+    }
+    public func merge(with snapshot: CatalogSnapshot) {
+        for host in snapshot.hosts { hostValues[host.id] = host }
+        for group in snapshot.groups { groupValues[group.id] = group }
+        for tag in snapshot.tags { tagValues[tag.id] = tag }
+        for identity in snapshot.identities { identityValues[identity.id] = identity }
+        for snippet in snapshot.snippets { snippetValues[snippet.id] = snippet }
+    }
 }
 
 public struct TerminalCell: Hashable, Sendable { public var character: Character; public var inverse: Bool; public init(character: Character = " ", inverse: Bool = false) { self.character = character; self.inverse = inverse } }
