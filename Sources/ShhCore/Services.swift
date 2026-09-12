@@ -949,8 +949,6 @@ public protocol ForwardingService: Sendable { func start(_ rule: ForwardingRule,
 public struct UnavailableForwardingService: ForwardingService { public init() {}; public func start(_ rule: ForwardingRule, for host: Host) async throws { throw TransportError.unsupported }; public func stop(_ rule: ForwardingRule) async {} }
 public protocol SyncService: Sendable { func synchronize() async throws }
 public struct UnavailableSyncService: SyncService { public init() {}; public func synchronize() async throws { throw TransportError.unsupported } }
-public protocol AudioRecorder: Sendable { func start() async throws; func stop() async throws -> Data; func cancel() async }
-public struct UnavailableAudioRecorder: AudioRecorder { public init() {}; public func start() async throws { throw TranscriptionError.modelUnavailable }; public func stop() async throws -> Data { throw TranscriptionError.modelUnavailable }; public func cancel() async {} }
 
 public actor SessionCoordinator {
     private var sessions: [UUID: TerminalSession] = [:]
@@ -961,7 +959,3 @@ public actor SessionCoordinator {
     public func current() -> [TerminalSession] { Array(sessions.values) }
 }
 
-public enum SpeechComposerState: Equatable, Sendable { case idle; case recording; case transcribing; case preview(text: String); case unavailable; case cancelled }
-public enum TranscriptionError: Error, Equatable, Sendable { case modelUnavailable; case cancelled }
-public protocol LocalTranscriber: Sendable { func transcribe(audio: Data) async throws -> String }
-public struct UnavailableTranscriber: LocalTranscriber { public init() {}; public func transcribe(audio: Data) async throws -> String { throw TranscriptionError.modelUnavailable } }
