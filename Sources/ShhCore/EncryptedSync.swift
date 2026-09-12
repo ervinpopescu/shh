@@ -48,6 +48,7 @@ public struct VaultPayload: Codable, Sendable {
 public struct VaultExportOptions: Sendable {
     public static let defaultIterations: Int = 600_000
     public static let minimumIterations: Int = 10_000
+    public static let maximumIterations: Int = 5_000_000
 
     public var iterations: Int
     public var saltLength: Int
@@ -56,7 +57,7 @@ public struct VaultExportOptions: Sendable {
         iterations: Int = VaultExportOptions.defaultIterations,
         saltLength: Int = 32
     ) {
-        self.iterations = max(iterations, VaultExportOptions.minimumIterations)
+        self.iterations = min(max(iterations, VaultExportOptions.minimumIterations), VaultExportOptions.maximumIterations)
         self.saltLength = max(saltLength, 16)
     }
 }
@@ -87,7 +88,7 @@ public enum VaultBackupError: Error, LocalizedError, Sendable, Equatable {
         case .unsupportedCipher(let cipher):
             return "Unsupported cipher algorithm: \(cipher)."
         case .insufficientIterations(let count):
-            return "PBKDF2 iteration count is too low (\(count))."
+            return "PBKDF2 iteration count is out of bounds (\(count)). Allowed range: \(VaultExportOptions.minimumIterations)...\(VaultExportOptions.maximumIterations)."
         case .corruptedPayload(let reason):
             return "Vault backup payload is corrupted: \(reason)."
         case .authenticationFailed:
@@ -239,6 +240,8 @@ public struct SyncManifest: Codable, Sendable, Equatable {
 
 /// Service providing zero-knowledge encrypted backup and restore for Shh vaults.
 public struct EncryptedVaultService: Sendable {
+    public static let maximumBackupSizeBytes: Int = 50 * 1024 * 1024 // 50 MB
+
     public init() {}
 
     /// Export a catalog snapshot and preferences to an authenticated encrypted backup.
@@ -251,15 +254,32 @@ public struct EncryptedVaultService: Sendable {
         guard !passphrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw VaultBackupError.emptyPassphrase
         }
+        return try exportBackup(
+            catalog: catalog,
+            preferences: preferences,
+            passphraseData: Data(passphrase.utf8),
+            options: options
+        )
+    }
 
-        // Validate that catalog contains no secret material before encrypting
-        try validateNoSecrets(in: catalog)
+    /// Export a catalog snapshot and preferences using raw passphrase data (permitting explicit memory wiping).
+    public func exportBackup(
+        catalog: CatalogSnapshot,
+        preferences: VaultPreferences = VaultPreferences(),
+        passphraseData: Data,
+        options: VaultExportOptions = VaultExportOptions()
+    ) throws -> EncryptedVaultBackup {
+        guard !passphraseData.isEmpty else {
+            throw VaultBackupError.emptyPassphrase
+        }
 
+        // Validate that vault payload contains no secret material before encrypting
         let payload = VaultPayload(
             catalog: catalog,
             preferences: preferences,
             exportedAt: Date()
         )
+        try validateNoSecrets(in: payload)
 
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -272,7 +292,7 @@ public struct EncryptedVaultService: Sendable {
         let salt = generateRandomBytes(count: options.saltLength)
 
         // Derive 256-bit symmetric key using PBKDF2-HMAC-SHA256
-        let derivedKey = try deriveKey(passphrase: passphrase, salt: salt, iterations: options.iterations)
+        let derivedKey = try deriveKey(passphraseData: passphraseData, salt: salt, iterations: options.iterations)
 
         // Generate 12-byte random nonce for AES-GCM
         let nonce = AES.GCM.Nonce()
@@ -341,6 +361,17 @@ public struct EncryptedVaultService: Sendable {
         guard !passphrase.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw VaultBackupError.emptyPassphrase
         }
+        return try restoreBackup(backup: backup, passphraseData: Data(passphrase.utf8))
+    }
+
+    /// Restore and decrypt a vault backup with raw passphrase data verification.
+    public func restoreBackup(
+        backup: EncryptedVaultBackup,
+        passphraseData: Data
+    ) throws -> VaultPayload {
+        guard !passphraseData.isEmpty else {
+            throw VaultBackupError.emptyPassphrase
+        }
 
         // Validate envelope headers
         guard backup.format == EncryptedVaultBackup.currentFormat else {
@@ -355,8 +386,20 @@ public struct EncryptedVaultService: Sendable {
         guard backup.cipher.algorithm == EncryptedVaultBackup.CipherPayload.defaultAlgorithm else {
             throw VaultBackupError.unsupportedCipher(backup.cipher.algorithm)
         }
-        guard backup.kdf.iterations >= VaultExportOptions.minimumIterations else {
+        guard backup.kdf.iterations >= VaultExportOptions.minimumIterations,
+              backup.kdf.iterations <= VaultExportOptions.maximumIterations else {
             throw VaultBackupError.insufficientIterations(backup.kdf.iterations)
+        }
+
+        // Validate cryptographic parameters before expensive PBKDF2 key derivation
+        guard backup.kdf.salt.count >= 16 else {
+            throw VaultBackupError.corruptedPayload("Salt length must be at least 16 bytes.")
+        }
+        guard backup.cipher.nonce.count == 12 else {
+            throw VaultBackupError.corruptedPayload("Invalid GCM nonce length.")
+        }
+        guard backup.cipher.tag.count == 16 else {
+            throw VaultBackupError.corruptedPayload("Invalid GCM tag length.")
         }
 
         // Verify authenticated checksum
@@ -371,7 +414,7 @@ public struct EncryptedVaultService: Sendable {
 
         // Derive key
         let derivedKey = try deriveKey(
-            passphrase: passphrase,
+            passphraseData: passphraseData,
             salt: backup.kdf.salt,
             iterations: backup.kdf.iterations
         )
@@ -408,8 +451,8 @@ public struct EncryptedVaultService: Sendable {
             throw VaultBackupError.corruptedPayload("Failed to decode decrypted vault payload.")
         }
 
-        // Verify catalog contains no prohibited secrets
-        try validateNoSecrets(in: payload.catalog)
+        // Verify entire payload contains no prohibited secrets
+        try validateNoSecrets(in: payload)
 
         return payload
     }
@@ -419,6 +462,9 @@ public struct EncryptedVaultService: Sendable {
         data: Data,
         passphrase: String
     ) throws -> VaultPayload {
+        guard data.count <= Self.maximumBackupSizeBytes else {
+            throw VaultBackupError.corruptedPayload("Backup payload exceeds maximum allowed size (\(Self.maximumBackupSizeBytes) bytes).")
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         guard let backup = try? decoder.decode(EncryptedVaultBackup.self, from: data) else {
@@ -439,22 +485,29 @@ public struct EncryptedVaultService: Sendable {
 
     // MARK: - Internal Cryptographic Primitives
 
-    private func deriveKey(passphrase: String, salt: Data, iterations: Int) throws -> SymmetricKey {
+    private func deriveKey(passphraseData: Data, salt: Data, iterations: Int) throws -> SymmetricKey {
         #if canImport(CommonCrypto)
+        guard iterations >= VaultExportOptions.minimumIterations,
+              iterations <= VaultExportOptions.maximumIterations,
+              let u32Iterations = UInt32(exactly: iterations) else {
+            throw VaultBackupError.insufficientIterations(iterations)
+        }
         var derivedKeyData = Data(repeating: 0, count: 32)
         let status = derivedKeyData.withUnsafeMutableBytes { derivedKeyBytes in
             salt.withUnsafeBytes { saltBytes in
-                CCKeyDerivationPBKDF(
-                    CCPBKDFAlgorithm(kCCPBKDF2),
-                    passphrase,
-                    passphrase.utf8.count,
-                    saltBytes.bindMemory(to: UInt8.self).baseAddress,
-                    salt.count,
-                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
-                    UInt32(iterations),
-                    derivedKeyBytes.bindMemory(to: UInt8.self).baseAddress,
-                    32
-                )
+                passphraseData.withUnsafeBytes { passBytes in
+                    CCKeyDerivationPBKDF(
+                        CCPBKDFAlgorithm(kCCPBKDF2),
+                        passBytes.bindMemory(to: Int8.self).baseAddress,
+                        passphraseData.count,
+                        saltBytes.bindMemory(to: UInt8.self).baseAddress,
+                        salt.count,
+                        CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                        u32Iterations,
+                        derivedKeyBytes.bindMemory(to: UInt8.self).baseAddress,
+                        32
+                    )
+                }
             }
         }
         guard status == 0 else {
@@ -467,7 +520,7 @@ public struct EncryptedVaultService: Sendable {
         return SymmetricKey(data: derivedKeyData)
         #else
         // Fallback or non-Darwin HKDF derivation
-        let inputKey = SymmetricKey(data: Data(passphrase.utf8))
+        let inputKey = SymmetricKey(data: passphraseData)
         return HKDF<SHA256>.deriveKey(inputKeyMaterial: inputKey, salt: salt, outputByteCount: 32)
         #endif
     }
@@ -492,11 +545,16 @@ public struct EncryptedVaultService: Sendable {
         return Data((0..<count).map { _ in UInt8.random(in: 0...255) })
     }
 
-    private func validateNoSecrets(in catalog: CatalogSnapshot) throws {
-        // Confirm no private key headers or secret markers exist in any identity or host
+    public func validateNoSecrets(in catalog: CatalogSnapshot) throws {
+        let payload = VaultPayload(catalog: catalog)
+        try validateNoSecrets(in: payload)
+    }
+
+    public func validateNoSecrets(in payload: VaultPayload) throws {
+        // Confirm no private key headers or secret markers exist in any catalog entity or preferences
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
-        guard let data = try? encoder.encode(catalog),
+        guard let data = try? encoder.encode(payload),
               let jsonString = String(data: data, encoding: .utf8) else {
             return
         }
@@ -506,12 +564,14 @@ public struct EncryptedVaultService: Sendable {
             "-----BEGIN RSA PRIVATE KEY-----",
             "-----BEGIN EC PRIVATE KEY-----",
             "-----BEGIN PRIVATE KEY-----",
-            "-----BEGIN DSA PRIVATE KEY-----"
+            "-----BEGIN DSA PRIVATE KEY-----",
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----",
+            "PuTTY-User-Key-File"
         ]
 
         for pattern in forbiddenPatterns {
             if jsonString.contains(pattern) {
-                throw VaultBackupError.credentialsDisallowed("Prohibited private key pattern detected in catalog snapshot.")
+                throw VaultBackupError.credentialsDisallowed("Prohibited private key pattern detected in vault payload.")
             }
         }
     }
