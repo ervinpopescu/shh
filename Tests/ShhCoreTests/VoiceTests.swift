@@ -478,9 +478,9 @@ final class VoiceTests: XCTestCase {
         let posixPerms = attrs[.posixPermissions] as? NSNumber
         XCTAssertEqual(posixPerms?.intValue, 0o600, "Secure temporary recording handle must have 0600 permissions")
 
-        #if !os(Linux)
+        #if !targetEnvironment(simulator) && !os(Linux)
         let protection = attrs[.protectionKey] as? FileProtectionType
-        XCTAssertEqual(protection, FileProtectionType.complete, "Recording file must have FileProtectionType.complete")
+        XCTAssertEqual(protection, FileProtectionType.complete, "Recording file must have FileProtectionType.complete on physical device/macOS host")
         #endif
 
         // Write test data

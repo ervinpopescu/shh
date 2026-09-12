@@ -302,6 +302,7 @@ public struct AudioRecordingHandle: Identifiable, Hashable, Sendable {
         guard created else {
             throw AudioRecorderError.temporaryFileError(reason: "Failed to create secure temporary file at \(targetURL.path)")
         }
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: targetURL.path)
 
         return AudioRecordingHandle(
             id: UUID(),
