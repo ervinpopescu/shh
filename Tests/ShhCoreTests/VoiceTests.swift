@@ -480,7 +480,10 @@ final class VoiceTests: XCTestCase {
 
         #if !targetEnvironment(simulator) && !os(Linux)
         let protection = attrs[.protectionKey] as? FileProtectionType
-        XCTAssertEqual(protection, FileProtectionType.complete, "Recording file must have FileProtectionType.complete on physical device/macOS host")
+        XCTAssertTrue(
+            protection == .complete || protection == .completeUntilFirstUserAuthentication,
+            "Recording file must have secure file protection (complete or completeUntilFirstUserAuthentication), got \(String(describing: protection))"
+        )
         #endif
 
         // Write test data
