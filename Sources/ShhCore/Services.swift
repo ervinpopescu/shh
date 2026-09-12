@@ -368,7 +368,7 @@ public struct KeychainCredentialStore: CredentialStore {
         return data
     }
     public func delete(reference: String) async throws {
-        var query = baseQuery(reference: reference)
+        let query = baseQuery(reference: reference)
         var status = SecItemDelete(query as CFDictionary)
         if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
             var fallbackQuery = query
@@ -441,7 +441,7 @@ public struct Redactor: Sendable {
 }
 
 public protocol HostRepository: Sendable { func listHosts() async throws -> [Host]; func save(_ host: Host) async throws; func delete(id: UUID) async throws }
-public protocol CatalogRepository: HostRepository { func groups() async throws -> [Group]; func tags() async throws -> [Tag]; func identities() async throws -> [IdentityDescriptor]; func snippets() async throws -> [Snippet]; func save(_ group: Group) async throws; func save(_ tag: Tag) async throws; func save(_ identity: IdentityDescriptor) async throws; func save(_ snippet: Snippet) async throws }
+public protocol CatalogRepository: HostRepository { func groups() async throws -> [Group]; func tags() async throws -> [Tag]; func identities() async throws -> [IdentityDescriptor]; func snippets() async throws -> [Snippet]; func save(_ group: Group) async throws; func save(_ tag: Tag) async throws; func save(_ identity: IdentityDescriptor) async throws; func save(_ snippet: Snippet) async throws; func deleteIdentity(id: UUID) async throws }
 public struct StoreMetadata: Codable, Hashable, Sendable { public static let currentSchemaVersion = 1; public var schemaVersion: Int; public init(schemaVersion: Int = StoreMetadata.currentSchemaVersion) { self.schemaVersion = schemaVersion } }
 public struct CatalogSnapshot: Codable, Sendable { public var metadata: StoreMetadata; public var hosts: [Host]; public var groups: [Group]; public var tags: [Tag]; public var identities: [IdentityDescriptor]; public var snippets: [Snippet]; public init(metadata: StoreMetadata = StoreMetadata(), hosts: [Host] = [], groups: [Group] = [], tags: [Tag] = [], identities: [IdentityDescriptor] = [], snippets: [Snippet] = []) { self.metadata = metadata; self.hosts = hosts; self.groups = groups; self.tags = tags; self.identities = identities; self.snippets = snippets } }
 public actor InMemoryCatalog: CatalogRepository {
@@ -462,6 +462,7 @@ public actor InMemoryCatalog: CatalogRepository {
     public func save(_ group: Group) async throws { groupValues[group.id] = group }
     public func save(_ tag: Tag) async throws { tagValues[tag.id] = tag }
     public func save(_ identity: IdentityDescriptor) async throws { identityValues[identity.id] = identity }
+    public func deleteIdentity(id: UUID) async throws { identityValues.removeValue(forKey: id) }
     public func save(_ snippet: Snippet) async throws { snippetValues[snippet.id] = snippet }
     public func snapshot() -> CatalogSnapshot { CatalogSnapshot(hosts: Array(hostValues.values), groups: Array(groupValues.values), tags: Array(tagValues.values), identities: Array(identityValues.values), snippets: Array(snippetValues.values)) }
     public func replace(with snapshot: CatalogSnapshot) {

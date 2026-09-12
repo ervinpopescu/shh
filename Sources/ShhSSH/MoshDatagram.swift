@@ -71,6 +71,7 @@ public final class MockMoshDatagramChannel: MoshDatagramChannel, @unchecked Send
     private var _isStarted: Bool = false
     private var _isClosed: Bool = false
     private var streamContinuation: AsyncThrowingStream<Data, Error>.Continuation?
+    private var pendingDatagrams: [Data] = []
 
     public init(remoteHost: String = "127.0.0.1", remotePort: UInt16 = 60001) {
         self._currentHost = remoteHost
@@ -112,13 +113,21 @@ public final class MockMoshDatagramChannel: MoshDatagramChannel, @unchecked Send
         AsyncThrowingStream { continuation in
             self.lock.withLock {
                 self.streamContinuation = continuation
+                for data in self.pendingDatagrams {
+                    continuation.yield(data)
+                }
+                self.pendingDatagrams.removeAll()
             }
         }
     }
 
     public func simulateInboundDatagram(_ data: Data) {
-        _ = lock.withLock {
-            streamContinuation?.yield(data)
+        lock.withLock {
+            if let streamContinuation {
+                streamContinuation.yield(data)
+            } else {
+                pendingDatagrams.append(data)
+            }
         }
     }
 

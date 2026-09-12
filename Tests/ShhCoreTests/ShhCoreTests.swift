@@ -181,4 +181,28 @@ final class ShhCoreTests: XCTestCase {
         XCTAssertEqual(snapshot.metadata.schemaVersion, StoreMetadata.currentSchemaVersion)
         XCTAssertEqual(snapshot.identities.first?.keychainReference, "kc-demo")
     }
+
+    func testCatalogIdentityPersistenceAndDeletion() async throws {
+        let store = InMemoryCatalog(seedDemoData: false)
+        let identity1 = try IdentityDescriptor(name: "Key 1", kind: .privateKey, publicFingerprint: "SHA256:fp1", keychainReference: "ref-1")
+        let identity2 = try IdentityDescriptor(name: "Key 2", kind: .password, keychainReference: "ref-2")
+
+        try await store.save(identity1)
+        try await store.save(identity2)
+
+        var current = try await store.identities()
+        XCTAssertEqual(current.count, 2)
+        XCTAssertTrue(current.contains(where: { $0.id == identity1.id }))
+        XCTAssertTrue(current.contains(where: { $0.id == identity2.id }))
+
+        try await store.deleteIdentity(id: identity1.id)
+        current = try await store.identities()
+        XCTAssertEqual(current.count, 1)
+        XCTAssertFalse(current.contains(where: { $0.id == identity1.id }))
+        XCTAssertTrue(current.contains(where: { $0.id == identity2.id }))
+
+        try await store.deleteIdentity(id: identity2.id)
+        current = try await store.identities()
+        XCTAssertTrue(current.isEmpty)
+    }
 }

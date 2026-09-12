@@ -32,10 +32,18 @@ extension View {
 }
 
 enum AppSection: String, CaseIterable, Identifiable {
-    case hosts = "Hosts", sessions = "Sessions", files = "Files", snippets = "Snippets", monitoring = "Monitoring", settings = "Settings"
+    case hosts = "Hosts", sessions = "Sessions", files = "Files", keys = "Keys", snippets = "Snippets", monitoring = "Monitoring", settings = "Settings"
     var id: String { rawValue }
     var systemImage: String {
-        switch self { case .hosts: "server.rack"; case .sessions: "rectangle.split.2x1"; case .files: "folder"; case .snippets: "text.badge.plus"; case .monitoring: "waveform.path.ecg"; case .settings: "gear" }
+        switch self {
+        case .hosts: "server.rack"
+        case .sessions: "rectangle.split.2x1"
+        case .files: "folder"
+        case .keys: "key.fill"
+        case .snippets: "text.badge.plus"
+        case .monitoring: "waveform.path.ecg"
+        case .settings: "gear"
+        }
     }
 }
 
@@ -45,18 +53,23 @@ struct RootView: View {
     var body: some View {
         NavigationSplitView {
             List(AppSection.allCases, selection: $section) { item in
-                Label(item.rawValue, systemImage: item.systemImage).tag(item as AppSection?)
+                NavigationLink(value: item) {
+                    Label(item.rawValue, systemImage: item.systemImage)
+                }
             }
             .navigationTitle("Shh")
             .safeAreaInset(edge: .bottom) { capabilityFooter }
         } detail: {
-            switch section ?? .hosts {
-            case .hosts: HostListView()
-            case .sessions: SessionDashboardView()
-            case .files: FilesView()
-            case .snippets: SnippetsView()
-            case .monitoring: MonitoringView()
-            case .settings: SettingsView()
+            NavigationStack {
+                switch section ?? .hosts {
+                case .hosts: HostListView()
+                case .sessions: SessionDashboardView()
+                case .files: FilesView()
+                case .keys: KeyManagementView()
+                case .snippets: SnippetsView()
+                case .monitoring: MonitoringView()
+                case .settings: SettingsView()
+                }
             }
         }
         .confirmationDialog("Approve host key?", isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }), titleVisibility: .visible) {
@@ -312,6 +325,7 @@ struct HostEditorView: View {
     @State private var allowInsertOnly: Bool
     @State private var isProductionHost: Bool
     @State private var identities: [IdentityDescriptor] = []
+    @State private var showingNewKeySheet = false
 
     // Mosh settings
     @State private var moshServerCommand: String
@@ -392,13 +406,21 @@ struct HostEditorView: View {
                         .accessibilityIdentifier("host-editor-username-field")
                     TextField("Port", text: $port).keyboardType(.numberPad)
                         .accessibilityIdentifier("host-editor-port-field")
-                    Picker("Identity", selection: $identityID) {
-                        Text("None").tag(UUID?.none)
-                        ForEach(identities) { identity in
-                            Text(identity.name).tag(Optional(identity.id))
+                    HStack {
+                        Picker("Identity", selection: $identityID) {
+                            Text("None").tag(UUID?.none)
+                            ForEach(identities) { identity in
+                                Text(identity.name).tag(Optional(identity.id))
+                            }
                         }
+                        .accessibilityIdentifier("host-editor-identity-picker")
+
+                        Button("New Key", systemImage: "plus") {
+                            showingNewKeySheet = true
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityIdentifier("host-editor-new-key-button")
                     }
-                    .accessibilityIdentifier("host-editor-identity-picker")
                 }
 
                 Section("Connection & ProxyJump") {
@@ -610,6 +632,15 @@ struct HostEditorView: View {
                 PortForwardingRuleEditorSheet { newRule in
                     forwardingRules.append(newRule)
                 }
+            }
+            .sheet(isPresented: $showingNewKeySheet) {
+                IdentityEditorView { newIdentity in
+                    Task {
+                        identities = (try? await container.catalog.identities()) ?? []
+                        identityID = newIdentity.id
+                    }
+                }
+                .environmentObject(container)
             }
             .sheet(item: $ruleToEdit) { rule in
                 PortForwardingRuleEditorSheet(existingRule: rule) { updatedRule in
@@ -2893,6 +2924,14 @@ struct SettingsView: View {
     @EnvironmentObject private var container: AppContainer
     var body: some View {
         Form {
+            Section("SSH Keys & Credentials") {
+                NavigationLink {
+                    KeyManagementView().environmentObject(container)
+                } label: {
+                    Label("SSH Keys & Credentials", systemImage: "key.fill")
+                }
+                .accessibilityIdentifier("settings-keys-navigation-link")
+            }
             Section("Voice & Local AI") {
                 NavigationLink {
                     VoiceSettingsView().environmentObject(container)

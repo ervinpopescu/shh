@@ -10,6 +10,7 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
 
     private let channel: any MoshDatagramChannel
     private var eventContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
+    private var pendingEvents: [TerminalEvent] = []
     private var stateContinuations: [UUID: AsyncStream<MoshState>.Continuation] = [:]
     private var receiveTask: Task<Void, Never>?
     private var sequenceNumber: UInt64 = 0
@@ -39,6 +40,10 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
             self.eventContinuation = continuation
+            for event in self.pendingEvents {
+                continuation.yield(event)
+            }
+            self.pendingEvents.removeAll()
             continuation.onTermination = { @Sendable _ in
                 Task { [weak self] in
                     await self?.close()
@@ -184,7 +189,11 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
             switch packet.kind {
             case .data:
                 if !packet.payload.isEmpty {
-                    eventContinuation?.yield(.bytes(packet.payload))
+                    if let eventContinuation {
+                        eventContinuation.yield(.bytes(packet.payload))
+                    } else {
+                        pendingEvents.append(.bytes(packet.payload))
+                    }
                 }
             case .keepalive, .roamingProbe, .resize:
                 break
