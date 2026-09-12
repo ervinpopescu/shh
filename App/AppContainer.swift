@@ -51,6 +51,43 @@ final class AppContainer: ObservableObject {
     @Published var isTranscribingVoice: Bool = false
     @Published var activeVoicePreview: VoicePreviewState? = nil
     @Published var isSlideToCancelActive: Bool = false
+
+    // MARK: - SFTP & File Management
+    public let customSFTPRepository: (any SFTPRepository)?
+    @Published public var sftpRepository: (any SFTPRepository)?
+    @Published public var currentPath: RemotePath = RemotePath("/home/dev")
+    @Published public var currentDirectoryFiles: [RemoteFile] = []
+    @Published public var isLoadingDirectory: Bool = false
+    @Published public var directoryErrorMessage: String? = nil
+    @Published public var sftpErrorMessage: String? = nil
+
+    // Sorting & Filtering
+    @Published public var sortField: FileSortField = .type
+    @Published public var sortAscending: Bool = true
+    @Published public var fileSearchQuery: String = ""
+
+    // Transfer Queue & Conflicts
+    public let transferCoordinator = TransferQueueCoordinator()
+    @Published public var transferQueueState: TransferQueueState = TransferQueueState()
+    @Published public var isTransferQueueOpen: Bool = false
+    @Published public var pendingConflict: FileTransferConflict? = nil
+    private var activeTransferTasks: [UUID: Task<Void, Never>] = [:]
+
+    // Previews & Editor
+    @Published public var previewFile: RemoteFile? = nil
+    @Published public var previewData: Data? = nil
+    @Published public var isPreviewLoading: Bool = false
+    @Published public var previewErrorMessage: String? = nil
+
+    @Published public var activeEditingFile: RemoteFile? = nil
+    @Published public var editingFileContent: String = ""
+    @Published public var isSavingFile: Bool = false
+    @Published public var editorErrorMessage: String? = nil
+
+    // Directory Cache
+    private var directoryCache: [RemotePath: (files: [RemoteFile], timestamp: Date)] = [:]
+    private let directoryCacheTTL: TimeInterval = 60.0
+
     private(set) var activeHost: Host?
     private(set) var isExplicitDisconnect = false
     private var pendingTrustHost: Host?
@@ -106,7 +143,8 @@ final class AppContainer: ObservableObject {
         useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
-        reconnectCoordinator: ReconnectCoordinator? = nil
+        reconnectCoordinator: ReconnectCoordinator? = nil,
+        sftpRepository: (any SFTPRepository)? = nil
     ) {
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore()
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
@@ -155,6 +193,15 @@ final class AppContainer: ObservableObject {
         let coordinator = reconnectCoordinator ?? ReconnectCoordinator()
         self.reconnectCoordinator = coordinator
 
+        self.customSFTPRepository = sftpRepository
+        if let sftpRepository {
+            self.sftpRepository = sftpRepository
+        } else if self.transport is DemoSSHTransport {
+            self.sftpRepository = DemoSFTPRepository(seedDemoData: true)
+        } else {
+            self.sftpRepository = nil
+        }
+
         bridge.onInterruption = { [weak self] in
             Task { @MainActor [weak self] in
                 await self?.cancelVoiceRecording()
@@ -179,6 +226,10 @@ final class AppContainer: ObservableObject {
         Task { [weak self] in
             await self?.refreshVoiceModels()
         }
+
+        Task { [weak self] in
+            await self?.loadDirectory(at: RemotePath("/home/dev"))
+        }
     }
 
     static func demo(
@@ -193,7 +244,8 @@ final class AppContainer: ObservableObject {
         useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
-        reconnectCoordinator: ReconnectCoordinator? = nil
+        reconnectCoordinator: ReconnectCoordinator? = nil,
+        sftpRepository: (any SFTPRepository)? = nil
     ) -> AppContainer {
         let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
         let demoTranscriber = transcriber ?? DemoTranscriber()
@@ -223,7 +275,8 @@ final class AppContainer: ObservableObject {
             reconnectCoordinator: reconnectCoordinator ?? ReconnectCoordinator(
                 clock: { _ in },
                 jitter: ReconnectCoordinator.zeroJitter
-            )
+            ),
+            sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true)
         )
     }
 
@@ -335,6 +388,9 @@ final class AppContainer: ObservableObject {
 
             Task { [weak self] in
                 await self?.refreshTmuxState()
+            }
+            Task { [weak self] in
+                await self?.setupSFTPForHost(host)
             }
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
@@ -661,6 +717,16 @@ final class AppContainer: ObservableObject {
         isProbingTmux = false
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
+
+        if customSFTPRepository == nil {
+            if let live = sftpRepository as? LiveSFTPRepository {
+                await live.close()
+            }
+            if !isDemo {
+                sftpRepository = nil
+            }
+        }
+        directoryCache.removeAll()
     }
 
     private func detachCallbacks() {
@@ -1366,5 +1432,483 @@ final class AppContainer: ObservableObject {
         let success = await sendRawInteractive(bracketed)
         if success { resetVoiceState() }
         return success
+    }
+
+    // MARK: - SFTP & File Management Methods
+
+    func setupSFTPForHost(_ host: Host) async {
+        guard customSFTPRepository == nil else {
+            await loadDirectory(at: currentPath)
+            return
+        }
+        if isDemo {
+            if sftpRepository == nil {
+                sftpRepository = DemoSFTPRepository(seedDemoData: true)
+            }
+            await loadDirectory(at: currentPath)
+        } else {
+            do {
+                let repo = try await LiveSFTPRepository.connect(
+                    host: host,
+                    identity: await identity(for: host),
+                    trustEvaluator: trustStore,
+                    credentialStore: credentialStore
+                )
+                self.sftpRepository = repo
+                self.sftpErrorMessage = nil
+                await loadDirectory(at: currentPath)
+            } catch {
+                self.sftpErrorMessage = "SFTP connection failed: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    public var sortedAndFilteredFiles: [RemoteFile] {
+        let query = fileSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let filtered: [RemoteFile]
+        if query.isEmpty {
+            filtered = currentDirectoryFiles
+        } else {
+            filtered = currentDirectoryFiles.filter {
+                $0.name.localizedCaseInsensitiveContains(query)
+            }
+        }
+
+        return filtered.sorted { lhs, rhs in
+            switch sortField {
+            case .type:
+                let lhsRank = typeRank(lhs.entryType)
+                let rhsRank = typeRank(rhs.entryType)
+                if lhsRank != rhsRank {
+                    return sortAscending ? (lhsRank < rhsRank) : (lhsRank > rhsRank)
+                }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            case .name:
+                let result = lhs.name.localizedStandardCompare(rhs.name)
+                return sortAscending ? (result == .orderedAscending) : (result == .orderedDescending)
+            case .date:
+                let lDate = lhs.modificationDate ?? Date.distantPast
+                let rDate = rhs.modificationDate ?? Date.distantPast
+                if lDate != rDate {
+                    return sortAscending ? (lDate < rDate) : (lDate > rDate)
+                }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            case .size:
+                if lhs.size != rhs.size {
+                    return sortAscending ? (lhs.size < rhs.size) : (lhs.size > rhs.size)
+                }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+        }
+    }
+
+    private func typeRank(_ type: RemoteFileEntryType) -> Int {
+        switch type {
+        case .directory: return 0
+        case .symlink: return 1
+        case .file: return 2
+        case .other: return 3
+        }
+    }
+
+    public func loadDirectory(at path: RemotePath, bypassCache: Bool = false) async {
+        guard let repo = sftpRepository else {
+            directoryErrorMessage = "SFTP repository unavailable."
+            return
+        }
+
+        if !bypassCache, let cached = directoryCache[path], Date().timeIntervalSince(cached.timestamp) < directoryCacheTTL {
+            currentPath = path
+            currentDirectoryFiles = cached.files
+            directoryErrorMessage = nil
+            return
+        }
+
+        isLoadingDirectory = true
+        directoryErrorMessage = nil
+
+        do {
+            let files = try await repo.listDirectory(at: path)
+            directoryCache[path] = (files: files, timestamp: Date())
+            currentPath = path
+            currentDirectoryFiles = files
+            isLoadingDirectory = false
+        } catch {
+            isLoadingDirectory = false
+            directoryErrorMessage = error.localizedDescription
+            if path != .root && currentDirectoryFiles.isEmpty {
+                await loadDirectory(at: .root, bypassCache: true)
+            }
+        }
+    }
+
+    public func navigateTo(_ path: RemotePath) async {
+        await loadDirectory(at: path)
+    }
+
+    public func navigateUp() async {
+        guard !currentPath.isRoot else { return }
+        await loadDirectory(at: currentPath.parent)
+    }
+
+    public func refreshCurrentDirectory() async {
+        await loadDirectory(at: currentPath, bypassCache: true)
+    }
+
+    public func invalidateDirectoryCache(at path: RemotePath? = nil) {
+        if let path {
+            directoryCache.removeValue(forKey: path)
+            directoryCache.removeValue(forKey: path.parent)
+        } else {
+            directoryCache.removeAll()
+        }
+    }
+
+    // MARK: - Transfers & Conflict Handling
+
+    @discardableResult
+    public func enqueueDownload(
+        file: RemoteFile,
+        destinationURL: URL? = nil,
+        overwrite: Bool? = nil
+    ) async -> TransferTask? {
+        guard let repo = sftpRepository else {
+            directoryErrorMessage = "SFTP repository unavailable."
+            return nil
+        }
+
+        let defaultDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhDownloads", isDirectory: true)
+        try? FileManager.default.createDirectory(at: defaultDir, withIntermediateDirectories: true)
+        let targetURL = destinationURL ?? defaultDir.appendingPathComponent(file.name)
+        let fileExists = FileManager.default.fileExists(atPath: targetURL.path)
+
+        let proceed: Bool
+        if let overwrite {
+            proceed = overwrite
+        } else if fileExists {
+            proceed = await withCheckedContinuation { continuation in
+                self.pendingConflict = FileTransferConflict(
+                    direction: .download,
+                    remotePath: file.path,
+                    localURL: targetURL,
+                    existingItemName: file.name,
+                    destinationDescription: targetURL.lastPathComponent,
+                    continuation: { choice in
+                        continuation.resume(returning: choice)
+                    }
+                )
+            }
+            self.pendingConflict = nil
+        } else {
+            proceed = true
+        }
+
+        guard proceed else { return nil }
+
+        if fileExists {
+            try? FileManager.default.removeItem(at: targetURL)
+        }
+
+        let task = await transferCoordinator.enqueue(
+            direction: .download,
+            remotePath: file.path,
+            localURL: targetURL,
+            totalBytes: file.size
+        )
+        self.transferQueueState = await transferCoordinator.snapshot()
+
+        let taskID = task.id
+        let executionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                await self.transferCoordinator.registerCancellation(id: taskID) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.activeTransferTasks[taskID]?.cancel()
+                    }
+                }
+                try await repo.download(from: file.path, to: targetURL) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.transferCoordinator.updateProgress(
+                            id: taskID,
+                            bytesTransferred: progress.bytesTransferred,
+                            totalBytes: progress.totalBytes
+                        )
+                        self.transferQueueState = await self.transferCoordinator.snapshot()
+                    }
+                }
+                await self.transferCoordinator.markCompleted(id: taskID)
+                self.transferQueueState = await self.transferCoordinator.snapshot()
+            } catch {
+                if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
+                    await self.transferCoordinator.cancel(id: taskID)
+                } else {
+                    await self.transferCoordinator.markFailed(id: taskID, error: error.localizedDescription)
+                }
+                self.transferQueueState = await self.transferCoordinator.snapshot()
+            }
+            self.activeTransferTasks.removeValue(forKey: taskID)
+        }
+        activeTransferTasks[taskID] = executionTask
+        return task
+    }
+
+    @discardableResult
+    public func enqueueUpload(
+        localURL: URL,
+        destinationDirectory: RemotePath? = nil,
+        overwrite: Bool? = nil
+    ) async -> TransferTask? {
+        guard let repo = sftpRepository else {
+            directoryErrorMessage = "SFTP repository unavailable."
+            return nil
+        }
+
+        let dir = destinationDirectory ?? currentPath
+        let fileName = localURL.lastPathComponent
+        let remotePath = dir.appending(fileName)
+
+        var existsRemote = false
+        if currentPath == dir && currentDirectoryFiles.contains(where: { $0.name == fileName }) {
+            existsRemote = true
+        } else if let _ = try? await repo.fetchAttributes(at: remotePath) {
+            existsRemote = true
+        }
+
+        let proceed: Bool
+        if let overwrite {
+            proceed = overwrite
+        } else if existsRemote {
+            proceed = await withCheckedContinuation { continuation in
+                self.pendingConflict = FileTransferConflict(
+                    direction: .upload,
+                    remotePath: remotePath,
+                    localURL: localURL,
+                    existingItemName: fileName,
+                    destinationDescription: remotePath.description,
+                    continuation: { choice in
+                        continuation.resume(returning: choice)
+                    }
+                )
+            }
+            self.pendingConflict = nil
+        } else {
+            proceed = true
+        }
+
+        guard proceed else { return nil }
+
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+
+        let task = await transferCoordinator.enqueue(
+            direction: .upload,
+            remotePath: remotePath,
+            localURL: localURL,
+            totalBytes: fileSize
+        )
+        self.transferQueueState = await transferCoordinator.snapshot()
+
+        let taskID = task.id
+        let executionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                await self.transferCoordinator.registerCancellation(id: taskID) { [weak self] in
+                    Task { @MainActor [weak self] in
+                        self?.activeTransferTasks[taskID]?.cancel()
+                    }
+                }
+                try await repo.upload(from: localURL, to: remotePath) { [weak self] progress in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.transferCoordinator.updateProgress(
+                            id: taskID,
+                            bytesTransferred: progress.bytesTransferred,
+                            totalBytes: progress.totalBytes
+                        )
+                        self.transferQueueState = await self.transferCoordinator.snapshot()
+                    }
+                }
+                await self.transferCoordinator.markCompleted(id: taskID)
+                self.transferQueueState = await self.transferCoordinator.snapshot()
+                self.invalidateDirectoryCache(at: dir)
+                if self.currentPath == dir {
+                    await self.refreshCurrentDirectory()
+                }
+            } catch {
+                if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
+                    await self.transferCoordinator.cancel(id: taskID)
+                } else {
+                    await self.transferCoordinator.markFailed(id: taskID, error: error.localizedDescription)
+                }
+                self.transferQueueState = await self.transferCoordinator.snapshot()
+            }
+            self.activeTransferTasks.removeValue(forKey: taskID)
+        }
+        activeTransferTasks[taskID] = executionTask
+        return task
+    }
+
+    public func cancelTransfer(id: UUID) async {
+        activeTransferTasks[id]?.cancel()
+        activeTransferTasks.removeValue(forKey: id)
+        await transferCoordinator.cancel(id: id)
+        transferQueueState = await transferCoordinator.snapshot()
+    }
+
+    public func retryTransfer(id: UUID) async {
+        guard let task = transferQueueState.task(withID: id) else { return }
+        await transferCoordinator.remove(id: id)
+        if task.direction == .download {
+            let file = RemoteFile(name: task.remotePath.lastComponent, path: task.remotePath)
+            _ = await enqueueDownload(file: file, destinationURL: task.localURL, overwrite: true)
+        } else {
+            _ = await enqueueUpload(localURL: task.localURL, destinationDirectory: task.remotePath.parent, overwrite: true)
+        }
+    }
+
+    public func clearCompletedTransfers() async {
+        await transferCoordinator.clearTerminal()
+        transferQueueState = await transferCoordinator.snapshot()
+    }
+
+    public func resolvePendingConflict(overwrite: Bool) {
+        guard let conflict = pendingConflict else { return }
+        self.pendingConflict = nil
+        conflict.continuation(overwrite)
+    }
+
+    // MARK: - File Actions (Delete, Rename, Move, Create)
+
+    public func deleteFile(_ file: RemoteFile) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        if file.isDirectory {
+            try await repo.removeDirectory(at: file.path)
+        } else {
+            try await repo.removeFile(at: file.path)
+        }
+        invalidateDirectoryCache(at: file.path.parent)
+        await refreshCurrentDirectory()
+    }
+
+    public func renameFile(_ file: RemoteFile, to newName: String) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+            throw SFTPRepositoryError.invalidPath("Invalid file name: '\(newName)'")
+        }
+        let newPath = file.path.parent.appending(trimmed)
+        try await repo.rename(from: file.path, to: newPath)
+        invalidateDirectoryCache(at: file.path.parent)
+        await refreshCurrentDirectory()
+    }
+
+    public func moveFile(_ file: RemoteFile, to destinationDirectory: RemotePath) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        let targetPath = destinationDirectory.appending(file.name)
+        try await repo.rename(from: file.path, to: targetPath)
+        invalidateDirectoryCache(at: file.path.parent)
+        invalidateDirectoryCache(at: destinationDirectory)
+        await refreshCurrentDirectory()
+    }
+
+    public func createDirectory(named name: String) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+            throw SFTPRepositoryError.invalidPath("Invalid directory name: '\(name)'")
+        }
+        let targetPath = currentPath.appending(trimmed)
+        try await repo.createDirectory(at: targetPath)
+        invalidateDirectoryCache(at: currentPath)
+        await refreshCurrentDirectory()
+    }
+
+    public func createFile(named name: String, content: Data = Data()) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+            throw SFTPRepositoryError.invalidPath("Invalid file name: '\(name)'")
+        }
+        let targetPath = currentPath.appending(trimmed)
+        try await repo.writeFile(data: content, at: targetPath, progress: nil)
+        invalidateDirectoryCache(at: currentPath)
+        await refreshCurrentDirectory()
+    }
+
+    // MARK: - Previews & In-App Text Editor
+
+    public func loadPreview(for file: RemoteFile) async {
+        guard let repo = sftpRepository else { return }
+        previewFile = file
+        previewData = nil
+        previewErrorMessage = nil
+        isPreviewLoading = true
+        do {
+            let data = try await repo.readFile(at: file.path)
+            previewData = data
+            isPreviewLoading = false
+        } catch {
+            isPreviewLoading = false
+            previewErrorMessage = error.localizedDescription
+        }
+    }
+
+    public func closePreview() {
+        previewFile = nil
+        previewData = nil
+        previewErrorMessage = nil
+        isPreviewLoading = false
+    }
+
+    public func openEditor(for file: RemoteFile) async {
+        guard let repo = sftpRepository else { return }
+        isSavingFile = false
+        editorErrorMessage = nil
+        do {
+            let data = try await repo.readFile(at: file.path)
+            let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            editingFileContent = text
+            activeEditingFile = file
+        } catch {
+            editorErrorMessage = error.localizedDescription
+        }
+    }
+
+    public func closeEditor() {
+        activeEditingFile = nil
+        editingFileContent = ""
+        isSavingFile = false
+        editorErrorMessage = nil
+    }
+
+    public func saveEditedFile() async throws {
+        guard let repo = sftpRepository, let file = activeEditingFile else {
+            throw SFTPRepositoryError.connectionClosed
+        }
+        isSavingFile = true
+        editorErrorMessage = nil
+        do {
+            let data = Data(editingFileContent.utf8)
+            try await repo.writeFile(data: data, at: file.path, progress: nil)
+            invalidateDirectoryCache(at: file.path.parent)
+            if currentPath == file.path.parent {
+                await refreshCurrentDirectory()
+            }
+            isSavingFile = false
+        } catch {
+            isSavingFile = false
+            editorErrorMessage = error.localizedDescription
+            throw error
+        }
     }
 }

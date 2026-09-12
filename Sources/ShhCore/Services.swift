@@ -1098,6 +1098,45 @@ public struct RemoteFile: Identifiable, Hashable, Sendable, Codable {
     }
 }
 
+extension RemoteFile {
+    public var formattedSize: String {
+        if isDirectory {
+            return "Directory"
+        }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useAll]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: size)
+    }
+
+    public var formattedDate: String {
+        guard let modificationDate else { return "Unknown date" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: modificationDate)
+    }
+
+    public var iconName: String {
+        if isDirectory { return "folder.fill" }
+        if isSymlink { return "arrow.triangle.branch" }
+        let ext = path.pathExtension.lowercased()
+        switch ext {
+        case "swift": return "swift"
+        case "sh", "bash", "zsh": return "terminal.fill"
+        case "py": return "chevron.left.forwardslash.chevron.right"
+        case "json", "yml", "yaml", "toml", "xml", "plist": return "curlybraces"
+        case "txt", "md", "markdown", "rst": return "doc.text.fill"
+        case "png", "jpg", "jpeg", "gif", "webp", "bmp", "svg", "heic", "ico": return "photo.fill"
+        case "zip", "gz", "tar", "bz2", "xz", "7z": return "archivebox.fill"
+        case "log": return "doc.plaintext.fill"
+        case "conf", "ini", "env", "cfg": return "gearshape.fill"
+        case "c", "h", "cpp", "hpp": return "c.square.fill"
+        default: return "doc.fill"
+        }
+    }
+}
+
 public protocol RemoteFileRepository: SFTPRepository {
     func list(at path: RemotePath) async throws -> [RemoteFile]
 }

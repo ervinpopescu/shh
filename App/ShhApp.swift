@@ -76,8 +76,8 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
             Text(container.isDemo
-                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP and Mosh are not enabled in this build. Local voice AI active."
-                : "Live SSH transport active. \(surfaceDescription) SFTP and Mosh are not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
+                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP active. Mosh is not enabled in this build. Local voice AI active."
+                : "Live SSH transport active. \(surfaceDescription) SFTP active. Mosh is not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -1367,7 +1367,6 @@ struct SnippetEditor: View {
     init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
     var body: some View { Form { TextField("Name", text: .constant(snippet.name)); TextEditor(text: $bodyText).frame(minHeight: 160); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
-struct FilesView: View { var body: some View { ContentUnavailableView("Files unavailable", systemImage: "folder", description: Text("SFTP is modeled behind RemoteFileRepository and is not enabled in this build.")) .navigationTitle("Files") } }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
 struct SettingsView: View {
     @EnvironmentObject private var container: AppContainer

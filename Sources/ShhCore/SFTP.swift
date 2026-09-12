@@ -365,6 +365,54 @@ public actor TransferQueueCoordinator {
     public func registerCancellation(id: UUID, handler: @escaping @Sendable () -> Void) {
         taskCancels[id] = handler
     }
+
+    public func remove(id: UUID) {
+        state.remove(id: id)
+        taskCancels.removeValue(forKey: id)
+    }
+
+    public func clearTerminal() {
+        state.clearTerminal()
+    }
+}
+
+// MARK: - File Sort & Conflict Models
+
+public enum FileSortField: String, CaseIterable, Identifiable, Sendable, Codable {
+    case name = "Name"
+    case date = "Date"
+    case size = "Size"
+    case type = "Type"
+
+    public var id: String { rawValue }
+}
+
+public struct FileTransferConflict: Identifiable, @unchecked Sendable {
+    public let id: UUID
+    public let direction: TransferDirection
+    public let remotePath: RemotePath
+    public let localURL: URL
+    public let existingItemName: String
+    public let destinationDescription: String
+    public let continuation: @Sendable (Bool) -> Void
+
+    public init(
+        id: UUID = UUID(),
+        direction: TransferDirection,
+        remotePath: RemotePath,
+        localURL: URL,
+        existingItemName: String,
+        destinationDescription: String,
+        continuation: @escaping @Sendable (Bool) -> Void
+    ) {
+        self.id = id
+        self.direction = direction
+        self.remotePath = remotePath
+        self.localURL = localURL
+        self.existingItemName = existingItemName
+        self.destinationDescription = destinationDescription
+        self.continuation = continuation
+    }
 }
 
 // MARK: - SFTP Repository Protocol
