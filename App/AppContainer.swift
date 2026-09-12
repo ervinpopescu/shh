@@ -41,6 +41,15 @@ final class AppContainer: ObservableObject {
     @Published var isTmuxServerRunning: Bool = false
     @Published var tmuxError: String? = nil
     @Published var activeTmuxSessionID: String? = nil
+
+    // MARK: - Herdr Multiplexer & Agent State
+    @Published public var herdrAvailability: HerdrAvailability = .unavailable(reason: "Not connected")
+    @Published public var herdrWorkspaces: [HerdrWorkspace] = []
+    @Published public var isProbingHerdr: Bool = false
+    @Published public var isPollingHerdr: Bool = false
+    @Published public var herdrError: String? = nil
+    private var herdrRefreshGeneration: Int = 0
+    private var herdrPollingTask: Task<Void, Never>?
     @Published var selectedVoiceProviderID: String
     @Published var defaultVoiceMode: VoiceInputMode = .shellCommand
     @Published var voiceModels: [VoiceModelDescriptor] = []
@@ -358,6 +367,12 @@ final class AppContainer: ObservableObject {
         await cancelVoiceRecording()
         resetVoiceState()
         tmuxRefreshGeneration += 1
+        herdrRefreshGeneration += 1
+        stopHerdrPolling()
+        herdrWorkspaces = []
+        isProbingHerdr = false
+        herdrAvailability = .unavailable(reason: "Not connected")
+        herdrError = nil
         isExplicitDisconnect = false
         activeHost = host
         activeTmuxSessionID = nil
@@ -532,7 +547,10 @@ final class AppContainer: ObservableObject {
                         }
                     case .closed:
                         self.tmuxRefreshGeneration += 1
+                        self.herdrRefreshGeneration += 1
+                        self.stopHerdrPolling()
                         self.isProbingTmux = false
+                        self.isProbingHerdr = false
                         self.activeSession?.state = .disconnected
                         self.detachCallbacks()
                         if !self.useLegacyTerminalFallback {
@@ -546,7 +564,10 @@ final class AppContainer: ObservableObject {
                         self.handleConnectionDrop(host: host)
                     case .error(let error):
                         self.tmuxRefreshGeneration += 1
+                        self.herdrRefreshGeneration += 1
+                        self.stopHerdrPolling()
                         self.isProbingTmux = false
+                        self.isProbingHerdr = false
                         self.activeSession?.state = .failed
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
@@ -565,7 +586,10 @@ final class AppContainer: ObservableObject {
             } catch {
                 guard let self, self.activeSession?.id == session.id else { return }
                 self.tmuxRefreshGeneration += 1
+                self.herdrRefreshGeneration += 1
+                self.stopHerdrPolling()
                 self.isProbingTmux = false
+                self.isProbingHerdr = false
                 self.activeSession?.state = .failed
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
@@ -602,7 +626,10 @@ final class AppContainer: ObservableObject {
             throw TransportError.networkUnavailable
         }
         tmuxRefreshGeneration += 1
+        herdrRefreshGeneration += 1
+        stopHerdrPolling()
         isProbingTmux = false
+        isProbingHerdr = false
 
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
@@ -680,7 +707,10 @@ final class AppContainer: ObservableObject {
     func cancelReconnect() async {
         isExplicitDisconnect = true
         tmuxRefreshGeneration += 1
+        herdrRefreshGeneration += 1
+        stopHerdrPolling()
         isProbingTmux = false
+        isProbingHerdr = false
         await reconnectCoordinator.cancel()
         reconnectState = .cancelled
     }
@@ -843,6 +873,13 @@ final class AppContainer: ObservableObject {
         isProbingTmux = false
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
+
+        herdrRefreshGeneration += 1
+        stopHerdrPolling()
+        herdrWorkspaces = []
+        isProbingHerdr = false
+        herdrAvailability = .unavailable(reason: "Not connected")
+        herdrError = nil
 
         // Reset SFTP session, preview, editor, and transfer state
         closePreview()
@@ -1339,6 +1376,353 @@ final class AppContainer: ObservableObject {
         } else {
             tmuxError = "Failed to create tmux session \(validatedName.value)."
             return false
+        }
+    }
+
+    // MARK: - Live Herdr Workspace & Agent Management
+
+    @discardableResult
+    func probeHerdr() async -> HerdrAvailability {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            let avail = HerdrAvailability.unavailable(reason: "Not connected")
+            if activeSession == nil || activeSession?.state != .connected {
+                herdrAvailability = avail
+            }
+            return avail
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+        do {
+            let result = try await executor.executeCommand(HerdrCommand.probe, timeout: 5.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return .unavailable(reason: "Session disconnected")
+            }
+            let avail = HerdrAvailability.parse(result: result)
+            herdrAvailability = avail
+            return avail
+        } catch {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return .unavailable(reason: "Session disconnected")
+            }
+            let avail = HerdrAvailability.unavailable(reason: error.localizedDescription)
+            herdrAvailability = avail
+            return avail
+        }
+    }
+
+    @discardableResult
+    func listHerdrWorkspaces() async -> [HerdrWorkspace] {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            herdrWorkspaces = []
+            return []
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+        do {
+            let cmd = HerdrCommand.workspaceList().renderedCommand
+            let result = try await executor.executeCommand(cmd, timeout: 5.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return []
+            }
+            if result.isSuccess {
+                do {
+                    let parsed = try HerdrOutputParser.parseWorkspaces(from: result.stdout)
+                    herdrWorkspaces = parsed
+                    herdrError = nil
+                    return parsed
+                } catch {
+                    herdrWorkspaces = []
+                    herdrError = "Failed to parse Herdr workspaces: \(error.localizedDescription)"
+                    return []
+                }
+            } else {
+                herdrWorkspaces = []
+                let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let out = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                herdrError = !err.isEmpty ? err : (!out.isEmpty ? out : "Failed to list Herdr workspaces (exit code \(result.exitCode))")
+                return []
+            }
+        } catch {
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return []
+            }
+            herdrWorkspaces = []
+            herdrError = error.localizedDescription
+            return []
+        }
+    }
+
+    func refreshHerdrState() async {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let currentConnection = connection, currentConnection is SSHCommandExecuting else {
+            herdrAvailability = .unavailable(reason: "Not connected")
+            herdrWorkspaces = []
+            return
+        }
+        let sessionID = currentSession.id
+        let connObj = currentConnection as AnyObject
+        herdrRefreshGeneration += 1
+        let generation = herdrRefreshGeneration
+        isProbingHerdr = true
+        defer {
+            if herdrRefreshGeneration == generation {
+                isProbingHerdr = false
+            }
+        }
+
+        let availability = await probeHerdr()
+        guard herdrRefreshGeneration == generation,
+              activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            return
+        }
+
+        if availability.isAvailable {
+            _ = await listHerdrWorkspaces()
+        } else {
+            herdrWorkspaces = []
+        }
+    }
+
+    func startHerdrPolling(interval: TimeInterval = 3.0) {
+        stopHerdrPolling()
+        isPollingHerdr = true
+        let generation = herdrRefreshGeneration
+        herdrPollingTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                guard let self,
+                      self.herdrRefreshGeneration == generation,
+                      self.activeSession?.state == .connected,
+                      !self.isExplicitDisconnect else {
+                    break
+                }
+                await self.refreshHerdrState()
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                } catch {
+                    break
+                }
+            }
+            if let self, self.herdrRefreshGeneration == generation {
+                self.isPollingHerdr = false
+            }
+        }
+    }
+
+    func stopHerdrPolling() {
+        herdrPollingTask?.cancel()
+        herdrPollingTask = nil
+        isPollingHerdr = false
+    }
+
+    @discardableResult
+    func runHerdrPaneCommand(paneID: String, command: String, approved: Bool = false) async -> (success: Bool, error: String?) {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            let msg = "Not connected."
+            herdrError = msg
+            return (false, msg)
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+
+        let rendered = HerdrCommand.paneRun(pane: paneID, command: command).renderedCommand
+        let policy = CommandPolicy()
+        let risk = policy.classify(rendered)
+
+        guard risk != .blocked else {
+            let msg = "Safety policy blocked destructive command: '\(command)'."
+            herdrError = msg
+            return (false, msg)
+        }
+
+        if risk == .reviewRequired && !approved {
+            let msg = "Command requires explicit approval: '\(command)'."
+            herdrError = msg
+            return (false, msg)
+        }
+
+        do {
+            let result = try await executor.executeCommand(rendered, timeout: 10.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return (false, "Session disconnected")
+            }
+            if result.isSuccess {
+                herdrError = nil
+                await refreshHerdrState()
+                return (true, nil)
+            } else {
+                let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let out = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+                let msg = !err.isEmpty ? err : (!out.isEmpty ? out : "Command failed with code \(result.exitCode)")
+                herdrError = msg
+                return (false, msg)
+            }
+        } catch {
+            herdrError = error.localizedDescription
+            return (false, error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    func splitHerdrPane(paneID: String, direction: String = "right") async -> (success: Bool, error: String?) {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            let msg = "Not connected."
+            herdrError = msg
+            return (false, msg)
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+
+        let cmd = HerdrCommand.paneSplit(pane: paneID, direction: direction).renderedCommand
+        let policy = CommandPolicy()
+        let risk = policy.classify(cmd)
+        guard risk != .blocked else {
+            let msg = "Safety policy blocked pane split."
+            herdrError = msg
+            return (false, msg)
+        }
+
+        do {
+            let result = try await executor.executeCommand(cmd, timeout: 5.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return (false, "Session disconnected")
+            }
+            if result.isSuccess {
+                herdrError = nil
+                await refreshHerdrState()
+                return (true, nil)
+            } else {
+                let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let msg = !err.isEmpty ? err : "Failed to split pane (exit code \(result.exitCode))"
+                herdrError = msg
+                return (false, msg)
+            }
+        } catch {
+            herdrError = error.localizedDescription
+            return (false, error.localizedDescription)
+        }
+    }
+
+    func readHerdrPaneOutput(paneID: String, source: String = "recent-unwrapped") async throws -> String {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            throw HerdrParseError.emptyOutput
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+
+        let cmd = HerdrCommand.paneRead(pane: paneID, source: source).renderedCommand
+        let result = try await executor.executeCommand(cmd, timeout: 5.0)
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            throw HerdrParseError.emptyOutput
+        }
+        guard result.isSuccess else {
+            let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw HerdrParseError.invalidState(!err.isEmpty ? err : "Read failed with code \(result.exitCode)")
+        }
+        return HerdrOutputParser.parseRecentUnwrapped(from: result.stdout)
+    }
+
+    func waitHerdrAgentStatus(paneID: String? = nil, status: String? = nil, timeout: TimeInterval = 10.0) async throws -> HerdrAgentState {
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            throw HerdrParseError.emptyOutput
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+
+        let cmd = HerdrCommand.waitAgentStatus(pane: paneID, status: status).renderedCommand
+        let result = try await executor.executeCommand(cmd, timeout: timeout)
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+                throw HerdrParseError.emptyOutput
+        }
+        guard result.isSuccess else {
+            let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw HerdrParseError.invalidState(!err.isEmpty ? err : "Wait failed with code \(result.exitCode)")
+        }
+        let state = try HerdrOutputParser.parseAgentState(from: result.stdout)
+        await refreshHerdrState()
+        return state
+    }
+
+    @discardableResult
+    func createHerdrWorkspace(label: String, cwd: String = ".") async -> (success: Bool, error: String?) {
+        let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedLabel.isEmpty else {
+            let msg = "Workspace label cannot be empty."
+            herdrError = msg
+            return (false, msg)
+        }
+        guard let currentSession = activeSession, currentSession.state == .connected,
+              let executor = connection as? SSHCommandExecuting else {
+            let msg = "Not connected."
+            herdrError = msg
+            return (false, msg)
+        }
+        let sessionID = currentSession.id
+        let connObj = connection as AnyObject
+
+        let cleanCwd = cwd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "." : cwd
+        let cmd = HerdrCommand.workspaceCreate(cwd: cleanCwd, label: trimmedLabel).renderedCommand
+        let policy = CommandPolicy()
+        let risk = policy.classify(cmd)
+        guard risk != .blocked else {
+            let msg = "Safety policy blocked workspace creation."
+            herdrError = msg
+            return (false, msg)
+        }
+
+        do {
+            let result = try await executor.executeCommand(cmd, timeout: 5.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
+                return (false, "Session disconnected")
+            }
+            if result.isSuccess {
+                herdrError = nil
+                await refreshHerdrState()
+                return (true, nil)
+            } else {
+                let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                let msg = !err.isEmpty ? err : "Failed to create workspace (exit code \(result.exitCode))"
+                herdrError = msg
+                return (false, msg)
+            }
+        } catch {
+            herdrError = error.localizedDescription
+            return (false, error.localizedDescription)
         }
     }
 
