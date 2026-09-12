@@ -19,32 +19,71 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
 
     // MARK: - MoshBootstrapper Command Generation Tests
 
-    func testBuildCommandDefaultOptions() {
+    func testBuildCommandDefaultOptions() throws {
         let options = MoshOptions()
-        let cmd = MoshBootstrapper.buildCommand(options: options)
+        let cmd = try MoshBootstrapper.buildCommand(options: options)
         XCTAssertEqual(cmd, "mosh-server new -s -c 256")
     }
 
-    func testBuildCommandWithPortRangeAndRows() {
+    func testBuildCommandWithPortRangeAndRows() throws {
         let options = MoshOptions(
             serverCommand: "mosh-server",
             portRange: MoshPortRange(start: 60000, end: 60050)
         )
         let size = TerminalSize(columns: 120, rows: 40)
-        let cmd = MoshBootstrapper.buildCommand(options: options, initialSize: size)
+        let cmd = try MoshBootstrapper.buildCommand(options: options, initialSize: size)
         XCTAssertEqual(cmd, "mosh-server new -s -c 256 -p 60000:60050 -l rows=40")
     }
 
-    func testBuildCommandWithQuotedPathAndRemoteCommand() {
+    func testBuildCommandWithQuotedPathAndRemoteCommand() throws {
         let options = MoshOptions(
             serverCommand: "/opt/custom bin/mosh-server",
             portRange: MoshPortRange(port: 60020)
         )
-        let cmd = MoshBootstrapper.buildCommand(
+        let cmd = try MoshBootstrapper.buildCommand(
             options: options,
             remoteCommand: "tmux new-session -A -s dev"
         )
         XCTAssertEqual(cmd, "'/opt/custom bin/mosh-server' new -s -c 256 -p 60020 -- tmux new-session -A -s dev")
+    }
+
+    func testBuildCommandRejectsShellMetacharacters() {
+        let maliciousCommands = [
+            "mosh-server;reboot",
+            "mosh-server$(malicious)",
+            "mosh-server`whoami`",
+            "mosh-server|cat",
+            "mosh-server&disown",
+            "mosh-server>file"
+        ]
+        for badCmd in maliciousCommands {
+            let options = MoshOptions(serverCommand: badCmd)
+            XCTAssertThrowsError(try MoshBootstrapper.buildCommand(options: options)) { error in
+                guard case MoshBootstrapError.invalidServerCommand(let cmd) = error else {
+                    XCTFail("Expected invalidServerCommand for '\(badCmd)', got \(error)")
+                    return
+                }
+                XCTAssertEqual(cmd, badCmd)
+            }
+        }
+    }
+
+    func testBuildCommandRejectsBlockedRemoteCommand() {
+        let blockedCommands = [
+            "rm -rf /",
+            "tmux kill-server",
+            "dd if=/dev/zero of=/dev/sda"
+        ]
+        for blocked in blockedCommands {
+            let options = MoshOptions()
+            XCTAssertThrowsError(try MoshBootstrapper.buildCommand(options: options, remoteCommand: blocked)) { error in
+                guard case MoshBootstrapError.blockedRemoteCommand(let cmd) = error else {
+                    XCTFail("Expected blockedRemoteCommand for '\(blocked)', got \(error)")
+                    return
+                }
+                XCTAssertEqual(cmd, blocked)
+            }
+        }
     }
 
     // MARK: - MoshBootstrapper Output Parsing Tests
@@ -90,6 +129,19 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
                 return
             }
             XCTAssertEqual(str, invalid)
+        }
+    }
+
+    func testParseOutputErrorRedactsSecretKey() {
+        // Output with MOSH CONNECT pattern but invalid/incomplete tokens that triggers invalidHandshake
+        let outputWithSecret = "MOSH CONNECT notaport SUPER_SECRET_MOSH_KEY_12345"
+        XCTAssertThrowsError(try MoshBootstrapper.parseOutput(outputWithSecret)) { error in
+            guard case MoshBootstrapError.invalidHandshake(let str) = error else {
+                XCTFail("Expected invalidHandshake error, got \(error)")
+                return
+            }
+            XCTAssertFalse(str.contains("SUPER_SECRET_MOSH_KEY_12345"))
+            XCTAssertFalse(error.localizedDescription.contains("SUPER_SECRET_MOSH_KEY_12345"))
         }
     }
 
@@ -204,6 +256,22 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
         XCTAssertEqual(decoded?.payload, payload)
     }
 
+    func testMoshDatagramDecodeUnalignedMemory() {
+        let original = MoshDatagram(kind: .data, sequenceNumber: 123456789, timestamp: 987654321, payload: Data("unaligned test".utf8))
+        let encoded = original.encode()
+
+        // Prepend an odd number of bytes to force unaligned buffer slice
+        var unalignedBuffer = Data([0xAA])
+        unalignedBuffer.append(encoded)
+
+        let slice = unalignedBuffer.subdata(in: 1..<unalignedBuffer.count)
+        let decoded = MoshDatagram.decode(from: slice)
+        XCTAssertNotNil(decoded)
+        XCTAssertEqual(decoded?.sequenceNumber, 123456789)
+        XCTAssertEqual(decoded?.timestamp, 987654321)
+        XCTAssertEqual(decoded?.payload, Data("unaligned test".utf8))
+    }
+
     func testMoshDatagramDecodeTooShortReturnsNil() {
         let shortData = Data(repeating: 0, count: 16)
         XCTAssertNil(MoshDatagram.decode(from: shortData))
@@ -268,6 +336,59 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
         XCTAssertEqual(key.base64String, "")
     }
 
+    func testMoshConnectionNetworkRoamingRejectsThirdPartyAddress() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "198.51.100.1", remotePort: 60010)
+        let info = MoshSessionInfo(udpPort: 60010, sessionKey: "secretRoamingKey123", pid: 3000)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "198.51.100.1",
+            channel: channel
+        )
+        try await connection.start()
+
+        let unauthorizedRoaming = NetworkRoamingState(
+            currentInterface: .cellular,
+            remoteAddress: "203.0.113.99",
+            remotePort: 60010
+        )
+        do {
+            try await connection.handleNetworkRoaming(unauthorizedRoaming)
+            XCTFail("Expected TransportError.invalidConfiguration")
+        } catch let error as TransportError {
+            XCTAssertEqual(error, .invalidConfiguration)
+        }
+        await connection.close()
+    }
+
+    func testMoshConnectionDiscardsRawUnauthenticatedDatagrams() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "192.168.1.50", remotePort: 60001)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "secretKey1234567890", pid: 2000)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+        try await connection.start()
+        let stream = await connection.events()
+        var iterator = stream.makeAsyncIterator()
+
+        // Inject raw unauthenticated bytes that do not decode as MoshDatagram
+        channel.simulateInboundDatagram(Data("rm -rf /\n".utf8))
+
+        // Inject valid datagram
+        let valid = MoshDatagram(kind: .data, sequenceNumber: 1, payload: Data("legit\n".utf8))
+        channel.simulateInboundDatagram(valid.encode())
+
+        // The first yielded event should be the valid datagram, NOT the raw unauthenticated bytes
+        let event = try await iterator.next()
+        guard case .bytes(let bytes) = event else {
+            XCTFail("Expected .bytes event")
+            return
+        }
+        XCTAssertEqual(String(decoding: bytes, as: UTF8.self), "legit\n")
+        await connection.close()
+    }
+
     // MARK: - Network Roaming Recovery Tests
 
     func testMoshConnectionNetworkRoamingRecovery() async throws {
@@ -293,13 +414,13 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
             previousInterface: .wifi,
             currentInterface: .cellular,
             isExpensive: true,
-            remoteAddress: "198.51.100.2",
+            remoteAddress: "198.51.100.1",
             remotePort: 60010
         )
         try await connection.handleNetworkRoaming(cellularRoaming)
 
-        // Channel endpoint should be updated to new remote address
-        XCTAssertEqual(channel.currentHost, "198.51.100.2")
+        // Channel endpoint should be updated
+        XCTAssertEqual(channel.currentHost, "198.51.100.1")
         XCTAssertEqual(channel.currentPort, 60010)
 
         // Roaming probe datagram should have been sent

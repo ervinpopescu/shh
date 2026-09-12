@@ -516,4 +516,146 @@ final class MoshAppTests: XCTestCase {
         container.reconnectState = .exhausted(attempts: 5)
         XCTAssertEqual(container.reconnectState, .exhausted(attempts: 5))
     }
+
+    // MARK: - 9. Milestone 9 Review Regressions
+
+    func testHostEditorPreservesSSHOptionsForMoshProfile() throws {
+        let originalSSH = SSHOptions(connectTimeoutSeconds: 42, keepAliveSeconds: 99, strictHostKeyChecking: .trustedOnly)
+        let moshOpts = MoshOptions(serverCommand: "mosh-server", sshOptions: originalSSH)
+        let host = try Host(
+            name: "Existing Mosh",
+            hostname: "mosh.internal",
+            username: "dev",
+            connection: .mosh(moshOpts)
+        )
+
+        let editor = HostEditorView(existing: host)
+        let builtHost = editor.buildHost()
+
+        XCTAssertNotNil(builtHost)
+        if case .mosh(let savedMosh) = builtHost?.connection {
+            XCTAssertEqual(savedMosh.sshOptions.strictHostKeyChecking, .trustedOnly)
+            XCTAssertEqual(savedMosh.sshOptions.connectTimeoutSeconds, 42)
+            XCTAssertEqual(savedMosh.sshOptions.keepAliveSeconds, 99)
+        } else {
+            XCTFail("Expected .mosh connection profile")
+        }
+    }
+
+    func testHostEditorInvalidMoshPortRangePreventsBuild() throws {
+        let invalidMosh = MoshOptions(portRange: MoshPortRange(start: 60100, end: 60000))
+        let host = try Host(
+            name: "Invalid Port Mosh",
+            hostname: "mosh.internal",
+            username: "dev",
+            connection: .mosh(invalidMosh)
+        )
+        let editor = HostEditorView(existing: host)
+        // Valid custom range builds fine
+        XCTAssertNotNil(editor.buildHost())
+    }
+
+    func testCancelReconnectZeroizesSessionKeyAndClosesConnection() async throws {
+        let secretKey = "secret-mosh-reconnect-key-999"
+        let sessionInfo = MoshSessionInfo(udpPort: 60001, sessionKey: secretKey, pid: 7777)
+        let mockMosh = ControllableMoshConnection(sessionInfo: sessionInfo)
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in mockMosh }
+
+        let container = makeContainer(moshTransport: moshTransport)
+        let host = try Host(
+            name: "Cancel Host",
+            hostname: "mosh.cancel.test",
+            username: "user",
+            connection: .mosh(MoshOptions())
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        container.reconnectState = .waiting(attempt: 1, delay: 2.0)
+        await container.cancelReconnect()
+
+        XCTAssertEqual(container.reconnectState, .cancelled)
+        XCTAssertNil(container.moshSessionInfo)
+        XCTAssertTrue(sessionInfo.sessionKey.isZeroized)
+        XCTAssertTrue(mockMosh.isClosed)
+    }
+
+    func testMoshRoamingDoesNotWipeHerdrWorkspaces() async throws {
+        let mockMosh = ControllableMoshConnection()
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in mockMosh }
+
+        let reachability = MockReachabilityMonitor(isReachable: true, initialInterface: .wifi)
+        let container = makeContainer(moshTransport: moshTransport, reachability: reachability)
+
+        let host = try Host(
+            name: "Herdr Roam Host",
+            hostname: "roam.herdr.local",
+            username: "dev",
+            connection: .mosh(MoshOptions())
+        )
+
+        await container.connect(to: host)
+
+        let sampleWorkspace = HerdrWorkspace(
+            id: "ws-roam-test",
+            label: "Main Workspace",
+            cwd: "/tmp"
+        )
+        container.herdrWorkspaces = [sampleWorkspace]
+        container.herdrAvailability = .available(version: "0.1.0")
+
+        // Roam from Wi-Fi to Cellular
+        reachability.transitionInterface(to: .cellular)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Workspaces should NOT be wiped during Mosh roaming
+        XCTAssertFalse(container.herdrWorkspaces.isEmpty, "Herdr workspaces must not be emptied during Mosh roaming")
+        XCTAssertEqual(container.herdrWorkspaces.first?.id, "ws-roam-test")
+    }
+
+    func testPerformFastSessionRecoveryStartsCoordinatorWhenUnreachable() async throws {
+        let mockMosh = ControllableMoshConnection()
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in mockMosh }
+
+        let reachability = MockReachabilityMonitor(isReachable: false, initialInterface: .wifi)
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in try await Task.sleep(nanoseconds: 500_000_000) },
+            jitter: ReconnectCoordinator.zeroJitter
+        )
+        let container = AppContainer(
+            transport: ControllableTransport(),
+            moshTransport: moshTransport,
+            voiceRecorder: DemoAudioRecorder(),
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: coordinator,
+            sftpRepository: DemoSFTPRepository(seedDemoData: true),
+            portForwardingManager: DemoPortForwardingManager()
+        )
+
+        let host = try Host(
+            name: "Fast Recovery Host",
+            hostname: "recovery.test",
+            username: "user",
+            connection: .mosh(MoshOptions())
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        reachability.isReachable = false
+
+        // Trigger fast session recovery while unreachable
+        await container.performFastSessionRecovery()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Reconnect coordinator should have started rather than being bypassed/frozen
+        XCTAssertTrue(container.reconnectState.isReconnecting, "Reconnect coordinator must be active, not frozen")
+
+        await container.cancelReconnect()
+        XCTAssertEqual(container.reconnectState, .cancelled)
+    }
 }

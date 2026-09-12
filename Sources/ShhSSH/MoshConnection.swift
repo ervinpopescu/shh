@@ -112,6 +112,9 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
 
         // If remote address or port changed, update channel endpoint
         if let newAddress = newState.remoteAddress, !newAddress.isEmpty {
+            guard newAddress == remoteHostname else {
+                throw TransportError.invalidConfiguration
+            }
             let port = newState.remotePort ?? sessionInfo.udpPort
             try await channel.updateEndpoint(host: newAddress, port: port)
         }
@@ -190,8 +193,6 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
                     await self?.close()
                 }
             }
-        } else {
-            eventContinuation?.yield(.bytes(data))
         }
     }
 

@@ -8,6 +8,8 @@ public enum MoshBootstrapError: Error, Equatable, LocalizedError, Sendable {
     case missingPortOrKey
     case timeout
     case cancelled
+    case invalidServerCommand(String)
+    case blockedRemoteCommand(String)
 
     public var errorDescription: String? {
         switch self {
@@ -16,13 +18,17 @@ public enum MoshBootstrapError: Error, Equatable, LocalizedError, Sendable {
         case .executionFailed(let exitStatus, let stderr):
             return "mosh-server failed with exit status \(exitStatus): \(stderr)"
         case .invalidHandshake(let output):
-            return "Failed to parse MOSH CONNECT handshake from output: \(output)"
+            return "Failed to parse MOSH CONNECT handshake from output: \(MoshBootstrapper.redactKeyTokens(in: output))"
         case .missingPortOrKey:
             return "mosh-server output did not contain valid UDP port and session key"
         case .timeout:
             return "mosh-server bootstrap timed out"
         case .cancelled:
             return "mosh-server bootstrap was cancelled"
+        case .invalidServerCommand(let cmd):
+            return "Invalid mosh server command contains disallowed characters: '\(cmd)'"
+        case .blockedRemoteCommand(let cmd):
+            return "Remote command was blocked by policy: '\(cmd)'"
         }
     }
 }
@@ -30,14 +36,28 @@ public enum MoshBootstrapError: Error, Equatable, LocalizedError, Sendable {
 public struct MoshBootstrapper: Sendable {
     public init() {}
 
+    public static func redactKeyTokens(in text: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: "MOSH CONNECT\\s+(\\S+)\\s+(\\S+)") else {
+            return text
+        }
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: "MOSH CONNECT $1 [REDACTED]")
+    }
+
     public static func buildCommand(
         options: MoshOptions,
         initialSize: TerminalSize? = nil,
         remoteCommand: String? = nil
-    ) -> String {
+    ) throws -> String {
         var parts: [String] = []
         let rawCmd = options.serverCommand.trimmingCharacters(in: .whitespaces)
         let serverCmd = rawCmd.isEmpty ? "mosh-server" : rawCmd
+
+        let allowedCharacterSet = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/.-_ ")
+        guard serverCmd.unicodeScalars.allSatisfy({ allowedCharacterSet.contains($0) }) else {
+            throw MoshBootstrapError.invalidServerCommand(serverCmd)
+        }
+
         if serverCmd.contains(" ") {
             parts.append(ShellQuoting.quote(serverCmd))
         } else {
@@ -56,8 +76,13 @@ public struct MoshBootstrapper: Sendable {
         }
 
         if let remoteCommand, !remoteCommand.trimmingCharacters(in: .whitespaces).isEmpty {
+            let trimmedRemote = remoteCommand.trimmingCharacters(in: .whitespaces)
+            let policy = CommandPolicy()
+            guard policy.classify(trimmedRemote) != .blocked else {
+                throw MoshBootstrapError.blockedRemoteCommand(trimmedRemote)
+            }
             parts.append("--")
-            parts.append(remoteCommand)
+            parts.append(trimmedRemote)
         }
 
         return parts.joined(separator: " ")
@@ -100,7 +125,7 @@ public struct MoshBootstrapper: Sendable {
         }
 
         guard let port = parsedPort, let key = parsedKey, !key.isEmpty else {
-            throw MoshBootstrapError.invalidHandshake(output)
+            throw MoshBootstrapError.invalidHandshake(redactKeyTokens(in: output))
         }
 
         return MoshSessionInfo(udpPort: port, sessionKey: key, pid: parsedPid)
@@ -127,7 +152,7 @@ public struct MoshBootstrapper: Sendable {
         remoteCommand: String? = nil,
         timeout: TimeInterval? = 15.0
     ) async throws -> MoshSessionInfo {
-        let command = Self.buildCommand(options: options, initialSize: initialSize, remoteCommand: remoteCommand)
+        let command = try Self.buildCommand(options: options, initialSize: initialSize, remoteCommand: remoteCommand)
         let result = try await executor.executeCommand(command, timeout: timeout, maxOutputBytes: 65536)
 
         let stdoutStr = result.stdout

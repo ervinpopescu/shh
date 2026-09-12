@@ -408,6 +408,7 @@ final class AppContainer: ObservableObject {
         moshStateTask?.cancel()
         moshStateTask = nil
         moshState = nil
+        moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
         activeHerdrWorkspaceID = nil
@@ -793,6 +794,14 @@ final class AppContainer: ObservableObject {
         isProbingHerdr = false
         await reconnectCoordinator.cancel()
         reconnectState = .cancelled
+        moshStateTask?.cancel()
+        moshStateTask = nil
+        moshState = nil
+        moshSessionInfo?.zeroize()
+        moshSessionInfo = nil
+        networkRoamingState = nil
+        await connection?.close()
+        connection = nil
     }
 
     func retryReconnect() async {
@@ -849,13 +858,6 @@ final class AppContainer: ObservableObject {
             do {
                 try await moshController.handleNetworkRoaming(roamingState)
                 self.moshState = await moshController.moshState
-                // Probe/resync Tmux and Herdr without corrupting terminal buffer
-                if activeTmuxSessionID != nil {
-                    _ = await probeTmux()
-                }
-                if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
-                    await refreshHerdrState()
-                }
             } catch {
                 await performFastSessionRecovery()
             }
@@ -864,22 +866,12 @@ final class AppContainer: ObservableObject {
 
     func performFastSessionRecovery() async {
         guard let host = activeHost, !isExplicitDisconnect else { return }
-        guard reachabilityMonitor.isReachable else {
-            reconnectState = .waiting(attempt: 1, delay: 2.0)
-            return
-        }
 
-        if let moshController = connection as? any MoshSessionControlling {
+        if reachabilityMonitor.isReachable, let moshController = connection as? any MoshSessionControlling {
             let roaming = networkRoamingState ?? NetworkRoamingState(currentInterface: reachabilityMonitor.currentInterfaceType)
             do {
                 try await moshController.handleNetworkRoaming(roaming)
                 self.moshState = await moshController.moshState
-                if activeTmuxSessionID != nil {
-                    _ = await probeTmux()
-                }
-                if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
-                    await refreshHerdrState()
-                }
                 return
             } catch {
                 // In-place recovery probe failed; fall back to reconnect coordinator
@@ -1036,6 +1028,7 @@ final class AppContainer: ObservableObject {
         moshStateTask?.cancel()
         moshStateTask = nil
         moshState = nil
+        moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
 
@@ -1251,6 +1244,9 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func probeTmux() async -> TmuxAvailability {
+        if connection is any MoshSessionControlling {
+            return tmuxAvailability
+        }
         guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             let avail = TmuxAvailability.unavailable(reason: "Not connected")
@@ -1399,6 +1395,9 @@ final class AppContainer: ObservableObject {
     }
 
     func refreshTmuxState() async {
+        if connection is any MoshSessionControlling {
+            return
+        }
         guard let currentSession = activeSession, currentSession.state == .connected,
               let currentConnection = connection, currentConnection is SSHCommandExecuting else {
             tmuxAvailability = .unavailable(reason: "Not connected")
@@ -1636,6 +1635,9 @@ final class AppContainer: ObservableObject {
     }
 
     func refreshHerdrState() async {
+        if connection is any MoshSessionControlling {
+            return
+        }
         guard let currentSession = activeSession, currentSession.state == .connected,
               let currentConnection = connection, currentConnection is SSHCommandExecuting else {
             herdrAvailability = .unavailable(reason: "Not connected")

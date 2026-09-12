@@ -132,8 +132,10 @@ public final class MoshSessionKey: @unchecked Sendable, CustomStringConvertible,
     public func zeroize() {
         lock.withLock {
             guard !_isZeroized else { return }
-            for i in 0..<storage.count {
-                storage[i] = 0
+            storage.withUnsafeMutableBytes { buffer in
+                if let baseAddress = buffer.baseAddress, buffer.count > 0 {
+                    memset_s(baseAddress, buffer.count, 0, buffer.count)
+                }
             }
             storage.removeAll()
             _isZeroized = true
@@ -155,13 +157,13 @@ public final class MoshSessionKey: @unchecked Sendable, CustomStringConvertible,
 
 extension MoshSessionKey: Equatable {
     public static func == (lhs: MoshSessionKey, rhs: MoshSessionKey) -> Bool {
-        lhs.base64String == rhs.base64String
+        lhs.rawBytes == rhs.rawBytes
     }
 }
 
 extension MoshSessionKey: Hashable {
     public func hash(into hasher: inout Hasher) {
-        hasher.combine(base64String)
+        hasher.combine(rawBytes)
     }
 }
 
@@ -473,6 +475,17 @@ public struct DemoMoshTransport: MoshTransport, SSHTransport {
             fingerprint: "SHA256:demo-mosh-fingerprint"
         )
         guard await trustEvaluator.evaluate(challenge) != .reject else {
+            switch await trustEvaluator.status(for: challenge) {
+            case .unknown:
+                if case .mosh(let opts) = host.connection, opts.sshOptions.strictHostKeyChecking == .trustedOnly {
+                    throw TransportError.remoteFailure("Host key is not trusted")
+                }
+                throw TransportError.hostKeyApprovalRequired(challenge)
+            case .changed(let oldFingerprint):
+                throw TransportError.hostKeyChanged(old: oldFingerprint, new: challenge.fingerprint)
+            case .trusted:
+                break
+            }
             throw TransportError.remoteFailure("Host key was rejected")
         }
 
