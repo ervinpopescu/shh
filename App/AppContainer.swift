@@ -49,6 +49,7 @@ final class AppContainer: ObservableObject {
     @Published public var isPollingHerdr: Bool = false
     @Published public var herdrError: String? = nil
     private var herdrRefreshGeneration: Int = 0
+    private var herdrPollingGeneration: Int = 0
     private var herdrPollingTask: Task<Void, Never>?
     @Published var selectedVoiceProviderID: String
     @Published var defaultVoiceMode: VoiceInputMode = .shellCommand
@@ -1503,11 +1504,17 @@ final class AppContainer: ObservableObject {
     func startHerdrPolling(interval: TimeInterval = 3.0) {
         stopHerdrPolling()
         isPollingHerdr = true
-        let generation = herdrRefreshGeneration
+        herdrPollingGeneration += 1
+        let generation = herdrPollingGeneration
         herdrPollingTask = Task { @MainActor [weak self] in
+            defer {
+                if let self, self.herdrPollingGeneration == generation {
+                    self.isPollingHerdr = false
+                }
+            }
             while !Task.isCancelled {
                 guard let self,
-                      self.herdrRefreshGeneration == generation,
+                      self.herdrPollingGeneration == generation,
                       self.activeSession?.state == .connected,
                       !self.isExplicitDisconnect else {
                     break
@@ -1519,13 +1526,11 @@ final class AppContainer: ObservableObject {
                     break
                 }
             }
-            if let self, self.herdrRefreshGeneration == generation {
-                self.isPollingHerdr = false
-            }
         }
     }
 
     func stopHerdrPolling() {
+        herdrPollingGeneration += 1
         herdrPollingTask?.cancel()
         herdrPollingTask = nil
         isPollingHerdr = false
@@ -1533,6 +1538,12 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func runHerdrPaneCommand(paneID: String, command: String, approved: Bool = false) async -> (success: Bool, error: String?) {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            let msg = "Command cannot be empty."
+            herdrError = msg
+            return (false, msg)
+        }
         guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             let msg = "Not connected."
@@ -1542,7 +1553,7 @@ final class AppContainer: ObservableObject {
         let sessionID = currentSession.id
         let connObj = connection as AnyObject
 
-        let rendered = HerdrCommand.paneRun(pane: paneID, command: command).renderedCommand
+        let rendered = HerdrCommand.paneRun(pane: paneID, command: trimmed).renderedCommand
         let policy = CommandPolicy()
         let risk = policy.classify(rendered)
 
@@ -1645,9 +1656,10 @@ final class AppContainer: ObservableObject {
         }
         guard result.isSuccess else {
             let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw HerdrParseError.invalidState(!err.isEmpty ? err : "Read failed with code \(result.exitCode)")
+            throw HerdrParseError.executionFailed(!err.isEmpty ? err : "Read failed with code \(result.exitCode)")
         }
-        return HerdrOutputParser.parseRecentUnwrapped(from: result.stdout)
+        let unwrapped = HerdrOutputParser.parseRecentUnwrapped(from: result.stdout)
+        return redactor.redact(unwrapped)
     }
 
     func waitHerdrAgentStatus(paneID: String? = nil, status: String? = nil, timeout: TimeInterval = 10.0) async throws -> HerdrAgentState {
@@ -1668,7 +1680,7 @@ final class AppContainer: ObservableObject {
         }
         guard result.isSuccess else {
             let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw HerdrParseError.invalidState(!err.isEmpty ? err : "Wait failed with code \(result.exitCode)")
+            throw HerdrParseError.executionFailed(!err.isEmpty ? err : "Wait failed with code \(result.exitCode)")
         }
         let state = try HerdrOutputParser.parseAgentState(from: result.stdout)
         await refreshHerdrState()

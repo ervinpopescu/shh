@@ -373,13 +373,39 @@ final class HerdrTests: XCTestCase {
         let parsed = HerdrOutputParser.parseRecentUnwrapped(from: raw)
         XCTAssertEqual(parsed, "Line 1\nLine 2\nLine 3\n")
 
-        let jsonWrapper = "{\"output\": \"Unwrapped pane content\\nSecond line\\n\"}"
+        let jsonWrapper = "{\"output\": \"Unwrapped pane content\\r\\nSecond line\\r\\n\"}"
         let parsedJSON = HerdrOutputParser.parseRecentUnwrapped(from: jsonWrapper)
         XCTAssertEqual(parsedJSON, "Unwrapped pane content\nSecond line\n")
 
-        let linesWrapper = "{\"lines\": [\"First\", \"Second\"]}"
+        let textWrapper = "{\"text\": \"Line A\\r\\nLine B\\r\\n\"}"
+        let parsedText = HerdrOutputParser.parseRecentUnwrapped(from: textWrapper)
+        XCTAssertEqual(parsedText, "Line A\nLine B\n")
+
+        let contentWrapper = "{\"content\": \"Alpha\\r\\nBeta\\r\\n\"}"
+        let parsedContent = HerdrOutputParser.parseRecentUnwrapped(from: contentWrapper)
+        XCTAssertEqual(parsedContent, "Alpha\nBeta\n")
+
+        let linesWrapper = "{\"lines\": [\"First\\r\\nsubline\", \"Second\"]}"
         let parsedLines = HerdrOutputParser.parseRecentUnwrapped(from: linesWrapper)
-        XCTAssertEqual(parsedLines, "First\nSecond")
+        XCTAssertEqual(parsedLines, "First\nsubline\nSecond")
+    }
+
+    func testHerdrParseErrorCases() {
+        let empty = HerdrParseError.emptyOutput
+        XCTAssertEqual(empty.errorDescription, "Herdr command output was empty.")
+
+        let invalidJSON = HerdrParseError.invalidJSON("corrupt")
+        XCTAssertEqual(invalidJSON.errorDescription, "Failed to parse Herdr JSON: corrupt")
+
+        let missing = HerdrParseError.missingRequiredField("id")
+        XCTAssertEqual(missing.errorDescription, "Missing required field 'id' in Herdr output.")
+
+        let invalidState = HerdrParseError.invalidState("mysterious")
+        XCTAssertEqual(invalidState.errorDescription, "Unknown or invalid Herdr agent state: 'mysterious'")
+
+        let failed = HerdrParseError.executionFailed("pane exited with code 1")
+        XCTAssertEqual(failed.errorDescription, "Herdr command failed: pane exited with code 1")
+        XCTAssertEqual(failed, HerdrParseError.executionFailed("pane exited with code 1"))
     }
 
     // MARK: - 6. CommandPolicy Hardening Tests for Herdr

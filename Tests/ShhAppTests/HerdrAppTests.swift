@@ -265,6 +265,33 @@ final class HerdrAppTests: XCTestCase {
         XCTAssertFalse(container.isPollingHerdr)
     }
 
+    func testHerdrAgentStatePollingPersistsAcrossMultipleCycles() async throws {
+        let container = AppContainer.demo()
+        let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        await container.trustStore.save(demoChallenge)
+
+        let host = try Host(name: "Polling Multi Host", hostname: "demo.local", username: "dev")
+        await container.connect(to: host)
+
+        XCTAssertFalse(container.isPollingHerdr)
+        container.startHerdrPolling(interval: 0.04)
+        XCTAssertTrue(container.isPollingHerdr)
+
+        // Wait long enough for multiple polling intervals (0.04s * 5 = 0.2s)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        // Polling must persist and not abort due to herdrRefreshGeneration increment
+        XCTAssertTrue(container.isPollingHerdr, "Polling must not exit after first cycle")
+        XCTAssertTrue(container.herdrAvailability.isAvailable)
+
+        // Triggering an external single-shot refresh should NOT kill background polling
+        await container.refreshHerdrState()
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertTrue(container.isPollingHerdr, "Polling must survive concurrent refreshHerdrState() calls")
+
+        container.stopHerdrPolling()
+        XCTAssertFalse(container.isPollingHerdr)
+    }
+
     func testHerdrPollingCancelledOnDisconnect() async throws {
         let container = AppContainer.demo()
         let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
@@ -303,6 +330,23 @@ final class HerdrAppTests: XCTestCase {
         // Verify pane transitioned to working state in demo connection
         let updatedIdlePane = container.herdrWorkspaces.flatMap(\.panes).first(where: { $0.id == "pane-idle" })
         XCTAssertEqual(updatedIdlePane?.agentState, .working)
+    }
+
+    func testHerdrRunCommandRejectsEmptyOrWhitespace() async throws {
+        let container = AppContainer.demo()
+        let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        await container.trustStore.save(demoChallenge)
+
+        let host = try Host(name: "Run Host", hostname: "demo.local", username: "dev")
+        await container.connect(to: host)
+
+        let emptyResult = await container.runHerdrPaneCommand(paneID: "p1", command: "")
+        XCTAssertFalse(emptyResult.success)
+        XCTAssertEqual(emptyResult.error, "Command cannot be empty.")
+
+        let whitespaceResult = await container.runHerdrPaneCommand(paneID: "p1", command: "   \t\n  ")
+        XCTAssertFalse(whitespaceResult.success)
+        XCTAssertEqual(whitespaceResult.error, "Command cannot be empty.")
     }
 
     func testHerdrRunCommandDestructiveBlockedByPolicy() async throws {
@@ -413,6 +457,82 @@ final class HerdrAppTests: XCTestCase {
         XCTAssertFalse(output.contains("\u{1b}["))
     }
 
+    func testHerdrReadPaneOutputRedactsCredentials() async throws {
+        let secret = "super-sensitive-api-token-xyz"
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data(secret.utf8), reference: "ref-token-xyz")
+        let identity = try IdentityDescriptor(name: "TokenID", kind: .password, keychainReference: "ref-token-xyz")
+
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(credentialStore: credStore, transport: transport)
+        try await container.catalog.save(identity)
+        let demoChallenge = HostKeyChallenge(hostname: "secure.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:fingerprint")
+        await container.trustStore.save(demoChallenge)
+
+        mock.onExecuteCommand = { cmd in
+            if cmd.contains("herdr pane read") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "Token exposed in logs: \(secret)\nAll good.\n",
+                    stderr: ""
+                )
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "herdr 0.1.0\n", stderr: "")
+        }
+
+        let host = try Host(name: "Secure Host", hostname: "secure.local", username: "dev", identityID: identity.id)
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        let output = try await container.readHerdrPaneOutput(paneID: "p1")
+        XCTAssertFalse(output.contains(secret), "Active credentials must be redacted from pane output")
+        XCTAssertTrue(output.contains("[REDACTED]"), "Redacted placeholder must replace credential")
+    }
+
+    func testHerdrCLICommandFailureThrowsExecutionFailed() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+
+        let container = AppContainer(transport: transport)
+        let demoChallenge = HostKeyChallenge(hostname: "error.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:fingerprint")
+        await container.trustStore.save(demoChallenge)
+
+        mock.onExecuteCommand = { cmd in
+            if cmd.contains("herdr pane read") {
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "pane 999 not found\n")
+            }
+            if cmd.contains("herdr wait agent-status") {
+                return SSHCommandResult(exitCode: 2, stdout: "", stderr: "timeout waiting for status\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "herdr 0.1.0\n", stderr: "")
+        }
+
+        let host = try Host(name: "Error Host", hostname: "error.local", username: "dev")
+        await container.connect(to: host)
+
+        do {
+            _ = try await container.readHerdrPaneOutput(paneID: "999")
+            XCTFail("readHerdrPaneOutput on failure must throw")
+        } catch let HerdrParseError.executionFailed(msg) {
+            XCTAssertTrue(msg.contains("pane 999 not found"))
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+
+        do {
+            _ = try await container.waitHerdrAgentStatus(paneID: "999", status: "done")
+            XCTFail("waitHerdrAgentStatus on failure must throw")
+        } catch let HerdrParseError.executionFailed(msg) {
+            XCTAssertTrue(msg.contains("timeout waiting for status"))
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
     func testHerdrWaitAgentStatus() async throws {
         let container = AppContainer.demo()
         let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
@@ -506,6 +626,34 @@ final class HerdrAppTests: XCTestCase {
         XCTAssertFalse(splitCalled)
         card.onSplitPane()
         XCTAssertTrue(splitCalled)
+    }
+
+    func testHerdrAgentStateBadgeAccessibilityAndCardPresentation() {
+        let badge = HerdrAgentStateBadge(state: .blocked(reason: "Needs approval"))
+        let hostingBadge = UIHostingController(rootView: badge)
+        let badgeSize = hostingBadge.sizeThatFits(in: CGSize(width: 300, height: 100))
+        XCTAssertGreaterThan(badgeSize.width, 0)
+        XCTAssertGreaterThan(badgeSize.height, 0)
+
+        // HerdrAgentCardView under narrow width and dynamic type
+        let pane = HerdrPane(
+            id: "pane-narrow-test",
+            label: "A very long pane label that exceeds standard narrow bounds",
+            agentState: .blocked(reason: "Waiting for review"),
+            currentCommand: "npm run build",
+            lastActivity: Date()
+        )
+        let card = HerdrAgentCardView(
+            pane: pane,
+            onReadOutput: {},
+            onSendCommand: {},
+            onSplitPane: {}
+        )
+        let hostingCard = UIHostingController(rootView: card)
+        // Test in narrow width (e.g. 180pt) to exercise header reflow
+        let narrowSize = hostingCard.sizeThatFits(in: CGSize(width: 180, height: 600))
+        XCTAssertGreaterThan(narrowSize.width, 0)
+        XCTAssertGreaterThan(narrowSize.height, 0)
     }
 
     func testHerdrOutputSheetPresentation() async throws {
