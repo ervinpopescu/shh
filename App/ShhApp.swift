@@ -76,8 +76,8 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
             Text(container.isDemo
-                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP, Mosh, and Whisper are not enabled in this build."
-                : "Live SSH transport active. \(surfaceDescription) SFTP, Mosh, and Whisper are not enabled in this build.").font(.caption2).foregroundStyle(.secondary)
+                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP and Mosh are not enabled in this build. Local voice AI active."
+                : "Live SSH transport active. \(surfaceDescription) SFTP and Mosh are not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -136,6 +136,10 @@ struct HostDetailView: View {
                 Label("Secrets stay in Keychain references", systemImage: "lock.shield")
                 Label("Unknown host keys require approval", systemImage: "checkmark.shield")
             }
+            Section("Voice & Environment") {
+                LabeledContent("Voice input", value: host.isVoiceEnabled ? "Enabled" : "Disabled (Default)")
+                LabeledContent("Environment", value: host.isProduction ? "Production" : "Standard")
+            }
             Section {
                 Button("Connect", systemImage: "bolt.horizontal") { Task { await container.connect(to: host) } }
                     .disabled(isConnectDisabled)
@@ -181,6 +185,11 @@ struct HostEditorView: View {
     @State private var identityID: UUID?
     @State private var defaultTmuxSession: String
     @State private var autoAttachTmux: Bool
+    @State private var enableVoice: Bool
+    @State private var allowShellCommand: Bool
+    @State private var allowAgentMessage: Bool
+    @State private var allowInsertOnly: Bool
+    @State private var isProductionHost: Bool
     @State private var identities: [IdentityDescriptor] = []
 
     init(existing: Host? = nil) {
@@ -192,6 +201,12 @@ struct HostEditorView: View {
         _identityID = State(initialValue: existing?.identityID)
         _defaultTmuxSession = State(initialValue: existing?.defaultTmuxSession ?? "")
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
+        _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
+        let allowed = existing?.voicePolicy.allowedModes ?? Set(VoiceInputMode.allCases)
+        _allowShellCommand = State(initialValue: allowed.contains(.shellCommand))
+        _allowAgentMessage = State(initialValue: allowed.contains(.agentMessage))
+        _allowInsertOnly = State(initialValue: allowed.contains(.insertOnly))
+        _isProductionHost = State(initialValue: existing?.isProduction ?? false)
     }
 
     var body: some View {
@@ -221,6 +236,22 @@ struct HostEditorView: View {
                             .font(.caption)
                             .foregroundStyle(hint.isValid ? Color.secondary : Color.red)
                             .accessibilityIdentifier("host-editor-session-validation-hint")
+                    }
+                }
+                Section("Voice input policy") {
+                    Toggle("Enable voice input", isOn: $enableVoice)
+                        .accessibilityIdentifier("host-editor-voice-toggle")
+                    if enableVoice {
+                        Toggle("Allow Shell Commands", isOn: $allowShellCommand)
+                        Toggle("Allow Agent Messages", isOn: $allowAgentMessage)
+                        Toggle("Allow Insert Text", isOn: $allowInsertOnly)
+                    }
+                    Toggle("Production environment", isOn: $isProductionHost)
+                        .accessibilityIdentifier("host-editor-production-toggle")
+                    if isProductionHost {
+                        Text("Production hosts require extra confirmation before dispatching agent messages.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
                     }
                 }
                 Section {
@@ -275,6 +306,12 @@ struct HostEditorView: View {
         guard isTmuxPreferenceValid else { return }
         let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
+        var allowedModes: Set<VoiceInputMode> = []
+        if allowShellCommand { allowedModes.insert(.shellCommand) }
+        if allowAgentMessage { allowedModes.insert(.agentMessage) }
+        if allowInsertOnly { allowedModes.insert(.insertOnly) }
+        let voicePolicy = HostVoicePolicy(isEnabled: enableVoice, allowedModes: allowedModes)
+
         guard let portNumber = UInt16(port),
               let host = try? Host(
                   id: existing?.id ?? UUID(),
@@ -285,7 +322,9 @@ struct HostEditorView: View {
                   identityID: identityID,
                   connection: existing?.connection ?? .ssh(SSHOptions()),
                   defaultTmuxSession: sessionPref,
-                  autoAttachTmux: autoAttachTmux
+                  autoAttachTmux: autoAttachTmux,
+                  voicePolicy: voicePolicy,
+                  isProduction: isProductionHost
               ) else { return }
         Task {
             do {
@@ -479,6 +518,19 @@ struct SessionView: View {
 
             Spacer()
 
+            // Voice Command Button
+            Button(action: {
+                container.resetVoiceState()
+                showVoice = true
+            }) {
+                Image(systemName: "mic")
+                    .font(.subheadline)
+                    .foregroundStyle(container.activeHost?.isVoiceEnabled == true ? Color.accentColor : Color.secondary)
+            }
+            .accessibilityLabel("Voice command")
+            .accessibilityIdentifier("session-header-voice-button")
+            .disabled(container.activeSession?.state != .connected)
+
             // Search Toggle
             Button(action: {
                 isSearchPresented.toggle()
@@ -625,10 +677,11 @@ struct SessionView: View {
                         .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || container.activeSession?.state != .connected)
 
                         Button("Speak", systemImage: "mic") {
-                            container.speechState = .idle
+                            container.resetVoiceState()
                             showVoice = true
                         }
                         .accessibilityLabel("Push to talk")
+                        .accessibilityIdentifier("command-drawer-voice-button")
                     }
                     Text("Composed commands pass through CommandPolicy. Blocked commands are rejected.")
                         .font(.caption2)
@@ -1300,42 +1353,39 @@ struct SnippetEditor: View {
     init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
     var body: some View { Form { TextField("Name", text: .constant(snippet.name)); TextEditor(text: $bodyText).frame(minHeight: 160); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
-struct VoiceComposer: View {
-    @EnvironmentObject private var container: AppContainer
-    @Environment(\.dismiss) private var dismiss
-    @State private var text = ""
-    @State private var pendingApproval: PendingCommand?
-    @State private var blocked = false
-    private let policy = CommandPolicy()
-    var body: some View {
-        NavigationStack {
-            Form {
-                Section("Push to talk") {
-                    Button("Recording unavailable", systemImage: "mic.slash") { }
-                        .disabled(true)
-                    Text("Audio recording and local transcription are not enabled in this build. Type an editable command below.").font(.caption).foregroundStyle(.secondary)
-                }
-                Section("Editable preview") { TextEditor(text: $text).frame(minHeight: 100) }
-            }
-            .navigationTitle("Voice command")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
-                ToolbarItem(placement: .confirmationAction) { Button("Send") { submit() }.disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || container.activeSession?.state != .connected) }
-            }
-            .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
-            .alert("Command blocked", isPresented: $blocked) { Button("OK", role: .cancel) { blocked = false } } message: { Text("This command is not permitted by the safety policy.") }
-        }
-    }
-    private func submit() {
-        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty else { return }
-        switch policy.classify(value) {
-        case .safe: Task { if await container.sendValidatedCommand(value + "\n") { dismiss() } }
-        case .reviewRequired: pendingApproval = PendingCommand(command: value)
-        case .blocked: blocked = true
-        }
-    }
-}
 struct FilesView: View { var body: some View { ContentUnavailableView("Files unavailable", systemImage: "folder", description: Text("SFTP is modeled behind RemoteFileRepository and is not enabled in this build.")) .navigationTitle("Files") } }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
-struct SettingsView: View { var body: some View { Form { Section("Security") { Toggle("Require biometric presence (hook)", isOn: .constant(false)); Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill") }; Section("Capabilities") { Text("Mosh, ProxyJump, forwarding, SFTP, Whisper, and non-tmux adapters: not enabled in this build.").font(.caption) }; Section("Privacy") { Text("No transcript analytics. Voice processing is local-only when a model is installed.").font(.caption) } }.navigationTitle("Settings") } }
+struct SettingsView: View {
+    @EnvironmentObject private var container: AppContainer
+    var body: some View {
+        Form {
+            Section("Voice & Local AI") {
+                NavigationLink {
+                    VoiceSettingsView().environmentObject(container)
+                } label: {
+                    HStack {
+                        Label("Voice & Local AI", systemImage: "waveform.and.mic")
+                        Spacer()
+                        Text(container.selectedProviderDisplayName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .accessibilityIdentifier("settings-voice-navigation-link")
+            }
+            Section("Security") {
+                Toggle("Require biometric presence (hook)", isOn: .constant(false))
+                Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill")
+            }
+            Section("Capabilities") {
+                Text("Mosh, ProxyJump, forwarding, SFTP, and non-tmux adapters: not enabled in this build. WhisperKit and Apple Speech voice transcription: active.")
+                    .font(.caption)
+            }
+            Section("Privacy") {
+                Text("Zero transcript analytics. All speech processing is 100% on-device. Audio files are deleted immediately after transcription.")
+                    .font(.caption)
+            }
+        }
+        .navigationTitle("Settings")
+    }
+}
