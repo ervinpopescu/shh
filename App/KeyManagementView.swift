@@ -55,6 +55,12 @@ struct KeyManagementView: View {
     @State private var search = ""
     @State private var errorMessage: String?
 
+    init() {
+        if ProcessInfo.processInfo.arguments.contains("--new-key") {
+            _showingEditor = State(initialValue: true)
+        }
+    }
+
     private var filtered: [IdentityDescriptor] {
         if search.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return identities
@@ -99,6 +105,8 @@ struct KeyManagementView: View {
         }
         .navigationTitle("Keys & Credentials")
         .searchable(text: $search, prompt: "Search keys and fingerprints")
+        .autocorrectionDisabled()
+        .textInputAutocapitalization(.never)
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Button {
@@ -351,7 +359,22 @@ struct IdentityEditorView: View {
 
     var onCreated: ((IdentityDescriptor) -> Void)? = nil
 
+    private enum Field: Hashable {
+        case name
+        case comment
+        case privateKey
+        case password
+    }
+
+    @FocusState private var focusedField: Field?
     @State private var mode: IdentityEditorMode = .generate
+
+    init(onCreated: ((IdentityDescriptor) -> Void)? = nil) {
+        self.onCreated = onCreated
+        if ProcessInfo.processInfo.arguments.contains("--import-key") {
+            _mode = State(initialValue: .importKey)
+        }
+    }
 
     // Common
     @State private var name: String = ""
@@ -386,6 +409,9 @@ struct IdentityEditorView: View {
 
                     Section("Identity Info") {
                         TextField("Name", text: $name)
+                            .focused($focusedField, equals: .name)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
                             .accessibilityIdentifier("identity-name-field")
                     }
 
@@ -401,6 +427,7 @@ struct IdentityEditorView: View {
                     generatedResultSection
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle(generatedPublicKey == nil ? "New Identity" : "Key Generated")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -409,6 +436,25 @@ struct IdentityEditorView: View {
                         dismiss()
                     }
                     .accessibilityIdentifier("identity-editor-dismiss-button")
+                }
+                if focusedField != nil {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Done") {
+                            focusedField = nil
+                        }
+                        .accessibilityLabel("Dismiss keyboard")
+                        .accessibilityIdentifier("identity-editor-done-keyboard-button")
+                    }
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        focusedField = nil
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("identity-editor-dismiss-keyboard-button")
                 }
             }
             .alert("Error", isPresented: Binding(get: { errorMessage != nil }, set: { if !$0 { errorMessage = nil } })) {
@@ -419,6 +465,7 @@ struct IdentityEditorView: View {
                 }
             }
         }
+        .editorSheetPresentation()
     }
 
     // MARK: - Generate Mode
@@ -427,6 +474,7 @@ struct IdentityEditorView: View {
         Group {
             Section("Key Options") {
                 TextField("Comment (optional, e.g. dev@ipad)", text: $comment)
+                    .focused($focusedField, equals: .comment)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .accessibilityIdentifier("identity-comment-field")
@@ -460,8 +508,9 @@ struct IdentityEditorView: View {
         Group {
             Section("Private Key Material") {
                 TextEditor(text: $privateKeyText)
+                    .focused($focusedField, equals: .privateKey)
                     .font(.caption.monospaced())
-                    .frame(minHeight: 140)
+                    .frame(height: 180)
                     .autocorrectionDisabled()
                     .textInputAutocapitalization(.never)
                     .accessibilityIdentifier("identity-private-key-field")
@@ -499,6 +548,9 @@ struct IdentityEditorView: View {
         Group {
             Section("Password") {
                 SecureField("Password", text: $password)
+                    .focused($focusedField, equals: .password)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
                     .accessibilityIdentifier("identity-password-field")
                 Text("Passwords are saved securely into Keychain and never transmitted in logs.")
                     .font(.caption)

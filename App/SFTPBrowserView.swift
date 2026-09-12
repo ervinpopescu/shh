@@ -349,6 +349,8 @@ private struct FileModalsModifier: ViewModifier {
             }
             .alert("New Folder", isPresented: $showingCreateFolder) {
                 TextField("Folder name", text: $newFolderName)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
                 Button("Create") {
                     let name = newFolderName
                     newFolderName = ""
@@ -367,6 +369,8 @@ private struct FileModalsModifier: ViewModifier {
             }
             .alert("New File", isPresented: $showingCreateFile) {
                 TextField("File name", text: $newFileName)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
                 Button("Create") {
                     let name = newFileName
                     newFileName = ""
@@ -385,6 +389,8 @@ private struct FileModalsModifier: ViewModifier {
             }
             .alert("Rename File", isPresented: $showingRename) {
                 TextField("New name", text: $renameNewName)
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
                 Button("Rename") {
                     guard let file = fileToRename else { return }
                     let newName = renameNewName
@@ -758,6 +764,7 @@ struct FilePreviewSheet: View {
                 }
             }
         }
+        .editorSheetPresentation()
     }
 
     @ViewBuilder
@@ -1015,8 +1022,19 @@ struct FileEditorSheet: View {
                         .bold()
                     }
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("file-editor-dismiss-keyboard-button")
+                }
             }
         }
+        .editorSheetPresentation()
     }
 }
 
@@ -1092,6 +1110,7 @@ struct TransferQueueDrawerView: View {
                 }
             }
         }
+        .editorSheetPresentation()
     }
 }
 
@@ -1300,6 +1319,7 @@ struct FileMovePickerSheet: View {
                 await loadDirectories(at: selectedDestination)
             }
         }
+        .editorSheetPresentation()
     }
 
     private func navigateToDestination(_ path: RemotePath) {

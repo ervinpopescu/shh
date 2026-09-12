@@ -50,6 +50,15 @@ enum AppSection: String, CaseIterable, Identifiable {
 struct RootView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var section: AppSection? = .hosts
+
+    init() {
+        if ProcessInfo.processInfo.arguments.contains("--keys") {
+            _section = State(initialValue: .keys)
+        } else {
+            _section = State(initialValue: .hosts)
+        }
+    }
+
     var body: some View {
         NavigationSplitView {
             List(AppSection.allCases, selection: $section) { item in
@@ -101,6 +110,12 @@ struct HostListView: View {
     @State private var search = ""
     @State private var showingEditor = false
     @State private var healthyOnly = false
+
+    init() {
+        if ProcessInfo.processInfo.arguments.contains("--new-host") {
+            _showingEditor = State(initialValue: true)
+        }
+    }
     private var filtered: [Host] { hosts.filter { (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.address.localizedCaseInsensitiveContains(search)) && (!healthyOnly || $0.health == .healthy) } }
     var body: some View {
         List {
@@ -121,7 +136,12 @@ struct HostListView: View {
         .searchable(text: $search, prompt: "Search hosts, groups, tags")
         .toolbar { Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") { Toggle("Healthy only", isOn: $healthyOnly) }; Button("Add", systemImage: "plus") { showingEditor = true } }
         .sheet(isPresented: $showingEditor, onDismiss: { Task { await reload() } }) { HostEditorView().environmentObject(container) }
-        .task { await reload() }
+        .task {
+            await reload()
+            if ProcessInfo.processInfo.arguments.contains("--new-host") {
+                showingEditor = true
+            }
+        }
     }
     private func reload() async { hosts = (try? await container.catalog.listHosts()) ?? [] }
 }
@@ -399,12 +419,20 @@ struct HostEditorView: View {
             Form {
                 Section("Host metadata") {
                     TextField("Name", text: $name)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("host-editor-name-field")
                     TextField("Hostname", text: $hostname)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("host-editor-hostname-field")
                     TextField("Username", text: $username)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("host-editor-username-field")
                     TextField("Port", text: $port).keyboardType(.numberPad)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("host-editor-port-field")
                     HStack {
                         Picker("Identity", selection: $identityID) {
@@ -514,6 +542,8 @@ struct HostEditorView: View {
                             HStack {
                                 TextField("Start Port", text: $moshPortRangeStart)
                                     .keyboardType(.numberPad)
+                                    .autocorrectionDisabled()
+                                    .textInputAutocapitalization(.never)
                                     .accessibilityIdentifier("host-editor-mosh-port-start-field")
                                     .accessibilityLabel("Mosh start port")
                                 Text("-")
@@ -521,6 +551,8 @@ struct HostEditorView: View {
                                     .accessibilityHidden(true)
                                 TextField("End Port", text: $moshPortRangeEnd)
                                     .keyboardType(.numberPad)
+                                    .autocorrectionDisabled()
+                                    .textInputAutocapitalization(.never)
                                     .accessibilityIdentifier("host-editor-mosh-port-end-field")
                                     .accessibilityLabel("Mosh end port")
                             }
@@ -623,6 +655,7 @@ struct HostEditorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle(existing == nil ? "New host" : "Edit host")
             .task {
                 identities = (try? await container.catalog.identities()) ?? []
@@ -656,8 +689,19 @@ struct HostEditorView: View {
                         .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
                         .accessibilityIdentifier("host-editor-save-button")
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("host-editor-dismiss-keyboard-button")
+                }
             }
         }
+        .editorSheetPresentation()
     }
 
     private var isMoshPortRangeValid: Bool {
@@ -1359,6 +1403,8 @@ struct SessionView: View {
                         TextField("Command to validate and send", text: $command, axis: .vertical)
                             .lineLimit(1...3)
                             .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
                         Button("Send") {
                             submit(command)
                             command = ""
@@ -1670,8 +1716,12 @@ struct ApprovalSheet: View {
                 Section("Exact command") { Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
                 Toggle("I approve sending this command", isOn: $approved)
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Confirm command")
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Send") {
                         Task {
@@ -1685,6 +1735,7 @@ struct ApprovalSheet: View {
                 }
             }
         }
+        .editorSheetPresentation()
     }
 }
 
@@ -1720,6 +1771,7 @@ struct MultiplexerPicker: View {
                     deferredMultiplexerContent
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Remote Multiplexer")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1774,6 +1826,7 @@ struct MultiplexerPicker: View {
                 }
             }
         }
+        .editorSheetPresentation(detents: [.medium, .large])
     }
 
     @ViewBuilder
@@ -2403,6 +2456,7 @@ struct HerdrOutputSheet: View {
                 await loadOutput()
             }
         }
+        .editorSheetPresentation()
         .accessibilityIdentifier("herdr-output-sheet")
     }
 
@@ -2510,6 +2564,7 @@ struct HerdrSendCommandSheet: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Send Command")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -2532,8 +2587,19 @@ struct HerdrSendCommandSheet: View {
                     .accessibilityLabel(isExecuting ? "Executing command" : "Execute command in pane")
                     .accessibilityIdentifier("herdr-command-run-button")
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("herdr-command-dismiss-keyboard-button")
+                }
             }
         }
+        .editorSheetPresentation()
         .accessibilityIdentifier("herdr-send-command-sheet")
     }
 
@@ -2599,6 +2665,7 @@ struct HerdrCreateWorkspaceSheet: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Create Workspace")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -2621,8 +2688,19 @@ struct HerdrCreateWorkspaceSheet: View {
                     .accessibilityLabel(isCreating ? "Creating workspace" : "Create workspace")
                     .accessibilityIdentifier("herdr-create-workspace-confirm-button")
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("herdr-create-workspace-dismiss-keyboard-button")
+                }
             }
         }
+        .editorSheetPresentation()
         .accessibilityIdentifier("herdr-create-workspace-sheet")
     }
 
@@ -2917,7 +2995,7 @@ struct SnippetEditor: View {
     @State private var bodyText: String
     @State private var showApproval = false
     init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
-    var body: some View { Form { TextField("Name", text: .constant(snippet.name)); TextEditor(text: $bodyText).frame(minHeight: 160); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
+    var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
 struct SettingsView: View {
