@@ -61,12 +61,14 @@ public actor PortForwardingManager: PortForwardingManaging, ForwardingService {
                     .childChannelInitializer { [weak self, connection, counter, rule] clientChannel in
                         let promise = clientChannel.eventLoop.makePromise(of: Void.self)
                         Task { [weak self] in
+                            var openedSSHChannel: Channel? = nil
                             do {
                                 let sshChannel = try await connection.createDirectTCPIPChannel(
                                     targetHost: remoteHost,
                                     targetPort: Int(remotePort),
                                     originatorAddress: clientChannel.remoteAddress
                                 )
+                                openedSSHChannel = sshChannel
                                 await self?.registerBridgedChannel(ruleID: rule.id, channel: clientChannel)
                                 await self?.registerBridgedChannel(ruleID: rule.id, channel: sshChannel)
 
@@ -78,6 +80,7 @@ public actor PortForwardingManager: PortForwardingManaging, ForwardingService {
                                 _ = try await sshChannel.pipeline.addHandlers([sshTraffic, glueSSH]).get()
                                 promise.succeed(())
                             } catch {
+                                _ = try? await openedSSHChannel?.close()
                                 _ = try? await clientChannel.close()
                                 promise.succeed(())
                             }
@@ -262,9 +265,11 @@ public actor PortForwardingManager: PortForwardingManaging, ForwardingService {
             return
         }
 
+        var connectedLocalChannel: Channel? = nil
         do {
             let bootstrap = ClientBootstrap(group: group)
             let localChannel = try await bootstrap.connect(host: rule.localHost, port: Int(rule.localPort)).get()
+            connectedLocalChannel = localChannel
 
             registerBridgedChannel(ruleID: rule.id, channel: localChannel)
             registerBridgedChannel(ruleID: rule.id, channel: channel)
@@ -277,6 +282,7 @@ public actor PortForwardingManager: PortForwardingManaging, ForwardingService {
             _ = try await channel.pipeline.addHandlers([DataToBufferCodec(), sshTraffic, glueSSH]).get()
             promise.succeed(())
         } catch {
+            _ = try? await connectedLocalChannel?.close()
             _ = try? await channel.close()
             promise.succeed(())
         }

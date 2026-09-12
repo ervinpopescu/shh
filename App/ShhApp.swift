@@ -279,6 +279,15 @@ enum HostConnectionType: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+struct BastionHopItem: Identifiable, Equatable {
+    let id: UUID
+    var hostID: UUID
+    init(id: UUID = UUID(), hostID: UUID) {
+        self.id = id
+        self.hostID = hostID
+    }
+}
+
 struct HostEditorView: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
@@ -289,7 +298,7 @@ struct HostEditorView: View {
     @State private var port: String
     @State private var identityID: UUID?
     @State private var connectionType: HostConnectionType
-    @State private var selectedBastionIDs: [UUID]
+    @State private var bastionHops: [BastionHopItem]
     @State private var forwardingRules: [PortForwardingRule]
     @State private var showingAddRule = false
     @State private var ruleToEdit: PortForwardingRule? = nil
@@ -321,7 +330,7 @@ struct HostEditorView: View {
             initialBastions = []
         }
         _connectionType = State(initialValue: initialType)
-        _selectedBastionIDs = State(initialValue: initialBastions)
+        _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
         _forwardingRules = State(initialValue: existing?.forwardingRules ?? [])
 
         _defaultTmuxSession = State(initialValue: existing?.defaultTmuxSession ?? "")
@@ -377,23 +386,43 @@ struct HostEditorView: View {
                     .accessibilityLabel("Connection type picker")
 
                     if connectionType == .proxyJump {
-                        if selectedBastionIDs.isEmpty {
+                        if bastionHops.isEmpty {
                             Text("No jump bastions selected. Add one or more hops from saved hosts.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         } else {
-                            ForEach(Array(selectedBastionIDs.enumerated()), id: \.offset) { index, bastionID in
+                            ForEach(Array(bastionHops.enumerated()), id: \.element.id) { index, hop in
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text("Hop \(index + 1)")
                                             .font(.caption2.bold())
                                             .foregroundStyle(.secondary)
-                                        Text(bastionName(for: bastionID))
+                                        Text(bastionName(for: hop.hostID))
                                             .font(.subheadline)
                                     }
                                     Spacer()
+                                    if index > 0 {
+                                        Button {
+                                            bastionHops.swapAt(index, index - 1)
+                                        } label: {
+                                            Image(systemName: "arrow.up")
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .accessibilityLabel("Move hop \(index + 1) up")
+                                        .accessibilityIdentifier("move-up-hop-\(index)")
+                                    }
+                                    if index < bastionHops.count - 1 {
+                                        Button {
+                                            bastionHops.swapAt(index, index + 1)
+                                        } label: {
+                                            Image(systemName: "arrow.down")
+                                        }
+                                        .buttonStyle(.borderless)
+                                        .accessibilityLabel("Move hop \(index + 1) down")
+                                        .accessibilityIdentifier("move-down-hop-\(index)")
+                                    }
                                     Button(role: .destructive) {
-                                        selectedBastionIDs.remove(at: index)
+                                        bastionHops.remove(at: index)
                                     } label: {
                                         Image(systemName: "trash")
                                             .foregroundStyle(.red)
@@ -409,7 +438,7 @@ struct HostEditorView: View {
                             Menu {
                                 ForEach(availableBastions) { bastion in
                                     Button(bastion.name) {
-                                        selectedBastionIDs.append(bastion.id)
+                                        bastionHops.append(BastionHopItem(hostID: bastion.id))
                                     }
                                 }
                             } label: {
@@ -442,15 +471,18 @@ struct HostEditorView: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                 }
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    ruleToEdit = rule
+                                }
+                                .accessibilityAction(named: "Edit Rule") {
+                                    ruleToEdit = rule
+                                }
                                 Spacer()
                                 Toggle("", isOn: $rule.enabled)
                                     .labelsHidden()
                                     .accessibilityLabel("Enable \(rule.name)")
                                     .accessibilityIdentifier("toggle-rule-\(rule.id)")
-                            }
-                            .contentShape(Rectangle())
-                            .onTapGesture {
-                                ruleToEdit = rule
                             }
                         }
                         .onDelete { indices in
@@ -524,7 +556,7 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && selectedBastionIDs.isEmpty))
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && bastionHops.isEmpty))
                         .accessibilityIdentifier("host-editor-save-button")
                 }
             }
@@ -564,7 +596,7 @@ struct HostEditorView: View {
 
     private func save() {
         guard isTmuxPreferenceValid else { return }
-        if connectionType == .proxyJump && selectedBastionIDs.isEmpty { return }
+        if connectionType == .proxyJump && bastionHops.isEmpty { return }
         let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
         var allowedModes: Set<VoiceInputMode> = []
@@ -583,8 +615,9 @@ struct HostEditorView: View {
             existingSSH = SSHOptions()
         }
 
-        if connectionType == .proxyJump && !selectedBastionIDs.isEmpty {
-            profile = .proxyJump(ProxyJumpOptions(hopHostIDs: selectedBastionIDs, sshOptions: existingSSH))
+        if connectionType == .proxyJump && !bastionHops.isEmpty {
+            let hopHostIDs = bastionHops.map(\.hostID)
+            profile = .proxyJump(ProxyJumpOptions(hopHostIDs: hopHostIDs, sshOptions: existingSSH))
         } else {
             profile = .ssh(existingSSH)
         }
@@ -823,6 +856,19 @@ struct SessionView: View {
                 }
                 .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
                 .accessibilityIdentifier("session-forwarders-indicator")
+            } else if let errorMsg = container.forwardingErrorMessage {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Button(action: {
+                    showPortForwarding = true
+                }) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(.orange)
+                }
+                .accessibilityLabel("Port forwarding alert: \(errorMsg)")
+                .accessibilityIdentifier("session-forwarders-error-indicator")
             }
 
             Spacer()

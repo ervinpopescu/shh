@@ -112,8 +112,8 @@ func portForwardingRuleSummary(_ rule: PortForwardingRule, boundPort: UInt16? = 
         return "\(rule.localHost):\(localPortStr) -> \(rHost):\(rPort)"
     case .remote:
         let rHost = rule.remoteHost ?? "0.0.0.0"
-        let rPort = rule.remotePort.map { String($0) } ?? "0"
-        return "remote \(rHost):\(rPort) -> \(rule.localHost):\(localPortStr)"
+        let rPort = boundPort.map { String($0) } ?? rule.remotePort.map { String($0) } ?? "0"
+        return "remote \(rHost):\(rPort) -> \(rule.localHost):\(rule.localPort)"
     case .dynamic:
         return "SOCKS5 proxy on \(rule.localHost):\(localPortStr)"
     }
@@ -155,9 +155,12 @@ struct PortForwardingRuleEditorSheet: View {
     private var isFormValid: Bool {
         guard !localHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
         guard let lPort = UInt16(localPort), lPort > 0 else { return false }
-        if type == .local || type == .remote {
+        if type == .local {
             guard !remoteHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
             guard let rPort = UInt16(remotePort), rPort > 0 else { return false }
+        } else if type == .remote {
+            guard !remoteHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+            guard let _ = UInt16(remotePort) else { return false }
         }
         return true
     }
@@ -218,7 +221,7 @@ struct PortForwardingRuleEditorSheet: View {
                             .accessibilityIdentifier("rule-remote-host-field")
                             .accessibilityLabel("Remote host")
 
-                        TextField("Remote Port (1-65535)", text: $remotePort)
+                        TextField(type == .remote ? "Remote Port (0 for auto, 1-65535)" : "Remote Port (1-65535)", text: $remotePort)
                             .keyboardType(.numberPad)
                             .accessibilityIdentifier("rule-remote-port-field")
                             .accessibilityLabel("Remote port")
@@ -284,7 +287,7 @@ struct PortForwardingRuleEditorSheet: View {
                 validationErrorMessage = "Remote host is required for this rule type."
                 return
             }
-            guard let remotePortNumber = UInt16(remotePort), remotePortNumber > 0 else {
+            guard let remotePortNumber = UInt16(remotePort), (type == .remote || remotePortNumber > 0) else {
                 validationErrorMessage = "Invalid remote port. Port must be between 1 and 65535."
                 return
             }
@@ -326,14 +329,25 @@ struct PortForwardingRuleRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             // Header: Name, Type Badge, Status Pill
-            HStack(alignment: .center) {
-                Text(rule.name)
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer()
-                PortForwardingTypeBadge(type: rule.type)
-                if isConnected {
-                    ForwardingStatusPill(status: effectiveStatus)
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center) {
+                    Text(rule.name)
+                        .font(.headline)
+                    Spacer()
+                    PortForwardingTypeBadge(type: rule.type)
+                    if isConnected {
+                        ForwardingStatusPill(status: effectiveStatus)
+                    }
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(rule.name)
+                        .font(.headline)
+                    HStack {
+                        PortForwardingTypeBadge(type: rule.type)
+                        if isConnected {
+                            ForwardingStatusPill(status: effectiveStatus)
+                        }
+                    }
                 }
             }
 
@@ -341,7 +355,6 @@ struct PortForwardingRuleRow: View {
             Text(portForwardingRuleSummary(rule, boundPort: liveState?.boundPort))
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
 
             // Live traffic statistics if active
             if let state = liveState, state.status == .active || state.bytesSent > 0 || state.bytesReceived > 0 {
@@ -429,9 +442,9 @@ struct PortForwardingSheet: View {
     }
 
     // Combine configured rules and rules that might be running dynamically
-    private var allRules: [PortForwardingRule] {
+    var allRules: [PortForwardingRule] {
         var result = configuredRules
-        for session in container.forwardingSessions {
+        for session in container.forwardingSessions where session.status == .active || session.status == .starting {
             if !result.contains(where: { $0.id == session.ruleID }) {
                 result.append(session.rule)
             }
@@ -579,8 +592,15 @@ struct PortForwardingSheet: View {
 
     private func handleSaveRule(_ rule: PortForwardingRule) {
         guard let host = container.activeHost else { return }
-        Task {
-            try? await container.addForwardingRule(rule, for: host, autoStartIfConnected: isConnected)
+        if isConnected && rule.enabled && rule.requiresNonLoopbackApproval {
+            Task {
+                try? await container.addForwardingRule(rule, for: host, autoStartIfConnected: false)
+                pendingNonLoopbackApprovalRule = rule
+            }
+        } else {
+            Task {
+                try? await container.addForwardingRule(rule, for: host, autoStartIfConnected: isConnected)
+            }
         }
     }
 
