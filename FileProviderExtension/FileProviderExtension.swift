@@ -39,6 +39,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
 
     public func invalidate() {
         isInvalidated = true
+        storage.cleanupStagingDirectory()
     }
 
     // MARK: - Item Metadata Lookup
@@ -87,7 +88,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 ))
                 completionHandler(FileProviderItem(contract: contract), nil)
             } catch {
-                completionHandler(nil, NSFileProviderError(.noSuchItem))
+                completionHandler(nil, translateError(error))
             }
             progress.completedUnitCount = 1
         }
@@ -127,7 +128,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 // Update cache record
                 if var metadata = await cache.getMetadata(for: contractID) {
                     metadata.isMaterialized = true
-                    metadata.localRelativePath = targetLocalURL.lastPathComponent
+                    metadata.localRelativePath = nil
                     metadata.lastAccessDate = Date()
                     await cache.storeMetadata(metadata)
                     completionHandler(targetLocalURL, FileProviderItem(contract: metadata.item), nil)
@@ -139,7 +140,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                     completionHandler(targetLocalURL, FileProviderItem(contract: contract), nil)
                 }
             } catch {
-                completionHandler(nil, nil, error)
+                completionHandler(nil, nil, translateError(error))
             }
         }
 
@@ -164,7 +165,13 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         let progress = Progress(totalUnitCount: 100)
         let parentID = FileProviderItemIdentifier(rawValue: itemTemplate.parentItemIdentifier.rawValue)
         let parentPath = parentID.remotePath ?? RemotePath("/")
-        let itemPath = parentPath.appending(itemTemplate.filename)
+        guard !itemTemplate.filename.contains("/") &&
+              !itemTemplate.filename.contains("..") &&
+              !itemTemplate.filename.isEmpty,
+              let itemPath = try? parentPath.appendingSafely(itemTemplate.filename) else {
+            completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+            return progress
+        }
         let isDirectory = itemTemplate.contentType == .folder
 
         let task = Task {
@@ -179,12 +186,17 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                             progress.completedUnitCount = Int64(transferProgress.fractionCompleted * 100.0)
                         }
                     }
+                } else {
+                    try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 15.0) { repo in
+                        try await repo.writeFile(data: Data(), at: itemPath, progress: nil)
+                    }
                 }
 
                 let contractID = FileProviderItemIdentifier(hostID: hostID, remotePath: itemPath)
+                let parentContractID = itemPath.parent.isRoot ? .root : parentID
                 let itemContract = FileProviderItemContract(
                     identifier: contractID,
-                    parentIdentifier: parentID,
+                    parentIdentifier: parentContractID,
                     filename: itemTemplate.filename,
                     isDirectory: isDirectory,
                     size: (try? url?.resourceValues(forKeys: [.fileSizeKey]).fileSize).map(Int64.init) ?? 0,
@@ -206,7 +218,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 let item = FileProviderItem(contract: itemContract)
                 completionHandler(item, [], false, nil)
             } catch {
-                completionHandler(nil, [], false, error)
+                completionHandler(nil, [], false, translateError(error))
             }
         }
 
@@ -237,32 +249,77 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
 
         let task = Task {
             do {
+                var currentPath = remotePath
+                let parentID = FileProviderItemIdentifier(rawValue: item.parentItemIdentifier.rawValue)
+                var targetParentPath = parentID.remotePath ?? RemotePath("/")
+                let newFilename = changedFields.contains(.filename) ? item.filename : currentPath.lastComponent
+                guard !newFilename.contains("/") && !newFilename.contains("..") && !newFilename.isEmpty else {
+                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+                    return
+                }
+
+                if !changedFields.contains(.parentItemIdentifier) {
+                    targetParentPath = currentPath.parent
+                }
+
+                guard let destinationPath = try? targetParentPath.appendingSafely(newFilename) else {
+                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+                    return
+                }
+
+                // Handle rename / reparent if destination differs from source
+                if destinationPath != currentPath {
+                    try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 30.0) { repo in
+                        try await repo.rename(from: currentPath, to: destinationPath)
+                    }
+                    currentPath = destinationPath
+                }
+
+                // Handle new content upload if provided
                 if let newContents {
                     try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 60.0) { repo in
-                        try await repo.upload(from: newContents, to: remotePath) { transferProgress in
+                        try await repo.upload(from: newContents, to: currentPath) { transferProgress in
                             progress.completedUnitCount = Int64(transferProgress.fractionCompleted * 100.0)
                         }
                     }
                 }
 
+                let newContractID = FileProviderItemIdentifier(hostID: hostID, remotePath: currentPath)
+                let parentContractID = currentPath.parent.isRoot ? .root : FileProviderItemIdentifier(hostID: hostID, remotePath: currentPath.parent)
+
                 if var metadata = await cache.getMetadata(for: contractID) {
+                    if newContractID != contractID {
+                        await cache.removeMetadata(for: contractID)
+                    }
+                    metadata.remotePath = currentPath
+                    metadata.item.identifier = newContractID
+                    metadata.item.parentIdentifier = parentContractID
+                    metadata.item.filename = newFilename
                     metadata.item.contentModificationDate = Date()
                     if let newContents, let size = try? newContents.resourceValues(forKeys: [.fileSizeKey]).fileSize {
                         metadata.item.size = Int64(size)
                         metadata.fileSizeBytes = Int64(size)
                     }
                     await cache.storeMetadata(metadata)
-                    _ = await cache.recordChange(itemIdentifier: contractID, type: .updated, item: metadata.item)
+                    _ = await cache.recordChange(itemIdentifier: newContractID, type: .updated, item: metadata.item)
                     completionHandler(FileProviderItem(contract: metadata.item), [], false, nil)
                 } else {
                     let remoteFile = try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 10.0) { repo in
-                        try await repo.fetchAttributes(at: remotePath)
+                        try await repo.fetchAttributes(at: currentPath)
                     }
                     let contract = FileProviderItemContract(remoteFile: remoteFile, hostID: hostID)
+                    await cache.storeMetadata(FileProviderCacheMetadata(
+                        hostID: hostID,
+                        remotePath: currentPath,
+                        item: contract,
+                        fileSizeBytes: remoteFile.size,
+                        isMaterialized: newContents != nil
+                    ))
+                    _ = await cache.recordChange(itemIdentifier: newContractID, type: .updated, item: contract)
                     completionHandler(FileProviderItem(contract: contract), [], false, nil)
                 }
             } catch {
-                completionHandler(nil, [], false, error)
+                completionHandler(nil, [], false, translateError(error))
             }
         }
 
@@ -306,7 +363,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 _ = await cache.recordChange(itemIdentifier: contractID, type: .deleted, item: nil)
                 completionHandler(nil)
             } catch {
-                completionHandler(error)
+                completionHandler(translateError(error))
             }
             progress.completedUnitCount = 1
         }
@@ -330,6 +387,45 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
             repositoryProvider: repositoryProvider,
             cache: cache
         )
+    }
+
+    private func translateError(_ error: any Error) -> Error {
+        if let fpError = error as? NSFileProviderError {
+            return fpError
+        }
+        if let sftpError = error as? SFTPRepositoryError {
+            switch sftpError {
+            case .notFound:
+                return NSFileProviderError(.noSuchItem)
+            case .permissionDenied:
+                return NSFileProviderError(.notAuthenticated)
+            case .alreadyExists:
+                return NSFileProviderError(.filenameCollision)
+            case .connectionClosed:
+                return NSFileProviderError(.serverUnreachable)
+            case .invalidPath:
+                return NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil)
+            case .cancelled:
+                return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+            case .isDirectory, .notADirectory, .directoryNotEmpty, .remoteFailure:
+                return NSFileProviderError(.serverUnreachable)
+            }
+        }
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .networkUnavailable, .timeout:
+                return NSFileProviderError(.serverUnreachable)
+            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired:
+                return NSFileProviderError(.notAuthenticated)
+            case .cancelled:
+                return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+            case .invalidConfiguration, .unsupported:
+                return NSError(domain: NSCocoaErrorDomain, code: NSFeatureUnsupportedError, userInfo: nil)
+            case .remoteFailure:
+                return NSFileProviderError(.serverUnreachable)
+            }
+        }
+        return error
     }
 }
 #endif

@@ -284,29 +284,104 @@ public protocol CredentialStore: Sendable { func save(_ secret: Data, reference:
 public enum KeychainError: Error, Equatable, Sendable { case unavailable; case status(Int32) }
 #if canImport(Security)
 public struct KeychainCredentialStore: CredentialStore {
+    public static let baseSharedAccessGroup = "group.com.ervinpopescu.shh"
+
+    public static var defaultSharedAccessGroup: String? {
+        #if os(iOS)
+        if let prefix = Bundle.main.infoDictionary?["AppIdentifierPrefix"] as? String, !prefix.isEmpty {
+            let cleanPrefix = prefix.hasSuffix(".") ? prefix : "\(prefix)."
+            return "\(cleanPrefix)\(baseSharedAccessGroup)"
+        }
+        if let discovered = discoverAppIdentifierPrefix() {
+            return "\(discovered)\(baseSharedAccessGroup)"
+        }
+        return baseSharedAccessGroup
+        #else
+        return nil
+        #endif
+    }
+
+    private static func discoverAppIdentifierPrefix() -> String? {
+        let dummyAccount = "com.ervinpopescu.shh.prefixProbe.\(UUID().uuidString)"
+        let query: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: dummyAccount,
+            kSecAttrService: "prefixProbeService",
+            kSecReturnAttributes: true
+        ]
+        var result: CFTypeRef?
+        let status = SecItemAdd(query as CFDictionary, &result)
+        if status == errSecSuccess, let dict = result as? [CFString: Any], let accessGroup = dict[kSecAttrAccessGroup] as? String {
+            defer {
+                let deleteQuery: [CFString: Any] = [
+                    kSecClass: kSecClassGenericPassword,
+                    kSecAttrAccount: dummyAccount,
+                    kSecAttrService: "prefixProbeService"
+                ]
+                SecItemDelete(deleteQuery as CFDictionary)
+            }
+            let parts = accessGroup.split(separator: ".", maxSplits: 1)
+            if let teamID = parts.first, !teamID.isEmpty {
+                return "\(teamID)."
+            }
+        }
+        return nil
+    }
+
     private let service: String
     private let accessGroup: String?
-    public init(service: String = "com.ervinpopescu.shh.secrets", accessGroup: String? = nil) { self.service = service; self.accessGroup = accessGroup }
+    public init(service: String = "com.ervinpopescu.shh.secrets", accessGroup: String? = nil) {
+        self.service = service
+        self.accessGroup = accessGroup
+    }
     private func baseQuery(reference: String) -> [CFString: Any] {
         var query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: reference]
         if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
         return query
     }
     public func save(_ secret: Data, reference: String) async throws {
-        var query = baseQuery(reference: reference); query[kSecValueData] = secret; query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        SecItemDelete(baseQuery(reference: reference) as CFDictionary)
-        let status = SecItemAdd(query as CFDictionary, nil); guard status == errSecSuccess else { throw KeychainError.status(status) }
+        var query = baseQuery(reference: reference)
+        query[kSecValueData] = secret
+        query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        _ = SecItemDelete(baseQuery(reference: reference) as CFDictionary)
+        var status = SecItemAdd(query as CFDictionary, nil)
+        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+            var fallbackQuery = query
+            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
+            _ = SecItemDelete(fallbackQuery as CFDictionary)
+            status = SecItemAdd(fallbackQuery as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
     }
     public func load(reference: String) async throws -> Data {
-        var query = baseQuery(reference: reference); query[kSecReturnData] = true; query[kSecMatchLimit] = kSecMatchLimitOne
-        var result: CFTypeRef?; let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { throw KeychainError.status(status) }; return data
+        var query = baseQuery(reference: reference)
+        query[kSecReturnData] = true
+        query[kSecMatchLimit] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        var status = SecItemCopyMatching(query as CFDictionary, &result)
+        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+            var fallbackQuery = query
+            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
+            status = SecItemCopyMatching(fallbackQuery as CFDictionary, &result)
+        }
+        guard status == errSecSuccess, let data = result as? Data else { throw KeychainError.status(status) }
+        return data
     }
-    public func delete(reference: String) async throws { let status = SecItemDelete(baseQuery(reference: reference) as CFDictionary); guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError.status(status) } }
+    public func delete(reference: String) async throws {
+        var query = baseQuery(reference: reference)
+        var status = SecItemDelete(query as CFDictionary)
+        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+            var fallbackQuery = query
+            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
+            status = SecItemDelete(fallbackQuery as CFDictionary)
+        }
+        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError.status(status) }
+    }
 }
 #else
 public struct KeychainCredentialStore: CredentialStore {
-    public init() {}
+    public static var defaultSharedAccessGroup: String? { nil }
+    public init(service: String = "com.ervinpopescu.shh.secrets", accessGroup: String? = nil) {}
     public func save(_ secret: Data, reference: String) async throws { throw KeychainError.unavailable }
     public func load(reference: String) async throws -> Data { throw KeychainError.unavailable }
     public func delete(reference: String) async throws { throw KeychainError.unavailable }
@@ -323,7 +398,19 @@ public actor InMemoryCredentialStore: CredentialStore {
 public actor InMemoryTrustStore: HostTrustEvaluator {
     private var records: [String: TrustRecord] = [:]
     private var oneTimeRecords: Set<String> = []
-    public init() {}
+    public init(records: [TrustRecord] = []) {
+        for record in records {
+            self.records[record.lookupKey] = record
+        }
+    }
+    public func addRecord(_ record: TrustRecord) {
+        records[record.lookupKey] = record
+    }
+    public func addRecords(_ newRecords: [TrustRecord]) {
+        for record in newRecords {
+            records[record.lookupKey] = record
+        }
+    }
     public func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision {
         switch status(for: challenge) {
         case .trusted: return .trustPermanently

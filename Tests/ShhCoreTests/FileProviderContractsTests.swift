@@ -18,7 +18,15 @@ final class FileProviderContractsTests: XCTestCase {
         let etcID = FileProviderItemIdentifier(hostID: hostID, remotePath: etcPath)
         XCTAssertEqual(etcID.hostID, hostID)
         XCTAssertEqual(etcID.remotePath?.description, "/etc")
-        XCTAssertEqual(etcID.parentIdentifier, rootID)
+        XCTAssertEqual(etcID.parentIdentifier, .root)
+
+        let varPath = RemotePath("/var")
+        let varID = FileProviderItemIdentifier(hostID: hostID, remotePath: varPath)
+        XCTAssertEqual(varID.parentIdentifier, .root)
+
+        let homePath = RemotePath("/home")
+        let homeID = FileProviderItemIdentifier(hostID: hostID, remotePath: homePath)
+        XCTAssertEqual(homeID.parentIdentifier, .root)
 
         let sshConfigPath = RemotePath("/etc/ssh/sshd_config")
         let sshConfigID = FileProviderItemIdentifier(hostID: hostID, remotePath: sshConfigPath)
@@ -175,15 +183,43 @@ final class FileProviderContractsTests: XCTestCase {
         XCTAssertEqual(evictedForAge.count, 2)
         XCTAssertEqual(evictedForAge.map(\.item.filename), ["file1.txt", "file2.txt"])
 
-        // Test actor integration
+        // Test actor integration with disk file cleanup
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
         let cache = FileProviderMetadataCache()
-        for item in items {
+        for var item in items {
+            let diskFileName = "\(item.item.filename)-local"
+            let diskFileURL = tempDir.appendingPathComponent(diskFileName)
+            try? Data("staged".utf8).write(to: diskFileURL)
+            item.localRelativePath = diskFileName
             await cache.storeMetadata(item)
         }
-        let evictedFromCache = await cache.evaluateAndApplyEviction(policy: countPolicy, now: baseDate.addingTimeInterval(1000))
+
+        let evictedFromCache = await cache.evaluateAndApplyEviction(
+            policy: countPolicy,
+            now: baseDate.addingTimeInterval(1000),
+            baseStorageURL: tempDir
+        )
         XCTAssertEqual(evictedFromCache.count, 2)
         let remaining = await cache.allMetadata()
         XCTAssertEqual(remaining.count, 3)
         XCTAssertFalse(remaining.contains { $0.item.filename == "file1.txt" })
+
+        // Check that evicted files were removed from disk
+        let evictedFile1 = tempDir.appendingPathComponent("file1.txt-local")
+        let retainedFile5 = tempDir.appendingPathComponent("file5.txt-local")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: evictedFile1.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retainedFile5.path))
+    }
+
+    func testRootItemCapabilitiesIncludeWriting() {
+        let hostID = UUID()
+        let root = FileProviderItemContract.rootItem(hostID: hostID, hostName: "Production Box")
+        XCTAssertTrue(root.capabilities.contains(.allowsReading))
+        XCTAssertTrue(root.capabilities.contains(.allowsWriting))
+        XCTAssertTrue(root.identifier.isRoot)
+        XCTAssertTrue(root.parentIdentifier.isRoot)
     }
 }

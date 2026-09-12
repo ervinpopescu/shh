@@ -96,4 +96,288 @@ final class FileProviderAppTests: XCTestCase {
         XCTAssertTrue(files.contains { $0.name == "projects" })
         #endif
     }
+
+    func testFileProviderItemParentIdentifierRootMapping() async throws {
+        #if canImport(FileProvider)
+        let hostID = UUID()
+
+        // Root folder
+        let rootFile = RemoteFile(
+            id: "/",
+            name: "/",
+            path: RemotePath("/"),
+            entryType: .directory,
+            size: 4096,
+            modificationDate: Date()
+        )
+        let rootContract = FileProviderItemContract(remoteFile: rootFile, hostID: hostID)
+        let rootItem = FileProviderItem(contract: rootContract)
+        XCTAssertEqual(rootItem.itemIdentifier, .rootContainer)
+        XCTAssertEqual(rootItem.parentItemIdentifier, .rootContainer)
+
+        // Top-level item (/etc)
+        let etcFile = RemoteFile(
+            id: "/etc",
+            name: "etc",
+            path: RemotePath("/etc"),
+            entryType: .directory,
+            size: 4096,
+            modificationDate: Date()
+        )
+        let etcContract = FileProviderItemContract(remoteFile: etcFile, hostID: hostID)
+        XCTAssertTrue(etcContract.parentIdentifier.isRoot)
+        let etcItem = FileProviderItem(contract: etcContract)
+        XCTAssertEqual(etcItem.parentItemIdentifier, .rootContainer)
+
+        // Nested item (/etc/hosts)
+        let hostsFile = RemoteFile(
+            id: "/etc/hosts",
+            name: "hosts",
+            path: RemotePath("/etc/hosts"),
+            entryType: .file,
+            size: 256,
+            modificationDate: Date()
+        )
+        let hostsContract = FileProviderItemContract(remoteFile: hostsFile, hostID: hostID)
+        XCTAssertFalse(hostsContract.parentIdentifier.isRoot)
+        let hostsItem = FileProviderItem(contract: hostsContract)
+        XCTAssertNotEqual(hostsItem.parentItemIdentifier, .rootContainer)
+        let expectedParentID = FileProviderItemIdentifier(hostID: hostID, remotePath: RemotePath("/etc"))
+        XCTAssertEqual(hostsItem.parentItemIdentifier, NSFileProviderItemIdentifier(expectedParentID.rawValue))
+        #endif
+    }
+
+    func testFileProviderEnumeratorWorkingSetAndTrash() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let cache = FileProviderMetadataCache()
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+
+        // Seed 1 materialized item and 1 non-materialized item in cache
+        let matPath = RemotePath("/materialized.txt")
+        let matFile = RemoteFile(id: matPath.description, name: "materialized.txt", path: matPath, entryType: .file, size: 100, modificationDate: Date())
+        let matContract = FileProviderItemContract(remoteFile: matFile, hostID: hostID)
+        await cache.storeMetadata(FileProviderCacheMetadata(
+            hostID: hostID,
+            remotePath: matPath,
+            item: matContract,
+            fileSizeBytes: 100,
+            isMaterialized: true
+        ))
+
+        let nonMatPath = RemotePath("/cloud.txt")
+        let nonMatFile = RemoteFile(id: nonMatPath.description, name: "cloud.txt", path: nonMatPath, entryType: .file, size: 200, modificationDate: Date())
+        let nonMatContract = FileProviderItemContract(remoteFile: nonMatFile, hostID: hostID)
+        await cache.storeMetadata(FileProviderCacheMetadata(
+            hostID: hostID,
+            remotePath: nonMatPath,
+            item: nonMatContract,
+            fileSizeBytes: 200,
+            isMaterialized: false
+        ))
+
+        // Working set enumeration test
+        final class TestObserver: NSObject, NSFileProviderEnumerationObserver, @unchecked Sendable {
+            var items: [NSFileProviderItem] = []
+            var finished = false
+            var error: Error?
+
+            func didEnumerate(_ updatedItems: [NSFileProviderItemProtocol]) {
+                items.append(contentsOf: updatedItems.compactMap { $0 as? NSFileProviderItem })
+            }
+            func finishEnumerating(upTo page: NSFileProviderPage?) {
+                finished = true
+            }
+            func finishEnumeratingWithError(_ error: Error) {
+                self.error = error
+                finished = true
+            }
+        }
+
+        let workingSetEnumerator = FileProviderEnumerator(
+            containerItemIdentifier: .workingSet,
+            domain: domain,
+            repositoryProvider: provider,
+            cache: cache
+        )
+        let wsObserver = TestObserver()
+        workingSetEnumerator.enumerateItems(for: wsObserver, startingAt: NSFileProviderPage(Data()))
+
+        // Allow background Task to execute
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(wsObserver.finished)
+        XCTAssertEqual(wsObserver.items.count, 1)
+        XCTAssertEqual(wsObserver.items.first?.filename, "materialized.txt")
+
+        // Trash container enumeration test
+        let trashEnumerator = FileProviderEnumerator(
+            containerItemIdentifier: .trashContainer,
+            domain: domain,
+            repositoryProvider: provider,
+            cache: cache
+        )
+        let trashObserver = TestObserver()
+        trashEnumerator.enumerateItems(for: trashObserver, startingAt: NSFileProviderPage(Data()))
+        XCTAssertTrue(trashObserver.finished)
+        XCTAssertTrue(trashObserver.items.isEmpty)
+        #endif
+    }
+
+    func testFileProviderCreateItemTraversalRejection() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+        let extensionInstance = FileProviderExtension(domain: domain, repositoryProvider: provider)
+
+        // Attempt creation with path traversal in filename
+        let maliciousItem = FileProviderItem(contract: FileProviderItemContract(
+            identifier: FileProviderItemIdentifier.root,
+            parentIdentifier: .root,
+            filename: "../../etc/shadow",
+            isDirectory: false,
+            size: 0,
+            contentTypeIdentifier: "public.data"
+        ))
+
+        let expectation = expectation(description: "Create item traversal rejected")
+        _ = extensionInstance.createItem(
+            basedOn: maliciousItem,
+            fields: [],
+            contents: nil,
+            request: NSFileProviderRequest()
+        ) { createdItem, fields, shouldFetch, error in
+            XCTAssertNil(createdItem)
+            XCTAssertNotNil(error)
+            expectation.fulfill()
+        }
+
+        await fulfillment(of: [expectation], timeout: 5.0)
+        #endif
+    }
+
+    func testFileProviderCreateItemEmptyFileCreation() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+        let extensionInstance = FileProviderExtension(domain: domain, repositoryProvider: provider)
+
+        let newEmptyItem = FileProviderItem(contract: FileProviderItemContract(
+            identifier: FileProviderItemIdentifier.root,
+            parentIdentifier: .root,
+            filename: "empty_new.txt",
+            isDirectory: false,
+            size: 0,
+            contentTypeIdentifier: "public.plain-text"
+        ))
+
+        let expectation = expectation(description: "Create empty file")
+        _ = extensionInstance.createItem(
+            basedOn: newEmptyItem,
+            fields: [],
+            contents: nil,
+            request: NSFileProviderRequest()
+        ) { createdItem, fields, shouldFetch, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(createdItem)
+            XCTAssertEqual(createdItem?.filename, "empty_new.txt")
+            expectation.fulfill()
+        }
+
+        await fulfillment(of: [expectation], timeout: 5.0)
+
+        // Verify remote file was written
+        let file = try? await demoRepo.fetchAttributes(at: RemotePath("/empty_new.txt"))
+        XCTAssertNotNil(file)
+        #endif
+    }
+
+    func testFileProviderModifyItemRename() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+        let extensionInstance = FileProviderExtension(domain: domain, repositoryProvider: provider)
+
+        // First write an initial file
+        let initialPath = RemotePath("/home/dev/projects/original.txt")
+        try await demoRepo.writeFile(data: Data("original content".utf8), at: initialPath, progress: nil)
+
+        let itemID = FileProviderItemIdentifier(hostID: hostID, remotePath: initialPath)
+        let renamedItem = FileProviderItem(contract: FileProviderItemContract(
+            identifier: itemID,
+            parentIdentifier: itemID.parentIdentifier,
+            filename: "renamed.txt",
+            isDirectory: false,
+            size: 16,
+            contentTypeIdentifier: "public.plain-text"
+        ))
+
+        let expectation = expectation(description: "Modify rename item")
+        _ = extensionInstance.modifyItem(
+            renamedItem,
+            baseVersion: renamedItem.itemVersion,
+            changedFields: [.filename],
+            contents: nil,
+            request: NSFileProviderRequest()
+        ) { modifiedItem, fields, shouldFetch, error in
+            XCTAssertNil(error)
+            XCTAssertEqual(modifiedItem?.filename, "renamed.txt")
+            expectation.fulfill()
+        }
+
+        await fulfillment(of: [expectation], timeout: 5.0)
+
+        // Verify remote file was renamed
+        let oldFile = try? await demoRepo.fetchAttributes(at: initialPath)
+        let newFile = try? await demoRepo.fetchAttributes(at: RemotePath("/home/dev/projects/renamed.txt"))
+        XCTAssertNil(oldFile)
+        XCTAssertNotNil(newFile)
+        #endif
+    }
+
+    func testFileProviderSyncAnchorExpiration() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let cache = FileProviderMetadataCache()
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+
+        let enumerator = FileProviderEnumerator(
+            containerItemIdentifier: .rootContainer,
+            domain: domain,
+            repositoryProvider: provider,
+            cache: cache
+        )
+
+        final class ChangeObserver: NSObject, NSFileProviderChangeObserver, @unchecked Sendable {
+            var finished = false
+            var error: Error?
+            func didUpdate(_ updatedItems: [NSFileProviderItemProtocol]) {}
+            func didDeleteItems(withIdentifiers deletedItemIdentifiers: [NSFileProviderItemIdentifier]) {}
+            func finishEnumeratingChanges(upTo anchor: NSFileProviderSyncAnchor, moreComing: Bool) { finished = true }
+            func finishEnumeratingWithError(_ error: Error) { self.error = error; finished = true }
+        }
+
+        // Anchor with future generation (e.g. generation 999 while current is 0)
+        let futureAnchor = FileProviderChangeAnchor(generation: 999)
+        let syncAnchor = NSFileProviderSyncAnchor(futureAnchor.encodedData())
+
+        let observer = ChangeObserver()
+        enumerator.enumerateChanges(for: observer, from: syncAnchor)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(observer.finished)
+        XCTAssertNotNil(observer.error)
+        let nsError = observer.error as? NSError
+        XCTAssertEqual(nsError?.code, NSFileProviderError.syncAnchorExpired.rawValue)
+        #endif
+    }
 }
