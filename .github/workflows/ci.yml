@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    name: Build and Test
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Cache XcodeGen
+        id: cache-xcodegen
+        uses: actions/cache@v4
+        with:
+          path: /opt/homebrew/bin/xcodegen
+          key: xcodegen-${{ runner.os }}
+
+      - name: Install XcodeGen
+        if: steps.cache-xcodegen.outputs.cache-hit != 'true'
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+
+      - name: Resolve Swift Packages
+        run: |
+          swift package resolve
+          swift package dump-package > /dev/null
+
+      - name: Run Core Swift Tests
+        run: |
+          swift test 2>&1 | tee swift-test.log
+
+      - name: Generate Xcode Project
+        run: |
+          xcodegen generate
+
+      - name: Build Generic iOS Targets (Unsigned)
+        run: |
+          xcodebuild build \
+            -project Shh.xcodeproj \
+            -scheme Shh \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee xcodebuild-app.log
+
+          xcodebuild build \
+            -project Shh.xcodeproj \
+            -scheme ShhFileProvider \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee xcodebuild-fp.log
+
+      - name: Discover and Boot Available Simulators
+        id: simulators
+        run: |
+          set -euo pipefail
+          IPHONE_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" in runtime:
+                  for d in devices:
+                      if "iPhone" in d.get("name", "") and d.get("isAvailable"):
+                          print(d["udid"])
+                          sys.exit(0)
+          ')
+          IPAD_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" in runtime:
+                  for d in devices:
+                      if "iPad" in d.get("name", "") and d.get("isAvailable"):
+                          print(d["udid"])
+                          sys.exit(0)
+          ')
+
+          echo "iPhone Simulator ID: $IPHONE_ID"
+          echo "iPad Simulator ID: $IPAD_ID"
+
+          echo "iphone_id=$IPHONE_ID" >> "$GITHUB_OUTPUT"
+          echo "ipad_id=$IPAD_ID" >> "$GITHUB_OUTPUT"
+
+          xcrun simctl boot "$IPHONE_ID" || true
+          xcrun simctl boot "$IPAD_ID" || true
+
+      - name: Run iPhone Simulator Tests
+        if: steps.simulators.outputs.iphone_id != ''
+        run: |
+          xcodebuild test \
+            -project Shh.xcodeproj \
+            -scheme ShhAppTests \
+            -destination "platform=iOS Simulator,id=${{ steps.simulators.outputs.iphone_id }}" \
+            -resultBundlePath iphone-tests.xcresult \
+            2>&1 | tee iphone-tests.log
+
+      - name: Run iPad Simulator Tests
+        if: steps.simulators.outputs.ipad_id != ''
+        run: |
+          xcodebuild test \
+            -project Shh.xcodeproj \
+            -scheme ShhAppTests \
+            -destination "platform=iOS Simulator,id=${{ steps.simulators.outputs.ipad_id }}" \
+            -resultBundlePath ipad-tests.xcresult \
+            2>&1 | tee ipad-tests.log
+
+      - name: Upload Test Results and Logs on Failure
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-failure-artifacts
+          path: |
+            *.xcresult
+            *.log
+          retention-days: 7
