@@ -31,6 +31,19 @@ final class LiveSSHExecChannelHandler: ChannelDuplexHandler, @unchecked Sendable
         self.maxOutputBytes = maxOutputBytes
     }
 
+    deinit {
+        let shouldFail = lock.withLock {
+            if !isCompleted {
+                isCompleted = true
+                return true
+            }
+            return false
+        }
+        if shouldFail {
+            promise.fail(TransportError.cancelled)
+        }
+    }
+
     func handlerAdded(context: ChannelHandlerContext) {
         self.channel = context.channel
     }

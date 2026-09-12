@@ -135,6 +135,10 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         let promise = parentChannel.eventLoop.makePromise(of: SSHCommandResult.self)
         let handlerPromise = parentChannel.eventLoop.makePromise(of: LiveSSHExecChannelHandler.self)
         let childPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+        childPromise.futureResult.whenFailure { error in
+            handlerPromise.fail(error)
+            promise.fail(error)
+        }
 
         let execChannel: Channel
         let execHandler: LiveSSHExecChannelHandler
@@ -143,6 +147,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
                 self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
                     sshHandler.createChannel(childPromise, channelType: .session) { newChildChannel, channelType in
                         guard channelType == .session else {
+                            let err = TransportError.remoteFailure("Unexpected channel type: \(channelType)")
+                            handlerPromise.fail(err)
+                            promise.fail(err)
                             return newChildChannel.close()
                         }
                         let handler = LiveSSHExecChannelHandler(
