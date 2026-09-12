@@ -10,6 +10,7 @@ struct FileProviderSettingsView: View {
     @State private var hosts: [Host] = []
     @State private var errorMessage: String? = nil
     @State private var isPerformingOperation = false
+    @State private var hostPendingRemoval: Host? = nil
 
     var body: some View {
         Form {
@@ -52,10 +53,35 @@ struct FileProviderSettingsView: View {
         }
         .navigationTitle("File Provider Domains")
         .task {
+            container.fileProviderDomainError = nil
+            errorMessage = nil
             await reload()
+        }
+        .onDisappear {
+            container.fileProviderDomainError = nil
+            errorMessage = nil
         }
         .refreshable {
             await reload()
+        }
+        .confirmationDialog(
+            "Remove Files Domain",
+            isPresented: Binding(
+                get: { hostPendingRemoval != nil },
+                set: { if !$0 { hostPendingRemoval = nil } }
+            ),
+            presenting: hostPendingRemoval
+        ) { host in
+            Button("Remove Domain for \(host.name)", role: .destructive) {
+                Task {
+                    await unregisterDomain(for: host)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                hostPendingRemoval = nil
+            }
+        } message: { host in
+            Text("Removing the domain for '\(host.name)' will unmount this host from the iOS Files app and disconnect active file operations.")
         }
     }
 
@@ -113,14 +139,13 @@ struct FileProviderSettingsView: View {
                         .foregroundStyle(.secondary)
                 } else if isRegistered {
                     Button(role: .destructive) {
-                        Task {
-                            await unregisterDomain(for: host)
-                        }
+                        hostPendingRemoval = host
                     } label: {
                         Label("Remove Domain", systemImage: "trash")
                             .font(.subheadline)
                     }
                     .disabled(isPerformingOperation)
+                    .accessibilityLabel("Remove domain for \(host.name)")
                     .accessibilityIdentifier("fileprovider-remove-button-\(host.id)")
                 } else {
                     Button {
@@ -132,6 +157,7 @@ struct FileProviderSettingsView: View {
                             .font(.subheadline)
                     }
                     .disabled(isPerformingOperation)
+                    .accessibilityLabel("Register domain for \(host.name)")
                     .accessibilityIdentifier("fileprovider-register-button-\(host.id)")
                 }
             }
@@ -149,6 +175,11 @@ struct FileProviderSettingsView: View {
     private func reload() async {
         hosts = (try? await container.catalog.listHosts()) ?? []
         #if canImport(FileProvider)
+        do {
+            try await container.syncSharedCatalogAndTrust()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
         await container.refreshRegisteredDomains()
         #endif
     }

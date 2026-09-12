@@ -319,7 +319,7 @@ final class AppContainer: ObservableObject {
         }
 
         Task { [weak self] in
-            await self?.syncSharedCatalogAndTrust()
+            try? await self?.syncSharedCatalogAndTrust()
             #if canImport(FileProvider)
             await self?.refreshRegisteredDomains()
             #endif
@@ -952,7 +952,7 @@ final class AppContainer: ObservableObject {
         guard let challenge = pendingTrustChallenge, let host = pendingTrustHost else { return }
         if permanently {
             await trustStore.save(challenge)
-            await syncSharedCatalogAndTrust()
+            try? await syncSharedCatalogAndTrust()
         } else {
             await trustStore.trustOnce(challenge)
         }
@@ -2921,22 +2921,22 @@ final class AppContainer: ObservableObject {
 
     // MARK: - Host Management & Shared Catalog Sync
 
-    public func syncSharedCatalogAndTrust() async {
+    public func syncSharedCatalogAndTrust() async throws {
         let snapshot = await catalog.snapshot()
         let records = await trustStore.allRecords()
         #if canImport(FileProvider)
-        try? fileProviderHelper.syncSharedState(snapshot: snapshot, trustRecords: records)
+        try fileProviderHelper.syncSharedState(snapshot: snapshot, trustRecords: records)
         #endif
     }
 
     public func saveHost(_ host: Host) async throws {
         try await catalog.save(host)
-        await syncSharedCatalogAndTrust()
+        try await syncSharedCatalogAndTrust()
     }
 
     public func deleteHost(id: UUID) async throws {
         try await catalog.delete(id: id)
-        await syncSharedCatalogAndTrust()
+        try await syncSharedCatalogAndTrust()
     }
 
     // MARK: - File Provider Domains
@@ -2947,8 +2947,13 @@ final class AppContainer: ObservableObject {
             self.fileProviderDomainError = err.localizedDescription
             throw err
         }
+        guard fileProviderHelper.containerURL != nil else {
+            let err = FileProviderManagerError.containerUnavailable(fileProviderHelper.appGroupIdentifier)
+            self.fileProviderDomainError = err.localizedDescription
+            throw err
+        }
         do {
-            await syncSharedCatalogAndTrust()
+            try await syncSharedCatalogAndTrust()
             try await fileProviderHelper.registerDomain(for: host)
             self.fileProviderDomainError = nil
             await refreshRegisteredDomains()
@@ -3008,13 +3013,32 @@ final class AppContainer: ObservableObject {
         return try service.restoreBackup(backup: backup, passphrase: passphrase)
     }
 
-    public func restoreCatalog(from snapshot: CatalogSnapshot, mode: RestoreMode) async {
+    public func restoreCatalog(from snapshot: CatalogSnapshot, mode: RestoreMode) async throws {
         switch mode {
         case .merge:
             await catalog.merge(with: snapshot)
         case .replace:
+            #if canImport(FileProvider)
+            let newHostIDs = Set(snapshot.hosts.map(\.id.uuidString))
+            let existingHosts = (try? await catalog.listHosts()) ?? []
+            let activeDomainIDs: Set<String>
+            if let domains = try? await fileProviderHelper.registeredDomains() {
+                activeDomainIDs = Set(domains.map(\.identifier.rawValue))
+            } else {
+                activeDomainIDs = registeredFileProviderDomainIDs
+            }
+
+            for host in existingHosts where !newHostIDs.contains(host.id.uuidString) {
+                if activeDomainIDs.contains(host.id.uuidString) {
+                    try? await fileProviderHelper.unregisterDomain(for: host)
+                }
+            }
+            #endif
             await catalog.replace(with: snapshot)
         }
-        await syncSharedCatalogAndTrust()
+        try await syncSharedCatalogAndTrust()
+        #if canImport(FileProvider)
+        await refreshRegisteredDomains()
+        #endif
     }
 }
