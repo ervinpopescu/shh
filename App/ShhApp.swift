@@ -76,8 +76,8 @@ struct RootView: View {
         return VStack(alignment: .leading, spacing: 4) {
             Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
             Text(container.isDemo
-                ? "SSH adapter active in offline demo mode. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh is not enabled in this build. Local voice AI active."
-                : "Live SSH transport active. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh is not enabled in this build. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
+                ? "SSH and Mosh adapters active in offline demo mode. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh UDP active. Local voice AI active."
+                : "Live SSH transport active. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh UDP active. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
         }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
@@ -313,6 +313,13 @@ struct HostEditorView: View {
     @State private var isProductionHost: Bool
     @State private var identities: [IdentityDescriptor] = []
 
+    // Mosh settings
+    @State private var moshServerCommand: String
+    @State private var moshUseCustomPortRange: Bool
+    @State private var moshPortRangeStart: String
+    @State private var moshPortRangeEnd: String
+    @State private var moshPredictionMode: MoshPredictionMode
+
     init(existing: Host? = nil) {
         self.existing = existing
         _name = State(initialValue: existing?.name ?? "")
@@ -326,12 +333,27 @@ struct HostEditorView: View {
         if case .proxyJump(let jumpOpts) = existing?.connection {
             initialType = .proxyJump
             initialBastions = jumpOpts.config.hostIDs
-        } else if case .mosh = existing?.connection {
+            _moshServerCommand = State(initialValue: "mosh-server")
+            _moshUseCustomPortRange = State(initialValue: false)
+            _moshPortRangeStart = State(initialValue: "60001")
+            _moshPortRangeEnd = State(initialValue: "60999")
+            _moshPredictionMode = State(initialValue: .adaptive)
+        } else if case .mosh(let moshOpts) = existing?.connection {
             initialType = .mosh
             initialBastions = []
+            _moshServerCommand = State(initialValue: moshOpts.serverCommand)
+            _moshUseCustomPortRange = State(initialValue: moshOpts.portRange != nil)
+            _moshPortRangeStart = State(initialValue: moshOpts.portRange.map { String($0.start) } ?? "60001")
+            _moshPortRangeEnd = State(initialValue: moshOpts.portRange.map { String($0.end) } ?? "60999")
+            _moshPredictionMode = State(initialValue: moshOpts.predictionMode)
         } else {
             initialType = .direct
             initialBastions = []
+            _moshServerCommand = State(initialValue: "mosh-server")
+            _moshUseCustomPortRange = State(initialValue: false)
+            _moshPortRangeStart = State(initialValue: "60001")
+            _moshPortRangeEnd = State(initialValue: "60999")
+            _moshPredictionMode = State(initialValue: .adaptive)
         }
         _connectionType = State(initialValue: initialType)
         _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
@@ -455,6 +477,40 @@ struct HostEditorView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                    } else if connectionType == .mosh {
+                        TextField("Mosh Server Command", text: $moshServerCommand)
+                            .accessibilityIdentifier("host-editor-mosh-server-command-field")
+                            .accessibilityLabel("Mosh server command")
+                            .textInputAutocapitalization(.never)
+                            .disableAutocorrection(true)
+
+                        Toggle("Custom Port Range", isOn: $moshUseCustomPortRange)
+                            .accessibilityIdentifier("host-editor-mosh-port-range-toggle")
+                            .accessibilityLabel("Custom UDP port range")
+
+                        if moshUseCustomPortRange {
+                            HStack {
+                                TextField("Start Port", text: $moshPortRangeStart)
+                                    .keyboardType(.numberPad)
+                                    .accessibilityIdentifier("host-editor-mosh-port-start-field")
+                                    .accessibilityLabel("Mosh start port")
+                                Text("-")
+                                    .foregroundStyle(.secondary)
+                                    .accessibilityHidden(true)
+                                TextField("End Port", text: $moshPortRangeEnd)
+                                    .keyboardType(.numberPad)
+                                    .accessibilityIdentifier("host-editor-mosh-port-end-field")
+                                    .accessibilityLabel("Mosh end port")
+                            }
+                        }
+
+                        Picker("Prediction Mode", selection: $moshPredictionMode) {
+                            ForEach(MoshPredictionMode.allCases, id: \.self) { mode in
+                                Text(mode.rawValue.capitalized).tag(mode)
+                            }
+                        }
+                        .accessibilityIdentifier("host-editor-mosh-prediction-picker")
+                        .accessibilityLabel("Mosh prediction mode picker")
                     }
                 }
 
@@ -560,11 +616,19 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && bastionHops.isEmpty))
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
                         .accessibilityIdentifier("host-editor-save-button")
                 }
             }
         }
+    }
+
+    private var isMoshPortRangeValid: Bool {
+        guard connectionType == .mosh && moshUseCustomPortRange else { return true }
+        guard let start = UInt16(moshPortRangeStart),
+              let end = UInt16(moshPortRangeEnd),
+              start > 0, end > 0 else { return false }
+        return true
     }
 
     private var isTmuxPreferenceValid: Bool {
@@ -623,11 +687,24 @@ struct HostEditorView: View {
             let hopHostIDs = bastionHops.map(\.hostID)
             profile = .proxyJump(ProxyJumpOptions(hopHostIDs: hopHostIDs, sshOptions: existingSSH))
         } else if connectionType == .mosh {
-            if case .mosh(let existingMosh) = existing?.connection {
-                profile = .mosh(existingMosh)
+            let portRange: MoshPortRange?
+            if moshUseCustomPortRange,
+               let start = UInt16(moshPortRangeStart),
+               let end = UInt16(moshPortRangeEnd) {
+                portRange = MoshPortRange(start: start, end: end)
             } else {
-                profile = .mosh(MoshOptions(sshOptions: existingSSH))
+                portRange = nil
             }
+            let serverCmd = moshServerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? "mosh-server"
+                : moshServerCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            profile = .mosh(MoshOptions(
+                serverCommand: serverCmd,
+                portRange: portRange,
+                predictionMode: moshPredictionMode,
+                sshOptions: existingSSH
+            ))
         } else {
             profile = .ssh(existingSSH)
         }
@@ -685,6 +762,9 @@ struct SessionView: View {
         VStack(spacing: 0) {
             // Header / Status bar
             sessionHeader
+
+            // Live Network Roaming Recovery Indicator Banner
+            roamingRecoveryBanner
 
             // Reconnect status banner if coordinator is active
             reconnectBanner
@@ -749,58 +829,223 @@ struct SessionView: View {
     }
 
     @ViewBuilder
+    private var roamingRecoveryBanner: some View {
+        if let moshState = container.moshState, moshState.isRoaming {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Network Roaming - Re-syncing")
+                        .font(.caption.bold())
+                        .foregroundStyle(.primary)
+                    if let iface = container.networkRoamingState?.currentInterface {
+                        Text("(\(iface.displayName))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Network Roaming - Re-syncing")
+                            .font(.caption.bold())
+                            .foregroundStyle(.primary)
+                    }
+                    if let iface = container.networkRoamingState?.currentInterface {
+                        Text("Interface: \(iface.displayName)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.orange.opacity(0.15))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Network roaming re-syncing to \(container.networkRoamingState?.currentInterface.displayName ?? "new interface")")
+            .accessibilityIdentifier("mosh-roaming-banner")
+            Divider()
+        }
+    }
+
+    @ViewBuilder
     private var reconnectBanner: some View {
         switch container.reconnectState {
         case .waiting(let attempt, let delay):
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
-                    .font(.caption)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry Now") {
+                        Task { await container.retryReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-retry-button")
+                    .accessibilityLabel("Retry connection immediately")
+
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
                     .foregroundStyle(.secondary)
-                Spacer()
-                Button("Cancel") {
-                    Task { await container.cancelReconnect() }
+                    .accessibilityIdentifier("reconnect-cancel-button")
+                    .accessibilityLabel("Cancel reconnection")
                 }
-                .font(.caption.bold())
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        Button("Retry Now") {
+                            Task { await container.retryReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-retry-button")
+                        .accessibilityLabel("Retry connection immediately")
+
+                        Button("Cancel") {
+                            Task { await container.cancelReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("reconnect-cancel-button")
+                        .accessibilityLabel("Cancel reconnection")
+                    }
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 6)
             .background(Color.yellow.opacity(0.15))
             Divider()
         case .connecting(let attempt):
-            HStack(spacing: 8) {
-                ProgressView()
-                    .controlSize(.small)
-                Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Cancel") {
-                    Task { await container.cancelReconnect() }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-cancel-button")
+                    .accessibilityLabel("Cancel reconnection")
                 }
-                .font(.caption.bold())
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-cancel-button")
+                    .accessibilityLabel("Cancel reconnection")
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 6)
             .background(Color.blue.opacity(0.15))
             Divider()
         case .exhausted(let attempts):
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                Text("Reconnection failed after \(attempts) attempts.")
-                    .font(.caption)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Reconnection failed after \(attempts) attempts.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") {
+                        Task { await container.retryReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-retry-button")
+                    .accessibilityLabel("Retry connection")
+
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
                     .foregroundStyle(.secondary)
-                Spacer()
-                Button("Retry") {
-                    Task { await container.retryReconnect() }
+                    .accessibilityIdentifier("reconnect-cancel-button")
+                    .accessibilityLabel("Dismiss reconnection")
                 }
-                .font(.caption.bold())
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text("Reconnection failed after \(attempts) attempts.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack(spacing: 12) {
+                        Button("Retry") {
+                            Task { await container.retryReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-retry-button")
+                        .accessibilityLabel("Retry connection")
+
+                        Button("Cancel") {
+                            Task { await container.cancelReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("reconnect-cancel-button")
+                        .accessibilityLabel("Dismiss reconnection")
+                    }
+                }
             }
             .padding(.horizontal)
             .padding(.vertical, 6)
             .background(Color.orange.opacity(0.15))
+            Divider()
+        case .cancelled:
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    Text("Reconnection cancelled.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Retry") {
+                        Task { await container.retryReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-retry-button")
+                    .accessibilityLabel("Retry connection")
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Reconnection cancelled.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("Retry") {
+                        Task { await container.retryReconnect() }
+                    }
+                    .font(.caption.bold())
+                    .accessibilityIdentifier("reconnect-retry-button")
+                    .accessibilityLabel("Retry connection")
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.gray.opacity(0.15))
             Divider()
         default:
             EmptyView()
@@ -866,6 +1111,34 @@ struct SessionView: View {
                 }
                 .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
                 .accessibilityIdentifier("session-forwarders-indicator")
+            }
+
+            if let moshState = container.moshState {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                if moshState.isRoaming {
+                    Label("Network Roaming - Re-syncing", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("Network roaming re-syncing")
+                        .accessibilityIdentifier("mosh-roaming-indicator")
+                } else if let port = container.moshSessionPort {
+                    Label("Connected via Mosh (UDP :\(port))", systemImage: "bolt.horizontal.fill")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .accessibilityLabel("Connected via Mosh UDP port \(port)")
+                        .accessibilityIdentifier("mosh-connected-indicator")
+                }
+            } else if let port = container.moshSessionPort, container.activeSession?.state == .connected {
+                Text("•")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Label("Connected via Mosh (UDP :\(port))", systemImage: "bolt.horizontal.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel("Connected via Mosh UDP port \(port)")
+                    .accessibilityIdentifier("mosh-connected-indicator")
             } else if let errorMsg = container.forwardingErrorMessage {
                 Text("•")
                     .foregroundStyle(.secondary)
