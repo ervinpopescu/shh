@@ -301,8 +301,11 @@ public struct EncryptedVaultService: Sendable {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.sortedKeys]
-        guard let payloadData = try? encoder.encode(payload) else {
+        guard var payloadData = try? encoder.encode(payload) else {
             throw VaultBackupError.serializationFailed("Failed to encode vault payload.")
+        }
+        defer {
+            payloadData.resetBytes(in: 0..<payloadData.count)
         }
 
         // Generate cryptographically secure random salt
@@ -454,11 +457,14 @@ public struct EncryptedVaultService: Sendable {
         let aadData = Data(aadString.utf8)
 
         // Authenticated decrypt
-        let decryptedData: Data
+        var decryptedData: Data
         do {
             decryptedData = try AES.GCM.open(sealedBox, using: derivedKey, authenticating: aadData)
         } catch {
             throw VaultBackupError.authenticationFailed
+        }
+        defer {
+            decryptedData.resetBytes(in: 0..<decryptedData.count)
         }
 
         // Decode payload
