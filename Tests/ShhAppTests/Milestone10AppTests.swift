@@ -323,7 +323,7 @@ final class Milestone10AppTests: XCTestCase {
         let snapshotB = await isolatedCatalog.snapshot()
 
         // Merge snapshotB into container
-        await container.restoreCatalog(from: snapshotB, mode: .merge)
+        try await container.restoreCatalog(from: snapshotB, mode: .merge)
 
         let currentHosts = try await container.catalog.listHosts()
         XCTAssertTrue(currentHosts.contains(where: { $0.id == hostA.id }), "Host A must be preserved after merge")
@@ -342,7 +342,7 @@ final class Milestone10AppTests: XCTestCase {
         let snapshotNew = await isolatedCatalog.snapshot()
 
         // Replace container with snapshotNew
-        await container.restoreCatalog(from: snapshotNew, mode: .replace)
+        try await container.restoreCatalog(from: snapshotNew, mode: .replace)
 
         let currentHosts = try await container.catalog.listHosts()
         XCTAssertFalse(currentHosts.contains(where: { $0.id == oldHost.id }), "Old Host must be wiped on replace")
@@ -414,6 +414,128 @@ final class Milestone10AppTests: XCTestCase {
     }
 
     // MARK: - 5. Accessibility & Readiness Verification
+
+    func testVaultRestoreReplaceUnregistersOrphanedDomains() async throws {
+        let hostA = try Host(name: "Host A", hostname: "a.test", username: "user")
+        let hostB = try Host(name: "Host B", hostname: "b.test", username: "user")
+
+        let removedBox = SafeBox<[String]>([])
+        let registeredBox = SafeBox<[String]>([hostA.id.uuidString, hostB.id.uuidString])
+
+        let helper = FileProviderManagerHelper(
+            appGroupIdentifier: "group.test.m10",
+            containerURL: tempDirectory,
+            domainRemover: { domain in
+                removedBox.mutate { $0.append(domain.identifier.rawValue) }
+                registeredBox.mutate { $0.removeAll { id in id == domain.identifier.rawValue } }
+            },
+            domainLister: {
+                registeredBox.value.map { NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier($0), displayName: $0) }
+            }
+        )
+
+        let container = AppContainer.demo(fileProviderHelper: helper)
+        try await container.saveHost(hostA)
+        try await container.saveHost(hostB)
+        await container.refreshRegisteredDomains()
+        XCTAssertTrue(container.registeredFileProviderDomainIDs.contains(hostA.id.uuidString))
+
+        // Replace catalog with snapshot containing only hostB
+        let isolatedCatalog = InMemoryCatalog(seedDemoData: false)
+        try await isolatedCatalog.save(hostB)
+        let snapshotNew = await isolatedCatalog.snapshot()
+
+        try await container.restoreCatalog(from: snapshotNew, mode: .replace)
+
+        // Verify hostA was unregistered
+        XCTAssertTrue(removedBox.value.contains(hostA.id.uuidString), "Host A domain must be removed in replace mode")
+        XCTAssertFalse(container.registeredFileProviderDomainIDs.contains(hostA.id.uuidString), "Host A must not remain registered")
+    }
+
+    func testVaultRestorePropagatesAppGroupSyncFailure() async throws {
+        // Use a file as containerURL instead of directory to trigger write error
+        let fileAsContainer = tempDirectory.appendingPathComponent("not_a_dir")
+        try Data("block".utf8).write(to: fileAsContainer)
+
+        let helper = FileProviderManagerHelper(
+            appGroupIdentifier: "group.test.m10",
+            containerURL: fileAsContainer
+        )
+
+        let container = AppContainer.demo(fileProviderHelper: helper)
+        let testHost = try Host(name: "Test Host", hostname: "host.test", username: "user")
+        let isolatedCatalog = InMemoryCatalog(seedDemoData: false)
+        try await isolatedCatalog.save(testHost)
+        let snapshot = await isolatedCatalog.snapshot()
+
+        do {
+            try await container.restoreCatalog(from: snapshot, mode: .merge)
+            XCTFail("Expected restoreCatalog to throw when shared container write fails")
+        } catch {
+            XCTAssertNotNil(error)
+        }
+    }
+
+    func testDomainRegistrationFailsWhenContainerUnavailable() async throws {
+        let host = try Host(name: "Unentitled Host", hostname: "host.test", username: "user")
+        let helper = FileProviderManagerHelper(
+            appGroupIdentifier: "group.unentitled.test",
+            containerURL: nil
+        )
+        let container = AppContainer.demo(fileProviderHelper: helper)
+
+        do {
+            try await container.registerFileProviderDomain(for: host)
+            XCTFail("Expected registration to fail when containerURL is nil")
+        } catch let error as FileProviderManagerError {
+            guard case .containerUnavailable(let group) = error else {
+                XCTFail("Expected .containerUnavailable error, got: \(error)")
+                return
+            }
+            XCTAssertEqual(group, "group.unentitled.test")
+            XCTAssertNotNil(container.fileProviderDomainError)
+        }
+    }
+
+    func testTemporaryExportArtifactCleanup() throws {
+        let fileName = "ShhVault-TestCleanup.shhbackup"
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        try Data("dummy-encrypted-data".utf8).write(to: tempURL)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempURL.path))
+
+        try FileManager.default.removeItem(at: tempURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: tempURL.path))
+    }
+
+    func testVaultBackupAndRestoreEndToEndWithPayloadPreservation() async throws {
+        let container = AppContainer.demo(catalog: InMemoryCatalog(seedDemoData: false))
+        let host1 = try Host(name: "Prod Server", hostname: "prod.example.com", username: "admin")
+        let host2 = try Host(name: "Staging Server", hostname: "staging.example.com", username: "deploy")
+        try await container.saveHost(host1)
+        try await container.saveHost(host2)
+
+        let passphrase = "test-e2e-restore-passphrase"
+        let backupData = try await container.exportVaultBackup(passphrase: passphrase)
+
+        // Preview payload
+        let preview = try container.previewVaultBackup(data: backupData, passphrase: passphrase)
+        XCTAssertEqual(preview.catalog.hosts.count, 2)
+        XCTAssertTrue(preview.catalog.hosts.contains(where: { $0.name == "Prod Server" }))
+        XCTAssertTrue(preview.catalog.hosts.contains(where: { $0.name == "Staging Server" }))
+
+        // Clear container catalog to test clean restore
+        let emptySnapshot = CatalogSnapshot()
+        try await container.restoreCatalog(from: emptySnapshot, mode: .replace)
+        let hostsAfterWipe = try await container.catalog.listHosts()
+        XCTAssertEqual(hostsAfterWipe.count, 0)
+
+        // Restore using the preserved preview payload
+        try await container.restoreCatalog(from: preview.catalog, mode: .replace)
+        let hostsAfterRestore = try await container.catalog.listHosts()
+        XCTAssertEqual(hostsAfterRestore.count, 2)
+        XCTAssertTrue(hostsAfterRestore.contains(where: { $0.name == "Prod Server" }))
+        XCTAssertTrue(hostsAfterRestore.contains(where: { $0.name == "Staging Server" }))
+    }
 
     func testTruthfulReadinessAndAccessibilityIdentifiers() {
         let settingsView = SettingsView()
