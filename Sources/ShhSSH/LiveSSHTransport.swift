@@ -389,7 +389,7 @@ public struct LiveSSHTransport: SSHTransport {
         }
     }
 
-    private static func resolveAuthenticationCredential(
+    static func resolveAuthenticationCredential(
         identity: IdentityDescriptor?,
         credentialStore: any CredentialStore
     ) async throws -> LiveSSHUserAuthDelegate.Credential {
