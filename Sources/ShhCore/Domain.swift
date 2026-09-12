@@ -518,7 +518,7 @@ public struct TerminalSession: Identifiable, Codable, Hashable, Sendable {
     public init(id: UUID = UUID(), hostID: UUID, startedAt: Date = Date(), state: TerminalSessionState = .connecting, terminalSize: TerminalSize = TerminalSize(), capabilities: Set<String> = []) { self.id = id; self.hostID = hostID; self.startedAt = startedAt; self.state = state; self.terminalSize = terminalSize; self.capabilities = capabilities }
 }
 
-public enum RemoteMultiplexer: String, Codable, CaseIterable, Sendable { case tmux, zellij, byobu, screen }
+public enum RemoteMultiplexer: String, Codable, CaseIterable, Sendable { case tmux, zellij, byobu, screen, herdr }
 public enum CapabilityAvailability: Codable, Hashable, Sendable { case available; case unavailable(reason: String) }
 public struct CapabilityMatrix: Codable, Hashable, Sendable {
     public var mosh: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
@@ -526,6 +526,7 @@ public struct CapabilityMatrix: Codable, Hashable, Sendable {
     public var forwarding: CapabilityAvailability = .available
     public var sftp: CapabilityAvailability = .available
     public var tmux: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
+    public var herdr: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
     public init() {}
 }
 

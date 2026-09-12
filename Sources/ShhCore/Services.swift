@@ -35,9 +35,85 @@ public extension SSHTransport {
 public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
     private var continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     private var commandHandler: (@Sendable (String) -> SSHCommandResult)?
+    private var herdrWorkspaces: [HerdrWorkspace] = DemoSSHConnection.makeDefaultHerdrWorkspaces()
+    private var herdrPaneOutputs: [String: String] = DemoSSHConnection.makeDefaultHerdrOutputs()
+
+    public static func makeDefaultHerdrWorkspaces() -> [HerdrWorkspace] {
+        let paneIdle = HerdrPane(
+            id: "pane-idle",
+            label: "worker-idle",
+            agentState: .idle,
+            currentCommand: nil,
+            lastActivity: Date(timeIntervalSince1970: 1700000000)
+        )
+        let paneWorking = HerdrPane(
+            id: "pane-working",
+            label: "builder",
+            agentState: .working,
+            currentCommand: "swift build",
+            lastActivity: Date(timeIntervalSince1970: 1700000100)
+        )
+        let paneBlocked = HerdrPane(
+            id: "pane-blocked",
+            label: "deployer",
+            agentState: .blocked(reason: "Waiting for confirmation before database migration"),
+            currentCommand: "db-migrate",
+            lastActivity: Date(timeIntervalSince1970: 1700000200)
+        )
+        let paneCompleted = HerdrPane(
+            id: "pane-completed",
+            label: "tester",
+            agentState: .completed(summary: "All 220 tests passed"),
+            currentCommand: "swift test",
+            lastActivity: Date(timeIntervalSince1970: 1700000300)
+        )
+
+        let defaultWorkspace = HerdrWorkspace(
+            id: "ws-main",
+            label: "default",
+            cwd: "/home/dev/workspace",
+            panes: [paneIdle, paneWorking, paneBlocked, paneCompleted]
+        )
+        return [defaultWorkspace]
+    }
+
+    public static func makeDefaultHerdrOutputs() -> [String: String] {
+        [
+            "pane-idle": "Session idle. Awaiting next command.\n$ \n",
+            "pane-working": "Building targets in release configuration...\n[3/12] Compiling ShhCore/Herdr.swift\n[4/12] Compiling ShhCore/Services.swift\n",
+            "pane-blocked": "Pending migration: 20260912_add_herdr_tables.sql\nDo you want to proceed with production migration? [y/N]: \n",
+            "pane-completed": "Test Suite 'All tests' passed at 2026-09-12 19:00:00.\nExecuted 220 tests, with 0 failures.\n"
+        ]
+    }
 
     public init(commandHandler: (@Sendable (String) -> SSHCommandResult)? = nil) {
         self.commandHandler = commandHandler
+    }
+
+    public func resetHerdrState() {
+        self.herdrWorkspaces = DemoSSHConnection.makeDefaultHerdrWorkspaces()
+        self.herdrPaneOutputs = DemoSSHConnection.makeDefaultHerdrOutputs()
+    }
+
+    public func transitionPane(paneID: String, to state: HerdrAgentState, currentCommand: String? = nil) {
+        for wIndex in 0..<herdrWorkspaces.count {
+            for pIndex in 0..<herdrWorkspaces[wIndex].panes.count {
+                if herdrWorkspaces[wIndex].panes[pIndex].id == paneID {
+                    let old = herdrWorkspaces[wIndex].panes[pIndex]
+                    herdrWorkspaces[wIndex].panes[pIndex] = HerdrPane(
+                        id: old.id,
+                        label: old.label,
+                        agentState: state,
+                        currentCommand: currentCommand ?? old.currentCommand,
+                        lastActivity: Date()
+                    )
+                }
+            }
+        }
+    }
+
+    public func getHerdrWorkspaces() -> [HerdrWorkspace] {
+        herdrWorkspaces
     }
 
     public func setCommandHandler(_ handler: (@Sendable (String) -> SSHCommandResult)?) {
@@ -89,6 +165,75 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
             } else {
                 result = SSHCommandResult(exitCode: 1, stdout: "", stderr: "can't find session\n")
             }
+        } else if trimmed == HerdrCommand.probe || trimmed == "herdr --version" || trimmed == "herdr -v" || trimmed == "herdr version" {
+            result = SSHCommandResult(exitCode: 0, stdout: "herdr 0.1.0\n", stderr: "")
+        } else if trimmed.contains("herdr workspace list") || trimmed.contains("herdr status") {
+            let data = (try? JSONEncoder().encode(herdrWorkspaces)) ?? Data()
+            result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        } else if trimmed.contains("herdr workspace create") {
+            let newID = "ws-\(UUID().uuidString.prefix(8).lowercased())"
+            let label: String
+            if let labelRange = trimmed.range(of: "--label ") {
+                let rest = trimmed[labelRange.upperBound...].trimmingCharacters(in: .whitespaces)
+                label = rest.components(separatedBy: .whitespaces).first?.replacingOccurrences(of: "'", with: "") ?? "new-workspace"
+            } else {
+                label = "new-workspace"
+            }
+            let newWS = HerdrWorkspace(id: newID, label: label, cwd: "/home/dev/\(label)", panes: [])
+            herdrWorkspaces.append(newWS)
+            let data = (try? JSONEncoder().encode(newWS)) ?? Data()
+            result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        } else if trimmed.contains("herdr tab create") {
+            result = SSHCommandResult(exitCode: 0, stdout: "Tab created\n", stderr: "")
+        } else if trimmed.contains("herdr pane split") {
+            let newPaneID = "pane-\(UUID().uuidString.prefix(6).lowercased())"
+            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date())
+            if !herdrWorkspaces.isEmpty {
+                herdrWorkspaces[0] = HerdrWorkspace(
+                    id: herdrWorkspaces[0].id,
+                    label: herdrWorkspaces[0].label,
+                    cwd: herdrWorkspaces[0].cwd,
+                    panes: herdrWorkspaces[0].panes + [newPane]
+                )
+            }
+            let data = (try? JSONEncoder().encode(newPane)) ?? Data()
+            result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        } else if trimmed.contains("herdr pane list") {
+            let allPanes = herdrWorkspaces.flatMap(\.panes)
+            let data = (try? JSONEncoder().encode(allPanes)) ?? Data()
+            result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+        } else if trimmed.contains("herdr pane read") {
+            let out: String
+            if trimmed.contains("pane-idle") {
+                out = herdrPaneOutputs["pane-idle"] ?? "Session idle.\n"
+            } else if trimmed.contains("pane-working") {
+                out = herdrPaneOutputs["pane-working"] ?? "Working...\n"
+            } else if trimmed.contains("pane-blocked") {
+                out = herdrPaneOutputs["pane-blocked"] ?? "Blocked\n"
+            } else if trimmed.contains("pane-completed") {
+                out = herdrPaneOutputs["pane-completed"] ?? "Done\n"
+            } else {
+                out = "Unwrapped pane output\n"
+            }
+            result = SSHCommandResult(exitCode: 0, stdout: out, stderr: "")
+        } else if trimmed.contains("herdr wait agent-status") {
+            let targetPane = ["pane-idle", "pane-working", "pane-blocked", "pane-completed"].first(where: { trimmed.contains($0) }) ?? "pane-working"
+            if trimmed.contains("done") || trimmed.contains("completed") {
+                transitionPane(paneID: targetPane, to: .completed(summary: "Task finished successfully"))
+                let state = HerdrAgentState.completed(summary: "Task finished successfully")
+                let data = (try? JSONEncoder().encode(state)) ?? Data()
+                result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+            } else {
+                let pane = herdrWorkspaces.flatMap(\.panes).first(where: { $0.id == targetPane })
+                let state = pane?.agentState ?? .idle
+                let data = (try? JSONEncoder().encode(state)) ?? Data()
+                result = SSHCommandResult(exitCode: 0, stdout: String(data: data, encoding: .utf8)! + "\n", stderr: "")
+            }
+        } else if trimmed.contains("herdr pane run") {
+            let targetPane = ["pane-idle", "pane-working", "pane-blocked", "pane-completed"].first(where: { trimmed.contains($0) }) ?? "pane-idle"
+            transitionPane(paneID: targetPane, to: .working, currentCommand: "herdr-task")
+            herdrPaneOutputs[targetPane] = "Task started...\n"
+            result = SSHCommandResult(exitCode: 0, stdout: "Command sent to \(targetPane)\n", stderr: "")
         } else {
             result = SSHCommandResult(exitCode: 0, stdout: "[demo] \(command)\n", stderr: "")
         }
@@ -299,8 +444,22 @@ public struct TmuxAdapter: MultiplexerAdapter {
 }
 public struct UnavailableMultiplexerAdapter: MultiplexerAdapter { public let kind: RemoteMultiplexer; public init(kind: RemoteMultiplexer) { self.kind = kind }; public func command(for action: MultiplexerAction) -> String { "# \(kind.rawValue) is not enabled in this build" } }
 
-public enum HerdrCommand: Hashable, Sendable { case remoteLaunch(workbox: String); case workspaceCreate(name: String); case tabCreate(name: String); case paneSplit(direction: String); case paneRun(command: String); case paneRead; case waitAgentStatus }
-public extension HerdrCommand { var renderedCommand: String { switch self { case .remoteLaunch(let workbox): "herdr --remote \(ShellQuoting.quote(workbox))"; case .workspaceCreate(let name): "herdr workspace create \(ShellQuoting.quote(name))"; case .tabCreate(let name): "herdr tab create \(ShellQuoting.quote(name))"; case .paneSplit(let direction): "herdr pane split \(ShellQuoting.quote(direction))"; case .paneRun(let command): "herdr pane run \(ShellQuoting.quote(command))"; case .paneRead: "herdr pane read"; case .waitAgentStatus: "herdr wait agent-status" } } }
+public struct HerdrAdapter: MultiplexerAdapter {
+    public let kind = RemoteMultiplexer.herdr
+    public init() {}
+    public func command(for action: MultiplexerAction) -> String {
+        switch action {
+        case .list:
+            return HerdrCommand.workspaceList().renderedCommand
+        case .attach(let name):
+            return "herdr attach \(ShellQuoting.quote(name))"
+        case .create(let name):
+            return HerdrCommand.workspaceCreate(cwd: ".", label: name).renderedCommand
+        case .send(let text):
+            return HerdrCommand.paneRun(pane: "", command: text).renderedCommand
+        }
+    }
+}
 
 public enum CommandRisk: String, Equatable, Sendable { case safe, reviewRequired, blocked }
 
@@ -560,7 +719,7 @@ private enum ShellTokenizer {
 public struct CommandPolicy: Sendable {
     private static let safeCommands: Set<String> = [
         "[", "basename", "cat", "cd", "command", "cut", "date", "dirname", "df", "du", "echo",
-        "false", "file", "free", "git", "grep", "groups", "head", "help", "hostname", "id", "less",
+        "false", "file", "free", "git", "grep", "groups", "head", "help", "herdr", "hostname", "id", "less",
         "ls", "man", "more", "printf", "pwd", "realpath", "readlink", "rg", "sort", "stat", "tail",
         "test", "tmux", "tree", "true", "tty", "uname", "uniq", "uptime", "whoami", "which", "wc"
     ]
@@ -658,6 +817,14 @@ public struct CommandPolicy: Sendable {
         }
         if executable == "tmux" {
             let risk = tmuxRisk(arguments)
+            if risk == .blocked { return .blocked }
+            if words.prefix(executableIndex).contains(where: { commandName($0) == "sudo" }) {
+                return .reviewRequired
+            }
+            return risk
+        }
+        if executable == "herdr" {
+            let risk = herdrRisk(arguments)
             if risk == .blocked { return .blocked }
             if words.prefix(executableIndex).contains(where: { commandName($0) == "sudo" }) {
                 return .reviewRequired
@@ -853,6 +1020,128 @@ public struct CommandPolicy: Sendable {
         }
 
         return .reviewRequired
+    }
+
+    private func herdrRisk(_ arguments: [String]) -> CommandRisk {
+        if arguments.contains("kill-server") || arguments.contains("destroy-all") || arguments.contains("wipe") {
+            return .blocked
+        }
+
+        let (subcommands, nonOptionOperands) = parseHerdrTokens(arguments)
+
+        // Exact probe: herdr --version, herdr -v, or herdr version
+        if (arguments.contains("-v") || arguments.contains("--version") || subcommands.first == "version") && subcommands.count <= 1 {
+            return .safe
+        }
+
+        guard let primary = subcommands.first else {
+            return .reviewRequired
+        }
+
+        switch primary {
+        case "workspace":
+            let action = subcommands.count > 1 ? subcommands[1] : ""
+            if ["list", "ls", "status"].contains(action) {
+                return .safe
+            }
+            return .reviewRequired
+
+        case "tab":
+            let action = subcommands.count > 1 ? subcommands[1] : ""
+            if ["list", "ls"].contains(action) {
+                return .safe
+            }
+            return .reviewRequired
+
+        case "pane":
+            let action = subcommands.count > 1 ? subcommands[1] : ""
+            if ["list", "ls", "read"].contains(action) {
+                return .safe
+            }
+            if action == "run" {
+                return herdrPaneRunRisk(nonOptionOperands: nonOptionOperands, allArguments: arguments)
+            }
+            return .reviewRequired
+
+        case "wait":
+            return .safe
+
+        case "agent":
+            let action = subcommands.count > 1 ? subcommands[1] : ""
+            if ["list", "ls", "status"].contains(action) {
+                return .safe
+            }
+            return .safe
+
+        case "status", "help":
+            return .safe
+
+        default:
+            return .reviewRequired
+        }
+    }
+
+    private func herdrPaneRunRisk(nonOptionOperands: [String], allArguments: [String]) -> CommandRisk {
+        guard let runIndex = allArguments.firstIndex(of: "run") else {
+            return .reviewRequired
+        }
+        let afterRun = Array(allArguments.dropFirst(runIndex + 1))
+        let operandsAfterRun = optionOperands(afterRun)
+
+        for operand in operandsAfterRun {
+            if classify(operand) == .blocked {
+                return .blocked
+            }
+        }
+
+        if operandsAfterRun.count >= 2 {
+            let commandTokens = Array(operandsAfterRun.dropFirst())
+            let joinedCommand = commandTokens.joined(separator: " ")
+            if classify(joinedCommand) == .blocked {
+                return .blocked
+            }
+        } else if let singleOperand = operandsAfterRun.first {
+            if classify(singleOperand) == .blocked {
+                return .blocked
+            }
+        }
+
+        return .reviewRequired
+    }
+
+    private func parseHerdrTokens(_ arguments: [String]) -> (subcommands: [String], nonOptionOperands: [String]) {
+        var subcommands: [String] = []
+        var operands: [String] = []
+        var index = 0
+        var optionsEnded = false
+
+        while index < arguments.count {
+            let arg = arguments[index]
+            if !optionsEnded && arg == "--" {
+                optionsEnded = true
+                index += 1
+                continue
+            }
+
+            if !optionsEnded && arg.hasPrefix("-") {
+                if ["--remote", "-r", "--cwd", "-C", "--config", "--format", "-f", "--source", "--status", "--direction", "-d"].contains(arg) {
+                    index += 2
+                    continue
+                }
+                index += 1
+                continue
+            }
+
+            if subcommands.isEmpty && ["workspace", "tab", "pane", "wait", "agent", "status", "version", "help"].contains(arg) {
+                subcommands.append(arg)
+            } else if subcommands.count == 1 && ["create", "list", "ls", "split", "run", "read", "agent-status", "status", "delete", "kill"].contains(arg) {
+                subcommands.append(arg)
+            } else {
+                operands.append(arg)
+            }
+            index += 1
+        }
+        return (subcommands, operands)
     }
 
     private func parseTmuxSubcommand(arguments: [String]) -> (subcommand: String?, remaining: [String]) {
