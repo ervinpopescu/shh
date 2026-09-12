@@ -262,6 +262,20 @@ public struct DemoSSHTransport: SSHTransport {
             }
             throw TransportError.remoteFailure("Host key was rejected")
         }
+        if case .mosh(let moshOptions) = host.connection {
+            let sessionInfo = MoshSessionInfo(
+                udpPort: moshOptions.portRange?.start ?? 60001,
+                sessionKey: "demo-mosh-session-key-42a12B4C",
+                pid: 42000
+            )
+            let connection = DemoMoshConnection(
+                sessionInfo: sessionInfo,
+                options: moshOptions,
+                remoteHostname: host.hostname
+            )
+            await connection.start()
+            return connection
+        }
         return DemoSSHConnection()
     }
 }

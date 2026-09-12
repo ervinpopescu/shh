@@ -256,7 +256,7 @@ struct HostDetailView: View {
         case .proxyJump(let opts):
             return "ProxyJump (\(opts.config.hops.count) hop\(opts.config.hops.count == 1 ? "" : "s"))"
         case .mosh:
-            return "Capability unavailable"
+            return container.isDemo ? "Mosh (demo adapter)" : "Mosh (UDP)"
         }
     }
 
@@ -276,6 +276,7 @@ struct HostDetailView: View {
 enum HostConnectionType: String, CaseIterable, Identifiable {
     case direct = "Direct SSH"
     case proxyJump = "ProxyJump Bastion"
+    case mosh = "Mosh (UDP)"
     var id: String { rawValue }
 }
 
@@ -325,6 +326,9 @@ struct HostEditorView: View {
         if case .proxyJump(let jumpOpts) = existing?.connection {
             initialType = .proxyJump
             initialBastions = jumpOpts.config.hostIDs
+        } else if case .mosh = existing?.connection {
+            initialType = .mosh
+            initialBastions = []
         } else {
             initialType = .direct
             initialBastions = []
@@ -618,6 +622,12 @@ struct HostEditorView: View {
         if connectionType == .proxyJump && !bastionHops.isEmpty {
             let hopHostIDs = bastionHops.map(\.hostID)
             profile = .proxyJump(ProxyJumpOptions(hopHostIDs: hopHostIDs, sshOptions: existingSSH))
+        } else if connectionType == .mosh {
+            if case .mosh(let existingMosh) = existing?.connection {
+                profile = .mosh(existingMosh)
+            } else {
+                profile = .mosh(MoshOptions(sshOptions: existingSSH))
+            }
         } else {
             profile = .ssh(existingSSH)
         }
