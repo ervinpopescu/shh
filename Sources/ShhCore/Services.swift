@@ -936,12 +936,191 @@ public struct CommandPolicy: Sendable {
 
 public struct RemotePath: Hashable, Codable, Sendable, CustomStringConvertible {
     public let components: [String]
-    public init(_ raw: String) { components = raw.split(separator: "/", omittingEmptySubsequences: true).reduce(into: []) { result, part in if part == ".." { if !result.isEmpty { result.removeLast() } } else if part != "." { result.append(String(part)) } } }
-    public var description: String { "/" + components.joined(separator: "/") }
+
+    public init(_ raw: String) {
+        self.components = raw.split(separator: "/", omittingEmptySubsequences: true).reduce(into: []) { result, part in
+            if part == ".." {
+                if !result.isEmpty { result.removeLast() }
+            } else if part != "." {
+                result.append(String(part))
+            }
+        }
+    }
+
+    public init(components: [String]) {
+        self.components = components.reduce(into: []) { result, part in
+            if part == ".." {
+                if !result.isEmpty { result.removeLast() }
+            } else if part != "." && !part.isEmpty {
+                result.append(part)
+            }
+        }
+    }
+
+    public var description: String {
+        "/" + components.joined(separator: "/")
+    }
+
+    public static let root = RemotePath("/")
+
+    public var isRoot: Bool {
+        components.isEmpty
+    }
+
+    public var lastComponent: String {
+        components.last ?? "/"
+    }
+
+    public var pathExtension: String {
+        (lastComponent as NSString).pathExtension
+    }
+
+    public func deletingPathExtension() -> RemotePath {
+        guard !components.isEmpty else { return self }
+        let last = lastComponent
+        let withoutExt = (last as NSString).deletingPathExtension
+        var newComponents = components
+        newComponents[newComponents.count - 1] = withoutExt
+        return RemotePath(components: newComponents)
+    }
+
+    public var parent: RemotePath {
+        guard !components.isEmpty else { return self }
+        return RemotePath(components: Array(components.dropLast()))
+    }
+
+    public func appending(_ component: String) -> RemotePath {
+        let trimmed = component.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return self }
+        let combined = description + "/" + trimmed
+        return RemotePath(combined)
+    }
+
+    public func appending(components other: [String]) -> RemotePath {
+        var result = self
+        for comp in other {
+            result = result.appending(comp)
+        }
+        return result
+    }
+
+    public func isDescendant(of other: RemotePath) -> Bool {
+        guard components.count > other.components.count else { return false }
+        return Array(components.prefix(other.components.count)) == other.components
+    }
+
+    public func isDescendantOrEqual(to other: RemotePath) -> Bool {
+        guard components.count >= other.components.count else { return false }
+        return Array(components.prefix(other.components.count)) == other.components
+    }
+
+    public func contains(_ other: RemotePath) -> Bool {
+        other.isDescendant(of: self)
+    }
+
+    /// Appends a child path ensuring traversal components ('..') do not escape `self`.
+    public func appendingSafely(_ subpath: String) throws -> RemotePath {
+        let candidate = appending(subpath)
+        guard candidate.isDescendantOrEqual(to: self) else {
+            throw SFTPRepositoryError.invalidPath("Path traversal escape detected: '\(subpath)' escapes base '\(description)'")
+        }
+        return candidate
+    }
+
+    /// Resolves a child path relative to `self`, preventing traversal escapes.
+    public func resolving(child: String, allowEscape: Bool = false) throws -> RemotePath {
+        let candidate = appending(child)
+        if !allowEscape && !candidate.isDescendantOrEqual(to: self) {
+            throw SFTPRepositoryError.invalidPath("Path traversal escape detected: '\(child)' escapes base '\(description)'")
+        }
+        return candidate
+    }
 }
-public struct RemoteFile: Identifiable, Hashable, Sendable { public let id: String; public var name: String; public var isDirectory: Bool; public var size: Int64; public init(name: String, isDirectory: Bool, size: Int64 = 0) { self.id = name; self.name = name; self.isDirectory = isDirectory; self.size = size } }
-public protocol RemoteFileRepository: Sendable { func list(at path: RemotePath) async throws -> [RemoteFile] }
-public struct UnavailableFileRepository: RemoteFileRepository { public init() {}; public func list(at path: RemotePath) async throws -> [RemoteFile] { throw TransportError.unsupported } }
+
+public struct RemoteFile: Identifiable, Hashable, Sendable, Codable {
+    public let id: String
+    public var name: String
+    public var path: RemotePath
+    public var entryType: RemoteFileEntryType
+    public var size: Int64
+    public var permissions: PosixPermissions?
+    public var modificationDate: Date?
+    public var accessDate: Date?
+    public var symlinkTarget: String?
+
+    public var isDirectory: Bool {
+        get { entryType == .directory }
+        set { entryType = newValue ? .directory : .file }
+    }
+
+    public var isFile: Bool {
+        entryType == .file
+    }
+
+    public var isSymlink: Bool {
+        entryType == .symlink
+    }
+
+    public init(
+        id: String? = nil,
+        name: String,
+        path: RemotePath? = nil,
+        entryType: RemoteFileEntryType = .file,
+        size: Int64 = 0,
+        permissions: PosixPermissions? = nil,
+        modificationDate: Date? = nil,
+        accessDate: Date? = nil,
+        symlinkTarget: String? = nil
+    ) {
+        let resolvedPath = path ?? RemotePath("/" + name)
+        self.id = id ?? resolvedPath.description
+        self.name = name
+        self.path = resolvedPath
+        self.entryType = entryType
+        self.size = size
+        self.permissions = permissions
+        self.modificationDate = modificationDate
+        self.accessDate = accessDate
+        self.symlinkTarget = symlinkTarget
+    }
+
+    public init(name: String, isDirectory: Bool, size: Int64 = 0) {
+        let path = RemotePath("/" + name)
+        self.id = name
+        self.name = name
+        self.path = path
+        self.entryType = isDirectory ? .directory : .file
+        self.size = size
+        self.permissions = isDirectory ? .standardDirectory : .standardFile
+        self.modificationDate = nil
+        self.accessDate = nil
+        self.symlinkTarget = nil
+    }
+}
+
+public protocol RemoteFileRepository: SFTPRepository {
+    func list(at path: RemotePath) async throws -> [RemoteFile]
+}
+
+extension RemoteFileRepository {
+    public func list(at path: RemotePath) async throws -> [RemoteFile] {
+        try await listDirectory(at: path)
+    }
+}
+
+public struct UnavailableFileRepository: RemoteFileRepository {
+    public init() {}
+    public func listDirectory(at path: RemotePath) async throws -> [RemoteFile] { throw TransportError.unsupported }
+    public func readFile(at path: RemotePath) async throws -> Data { throw TransportError.unsupported }
+    public func download(from remotePath: RemotePath, to localURL: URL, progress: (@Sendable (TransferProgress) -> Void)?) async throws { throw TransportError.unsupported }
+    public func writeFile(data: Data, at remotePath: RemotePath, progress: (@Sendable (TransferProgress) -> Void)?) async throws { throw TransportError.unsupported }
+    public func upload(from localURL: URL, to remotePath: RemotePath, progress: (@Sendable (TransferProgress) -> Void)?) async throws { throw TransportError.unsupported }
+    public func createDirectory(at path: RemotePath) async throws { throw TransportError.unsupported }
+    public func removeFile(at path: RemotePath) async throws { throw TransportError.unsupported }
+    public func removeDirectory(at path: RemotePath) async throws { throw TransportError.unsupported }
+    public func rename(from oldPath: RemotePath, to newPath: RemotePath) async throws { throw TransportError.unsupported }
+    public func fetchAttributes(at path: RemotePath) async throws -> RemoteFile { throw TransportError.unsupported }
+}
 
 public protocol HealthChecking: Sendable { func check(_ host: Host) async -> HealthState }
 public struct DemoHealthChecker: HealthChecking { public init() {}; public func check(_ host: Host) async -> HealthState { .unknown } }
