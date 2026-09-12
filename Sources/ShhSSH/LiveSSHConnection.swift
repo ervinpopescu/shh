@@ -6,27 +6,37 @@ import ShhCore
 public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
     private let childChannel: Channel
     private let parentChannel: Channel
+    private let hopChannels: [Channel]
     private let eventLoopGroup: EventLoopGroup?
     private let ownsGroup: Bool
+    private let inboundRouter: InboundChildChannelRouter?
     private let lock = NSLock()
     private var isClosed = false
     private var bufferedData: [Data] = []
     private var continuations: [UUID: AsyncThrowingStream<TerminalEvent, Error>.Continuation] = [:]
     private var activeExecChannels: [UUID: Channel] = [:]
+    private var activeForwardedChannels: [UUID: Channel] = [:]
     private var redactor: Redactor
+
+    public var eventLoop: EventLoop { parentChannel.eventLoop }
+    public var group: EventLoopGroup { eventLoopGroup ?? parentChannel.eventLoop }
 
     init(
         childChannel: Channel,
         parentChannel: Channel,
+        hopChannels: [Channel] = [],
         eventLoopGroup: EventLoopGroup?,
         ownsGroup: Bool,
-        redactor: Redactor = Redactor()
+        redactor: Redactor = Redactor(),
+        inboundRouter: InboundChildChannelRouter? = nil
     ) {
         self.childChannel = childChannel
         self.parentChannel = parentChannel
+        self.hopChannels = hopChannels
         self.eventLoopGroup = eventLoopGroup
         self.ownsGroup = ownsGroup
         self.redactor = redactor
+        self.inboundRouter = inboundRouter
     }
 
     public func setRedactor(_ redactor: Redactor) {
@@ -226,16 +236,121 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         }
     }
 
+    public func createDirectTCPIPChannel(
+        targetHost: String,
+        targetPort: Int,
+        originatorAddress: SocketAddress? = nil
+    ) async throws -> Channel {
+        let closed: Bool = lock.withLock { isClosed }
+        guard !closed else {
+            throw TransportError.remoteFailure("SSH connection is closed")
+        }
+
+        let defaultOrigin = try? SocketAddress(ipAddress: "127.0.0.1", port: 0)
+        let origin = originatorAddress ?? parentChannel.localAddress ?? defaultOrigin!
+
+        let channel = try await parentChannel.eventLoop.flatSubmit {
+            self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
+                let childPromise = self.parentChannel.eventLoop.makePromise(of: Channel.self)
+                let direct = SSHChannelType.DirectTCPIP(
+                    targetHost: targetHost,
+                    targetPort: targetPort,
+                    originatorAddress: origin
+                )
+                sshHandler.createChannel(childPromise, channelType: .directTCPIP(direct)) { childChannel, channelType in
+                    guard case .directTCPIP = channelType else {
+                        return childChannel.eventLoop.makeFailedFuture(TransportError.remoteFailure("Invalid channel type created"))
+                    }
+                    return childChannel.pipeline.addHandler(DataToBufferCodec())
+                }
+                return childPromise.futureResult
+            }
+        }.get()
+
+        let id = UUID()
+        lock.withLock {
+            self.activeForwardedChannels[id] = channel
+        }
+        channel.closeFuture.whenComplete { [weak self] _ in
+            self?.lock.withLock {
+                _ = self?.activeForwardedChannels.removeValue(forKey: id)
+            }
+        }
+        return channel
+    }
+
+    public func requestRemoteForwarding(
+        bindHost: String,
+        bindPort: Int
+    ) async throws -> Int? {
+        let closed: Bool = lock.withLock { isClosed }
+        guard !closed else {
+            throw TransportError.remoteFailure("SSH connection is closed")
+        }
+
+        return try await parentChannel.eventLoop.flatSubmit {
+            self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
+                let promise = self.parentChannel.eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
+                sshHandler.sendTCPForwardingRequest(.listen(host: bindHost, port: bindPort), promise: promise)
+                return promise.futureResult.map { response in
+                    response?.boundPort
+                }
+            }
+        }.get()
+    }
+
+    public func cancelRemoteForwarding(
+        bindHost: String,
+        bindPort: Int
+    ) async throws {
+        let closed: Bool = lock.withLock { isClosed }
+        guard !closed else { return }
+
+        try await parentChannel.eventLoop.flatSubmit {
+            self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { sshHandler in
+                let promise = self.parentChannel.eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
+                sshHandler.sendTCPForwardingRequest(.cancel(host: bindHost, port: bindPort), promise: promise)
+                return promise.futureResult.map { _ in () }
+            }
+        }.get()
+    }
+
+    public func registerForwardedTCPIPHandler(
+        _ handler: @escaping @Sendable (Channel, SSHChannelType.ForwardedTCPIP) -> EventLoopFuture<Void>
+    ) {
+        inboundRouter?.register(handler)
+    }
+
+    func trackForwardedChannel(_ channel: Channel) -> UUID {
+        let id = UUID()
+        lock.withLock {
+            self.activeForwardedChannels[id] = channel
+        }
+        channel.closeFuture.whenComplete { [weak self] _ in
+            self?.lock.withLock {
+                _ = self?.activeForwardedChannels.removeValue(forKey: id)
+            }
+        }
+        return id
+    }
+
     public func close() async {
-        let (activeContinuations, activeChannels, shouldClose): ([AsyncThrowingStream<TerminalEvent, Error>.Continuation], [Channel], Bool) = lock.withLock {
-            guard !isClosed else { return ([], [], false) }
+        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
+            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
+            [Channel],
+            [Channel],
+            Bool
+        ) = lock.withLock {
+            guard !isClosed else { return ([], [], [], false) }
             isClosed = true
             let list = Array(continuations.values)
             continuations.removeAll()
             bufferedData.removeAll()
             let execs = Array(activeExecChannels.values)
             activeExecChannels.removeAll()
-            return (list, execs, true)
+            let fwds = Array(activeForwardedChannels.values)
+            activeForwardedChannels.removeAll()
+            return (list, execs, fwds, true)
         }
 
         for continuation in activeContinuations {
@@ -247,10 +362,18 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             _ = try? await execChannel.close().get()
         }
 
+        for forwardedChannel in forwardedChannels {
+            _ = try? await forwardedChannel.close().get()
+        }
+
         guard shouldClose else { return }
 
         _ = try? await childChannel.close().get()
         _ = try? await parentChannel.close().get()
+
+        for hopChannel in hopChannels.reversed() {
+            _ = try? await hopChannel.close().get()
+        }
 
         if ownsGroup, let group = eventLoopGroup {
             try? await group.shutdownGracefully()
@@ -273,15 +396,22 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     func handleChannelClosed() {
-        let (activeContinuations, activeChannels, shouldClose): ([AsyncThrowingStream<TerminalEvent, Error>.Continuation], [Channel], Bool) = lock.withLock {
-            guard !isClosed else { return ([], [], false) }
+        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
+            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
+            [Channel],
+            [Channel],
+            Bool
+        ) = lock.withLock {
+            guard !isClosed else { return ([], [], [], false) }
             isClosed = true
             let list = Array(continuations.values)
             continuations.removeAll()
             bufferedData.removeAll()
             let execs = Array(activeExecChannels.values)
             activeExecChannels.removeAll()
-            return (list, execs, true)
+            let fwds = Array(activeForwardedChannels.values)
+            activeForwardedChannels.removeAll()
+            return (list, execs, fwds, true)
         }
 
         for continuation in activeContinuations {
@@ -293,10 +423,18 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             execChannel.close(promise: nil)
         }
 
+        for forwardedChannel in forwardedChannels {
+            forwardedChannel.close(promise: nil)
+        }
+
         guard shouldClose else { return }
 
+        let hops = hopChannels
         Task {
             _ = try? await self.parentChannel.close().get()
+            for hop in hops.reversed() {
+                _ = try? await hop.close().get()
+            }
             if self.ownsGroup, let group = self.eventLoopGroup {
                 try? await group.shutdownGracefully()
             }
@@ -304,19 +442,30 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     func handleChannelError(_ error: Error) {
-        let (activeContinuations, activeChannels, shouldClose): ([AsyncThrowingStream<TerminalEvent, Error>.Continuation], [Channel], Bool) = lock.withLock {
-            guard !isClosed else { return ([], [], false) }
+        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
+            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
+            [Channel],
+            [Channel],
+            Bool
+        ) = lock.withLock {
+            guard !isClosed else { return ([], [], [], false) }
             isClosed = true
             let list = Array(continuations.values)
             continuations.removeAll()
             bufferedData.removeAll()
             let execs = Array(activeExecChannels.values)
             activeExecChannels.removeAll()
-            return (list, execs, true)
+            let fwds = Array(activeForwardedChannels.values)
+            activeForwardedChannels.removeAll()
+            return (list, execs, fwds, true)
         }
 
         for execChannel in activeChannels {
             execChannel.close(promise: nil)
+        }
+
+        for forwardedChannel in forwardedChannels {
+            forwardedChannel.close(promise: nil)
         }
 
         let transportError = (error as? TransportError) ?? TransportError.remoteFailure(error.localizedDescription)
@@ -327,9 +476,13 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
 
         guard shouldClose else { return }
 
+        let hops = hopChannels
         Task {
             _ = try? await self.childChannel.close().get()
             _ = try? await self.parentChannel.close().get()
+            for hop in hops.reversed() {
+                _ = try? await hop.close().get()
+            }
             if self.ownsGroup, let group = self.eventLoopGroup {
                 try? await group.shutdownGracefully()
             }
@@ -343,26 +496,35 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     deinit {
-        let (shouldClose, activeChannels): (Bool, [Channel]) = lock.withLock {
+        let (shouldClose, activeChannels, forwardedChannels): (Bool, [Channel], [Channel]) = lock.withLock {
             if !isClosed {
                 isClosed = true
                 let execs = Array(activeExecChannels.values)
                 activeExecChannels.removeAll()
-                return (true, execs)
+                let fwds = Array(activeForwardedChannels.values)
+                activeForwardedChannels.removeAll()
+                return (true, execs, fwds)
             }
-            return (false, [])
+            return (false, [], [])
         }
         for execChannel in activeChannels {
             execChannel.close(promise: nil)
+        }
+        for forwardedChannel in forwardedChannels {
+            forwardedChannel.close(promise: nil)
         }
         let owns = ownsGroup
         let grp = eventLoopGroup
         let ch = childChannel
         let pch = parentChannel
+        let hops = hopChannels
         if shouldClose {
             Task {
                 _ = try? await ch.close().get()
                 _ = try? await pch.close().get()
+                for hop in hops.reversed() {
+                    _ = try? await hop.close().get()
+                }
                 if owns, let grp {
                     try? await grp.shutdownGracefully()
                 }

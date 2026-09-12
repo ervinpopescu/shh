@@ -156,16 +156,27 @@ private final class InboundEventRouter: @unchecked Sendable {
 }
 
 public struct LiveSSHTransport: SSHTransport {
+    public typealias HostResolver = @Sendable (UUID) async throws -> (ShhCore.Host, IdentityDescriptor?)
     public let credentialStore: any CredentialStore
+    public let hostResolver: HostResolver?
     private let customGroup: EventLoopGroup?
 
-    public init(credentialStore: any CredentialStore = KeychainCredentialStore()) {
+    public init(
+        credentialStore: any CredentialStore = KeychainCredentialStore(),
+        hostResolver: HostResolver? = nil
+    ) {
         self.credentialStore = credentialStore
+        self.hostResolver = hostResolver
         self.customGroup = nil
     }
 
-    init(credentialStore: any CredentialStore, group: EventLoopGroup?) {
+    init(
+        credentialStore: any CredentialStore,
+        hostResolver: HostResolver? = nil,
+        group: EventLoopGroup?
+    ) {
         self.credentialStore = credentialStore
+        self.hostResolver = hostResolver
         self.customGroup = group
     }
 
@@ -175,10 +186,116 @@ public struct LiveSSHTransport: SSHTransport {
         trustEvaluator: any HostTrustEvaluator,
         initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24)
     ) async throws -> any SSHConnection {
-        guard case .ssh(let options) = host.connection else {
+        switch host.connection {
+        case .ssh(let options):
+            return try await performConnectWithTimeout(
+                host: host,
+                identity: identity,
+                trustEvaluator: trustEvaluator,
+                initialSize: initialSize,
+                options: options
+            )
+        case .proxyJump(let jumpOptions):
+            var resolvedHops: [(ShhCore.Host, IdentityDescriptor?)] = []
+            if !jumpOptions.config.hops.isEmpty {
+                for hop in jumpOptions.config.hops {
+                    switch hop {
+                    case .hostID(let id):
+                        guard let hostResolver else { throw TransportError.unsupported }
+                        let resolved = try await hostResolver(id)
+                        resolvedHops.append(resolved)
+                    case .endpoint(let ep):
+                        let epHost = try ShhCore.Host(
+                            name: ep.hostname,
+                            hostname: ep.hostname,
+                            port: ep.port,
+                            username: ep.username,
+                            identityID: ep.identityID
+                        )
+                        var epIdent: IdentityDescriptor? = nil
+                        if let idID = ep.identityID, let hostResolver {
+                            let (_, resolvedIdent) = try await hostResolver(idID)
+                            epIdent = resolvedIdent
+                        }
+                        resolvedHops.append((epHost, epIdent))
+                    }
+                }
+            } else if !jumpOptions.hopHostIDs.isEmpty {
+                guard let hostResolver else { throw TransportError.unsupported }
+                for hopID in jumpOptions.hopHostIDs {
+                    let resolved = try await hostResolver(hopID)
+                    resolvedHops.append(resolved)
+                }
+            }
+
+            if resolvedHops.isEmpty {
+                return try await performConnectWithTimeout(
+                    host: host,
+                    identity: identity,
+                    trustEvaluator: trustEvaluator,
+                    initialSize: initialSize,
+                    options: jumpOptions.sshOptions
+                )
+            } else {
+                return try await performConnectProxyJumpWithTimeout(
+                    hops: resolvedHops,
+                    target: host,
+                    targetIdentity: identity,
+                    trustEvaluator: trustEvaluator,
+                    initialSize: initialSize,
+                    options: jumpOptions.sshOptions
+                )
+            }
+        case .mosh:
             throw TransportError.unsupported
         }
+    }
 
+    public func connectProxyJump(
+        hops: [(ShhCore.Host, IdentityDescriptor?)],
+        target: ShhCore.Host,
+        targetIdentity: IdentityDescriptor?,
+        trustEvaluator: any HostTrustEvaluator,
+        initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24),
+        options: SSHOptions? = nil
+    ) async throws -> any SSHConnection {
+        let effectiveOptions: SSHOptions
+        if let options {
+            effectiveOptions = options
+        } else if case .ssh(let opts) = target.connection {
+            effectiveOptions = opts
+        } else if case .proxyJump(let jumpOpts) = target.connection {
+            effectiveOptions = jumpOpts.sshOptions
+        } else {
+            effectiveOptions = SSHOptions()
+        }
+
+        if hops.isEmpty {
+            return try await connect(
+                host: target,
+                identity: targetIdentity,
+                trustEvaluator: trustEvaluator,
+                initialSize: initialSize
+            )
+        }
+
+        return try await performConnectProxyJumpWithTimeout(
+            hops: hops,
+            target: target,
+            targetIdentity: targetIdentity,
+            trustEvaluator: trustEvaluator,
+            initialSize: initialSize,
+            options: effectiveOptions
+        )
+    }
+
+    private func performConnectWithTimeout(
+        host: ShhCore.Host,
+        identity: IdentityDescriptor?,
+        trustEvaluator: any HostTrustEvaluator,
+        initialSize: TerminalSize,
+        options: SSHOptions
+    ) async throws -> any SSHConnection {
         do {
             if options.connectTimeoutSeconds > 0 {
                 return try await withThrowingTaskGroup(of: (any SSHConnection).self) { group in
@@ -210,6 +327,60 @@ public struct LiveSSHTransport: SSHTransport {
                 return try await performConnect(
                     host: host,
                     identity: identity,
+                    trustEvaluator: trustEvaluator,
+                    initialSize: initialSize,
+                    options: options
+                )
+            }
+        } catch {
+            if Task.isCancelled || error is CancellationError {
+                throw TransportError.cancelled
+            }
+            throw error
+        }
+    }
+
+    private func performConnectProxyJumpWithTimeout(
+        hops: [(ShhCore.Host, IdentityDescriptor?)],
+        target: ShhCore.Host,
+        targetIdentity: IdentityDescriptor?,
+        trustEvaluator: any HostTrustEvaluator,
+        initialSize: TerminalSize,
+        options: SSHOptions
+    ) async throws -> any SSHConnection {
+        do {
+            if options.connectTimeoutSeconds > 0 {
+                return try await withThrowingTaskGroup(of: (any SSHConnection).self) { group in
+                    group.addTask {
+                        try await self.performConnectProxyJump(
+                            hops: hops,
+                            target: target,
+                            targetIdentity: targetIdentity,
+                            trustEvaluator: trustEvaluator,
+                            initialSize: initialSize,
+                            options: options
+                        )
+                    }
+                    group.addTask {
+                        let nanos = UInt64(max(0.001, options.connectTimeoutSeconds) * 1_000_000_000)
+                        try await Task.sleep(nanoseconds: nanos)
+                        throw TransportError.timeout
+                    }
+
+                    do {
+                        let connection = try await group.next()!
+                        group.cancelAll()
+                        return connection
+                    } catch {
+                        group.cancelAll()
+                        throw error
+                    }
+                }
+            } else {
+                return try await performConnectProxyJump(
+                    hops: hops,
+                    target: target,
+                    targetIdentity: targetIdentity,
                     trustEvaluator: trustEvaluator,
                     initialSize: initialSize,
                     options: options
@@ -270,11 +441,15 @@ public struct LiveSSHTransport: SSHTransport {
             let handshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
             let handshakeHandler = LiveSSHHandshakeHandler(promise: handshakePromise)
 
+            let inboundRouter = InboundChildChannelRouter()
             bootstrap = bootstrap.channelInitializer { channel in
                 let sshHandler = NIOSSHHandler(
                     role: .client(clientConfig),
                     allocator: channel.allocator,
-                    inboundChildChannelInitializer: nil
+                    inboundChildChannelInitializer: { [weak inboundRouter] childChannel, channelType in
+                        guard let inboundRouter else { return childChannel.close() }
+                        return inboundRouter.handle(childChannel: childChannel, type: channelType)
+                    }
                 )
                 return channel.pipeline.addHandlers([sshHandler, handshakeHandler])
             }
@@ -338,9 +513,11 @@ public struct LiveSSHTransport: SSHTransport {
             let connection = LiveSSHConnection(
                 childChannel: childChannel,
                 parentChannel: channel,
+                hopChannels: [channel],
                 eventLoopGroup: eventLoopGroup,
                 ownsGroup: ownsGroup,
-                redactor: redactor
+                redactor: redactor,
+                inboundRouter: inboundRouter
             )
             createdConnection = connection
             router.setConnection(connection)
@@ -383,6 +560,356 @@ public struct LiveSSHTransport: SSHTransport {
                 await cleanup(channel: rawChannel, group: ownsGroup ? eventLoopGroup : nil)
             }
             if let captured = validator.capturedError {
+                throw captured
+            }
+            throw mapError(error)
+        }
+    }
+
+    private func performConnectProxyJump(
+        hops: [(ShhCore.Host, IdentityDescriptor?)],
+        target: ShhCore.Host,
+        targetIdentity: IdentityDescriptor?,
+        trustEvaluator: any HostTrustEvaluator,
+        initialSize: TerminalSize,
+        options: SSHOptions
+    ) async throws -> any SSHConnection {
+        if Task.isCancelled { throw TransportError.cancelled }
+
+        let ownsGroup = (customGroup == nil)
+        let eventLoopGroup = customGroup ?? MultiThreadedEventLoopGroup(numberOfThreads: 1)
+
+        var openedChannels: [Channel] = []
+        var redactionSecrets: [String] = []
+        var lastValidator: HostKeyValidatorDelegate?
+        var createdConnection: LiveSSHConnection?
+
+        do {
+            guard let firstHop = hops.first else {
+                throw TransportError.unsupported
+            }
+
+            // Hop 1: Direct TCP bootstrap
+            let (b1Host, b1Identity) = firstHop
+            let b1Validator = HostKeyValidatorDelegate(
+                hostname: b1Host.hostname,
+                port: b1Host.port,
+                strictChecking: options.strictHostKeyChecking,
+                trustEvaluator: trustEvaluator
+            )
+            lastValidator = b1Validator
+
+            let credStore = self.credentialStore
+            let b1AuthDelegate = LiveSSHUserAuthDelegate(
+                username: b1Host.username,
+                resolveCredential: {
+                    try await Self.resolveAuthenticationCredential(identity: b1Identity, credentialStore: credStore)
+                }
+            )
+
+            let b1Config = SSHClientConfiguration(
+                userAuthDelegate: b1AuthDelegate,
+                serverAuthDelegate: b1Validator
+            )
+
+            var bootstrap = ClientBootstrap(group: eventLoopGroup)
+                .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+                .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
+
+            if options.connectTimeoutSeconds > 0 {
+                bootstrap = bootstrap.connectTimeout(.milliseconds(Int64(options.connectTimeoutSeconds * 1000)))
+            }
+
+            let b1HandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
+            let b1HandshakeHandler = LiveSSHHandshakeHandler(promise: b1HandshakePromise)
+
+            bootstrap = bootstrap.channelInitializer { channel in
+                let sshHandler = NIOSSHHandler(
+                    role: .client(b1Config),
+                    allocator: channel.allocator,
+                    inboundChildChannelInitializer: nil
+                )
+                return channel.pipeline.addHandlers([sshHandler, b1HandshakeHandler])
+            }
+
+            let b1Channel = try await withTaskCancellationHandler {
+                try await bootstrap.connect(host: b1Host.hostname, port: Int(b1Host.port)).get()
+            } onCancel: {}
+            openedChannels.append(b1Channel)
+
+            if Task.isCancelled { throw TransportError.cancelled }
+
+            b1Channel.closeFuture.whenComplete { _ in
+                b1HandshakeHandler.fail(TransportError.remoteFailure("Bastion connection closed before handshake"))
+            }
+
+            try await withTaskCancellationHandler {
+                try await b1HandshakePromise.futureResult.get()
+            } onCancel: {
+                b1HandshakeHandler.fail(TransportError.cancelled)
+                _ = b1Channel.close()
+            }
+
+            if let captured = b1Validator.capturedError {
+                throw captured
+            }
+
+            if let b1Identity = b1Identity,
+               let secretData = try? await credentialStore.load(reference: b1Identity.keychainReference),
+               let secretString = String(data: secretData, encoding: .utf8),
+               !secretString.isEmpty {
+                redactionSecrets.append(secretString)
+            }
+
+            var currentChannel = b1Channel
+
+            // Intermediate hops: Bastion 2, Bastion 3, etc.
+            if hops.count > 1 {
+                for i in 1..<hops.count {
+                    if Task.isCancelled { throw TransportError.cancelled }
+
+                    let (hopHost, hopIdentity) = hops[i]
+                    let hopValidator = HostKeyValidatorDelegate(
+                        hostname: hopHost.hostname,
+                        port: hopHost.port,
+                        strictChecking: options.strictHostKeyChecking,
+                        trustEvaluator: trustEvaluator
+                    )
+                    lastValidator = hopValidator
+
+                    let hopAuthDelegate = LiveSSHUserAuthDelegate(
+                        username: hopHost.username,
+                        resolveCredential: {
+                            try await Self.resolveAuthenticationCredential(identity: hopIdentity, credentialStore: credStore)
+                        }
+                    )
+
+                    let hopConfig = SSHClientConfiguration(
+                        userAuthDelegate: hopAuthDelegate,
+                        serverAuthDelegate: hopValidator
+                    )
+
+                    let hopHandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
+                    let hopHandshakeHandler = LiveSSHHandshakeHandler(promise: hopHandshakePromise)
+
+                    let defaultOrigin = try? SocketAddress(ipAddress: "127.0.0.1", port: 0)
+                    let localOrigin = currentChannel.localAddress ?? defaultOrigin!
+                    let directSettings = SSHChannelType.DirectTCPIP(
+                        targetHost: hopHost.hostname,
+                        targetPort: Int(hopHost.port),
+                        originatorAddress: localOrigin
+                    )
+
+                    let nextChannel = try await currentChannel.eventLoop.flatSubmit {
+                        currentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { currentSSHHandler in
+                            let childPromise = currentChannel.eventLoop.makePromise(of: Channel.self)
+                            currentSSHHandler.createChannel(childPromise, channelType: .directTCPIP(directSettings)) { childChannel, channelType in
+                                guard case .directTCPIP = channelType else {
+                                    return childChannel.eventLoop.makeFailedFuture(TransportError.remoteFailure("Failed to open direct-tcpip channel for hop"))
+                                }
+                                let codec = DataToBufferCodec()
+                                let nestedSSHHandler = NIOSSHHandler(
+                                    role: .client(hopConfig),
+                                    allocator: childChannel.allocator,
+                                    inboundChildChannelInitializer: nil
+                                )
+                                return childChannel.pipeline.addHandlers([codec, nestedSSHHandler, hopHandshakeHandler])
+                            }
+                            return childPromise.futureResult
+                        }
+                    }.get()
+                    openedChannels.append(nextChannel)
+
+                    if Task.isCancelled { throw TransportError.cancelled }
+
+                    nextChannel.closeFuture.whenComplete { _ in
+                        hopHandshakeHandler.fail(TransportError.remoteFailure("Bastion hop connection closed before handshake"))
+                    }
+
+                    try await withTaskCancellationHandler {
+                        try await hopHandshakePromise.futureResult.get()
+                    } onCancel: {
+                        hopHandshakeHandler.fail(TransportError.cancelled)
+                        _ = nextChannel.close()
+                    }
+
+                    if let captured = hopValidator.capturedError {
+                        throw captured
+                    }
+
+                    if let hopIdentity = hopIdentity,
+                       let secretData = try? await credentialStore.load(reference: hopIdentity.keychainReference),
+                       let secretString = String(data: secretData, encoding: .utf8),
+                       !secretString.isEmpty {
+                        redactionSecrets.append(secretString)
+                    }
+
+                    currentChannel = nextChannel
+                }
+            }
+
+            // Target connection over direct-tcpip on the last bastion
+            if Task.isCancelled { throw TransportError.cancelled }
+
+            let targetValidator = HostKeyValidatorDelegate(
+                hostname: target.hostname,
+                port: target.port,
+                strictChecking: options.strictHostKeyChecking,
+                trustEvaluator: trustEvaluator
+            )
+            lastValidator = targetValidator
+
+            let targetAuthDelegate = LiveSSHUserAuthDelegate(
+                username: target.username,
+                resolveCredential: {
+                    try await Self.resolveAuthenticationCredential(identity: targetIdentity, credentialStore: credStore)
+                }
+            )
+
+            let targetConfig = SSHClientConfiguration(
+                userAuthDelegate: targetAuthDelegate,
+                serverAuthDelegate: targetValidator
+            )
+
+            let targetHandshakePromise = eventLoopGroup.next().makePromise(of: Void.self)
+            let targetHandshakeHandler = LiveSSHHandshakeHandler(promise: targetHandshakePromise)
+
+            let targetInboundRouter = InboundChildChannelRouter()
+            let defaultOrigin = try? SocketAddress(ipAddress: "127.0.0.1", port: 0)
+            let localOrigin = currentChannel.localAddress ?? defaultOrigin!
+            let targetDirectSettings = SSHChannelType.DirectTCPIP(
+                targetHost: target.hostname,
+                targetPort: Int(target.port),
+                originatorAddress: localOrigin
+            )
+
+            let targetTransportChannel = try await currentChannel.eventLoop.flatSubmit {
+                currentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { currentSSHHandler in
+                    let childPromise = currentChannel.eventLoop.makePromise(of: Channel.self)
+                    currentSSHHandler.createChannel(childPromise, channelType: .directTCPIP(targetDirectSettings)) { childChannel, channelType in
+                        guard case .directTCPIP = channelType else {
+                            return childChannel.eventLoop.makeFailedFuture(TransportError.remoteFailure("Failed to open direct-tcpip channel for target"))
+                        }
+                        let codec = DataToBufferCodec()
+                        let nestedSSHHandler = NIOSSHHandler(
+                            role: .client(targetConfig),
+                            allocator: childChannel.allocator,
+                            inboundChildChannelInitializer: { [weak targetInboundRouter] child, type in
+                                guard let targetInboundRouter else { return child.close() }
+                                return targetInboundRouter.handle(childChannel: child, type: type)
+                            }
+                        )
+                        return childChannel.pipeline.addHandlers([codec, nestedSSHHandler, targetHandshakeHandler])
+                    }
+                    return childPromise.futureResult
+                }
+            }.get()
+            openedChannels.append(targetTransportChannel)
+
+            if Task.isCancelled { throw TransportError.cancelled }
+
+            targetTransportChannel.closeFuture.whenComplete { _ in
+                targetHandshakeHandler.fail(TransportError.remoteFailure("Target connection closed before handshake"))
+            }
+
+            try await withTaskCancellationHandler {
+                try await targetHandshakePromise.futureResult.get()
+            } onCancel: {
+                targetHandshakeHandler.fail(TransportError.cancelled)
+                _ = targetTransportChannel.close()
+            }
+
+            if let captured = targetValidator.capturedError {
+                throw captured
+            }
+
+            if let targetIdentity = targetIdentity,
+               let secretData = try? await credentialStore.load(reference: targetIdentity.keychainReference),
+               let secretString = String(data: secretData, encoding: .utf8),
+               !secretString.isEmpty {
+                redactionSecrets.append(secretString)
+            }
+
+            // Interactive session channel on target
+            let router = InboundEventRouter()
+            let (sessionChannel, sessionHandler) = try await targetTransportChannel.eventLoop.flatSubmit {
+                targetTransportChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { targetSSHHandler in
+                    let childPromise = targetTransportChannel.eventLoop.makePromise(of: Channel.self)
+                    let handlerPromise = targetTransportChannel.eventLoop.makePromise(of: LiveSSHChildChannelHandler.self)
+                    targetSSHHandler.createChannel(childPromise, channelType: .session) { newChildChannel, channelType in
+                        guard channelType == .session else {
+                            return newChildChannel.close()
+                        }
+                        let handler = LiveSSHChildChannelHandler(
+                            onData: { data in router.onData(data) },
+                            onClosed: { router.onClosed() },
+                            onError: { error in router.onError(error) }
+                        )
+                        handlerPromise.succeed(handler)
+                        return newChildChannel.pipeline.addHandler(handler)
+                    }
+                    return childPromise.futureResult.flatMap { child in
+                        handlerPromise.futureResult.map { handler in (child, handler) }
+                    }
+                }
+            }.get()
+
+            let redactor = Redactor(secrets: redactionSecrets)
+            let connection = LiveSSHConnection(
+                childChannel: sessionChannel,
+                parentChannel: targetTransportChannel,
+                hopChannels: openedChannels,
+                eventLoopGroup: eventLoopGroup,
+                ownsGroup: ownsGroup,
+                redactor: redactor,
+                inboundRouter: targetInboundRouter
+            )
+            createdConnection = connection
+            router.setConnection(connection)
+
+            let ptyRequest = SSHChannelRequestEvent.PseudoTerminalRequest(
+                wantReply: true,
+                term: "xterm-256color",
+                terminalCharacterWidth: initialSize.columns,
+                terminalRowHeight: initialSize.rows,
+                terminalPixelWidth: 0,
+                terminalPixelHeight: 0,
+                terminalModes: SSHTerminalModes([:])
+            )
+            let ptyPromise = sessionChannel.eventLoop.makePromise(of: Void.self)
+            sessionHandler.addPendingReplyPromise(ptyPromise)
+            try await sessionChannel.triggerUserOutboundEvent(ptyRequest).get()
+            try await withTaskCancellationHandler {
+                try await ptyPromise.futureResult.get()
+            } onCancel: {
+                _ = targetTransportChannel.close()
+            }
+
+            if Task.isCancelled { throw TransportError.cancelled }
+
+            let shellRequest = SSHChannelRequestEvent.ShellRequest(wantReply: true)
+            let shellPromise = sessionChannel.eventLoop.makePromise(of: Void.self)
+            sessionHandler.addPendingReplyPromise(shellPromise)
+            try await sessionChannel.triggerUserOutboundEvent(shellRequest).get()
+            try await withTaskCancellationHandler {
+                try await shellPromise.futureResult.get()
+            } onCancel: {
+                _ = targetTransportChannel.close()
+            }
+
+            return connection
+        } catch {
+            if let createdConnection {
+                await createdConnection.close()
+            } else {
+                for ch in openedChannels.reversed() {
+                    _ = try? await ch.close().get()
+                }
+                if ownsGroup {
+                    try? await eventLoopGroup.shutdownGracefully()
+                }
+            }
+            if let captured = lastValidator?.capturedError {
                 throw captured
             }
             throw mapError(error)

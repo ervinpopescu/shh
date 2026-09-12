@@ -5,6 +5,7 @@ import Citadel
 import NIOCore
 import NIOPosix
 import ShhCore
+@testable import ShhSSH
 
 extension NIOSSHPublicKey {
     static func ed25519(_ key: Curve25519.Signing.PublicKey) throws -> NIOSSHPublicKey {
@@ -218,6 +219,77 @@ final class TestServerChildHandler: ChannelDuplexHandler, @unchecked Sendable {
     }
 }
 
+final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked Sendable {
+    private let group: EventLoopGroup
+    private let lock = NSLock()
+    private var listeners: [Int: Channel] = [:]
+
+    init(group: EventLoopGroup) {
+        self.group = group
+    }
+
+    func tcpForwardingRequest(
+        _ request: GlobalRequest.TCPForwardingRequest,
+        handler: NIOSSHHandler,
+        promise: EventLoopPromise<GlobalRequest.TCPForwardingResponse>
+    ) {
+        switch request {
+        case .listen(let host, let port):
+            let bootstrap = ServerBootstrap(group: group)
+                .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+                .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                .childChannelInitializer { inboundSocketChannel in
+                    let childPromise = inboundSocketChannel.eventLoop.makePromise(of: Channel.self)
+                    let boundPort = port == 0 ? (inboundSocketChannel.localAddress?.port ?? 0) : port
+                    let forwarded = SSHChannelType.ForwardedTCPIP(
+                        listeningHost: host,
+                        listeningPort: boundPort,
+                        originatorAddress: inboundSocketChannel.remoteAddress!
+                    )
+                    handler.createChannel(childPromise, channelType: .forwardedTCPIP(forwarded)) { sshChildChannel, _ in
+                        _ = sshChildChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                        let (ours, theirs) = GlueHandler.matchedPair()
+                        return sshChildChannel.pipeline.addHandlers([DataToBufferCodec(), theirs]).flatMap {
+                            inboundSocketChannel.pipeline.addHandler(ours)
+                        }
+                    }
+                    return childPromise.futureResult.map { _ in () }
+                }
+
+            bootstrap.bind(host: host, port: port).whenComplete { result in
+                switch result {
+                case .success(let boundChannel):
+                    let boundPort = boundChannel.localAddress?.port ?? port
+                    self.lock.withLock {
+                        self.listeners[boundPort] = boundChannel
+                    }
+                    promise.succeed(GlobalRequest.TCPForwardingResponse(boundPort: port == 0 ? boundPort : nil))
+                case .failure(let error):
+                    promise.fail(error)
+                }
+            }
+
+        case .cancel(_, let port):
+            let listener = lock.withLock { self.listeners.removeValue(forKey: port) }
+            if let listener {
+                listener.close(promise: nil)
+            }
+            promise.succeed(GlobalRequest.TCPForwardingResponse(boundPort: nil))
+        }
+    }
+
+    func stopAll() {
+        let list = lock.withLock {
+            let chs = Array(self.listeners.values)
+            self.listeners.removeAll()
+            return chs
+        }
+        for ch in list {
+            ch.close(promise: nil)
+        }
+    }
+}
+
 final class SSHTestServer: @unchecked Sendable {
     let group: MultiThreadedEventLoopGroup
     let authDelegate = TestServerAuthDelegate()
@@ -225,6 +297,7 @@ final class SSHTestServer: @unchecked Sendable {
     let hostPublicKey: NIOSSHPublicKey
     private var serverChannel: Channel?
     private var childChannels: [Channel] = []
+    private var globalRequestDelegate: TestServerGlobalRequestDelegate?
     private let lock = NSLock()
     private(set) var port: UInt16 = 0
     let sessionHandler = TestServerSessionChannelHandler()
@@ -250,10 +323,12 @@ final class SSHTestServer: @unchecked Sendable {
 
     func start() async throws -> UInt16 {
         let nioKey = NIOSSHPrivateKey(ed25519Key: hostPrivateKey)
+        let globalDelegate = TestServerGlobalRequestDelegate(group: group)
+        self.globalRequestDelegate = globalDelegate
         let serverConfig = SSHServerConfiguration(
             hostKeys: [nioKey],
             userAuthDelegate: authDelegate,
-            globalRequestDelegate: nil
+            globalRequestDelegate: globalDelegate
         )
 
         let bootstrap = ServerBootstrap(group: group)
@@ -265,13 +340,18 @@ final class SSHTestServer: @unchecked Sendable {
                     role: .server(serverConfig),
                     allocator: channel.allocator,
                     inboundChildChannelInitializer: { [weak self] childChannel, channelType in
-                        guard channelType == .session, let self = self else {
+                        guard let self = self else { return childChannel.close() }
+                        switch channelType {
+                        case .session:
+                            self.lock.withLock { self.childChannels.append(childChannel) }
+                            _ = childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+                            let handler = TestServerChildHandler(server: self)
+                            return childChannel.pipeline.addHandler(handler)
+                        case .directTCPIP(let direct):
+                            return self.handleDirectTCPIP(childChannel: childChannel, settings: direct)
+                        default:
                             return childChannel.close()
                         }
-                        self.lock.withLock { self.childChannels.append(childChannel) }
-                        _ = childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
-                        let handler = TestServerChildHandler(server: self)
-                        return childChannel.pipeline.addHandler(handler)
                     }
                 )
                 return channel.pipeline.addHandler(sshHandler)
@@ -283,7 +363,30 @@ final class SSHTestServer: @unchecked Sendable {
         return self.port
     }
 
+    private func handleDirectTCPIP(childChannel: Channel, settings: SSHChannelType.DirectTCPIP) -> EventLoopFuture<Void> {
+        self.lock.withLock { self.childChannels.append(childChannel) }
+        _ = childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+
+        let targetHost = settings.targetHost
+        let targetPort = settings.targetPort
+        let clientBootstrap = ClientBootstrap(group: group)
+
+        let connectFuture = clientBootstrap.connect(host: targetHost, port: targetPort)
+        return connectFuture.flatMap { targetChannel in
+            self.lock.withLock { self.childChannels.append(targetChannel) }
+            _ = targetChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
+            let (ours, theirs) = GlueHandler.matchedPair()
+            return childChannel.pipeline.addHandlers([DataToBufferCodec(), ours]).flatMap {
+                targetChannel.pipeline.addHandler(theirs)
+            }
+        }.flatMapError { error in
+            _ = childChannel.close()
+            return childChannel.eventLoop.makeFailedFuture(error)
+        }
+    }
+
     func stop() async throws {
+        globalRequestDelegate?.stopAll()
         _ = try? await serverChannel?.close().get()
         let children = lock.withLock { childChannels }
         for child in children {
