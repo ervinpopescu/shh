@@ -164,6 +164,32 @@ final class TranscriberAndRegistryTests: XCTestCase {
         }
     }
 
+    func testWhisperKitTranscriberFallsBackToInstalledTierWhenRequestedTierMissing() async throws {
+        let downloader = SimpleDownloader()
+        let manager = WhisperModelManager(modelsDirectory: tempModelsDir, downloader: downloader)
+        // Only download base model, leave tiny not installed
+        _ = try await manager.downloadModel(.base)
+
+        let engine = MockWhisperKitEngine()
+        engine.transcriptToReturn = "fallback base transcript"
+
+        // Default transcriber requests openai_whisper-tiny
+        let transcriber = WhisperKitTranscriber(
+            modelManager: manager,
+            modelID: "openai_whisper-tiny",
+            engine: engine
+        )
+
+        let handle = try AudioRecordingHandle.createTemporary(fileExtension: "wav")
+        defer { handle.cleanup() }
+        let wavData = VoiceAudioFormat.createSyntheticWavData(duration: 0.5)
+        try wavData.write(to: handle.url)
+
+        let result = try await transcriber.transcribe(recording: handle)
+        XCTAssertEqual(result, "fallback base transcript")
+        XCTAssertEqual(engine.transcribeCallCount, 1)
+    }
+
     func testWhisperKitTranscriberTimeoutThrows() async throws {
         let downloader = SimpleDownloader()
         let manager = WhisperModelManager(modelsDirectory: tempModelsDir, downloader: downloader)

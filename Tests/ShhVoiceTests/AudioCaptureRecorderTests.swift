@@ -534,4 +534,62 @@ final class AudioCaptureRecorderTests: XCTestCase {
             XCTFail("Unexpected error: \(error)")
         }
     }
+
+    func testInterruptionInvokesOnInterruptionCallback() async throws {
+        let session = MockAudioSessionManager()
+        let engine = MockAudioRecordingEngine()
+        let factory = MockAudioRecordingEngineFactory(engine: engine)
+        let notifier = MockAudioLifecycleNotifier()
+        let callbackBox = Box<Bool>(false)
+
+        let recorder = AudioCaptureRecorder(
+            sessionManager: session,
+            engineFactory: factory,
+            lifecycleNotifier: notifier,
+            tempFileFactory: {
+                try AudioRecordingHandle.createTemporary(fileExtension: "wav")
+            },
+            onInterruption: {
+                callbackBox.value = true
+            }
+        )
+
+        try await recorder.start()
+        notifier.fireInterruption(.began)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let isRec = await recorder.isRecording
+        XCTAssertFalse(isRec)
+        XCTAssertTrue(callbackBox.value, "onInterruption callback must be invoked when audio interruption begins")
+    }
+
+    func testRouteChangeInvokesOnInterruptionCallback() async throws {
+        let session = MockAudioSessionManager()
+        let engine = MockAudioRecordingEngine()
+        let factory = MockAudioRecordingEngineFactory(engine: engine)
+        let notifier = MockAudioLifecycleNotifier()
+        let callbackBox = Box<Bool>(false)
+
+        let recorder = AudioCaptureRecorder(
+            sessionManager: session,
+            engineFactory: factory,
+            lifecycleNotifier: notifier,
+            tempFileFactory: {
+                try AudioRecordingHandle.createTemporary(fileExtension: "wav")
+            },
+            onInterruption: {
+                callbackBox.value = true
+            }
+        )
+
+        try await recorder.start()
+        notifier.fireRouteChange(.oldDeviceUnavailable)
+
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let isRec = await recorder.isRecording
+        XCTAssertFalse(isRec)
+        XCTAssertTrue(callbackBox.value, "onInterruption callback must be invoked when audio route disconnects")
+    }
 }

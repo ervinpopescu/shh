@@ -56,6 +56,29 @@ public final class LiveAppleSpeechEngine: AppleSpeechEngine, @unchecked Sendable
             )
         }
 
+        let authStatus = SFSpeechRecognizer.authorizationStatus()
+        switch authStatus {
+        case .notDetermined:
+            let granted = await withCheckedContinuation { continuation in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    continuation.resume(returning: status == .authorized)
+                }
+            }
+            guard granted else {
+                throw TranscriptionError.transcriptionFailed(
+                    reason: "Speech recognition permission denied. Please enable Speech Recognition in iOS Settings."
+                )
+            }
+        case .denied, .restricted:
+            throw TranscriptionError.transcriptionFailed(
+                reason: "Speech recognition permission denied. Please enable Speech Recognition in iOS Settings."
+            )
+        case .authorized:
+            break
+        @unknown default:
+            break
+        }
+
         guard let recognizer = SFSpeechRecognizer(locale: locale), recognizer.isAvailable else {
             throw TranscriptionError.modelUnavailable
         }

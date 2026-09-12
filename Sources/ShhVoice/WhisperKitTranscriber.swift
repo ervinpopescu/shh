@@ -30,7 +30,7 @@ public final class LiveWhisperKitEngine: WhisperKitEngine, @unchecked Sendable {
             audioPath: audioURL.path,
             callback: { progressInfo in
                 progress?(0.5)
-                return true
+                return !Task.isCancelled
             }
         )
         return results.map { $0.text }.joined(separator: " ").trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
@@ -75,6 +75,15 @@ public final class WhisperKitTranscriber: LocalTranscriber, @unchecked Sendable 
         let modelFolder: URL
         do {
             modelFolder = try await modelManager.localModelURL(for: modelID)
+        } catch TranscriptionError.modelNotInstalled {
+            // Fall back to checking installed models via modelManager.listModels()
+            // and use the URL of the first ready model tier before throwing
+            let models = await modelManager.listModels()
+            if let installed = models.first(where: { $0.state.isReady }) {
+                modelFolder = try await modelManager.localModelURL(for: installed.id)
+            } else {
+                throw TranscriptionError.modelNotInstalled(modelID: modelID)
+            }
         } catch let err as TranscriptionError {
             throw err
         } catch {
