@@ -364,12 +364,9 @@ public actor AudioCaptureRecorder: AudioRecorder {
 
         teardownMonitoring()
 
-        let duration: TimeInterval
-        if let startTime = recordingStartTime {
-            duration = Date().timeIntervalSince(startTime)
-        } else {
-            duration = engine.currentTime
-        }
+        let wallDuration = recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0.0
+        let engineDuration = engine.currentTime
+        let duration = max(wallDuration, engineDuration)
 
         engine.stop()
         try? sessionManager.deactivateSession()
