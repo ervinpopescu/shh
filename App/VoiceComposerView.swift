@@ -92,6 +92,7 @@ public struct VoiceComposer: View {
                     cleanupOnExit()
                 }
         }
+        .editorSheetPresentation(detents: [.medium, .large])
     }
 
     // MARK: - Main Content Switcher

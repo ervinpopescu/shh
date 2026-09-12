@@ -312,6 +312,7 @@ struct VaultBackupView: View {
                 backupPreviewSheet(payload: payload)
             }
         }
+        .editorSheetPresentation()
     }
 
     // MARK: - Passphrase Prompt Sheet
@@ -353,6 +354,7 @@ struct VaultBackupView: View {
                 .accessibilityIdentifier("vault-import-decrypt-button")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Decrypt Backup")
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
@@ -405,6 +407,7 @@ struct VaultBackupView: View {
                 Text("• Merge adds new records and updates matching records while preserving other existing items.\n• Replace completely overwrites your existing catalog with the backup.")
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Backup Preview")
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {

@@ -185,6 +185,8 @@ struct PortForwardingRuleEditorSheet: View {
 
                 Section("Rule Details") {
                     TextField("Name (e.g. Web Server, Postgres)", text: $name)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("rule-name-field")
                         .accessibilityLabel("Rule name")
 
@@ -196,6 +198,8 @@ struct PortForwardingRuleEditorSheet: View {
 
                     TextField("Local Port (1-65535)", text: $localPort)
                         .keyboardType(.numberPad)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("rule-local-port-field")
                         .accessibilityLabel("Local port")
 
@@ -223,6 +227,8 @@ struct PortForwardingRuleEditorSheet: View {
 
                         TextField(type == .remote ? "Remote Port (0 for auto, 1-65535)" : "Remote Port (1-65535)", text: $remotePort)
                             .keyboardType(.numberPad)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
                             .accessibilityIdentifier("rule-remote-port-field")
                             .accessibilityLabel("Remote port")
                     }
@@ -243,6 +249,7 @@ struct PortForwardingRuleEditorSheet: View {
                     }
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle(existingRule == nil ? "Add Forwarding Rule" : "Edit Forwarding Rule")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -255,8 +262,19 @@ struct PortForwardingRuleEditorSheet: View {
                         .disabled(!isFormValid)
                         .accessibilityIdentifier("rule-save-button")
                 }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button {
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                    } label: {
+                        Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
+                    }
+                    .accessibilityLabel("Dismiss keyboard")
+                    .accessibilityIdentifier("port-forwarding-rule-dismiss-keyboard-button")
+                }
             }
         }
+        .editorSheetPresentation()
     }
 
     private var typeDescription: String {
@@ -578,6 +596,7 @@ struct PortForwardingSheet: View {
                 }
             }
         }
+        .editorSheetPresentation()
     }
 
     private func requestStart(rule: PortForwardingRule) {
