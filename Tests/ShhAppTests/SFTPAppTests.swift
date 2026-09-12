@@ -469,7 +469,7 @@ final class SFTPAppTests: XCTestCase {
         let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         // Open editor
-        await container.openEditor(for: notesFile)
+        try await container.openEditor(for: notesFile)
         XCTAssertEqual(container.activeEditingFile?.name, "notes.txt")
         XCTAssertTrue(container.editingFileContent.contains("Milestone 6"))
 
@@ -590,6 +590,347 @@ final class SFTPAppTests: XCTestCase {
         hosting.view.setNeedsLayout()
         hosting.view.layoutIfNeeded()
         XCTAssertNotNil(hosting.view)
+    }
+
+    // MARK: - 15. Regression: Disconnect Teardown & Editor Target Isolation (Finding 1)
+
+    func testDisconnectResetsSFTPStateAndCancelsTransfersAndGuardsIsolation() async throws {
+        let (container, repo) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+
+        // 1. Open preview and editor
+        await container.loadPreview(for: notesFile)
+        XCTAssertNotNil(container.previewFile)
+        XCTAssertNotNil(container.previewData)
+
+        try await container.openEditor(for: notesFile)
+        XCTAssertNotNil(container.activeEditingFile)
+        XCTAssertFalse(container.editingFileContent.isEmpty)
+
+        // 2. Start a transfer
+        await repo.setSimulateTransferChunkDelay(0.1)
+        _ = await container.enqueueDownload(file: notesFile)
+        XCTAssertFalse(container.transferQueueState.tasks.isEmpty)
+
+        // 3. Disconnect
+        await container.disconnect()
+
+        // Assert all SFTP session state is cleanly torn down
+        XCTAssertNil(container.previewFile)
+        XCTAssertNil(container.previewData)
+        XCTAssertNil(container.activeEditingFile)
+        XCTAssertEqual(container.editingFileContent, "")
+        XCTAssertTrue(container.currentDirectoryFiles.isEmpty)
+        XCTAssertEqual(container.currentPath.description, "/home/dev")
+        XCTAssertNil(container.pendingConflict)
+        XCTAssertNil(container.activeEditingHostID)
+
+        // Attempting to save after disconnect throws connectionClosed
+        do {
+            try await container.saveEditedFile()
+            XCTFail("Saving edited file after disconnect must fail")
+        } catch {
+            XCTAssertTrue(error is SFTPRepositoryError)
+        }
+    }
+
+    // MARK: - 16. Regression: Atomic Download Preserves Existing File On Interruption (Finding 2)
+
+    func testAtomicDownloadPreservesExistingFileOnFailureOrCancellation() async throws {
+        let (container, repo) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("atomic_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let localTarget = tempDir.appendingPathComponent("precious_local_file.txt")
+        let originalContent = "Precious local file content that must not be deleted\n"
+        try originalContent.write(to: localTarget, atomically: true, encoding: .utf8)
+
+        // Set slow transfer
+        await repo.setSimulateTransferChunkDelay(0.5)
+
+        // Start download with overwrite
+        let downloadTask = await container.enqueueDownload(file: notesFile, destinationURL: localTarget, overwrite: true)
+        let taskID = try XCTUnwrap(downloadTask?.id)
+
+        // Verify initial state
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localTarget.path), "Local file must exist before cancel")
+
+        // Cancel before download finishes
+        await container.cancelTransfer(id: taskID)
+
+        // Verify local file is STILL intact and contains the original content!
+        XCTAssertTrue(FileManager.default.fileExists(atPath: localTarget.path), "Original file must not have been removed prematurely")
+        let contentAfterCancel = try String(contentsOf: localTarget, encoding: .utf8)
+        XCTAssertEqual(contentAfterCancel, originalContent, "Original file content must be preserved upon cancellation")
+    }
+
+    // MARK: - 17. Regression: Path Traversal Rejection in File Actions (Finding 3)
+
+    func testPathTraversalRejectionInFileActionsAndDownloads() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+
+        // Create file with .. or .
+        do {
+            try await container.createFile(named: "..")
+            XCTFail("Creating file named '..' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains(".."))
+        }
+
+        do {
+            try await container.createFile(named: ".")
+            XCTFail("Creating file named '.' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains("."))
+        }
+
+        // Create directory with .. or .
+        do {
+            try await container.createDirectory(named: "..")
+            XCTFail("Creating directory named '..' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains(".."))
+        }
+
+        do {
+            try await container.createDirectory(named: ".")
+            XCTFail("Creating directory named '.' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains("."))
+        }
+
+        // Rename file to .. or .
+        do {
+            try await container.renameFile(notesFile, to: "..")
+            XCTFail("Renaming file to '..' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains(".."))
+        }
+
+        do {
+            try await container.renameFile(notesFile, to: ".")
+            XCTFail("Renaming file to '.' must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains("."))
+        }
+
+        // Download with traversal filename gets sanitized
+        let traversalFile = RemoteFile(
+            name: "../../escape.txt",
+            path: RemotePath("/home/dev/notes.txt")
+        )
+        let dlTask = await container.enqueueDownload(file: traversalFile, overwrite: true)
+        XCTAssertNotNil(dlTask)
+        XCTAssertTrue(dlTask?.localURL.path.contains("ShhDownloads/escape.txt") == true)
+        XCTAssertFalse(dlTask?.localURL.path.contains("..") == true)
+    }
+
+    // MARK: - 18. Regression: Directory Ancestry Validation in Move (UX Finding 5)
+
+    func testDirectoryAncestryValidationInMoveFile() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let projectsDir = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "projects" })
+
+        // Attempting to move /home/dev/projects into /home/dev/projects/shh (descendant)
+        do {
+            try await container.moveFile(projectsDir, to: RemotePath("/home/dev/projects/shh"))
+            XCTFail("Moving a directory into its descendant must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains("descendant") || msg.contains("Cannot move"))
+        }
+
+        // Attempting to move directory into itself
+        do {
+            try await container.moveFile(projectsDir, to: RemotePath("/home/dev/projects"))
+            XCTFail("Moving a directory into itself must throw invalidPath")
+        } catch let SFTPRepositoryError.invalidPath(msg) {
+            XCTAssertTrue(msg.contains("descendant") || msg.contains("Cannot move"))
+        }
+    }
+
+    // MARK: - 19. Regression: Concurrent Transfer Conflict Queue (Finding 5 / UX Finding 2)
+
+    func testConcurrentTransferConflictsQueueFIFOWitoutLeakingContinuations() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let bashrcFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == ".bashrc" })
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("conflict_q_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let localURL1 = tempDir.appendingPathComponent("file1.txt")
+        let localURL2 = tempDir.appendingPathComponent("file2.txt")
+        try "existing 1".write(to: localURL1, atomically: true, encoding: .utf8)
+        try "existing 2".write(to: localURL2, atomically: true, encoding: .utf8)
+
+        // Launch two downloads with collisions concurrently
+        let t1 = Task {
+            await container.enqueueDownload(file: notesFile, destinationURL: localURL1)
+        }
+        let t2 = Task {
+            await container.enqueueDownload(file: bashrcFile, destinationURL: localURL2)
+        }
+
+        // Wait briefly for both tasks to encounter conflicts
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Conflict 1 should be active
+        let conflict1 = try XCTUnwrap(container.pendingConflict)
+        XCTAssertEqual(conflict1.existingItemName, notesFile.name)
+
+        // Resolve conflict 1
+        container.resolvePendingConflict(overwrite: true)
+
+        // Wait briefly for queue to advance
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Conflict 2 should now automatically be presented
+        let conflict2 = try XCTUnwrap(container.pendingConflict)
+        XCTAssertEqual(conflict2.existingItemName, bashrcFile.name)
+
+        // Resolve conflict 2 (cancel)
+        container.resolvePendingConflict(overwrite: false)
+
+        let result1 = await t1.value
+        let result2 = await t2.value
+
+        XCTAssertNotNil(result1, "First transfer was overwritten, must have TransferTask")
+        XCTAssertNil(result2, "Second transfer was declined, must be nil")
+        XCTAssertNil(container.pendingConflict, "Conflict queue should be drained")
+    }
+
+    // MARK: - 20. Regression: Symlink Directory Navigation (Finding 6)
+
+    func testSymlinkDirectoryNavigation() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+
+        // Find symlink current_project -> /home/dev/projects/shh
+        let symlink = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "current_project" })
+        XCTAssertTrue(symlink.isSymlink)
+
+        // Open item (on tap)
+        await container.openItem(symlink)
+
+        // Should have navigated into the symlink directory
+        XCTAssertEqual(container.currentPath.description, "/home/dev/current_project")
+        XCTAssertFalse(container.currentDirectoryFiles.isEmpty)
+        let childNames = Set(container.currentDirectoryFiles.map(\.name))
+        XCTAssertTrue(childNames.contains("README.md"), "Symlinked directory must show README.md")
+    }
+
+    // MARK: - 21. Regression: Binary File Protection in Text Editor (Finding 9)
+
+    func testBinaryFileRejectedInTextEditor() async throws {
+        let (container, repo) = makeDemoContainer()
+        let binaryPath = RemotePath("/home/dev/corrupt.bin")
+        let binaryBytes = Data([0xFF, 0xFE, 0x00, 0xFD, 0xAA, 0xBB])
+        try await repo.writeFile(data: binaryBytes, at: binaryPath)
+
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let binFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "corrupt.bin" })
+
+        do {
+            try await container.openEditor(for: binFile)
+            XCTFail("Opening binary file in text editor must throw error")
+        } catch let SFTPRepositoryError.remoteFailure(msg) {
+            XCTAssertTrue(msg.contains("binary data") || msg.contains("non-UTF-8"))
+        }
+
+        XCTAssertNil(container.activeEditingFile)
+    }
+
+    // MARK: - 22. Regression: File Size Limits in Preview & Editor (UX Finding 6)
+
+    func testFileSizeLimitsInPreviewAndEditor() async throws {
+        let (container, repo) = makeDemoContainer()
+
+        // 6 MB file (exceeds 5 MB preview limit)
+        let hugePath = RemotePath("/home/dev/huge.txt")
+        let sixMB = Data(repeating: 0x41, count: 6 * 1024 * 1024)
+        try await repo.writeFile(data: sixMB, at: hugePath)
+
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let hugeFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "huge.txt" })
+
+        await container.loadPreview(for: hugeFile)
+        XCTAssertNil(container.previewData)
+        XCTAssertTrue(container.previewErrorMessage?.contains("5 MB preview limit") == true)
+
+        // 3 MB file (exceeds 2 MB editor limit)
+        let medPath = RemotePath("/home/dev/medium.txt")
+        let threeMB = Data(repeating: 0x42, count: 3 * 1024 * 1024)
+        try await repo.writeFile(data: threeMB, at: medPath)
+
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let medFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "medium.txt" })
+
+        do {
+            try await container.openEditor(for: medFile)
+            XCTFail("Opening file > 2MB in editor must throw error")
+        } catch let SFTPRepositoryError.remoteFailure(msg) {
+            XCTAssertTrue(msg.contains("2 MB editor limit"))
+        }
+        XCTAssertNil(container.activeEditingFile)
+    }
+
+    // MARK: - 23. Regression: Temporary Transfers Cleanup (Finding 8)
+
+    func testTemporaryTransfersCleanup() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+
+        // Download a file
+        let task = await container.enqueueDownload(file: notesFile)
+        XCTAssertNotNil(task)
+
+        // Wait for download to complete
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Clear completed transfers cleans up
+        await container.clearCompletedTransfers()
+        XCTAssertTrue(container.transferQueueState.tasks.isEmpty)
+
+        // Disconnect cleans up everything
+        await container.disconnect()
+    }
+
+    // MARK: - 24. Regression: Editor Target Host Isolation Mismatch (Finding 1)
+
+    func testEditorTargetHostIsolationMismatchRejectsSave() async throws {
+        let (container, _) = makeDemoContainer()
+        await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+
+        try await container.openEditor(for: notesFile)
+        XCTAssertNotNil(container.activeEditingFile)
+
+        // Switch to a new host directly
+        let hostB = try Host(name: "HostB", hostname: "hostb.invalid", username: "dev")
+        await container.connect(to: hostB)
+
+        // Verify editor was closed and activeEditingFile is nil
+        XCTAssertNil(container.activeEditingFile)
+        XCTAssertNil(container.activeEditingHostID)
+
+        // Attempting to save throws connectionClosed
+        do {
+            try await container.saveEditedFile()
+            XCTFail("Saving file after switching hosts must throw error")
+        } catch {
+            XCTAssertTrue(error is SFTPRepositoryError)
+        }
     }
 }
 

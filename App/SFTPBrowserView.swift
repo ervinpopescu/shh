@@ -48,11 +48,19 @@ struct FilesView: View {
     @ViewBuilder
     private var mainContent: some View {
         if container.sftpRepository == nil {
-            ContentUnavailableView(
-                "SFTP Not Connected",
-                systemImage: "folder.badge.gearshape",
-                description: Text("Connect to an SSH host to browse remote files.")
-            )
+            if let error = container.sftpErrorMessage {
+                ContentUnavailableView(
+                    "SFTP Unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text("Failed to initialize SFTP subsystem: \(error)")
+                )
+            } else {
+                ContentUnavailableView(
+                    "SFTP Not Connected",
+                    systemImage: "folder.badge.gearshape",
+                    description: Text("Connect to an SSH host to browse remote files.")
+                )
+            }
         } else {
             VStack(spacing: 0) {
                 BreadcrumbsBarView()
@@ -109,23 +117,27 @@ struct FilesView: View {
                 RemoteFileRowView(file: file)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        if file.isDirectory {
-                            Task { await container.navigateTo(file.path) }
-                        } else {
-                            Task { await container.loadPreview(for: file) }
-                        }
+                        Task { await container.openItem(file) }
                     }
                     .contextMenu {
-                        if file.isDirectory {
+                        if file.isDirectory || file.isSymlink {
                             Button("Open Folder", systemImage: "folder") {
                                 Task { await container.navigateTo(file.path) }
                             }
-                        } else {
+                        }
+                        if !file.isDirectory {
                             Button("Preview", systemImage: "eye") {
                                 Task { await container.loadPreview(for: file) }
                             }
                             Button("Edit in Editor", systemImage: "pencil") {
-                                Task { await container.openEditor(for: file) }
+                                Task {
+                                    do {
+                                        try await container.openEditor(for: file)
+                                    } catch {
+                                        errorMessage = error.localizedDescription
+                                        showingErrorAlert = true
+                                    }
+                                }
                             }
                             Button("Download", systemImage: "arrow.down.circle") {
                                 Task { _ = await container.enqueueDownload(file: file) }
@@ -306,8 +318,19 @@ private struct FileModalsModifier: ViewModifier {
                 get: { container.previewFile != nil },
                 set: { if !$0 { container.closePreview() } }
             )) {
-                FilePreviewSheet()
-                    .environmentObject(container)
+                FilePreviewSheet(onEdit: { file in
+                    container.closePreview()
+                    Task {
+                        try? await Task.sleep(nanoseconds: 350_000_000)
+                        do {
+                            try await container.openEditor(for: file)
+                        } catch {
+                            errorMessage = error.localizedDescription
+                            showingErrorAlert = true
+                        }
+                    }
+                })
+                .environmentObject(container)
             }
             .sheet(isPresented: Binding(
                 get: { container.activeEditingFile != nil },
@@ -396,6 +419,7 @@ private struct FileModalsModifier: ViewModifier {
                     get: { fileToDelete != nil },
                     set: { if !$0 { fileToDelete = nil } }
                 ),
+                titleVisibility: .visible,
                 presenting: fileToDelete
             ) { file in
                 Button("Delete '\(file.name)'", role: .destructive) {
@@ -418,6 +442,7 @@ private struct FileModalsModifier: ViewModifier {
                     get: { container.pendingConflict != nil },
                     set: { if !$0 { container.resolvePendingConflict(overwrite: false) } }
                 ),
+                titleVisibility: .visible,
                 presenting: container.pendingConflict
             ) { conflict in
                 Button("Overwrite", role: .destructive) {
@@ -436,11 +461,29 @@ private struct FileModalsModifier: ViewModifier {
             ) { result in
                 switch result {
                 case .success(let urls):
+                    let uploadBaseDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhUploads", isDirectory: true)
+                    try? FileManager.default.createDirectory(at: uploadBaseDir, withIntermediateDirectories: true)
+
                     for url in urls {
                         guard url.startAccessingSecurityScopedResource() else { continue }
-                        defer { url.stopAccessingSecurityScopedResource() }
-                        Task {
-                            _ = await container.enqueueUpload(localURL: url)
+                        let stagedFolder = uploadBaseDir.appendingPathComponent(UUID().uuidString, isDirectory: true)
+                        try? FileManager.default.createDirectory(at: stagedFolder, withIntermediateDirectories: true)
+                        let stagedURL = stagedFolder.appendingPathComponent(url.lastPathComponent)
+
+                        do {
+                            if FileManager.default.fileExists(atPath: stagedURL.path) {
+                                try? FileManager.default.removeItem(at: stagedURL)
+                            }
+                            try FileManager.default.copyItem(at: url, to: stagedURL)
+                            url.stopAccessingSecurityScopedResource()
+
+                            Task {
+                                _ = await container.enqueueUpload(localURL: stagedURL)
+                            }
+                        } catch {
+                            url.stopAccessingSecurityScopedResource()
+                            errorMessage = "Failed to prepare '\(url.lastPathComponent)' for upload: \(error.localizedDescription)"
+                            showingErrorAlert = true
                         }
                     }
                 case .failure(let error):
@@ -603,6 +646,8 @@ struct RemoteFileRowView: View {
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityDescription)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint(file.isDirectory ? "Double tap to open folder" : (file.isSymlink ? "Double tap to open folder or preview file" : "Double tap to preview file"))
     }
 
     @ViewBuilder
@@ -641,6 +686,7 @@ struct RemoteFileRowView: View {
 // MARK: - File Preview Sheet
 
 struct FilePreviewSheet: View {
+    var onEdit: ((RemoteFile) -> Void)? = nil
     @EnvironmentObject private var container: AppContainer
 
     var body: some View {
@@ -681,9 +727,18 @@ struct FilePreviewSheet: View {
                     if let file = container.previewFile {
                         if !isImageFile(file) {
                             Button("Edit", systemImage: "pencil") {
-                                Task {
-                                    await container.openEditor(for: file)
+                                if let onEdit {
+                                    onEdit(file)
+                                } else {
                                     container.closePreview()
+                                    Task {
+                                        try? await Task.sleep(nanoseconds: 350_000_000)
+                                        do {
+                                            try await container.openEditor(for: file)
+                                        } catch {
+                                            container.editorErrorMessage = error.localizedDescription
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -863,7 +918,8 @@ struct BinaryHexPreviewView: View {
             let chunk = data.subdata(in: i..<min(i + 16, maxBytes))
             let hex = chunk.map { String(format: "%02x", $0) }.joined(separator: " ")
             let ascii = chunk.map { (32...126).contains($0) ? String(UnicodeScalar($0)) : "." }.joined()
-            lines.append(String(format: "%04x: %-48s  |%@|", i, (hex as NSString).utf8String ?? "", ascii))
+            let paddedHex = hex.padding(toLength: 48, withPad: " ", startingAt: 0)
+            lines.append(String(format: "%04x: %@  |%@|", i, paddedHex, ascii))
         }
         if data.count > 512 {
             lines.append("... (\(data.count - 512) more bytes)")
@@ -1050,6 +1106,7 @@ private struct ActiveTransferRow: View {
             HStack {
                 Image(systemName: task.direction == .download ? "arrow.down.circle.fill" : "arrow.up.circle.fill")
                     .foregroundColor(.blue)
+                    .accessibilityHidden(true)
 
                 Text(task.remotePath.lastComponent)
                     .font(.subheadline.bold())
@@ -1088,6 +1145,7 @@ private struct CompletedTransferRow: View {
         HStack {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundColor(.green)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(task.remotePath.lastComponent)
@@ -1116,6 +1174,7 @@ private struct FailedTransferRow: View {
         HStack {
             Image(systemName: "exclamationmark.circle.fill")
                 .foregroundColor(.red)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(task.remotePath.lastComponent)
@@ -1148,6 +1207,7 @@ private struct CancelledTransferRow: View {
         HStack {
             Image(systemName: "slash.circle.fill")
                 .foregroundColor(.orange)
+                .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(task.remotePath.lastComponent)
@@ -1195,7 +1255,9 @@ struct FileMovePickerSheet: View {
                         }
                     }
 
-                    ForEach(directories.filter { $0.isDirectory && $0.name != file.name }) { dir in
+                    ForEach(directories.filter {
+                        $0.isDirectory && $0.name != file.name && (!file.isDirectory || !$0.path.isDescendantOrEqual(to: file.path))
+                    }) { dir in
                         Button {
                             navigateToDestination(dir.path)
                         } label: {
@@ -1222,7 +1284,16 @@ struct FileMovePickerSheet: View {
                         }
                     }
                     .bold()
+                    .disabled(file.isDirectory && selectedDestination.isDescendantOrEqual(to: file.path))
                 }
+            }
+            .alert("Move Failed", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("OK", role: .cancel) { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "An unexpected error occurred.")
             }
             .task {
                 selectedDestination = file.path.parent

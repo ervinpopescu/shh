@@ -83,6 +83,8 @@ final class AppContainer: ObservableObject {
     @Published public var editingFileContent: String = ""
     @Published public var isSavingFile: Bool = false
     @Published public var editorErrorMessage: String? = nil
+    private(set) var activeEditingHostID: Host.ID? = nil
+    private var conflictQueue: [FileTransferConflict] = []
 
     // Directory Cache
     private var directoryCache: [RemotePath: (files: [RemoteFile], timestamp: Date)] = [:]
@@ -331,6 +333,20 @@ final class AppContainer: ObservableObject {
         redactor = Redactor()
         terminalController.reset()
 
+        // Reset previous SFTP session, editor, preview, and transfers on connecting to new host
+        closePreview()
+        closeEditor()
+        currentDirectoryFiles = []
+        currentPath = RemotePath("/home/dev")
+        directoryErrorMessage = nil
+        sftpErrorMessage = nil
+        for (_, task) in activeTransferTasks {
+            task.cancel()
+        }
+        activeTransferTasks.removeAll()
+        drainPendingConflicts()
+        directoryCache.removeAll()
+
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
         let initialSize = terminalController.size
@@ -559,6 +575,7 @@ final class AppContainer: ObservableObject {
 
         Task { [weak self] in
             await self?.refreshTmuxState()
+            await self?.setupSFTPForHost(host)
         }
     }
 
@@ -718,6 +735,21 @@ final class AppContainer: ObservableObject {
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
 
+        // Reset SFTP session, preview, editor, and transfer state
+        closePreview()
+        closeEditor()
+        currentDirectoryFiles = []
+        currentPath = RemotePath("/home/dev")
+        directoryErrorMessage = nil
+        sftpErrorMessage = nil
+
+        for (_, task) in activeTransferTasks {
+            task.cancel()
+        }
+        activeTransferTasks.removeAll()
+
+        drainPendingConflicts()
+
         if customSFTPRepository == nil {
             if let live = sftpRepository as? LiveSFTPRepository {
                 await live.close()
@@ -727,6 +759,7 @@ final class AppContainer: ObservableObject {
             }
         }
         directoryCache.removeAll()
+        cleanTemporaryTransfersDirectory(removeAll: true)
     }
 
     private func detachCallbacks() {
@@ -1577,37 +1610,46 @@ final class AppContainer: ObservableObject {
             return nil
         }
 
+        let safeFileName = (file.name as NSString).lastPathComponent
+        guard !safeFileName.isEmpty && safeFileName != "." && safeFileName != ".." else {
+            directoryErrorMessage = "Invalid file name: '\(file.name)'"
+            return nil
+        }
+
         let defaultDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhDownloads", isDirectory: true)
         try? FileManager.default.createDirectory(at: defaultDir, withIntermediateDirectories: true)
-        let targetURL = destinationURL ?? defaultDir.appendingPathComponent(file.name)
+        let targetURL = destinationURL ?? defaultDir.appendingPathComponent(safeFileName)
+
+        if destinationURL == nil {
+            let standardizedTarget = targetURL.standardizedFileURL.path
+            let standardizedDefault = defaultDir.standardizedFileURL.path
+            guard standardizedTarget.hasPrefix(standardizedDefault) else {
+                directoryErrorMessage = "Invalid destination path."
+                return nil
+            }
+        }
+
         let fileExists = FileManager.default.fileExists(atPath: targetURL.path)
 
         let proceed: Bool
         if let overwrite {
             proceed = overwrite
         } else if fileExists {
-            proceed = await withCheckedContinuation { continuation in
-                self.pendingConflict = FileTransferConflict(
-                    direction: .download,
-                    remotePath: file.path,
-                    localURL: targetURL,
-                    existingItemName: file.name,
-                    destinationDescription: targetURL.lastPathComponent,
-                    continuation: { choice in
-                        continuation.resume(returning: choice)
-                    }
-                )
-            }
-            self.pendingConflict = nil
+            proceed = await requestConflictResolution(
+                direction: .download,
+                remotePath: file.path,
+                localURL: targetURL,
+                existingItemName: file.name,
+                destinationDescription: targetURL.lastPathComponent
+            )
         } else {
             proceed = true
         }
 
         guard proceed else { return nil }
 
-        if fileExists {
-            try? FileManager.default.removeItem(at: targetURL)
-        }
+        // Atomic safety: Do NOT remove targetURL up front.
+        // The SFTP repository downloads to a temporary file and atomically replaces destination on success.
 
         let task = await transferCoordinator.enqueue(
             direction: .download,
@@ -1666,7 +1708,14 @@ final class AppContainer: ObservableObject {
 
         let dir = destinationDirectory ?? currentPath
         let fileName = localURL.lastPathComponent
-        let remotePath = dir.appending(fileName)
+        guard !fileName.isEmpty && fileName != "." && fileName != ".." && !fileName.contains("/") else {
+            directoryErrorMessage = "Invalid upload file name: '\(fileName)'"
+            return nil
+        }
+        guard let remotePath = try? dir.appendingSafely(fileName) else {
+            directoryErrorMessage = "Invalid remote path for upload: '\(fileName)'"
+            return nil
+        }
 
         var existsRemote = false
         if currentPath == dir && currentDirectoryFiles.contains(where: { $0.name == fileName }) {
@@ -1679,19 +1728,13 @@ final class AppContainer: ObservableObject {
         if let overwrite {
             proceed = overwrite
         } else if existsRemote {
-            proceed = await withCheckedContinuation { continuation in
-                self.pendingConflict = FileTransferConflict(
-                    direction: .upload,
-                    remotePath: remotePath,
-                    localURL: localURL,
-                    existingItemName: fileName,
-                    destinationDescription: remotePath.description,
-                    continuation: { choice in
-                        continuation.resume(returning: choice)
-                    }
-                )
-            }
-            self.pendingConflict = nil
+            proceed = await requestConflictResolution(
+                direction: .upload,
+                remotePath: remotePath,
+                localURL: localURL,
+                existingItemName: fileName,
+                destinationDescription: remotePath.description
+            )
         } else {
             proceed = true
         }
@@ -1769,12 +1812,84 @@ final class AppContainer: ObservableObject {
     public func clearCompletedTransfers() async {
         await transferCoordinator.clearTerminal()
         transferQueueState = await transferCoordinator.snapshot()
+        cleanTemporaryTransfersDirectory(removeAll: false)
     }
 
     public func resolvePendingConflict(overwrite: Bool) {
-        guard let conflict = pendingConflict else { return }
-        self.pendingConflict = nil
-        conflict.continuation(overwrite)
+        guard !conflictQueue.isEmpty else {
+            pendingConflict = nil
+            return
+        }
+        let current = conflictQueue.removeFirst()
+        self.pendingConflict = conflictQueue.first
+        current.continuation(overwrite)
+    }
+
+    private func requestConflictResolution(
+        direction: TransferDirection,
+        remotePath: RemotePath,
+        localURL: URL,
+        existingItemName: String,
+        destinationDescription: String
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            let conflict = FileTransferConflict(
+                direction: direction,
+                remotePath: remotePath,
+                localURL: localURL,
+                existingItemName: existingItemName,
+                destinationDescription: destinationDescription,
+                continuation: { choice in
+                    continuation.resume(returning: choice)
+                }
+            )
+            self.conflictQueue.append(conflict)
+            if self.pendingConflict == nil {
+                self.pendingConflict = conflict
+            }
+        }
+    }
+
+    private func drainPendingConflicts() {
+        let conflicts = conflictQueue
+        conflictQueue.removeAll()
+        pendingConflict = nil
+        for conflict in conflicts {
+            conflict.continuation(false)
+        }
+    }
+
+    private func cleanTemporaryTransfersDirectory(removeAll: Bool = false) {
+        let fileManager = FileManager.default
+        let downloadDir = fileManager.temporaryDirectory.appendingPathComponent("ShhDownloads", isDirectory: true)
+        let uploadDir = fileManager.temporaryDirectory.appendingPathComponent("ShhUploads", isDirectory: true)
+
+        if removeAll {
+            try? fileManager.removeItem(at: downloadDir)
+            try? fileManager.removeItem(at: uploadDir)
+        } else {
+            if let contents = try? fileManager.contentsOfDirectory(at: downloadDir, includingPropertiesForKeys: nil) {
+                let activeLocalURLs = Set(transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
+                for fileURL in contents {
+                    if !activeLocalURLs.contains(fileURL.standardizedFileURL) {
+                        try? fileManager.removeItem(at: fileURL)
+                    }
+                }
+            }
+            if let stagedDirs = try? fileManager.contentsOfDirectory(at: uploadDir, includingPropertiesForKeys: nil) {
+                let activeLocalURLs = Set(transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
+                for stagedDir in stagedDirs {
+                    if let files = try? fileManager.contentsOfDirectory(at: stagedDir, includingPropertiesForKeys: nil) {
+                        let anyActive = files.contains { activeLocalURLs.contains($0.standardizedFileURL) }
+                        if !anyActive {
+                            try? fileManager.removeItem(at: stagedDir)
+                        }
+                    } else {
+                        try? fileManager.removeItem(at: stagedDir)
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - File Actions (Delete, Rename, Move, Create)
@@ -1797,10 +1912,10 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+        guard !trimmed.isEmpty && !trimmed.contains("/") && trimmed != ".." && trimmed != "." else {
             throw SFTPRepositoryError.invalidPath("Invalid file name: '\(newName)'")
         }
-        let newPath = file.path.parent.appending(trimmed)
+        let newPath = try file.path.parent.appendingSafely(trimmed)
         try await repo.rename(from: file.path, to: newPath)
         invalidateDirectoryCache(at: file.path.parent)
         await refreshCurrentDirectory()
@@ -1810,7 +1925,10 @@ final class AppContainer: ObservableObject {
         guard let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
-        let targetPath = destinationDirectory.appending(file.name)
+        if file.isDirectory && destinationDirectory.isDescendantOrEqual(to: file.path) {
+            throw SFTPRepositoryError.invalidPath("Cannot move directory into itself or descendant: '\(destinationDirectory.description)'")
+        }
+        let targetPath = try destinationDirectory.appendingSafely(file.name)
         try await repo.rename(from: file.path, to: targetPath)
         invalidateDirectoryCache(at: file.path.parent)
         invalidateDirectoryCache(at: destinationDirectory)
@@ -1822,10 +1940,10 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+        guard !trimmed.isEmpty && !trimmed.contains("/") && trimmed != ".." && trimmed != "." else {
             throw SFTPRepositoryError.invalidPath("Invalid directory name: '\(name)'")
         }
-        let targetPath = currentPath.appending(trimmed)
+        let targetPath = try currentPath.appendingSafely(trimmed)
         try await repo.createDirectory(at: targetPath)
         invalidateDirectoryCache(at: currentPath)
         await refreshCurrentDirectory()
@@ -1836,10 +1954,10 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty && !trimmed.contains("/") else {
+        guard !trimmed.isEmpty && !trimmed.contains("/") && trimmed != ".." && trimmed != "." else {
             throw SFTPRepositoryError.invalidPath("Invalid file name: '\(name)'")
         }
-        let targetPath = currentPath.appending(trimmed)
+        let targetPath = try currentPath.appendingSafely(trimmed)
         try await repo.writeFile(data: content, at: targetPath, progress: nil)
         invalidateDirectoryCache(at: currentPath)
         await refreshCurrentDirectory()
@@ -1847,11 +1965,40 @@ final class AppContainer: ObservableObject {
 
     // MARK: - Previews & In-App Text Editor
 
+    public func openItem(_ file: RemoteFile) async {
+        if file.isDirectory {
+            await navigateTo(file.path)
+            return
+        }
+        if file.isSymlink {
+            if let attrs = try? await sftpRepository?.fetchAttributes(at: file.path), attrs.isDirectory {
+                await navigateTo(file.path)
+                return
+            }
+            if let targetStr = file.symlinkTarget {
+                let resolvedPath = targetStr.hasPrefix("/") ? RemotePath(targetStr) : file.path.parent.appending(targetStr)
+                if let attrs = try? await sftpRepository?.fetchAttributes(at: resolvedPath), attrs.isDirectory {
+                    await navigateTo(file.path)
+                    return
+                }
+            }
+        }
+        await loadPreview(for: file)
+    }
+
     public func loadPreview(for file: RemoteFile) async {
         guard let repo = sftpRepository else { return }
         previewFile = file
         previewData = nil
         previewErrorMessage = nil
+
+        let maxPreviewSize: Int64 = 5 * 1024 * 1024 // 5 MB
+        if file.size > maxPreviewSize {
+            previewErrorMessage = "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 5 MB preview limit. Please download to view."
+            isPreviewLoading = false
+            return
+        }
+
         isPreviewLoading = true
         do {
             let data = try await repo.readFile(at: file.path)
@@ -1870,17 +2017,33 @@ final class AppContainer: ObservableObject {
         isPreviewLoading = false
     }
 
-    public func openEditor(for file: RemoteFile) async {
-        guard let repo = sftpRepository else { return }
+    public func openEditor(for file: RemoteFile) async throws {
+        guard let repo = sftpRepository else {
+            throw SFTPRepositoryError.connectionClosed
+        }
         isSavingFile = false
         editorErrorMessage = nil
+
+        let maxEditorSize: Int64 = 2 * 1024 * 1024 // 2 MB
+        if file.size > maxEditorSize {
+            let err = SFTPRepositoryError.remoteFailure("File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 2 MB editor limit. Please download to view.")
+            editorErrorMessage = err.localizedDescription
+            throw err
+        }
+
         do {
             let data = try await repo.readFile(at: file.path)
-            let text = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            guard let text = String(data: data, encoding: .utf8) else {
+                let err = SFTPRepositoryError.remoteFailure("Cannot edit '\(file.name)': File contains non-UTF-8 or binary data.")
+                editorErrorMessage = err.localizedDescription
+                throw err
+            }
             editingFileContent = text
             activeEditingFile = file
+            activeEditingHostID = activeHost?.id
         } catch {
             editorErrorMessage = error.localizedDescription
+            throw error
         }
     }
 
@@ -1889,11 +2052,15 @@ final class AppContainer: ObservableObject {
         editingFileContent = ""
         isSavingFile = false
         editorErrorMessage = nil
+        activeEditingHostID = nil
     }
 
     public func saveEditedFile() async throws {
         guard let repo = sftpRepository, let file = activeEditingFile else {
             throw SFTPRepositoryError.connectionClosed
+        }
+        guard activeHost?.id == activeEditingHostID else {
+            throw SFTPRepositoryError.remoteFailure("Host mismatch: File editor session belongs to a different host.")
         }
         isSavingFile = true
         editorErrorMessage = nil
