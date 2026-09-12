@@ -47,7 +47,12 @@ data, remote execution outputs, voice transcripts, and backup storage.
   key headers and passwords) before encryption and after decryption.
 - Import uses security-scoped file access and stages files securely in
   the application sandbox, deleting staged copies immediately after use.
-- Passphrase strings and memory buffers are cleared deterministically.
+- Passphrase UI state variables are promptly reset upon task completion
+  or modal dismissal. Raw `Data` overloads in `EncryptedVaultService`
+  allow caller-controlled memory wiping via `Data.resetBytes(in:)`,
+  plaintext payload serialization buffers are zeroed immediately
+  following encryption and decryption, and PBKDF2 derived key material
+  is wiped deterministically after use.
 
 ### 5. File Provider & Background Security
 - The `ShhFileProvider` extension runs in a dedicated sandboxed process.
@@ -71,3 +76,16 @@ data, remote execution outputs, voice transcripts, and backup storage.
 - `NSPrivacyTracking` is set to `false`.
 - `NSPrivacyCollectedDataTypes` is empty: zero analytics, zero crash
   reporting telemetry, zero user tracking.
+
+### 7. Cryptographic Export Compliance (EAR Category 5, Part 2)
+- Shh incorporates cryptographic software for remote communication
+  (SSH/SFTP tunnels via SwiftNIO SSH and Citadel) and zero-knowledge
+  local vault backup encryption (AES-256-GCM / PBKDF2).
+- Non-exempt encryption declaration `ITSAppUsesNonExemptEncryption` is
+  set to `YES` in `project.yml` (and rendered into `Info.plist`).
+- In accordance with U.S. Export Administration Regulations (EAR, 15
+  C.F.R. Part 740, Category 5, Part 2) and Apple App Store distribution
+  guidelines, Shh falls under mass-market encryption (ECCN 5D992.c)
+  with self-classification / BIS reporting. Distribution complies with
+  Apple App Store Connect export compliance screening.
+

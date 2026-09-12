@@ -38,4 +38,6 @@
 12. **Mosh SSP Hardening:** Full State Synchronization Protocol (SSP)
     cryptographic packet encryption and speculative local echo.
 13. **TestFlight Beta & App Store:** Build automation, TestFlight
-    internal and external beta testing, and App Store Connect metadata.
+    internal and external beta testing, App Store Connect metadata, and
+    EAR Category 5 Part 2 export compliance self-classification filing
+    (ECCN 5D992.c).
