@@ -1,5 +1,6 @@
 import XCTest
 @testable import Shh
+import Crypto
 import ShhCore
 import ShhSSH
 import ShhTerminal
@@ -799,6 +800,102 @@ final class AppContainerTests: XCTestCase {
         var query = "test"
         let searchBar = TerminalSearchBar(controller: container.terminalController, query: .init(get: { query }, set: { query = $0 }), onClose: {})
         _ = searchBar
+    }
+
+    func testCreateEd25519IdentityAndRetrievePublicKey() async throws {
+        let container = AppContainer.demo()
+        let initialCount = (try await container.catalog.identities()).count
+
+        let identity = try await container.createEd25519Identity(name: "Test iPad Key", comment: "user@ipad")
+        XCTAssertEqual(identity.name, "Test iPad Key")
+        XCTAssertEqual(identity.kind, IdentityKind.privateKey)
+        XCTAssertNotNil(identity.publicFingerprint)
+        XCTAssertTrue(identity.publicFingerprint?.hasPrefix("SHA256:") == true)
+
+        let allIdentities = try await container.catalog.identities()
+        XCTAssertEqual(allIdentities.count, initialCount + 1)
+        XCTAssertTrue(allIdentities.contains(where: { $0.id == identity.id }))
+
+        // Verify stored in keychain
+        let loadedSecret = try await container.keychain.load(reference: identity.keychainReference)
+        XCTAssertFalse(loadedSecret.isEmpty)
+
+        // Retrieve public key (defaults comment to identity.name)
+        let pubKey = try await container.openSSHPublicKey(for: identity)
+        XCTAssertNotNil(pubKey)
+        XCTAssertTrue(pubKey?.hasPrefix("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5") == true)
+        XCTAssertTrue(pubKey?.hasSuffix("Test iPad Key") == true)
+
+        // Retrieve with custom comment
+        let pubKeyWithComment = try await container.openSSHPublicKey(for: identity, comment: "user@ipad")
+        XCTAssertTrue(pubKeyWithComment?.hasSuffix("user@ipad") == true)
+    }
+
+    func testImportPrivateKeyIdentity() async throws {
+        let container = AppContainer.demo()
+        let originalKey = Curve25519.Signing.PrivateKey()
+        let openSSHRepresentation = originalKey.makeSSHRepresentation(comment: "imported-key")
+
+        let imported = try await container.importPrivateKeyIdentity(name: "Imported Ed25519", privateKeyText: openSSHRepresentation)
+        XCTAssertEqual(imported.name, "Imported Ed25519")
+        XCTAssertEqual(imported.kind, IdentityKind.privateKey)
+
+        let expectedFingerprint = Ed25519Parser.fingerprint(from: originalKey.publicKey)
+        XCTAssertEqual(imported.publicFingerprint, expectedFingerprint)
+
+        let pubKey = try await container.openSSHPublicKey(for: imported)
+        XCTAssertNotNil(pubKey)
+        XCTAssertTrue(pubKey?.hasPrefix("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5") == true)
+    }
+
+    func testCreatePasswordIdentity() async throws {
+        let container = AppContainer.demo()
+        let initialCount = (try await container.catalog.identities()).count
+
+        let identity = try await container.createPasswordIdentity(name: "Root Password", password: "secret-password-123")
+        XCTAssertEqual(identity.name, "Root Password")
+        XCTAssertEqual(identity.kind, IdentityKind.password)
+        XCTAssertNil(identity.publicFingerprint)
+
+        let all = try await container.catalog.identities()
+        XCTAssertEqual(all.count, initialCount + 1)
+
+        let secretData = try await container.keychain.load(reference: identity.keychainReference)
+        XCTAssertEqual(String(data: secretData, encoding: .utf8), "secret-password-123")
+
+        let pubKey = try await container.openSSHPublicKey(for: identity)
+        XCTAssertNil(pubKey, "Password identity has no SSH public key")
+    }
+
+    func testDeleteIdentityCleansKeychainAndHostReferences() async throws {
+        let container = AppContainer.demo()
+        let identity = try await container.createEd25519Identity(name: "Disposable Key", comment: "disposable")
+
+        // Create a host referencing this identity
+        let host = try Host(name: "Host with Key", hostname: "server.local", username: "admin", identityID: identity.id)
+        try await container.saveHost(host)
+
+        let savedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
+        XCTAssertEqual(savedHost?.identityID, identity.id)
+
+        // Delete the identity
+        try await container.deleteIdentity(id: identity.id)
+
+        // Identity must be gone from catalog
+        let remainingIdentities = try await container.catalog.identities()
+        XCTAssertFalse(remainingIdentities.contains(where: { $0.id == identity.id }))
+
+        // Keychain reference must be deleted
+        do {
+            _ = try await container.keychain.load(reference: identity.keychainReference)
+            XCTFail("Keychain secret should have been deleted")
+        } catch {
+            // Expected
+        }
+
+        // Host's identityID must be cleared to nil
+        let updatedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
+        XCTAssertNil(updatedHost?.identityID)
     }
 }
 

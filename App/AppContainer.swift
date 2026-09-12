@@ -2939,6 +2939,114 @@ final class AppContainer: ObservableObject {
         try await syncSharedCatalogAndTrust()
     }
 
+    // MARK: - SSH Keys & Credential Management
+
+    public var keychain: any CredentialStore {
+        credentialStore
+    }
+
+    @discardableResult
+    public func createEd25519Identity(name: String, comment: String? = nil) async throws -> IdentityDescriptor {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            throw ShhValidationError.empty(field: "identity name")
+        }
+        let commentValue = comment?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let effectiveComment = (commentValue?.isEmpty == false) ? (commentValue ?? trimmedName) : trimmedName
+        let generated = Ed25519Parser.generateKeyPair(comment: effectiveComment)
+        let reference = "id-\(UUID().uuidString)"
+        try await credentialStore.save(Data(generated.openSSHPrivateKey.utf8), reference: reference)
+        let descriptor = try IdentityDescriptor(
+            name: trimmedName,
+            kind: .privateKey,
+            publicFingerprint: generated.fingerprint,
+            keychainReference: reference
+        )
+        try await catalog.save(descriptor)
+        try? await syncSharedCatalogAndTrust()
+        return descriptor
+    }
+
+    @discardableResult
+    public func importPrivateKeyIdentity(name: String, privateKeyText: String) async throws -> IdentityDescriptor {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            throw ShhValidationError.empty(field: "identity name")
+        }
+        let trimmedKey = privateKeyText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            throw ShhValidationError.empty(field: "private key")
+        }
+        let privateKey = try Ed25519Parser.parse(from: trimmedKey)
+        let publicKey = privateKey.publicKey
+        let fingerprint = Ed25519Parser.fingerprint(from: publicKey)
+        let reference = "id-\(UUID().uuidString)"
+        let storeData: Data
+        if trimmedKey.contains("-----BEGIN") {
+            storeData = Data(trimmedKey.utf8)
+        } else {
+            let openSSH = privateKey.makeSSHRepresentation(comment: trimmedName)
+            storeData = Data(openSSH.utf8)
+        }
+        try await credentialStore.save(storeData, reference: reference)
+        let descriptor = try IdentityDescriptor(
+            name: trimmedName,
+            kind: .privateKey,
+            publicFingerprint: fingerprint,
+            keychainReference: reference
+        )
+        try await catalog.save(descriptor)
+        try? await syncSharedCatalogAndTrust()
+        return descriptor
+    }
+
+    @discardableResult
+    public func createPasswordIdentity(name: String, password: String) async throws -> IdentityDescriptor {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else {
+            throw ShhValidationError.empty(field: "identity name")
+        }
+        guard !password.isEmpty else {
+            throw ShhValidationError.empty(field: "password")
+        }
+        let reference = "pwd-\(UUID().uuidString)"
+        try await credentialStore.save(Data(password.utf8), reference: reference)
+        let descriptor = try IdentityDescriptor(
+            name: trimmedName,
+            kind: .password,
+            publicFingerprint: nil,
+            keychainReference: reference
+        )
+        try await catalog.save(descriptor)
+        try? await syncSharedCatalogAndTrust()
+        return descriptor
+    }
+
+    public func deleteIdentity(id: UUID) async throws {
+        let identities = try await catalog.identities()
+        if let target = identities.first(where: { $0.id == id }) {
+            try? await credentialStore.delete(reference: target.keychainReference)
+        }
+        try await catalog.deleteIdentity(id: id)
+        let hosts = try await catalog.listHosts()
+        for host in hosts where host.identityID == id {
+            var updated = host
+            updated.identityID = nil
+            try await catalog.save(updated)
+        }
+        try? await syncSharedCatalogAndTrust()
+    }
+
+    public func openSSHPublicKey(for identity: IdentityDescriptor, comment: String? = nil) async throws -> String? {
+        guard identity.kind == .privateKey else { return nil }
+        let data = try await credentialStore.load(reference: identity.keychainReference)
+        let privateKey = try Ed25519Parser.parse(from: data)
+        let effectiveComment = (comment?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+            ? comment!
+            : identity.name
+        return Ed25519Parser.openSSHPublicKeyString(from: privateKey.publicKey, comment: effectiveComment)
+    }
+
     // MARK: - File Provider Domains
 
     public func registerFileProviderDomain(for host: Host) async throws {

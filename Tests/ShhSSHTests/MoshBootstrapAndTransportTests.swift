@@ -372,6 +372,9 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
         let stream = await connection.events()
         var iterator = stream.makeAsyncIterator()
 
+        // Allow the receive loop task to start and subscribe
+        await Task.yield()
+
         // Inject raw unauthenticated bytes that do not decode as MoshDatagram
         channel.simulateInboundDatagram(Data("rm -rf /\n".utf8))
 
