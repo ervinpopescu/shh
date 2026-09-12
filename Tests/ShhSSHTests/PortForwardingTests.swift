@@ -157,7 +157,15 @@ final class PortForwardingTests: XCTestCase {
         let receivedPayload = try await client.receiveNext()
         XCTAssertEqual(receivedPayload, payload)
 
+        // Verify active connections counter is 1 during active SOCKS5 session (Security Finding P2)
+        let active = await forwardingManager.activeSessions()
+        XCTAssertEqual(active.first?.activeConnectionsCount, 1)
+
         await client.close()
+        try await Task.sleep(nanoseconds: 50_000_000)
+        let activeAfterClose = await forwardingManager.activeSessions()
+        XCTAssertEqual(activeAfterClose.first?.activeConnectionsCount, 0)
+
         try await forwardingManager.stopForwarding(ruleID: rule.id)
         await connection.close()
         try await sshServer.stop()

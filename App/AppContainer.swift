@@ -822,6 +822,17 @@ final class AppContainer: ObservableObject {
         detachCallbacks()
         eventTask?.cancel()
         eventTask = nil
+
+        // Reset port forwarding state before closing SSH connection
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        await portForwardingManager?.stopAll()
+        if !isDemo {
+            portForwardingManager = nil
+        }
+        forwardingSessions = []
+        forwardingErrorMessage = nil
+
         await connection?.close()
         connection = nil
         activeSession?.state = .disconnected
@@ -858,16 +869,6 @@ final class AppContainer: ObservableObject {
         }
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
-
-        // Reset port forwarding state
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = nil
-        await portForwardingManager?.stopAll()
-        if !isDemo {
-            portForwardingManager = nil
-        }
-        forwardingSessions = []
-        forwardingErrorMessage = nil
     }
 
     private func detachCallbacks() {
@@ -2225,10 +2226,18 @@ final class AppContainer: ObservableObject {
 
     private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async {
         for rule in host.forwardingRules where rule.enabled {
+            if rule.requiresNonLoopbackApproval {
+                let message = "\(rule.name) requires approval to bind to \(rule.localHost)."
+                forwardingErrorMessage = message
+                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
+                continue
+            }
             do {
                 _ = try await manager.startForwarding(rule: rule)
             } catch {
-                forwardingErrorMessage = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
+                let message = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
+                forwardingErrorMessage = message
+                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
             }
         }
     }
@@ -2263,7 +2272,7 @@ final class AppContainer: ObservableObject {
     }
 
     public func addForwardingRule(_ rule: PortForwardingRule, for host: Host, autoStartIfConnected: Bool = true) async throws {
-        var updatedHost = host
+        var updatedHost = (activeHost?.id == host.id ? activeHost! : host)
         if let idx = updatedHost.forwardingRules.firstIndex(where: { $0.id == rule.id }) {
             updatedHost.forwardingRules[idx] = rule
         } else {
@@ -2272,7 +2281,8 @@ final class AppContainer: ObservableObject {
         try await catalog.save(updatedHost)
         if activeHost?.id == host.id {
             activeHost = updatedHost
-            if autoStartIfConnected && rule.enabled {
+            await stopForwarding(ruleID: rule.id)
+            if autoStartIfConnected && rule.enabled && !rule.requiresNonLoopbackApproval {
                 _ = try? await startForwarding(rule: rule)
             }
         }
@@ -2280,7 +2290,7 @@ final class AppContainer: ObservableObject {
 
     public func removeForwardingRule(ruleID: UUID, for host: Host) async throws {
         await stopForwarding(ruleID: ruleID)
-        var updatedHost = host
+        var updatedHost = (activeHost?.id == host.id ? activeHost! : host)
         updatedHost.forwardingRules.removeAll { $0.id == ruleID }
         try await catalog.save(updatedHost)
         if activeHost?.id == host.id {

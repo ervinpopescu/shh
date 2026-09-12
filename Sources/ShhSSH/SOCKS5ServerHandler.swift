@@ -5,19 +5,33 @@ final class SOCKS5BridgeSSHHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private weak var clientChannel: Channel?
     private let counter: ForwardingTrafficCounter
+    private var hasIncremented = false
 
     init(clientChannel: Channel, counter: ForwardingTrafficCounter) {
         self.clientChannel = clientChannel
         self.counter = counter
     }
 
+    func handlerAdded(context: ChannelHandlerContext) {
+        if context.channel.isActive && !hasIncremented {
+            hasIncremented = true
+            counter.incrementConnections()
+        }
+    }
+
     func channelActive(context: ChannelHandlerContext) {
-        counter.incrementConnections()
+        if !hasIncremented {
+            hasIncremented = true
+            counter.incrementConnections()
+        }
         context.fireChannelActive()
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        counter.decrementConnections()
+        if hasIncremented {
+            hasIncremented = false
+            counter.decrementConnections()
+        }
         _ = clientChannel?.close()
         context.fireChannelInactive()
     }
@@ -229,18 +243,23 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, @unchecked Sendable {
             let onChannelOpened = self.onChannelOpened
 
             Task { [weak self] in
+                var openedSSHChannel: Channel? = nil
                 do {
                     let sshChannel = try await connection.createDirectTCPIPChannel(
                         targetHost: targetHost,
                         targetPort: targetPort,
                         originatorAddress: clientChannel.remoteAddress
                     )
+                    openedSSHChannel = sshChannel
 
                     let sshBridge = SOCKS5BridgeSSHHandler(clientChannel: clientChannel, counter: counter)
                     _ = try await sshChannel.pipeline.addHandler(sshBridge).get()
 
                     _ = try await clientChannel.eventLoop.submit {
-                        guard let self else { return }
+                        guard let self else {
+                            _ = sshChannel.close()
+                            return
+                        }
                         self.sshChannel = sshChannel
                         self.state = .bridged
 
@@ -256,6 +275,7 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, @unchecked Sendable {
 
                     onChannelOpened?(sshChannel)
                 } catch {
+                    _ = try? await openedSSHChannel?.close()
                     _ = try? await clientChannel.eventLoop.submit {
                         guard let self else { return }
                         var reply = clientChannel.allocator.buffer(capacity: 10)
