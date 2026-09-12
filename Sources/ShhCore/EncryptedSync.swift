@@ -62,6 +62,23 @@ public struct VaultExportOptions: Sendable {
     }
 }
 
+/// Mode for restoring catalog snapshots from encrypted vault backups.
+public enum RestoreMode: String, CaseIterable, Sendable, Identifiable {
+    case merge = "Merge"
+    case replace = "Replace"
+
+    public var id: String { rawValue }
+
+    public var description: String {
+        switch self {
+        case .merge:
+            return "Merge backup records into existing catalog without deleting existing hosts."
+        case .replace:
+            return "Replace existing catalog completely with backup contents."
+        }
+    }
+}
+
 /// Errors raised during vault encryption, decryption, and verification.
 public enum VaultBackupError: Error, LocalizedError, Sendable, Equatable {
     case emptyPassphrase

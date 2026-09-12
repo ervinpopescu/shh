@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(FileProvider)
+import FileProvider
+#endif
 import ShhCore
 import ShhSSH
 import ShhTerminal
@@ -73,6 +76,11 @@ final class AppContainer: ObservableObject {
     @Published var isTranscribingVoice: Bool = false
     @Published var activeVoicePreview: VoicePreviewState? = nil
     @Published var isSlideToCancelActive: Bool = false
+
+    // MARK: - File Provider Domain Management
+    public let fileProviderHelper: FileProviderManagerHelper
+    @Published public var registeredFileProviderDomainIDs: Set<String> = []
+    @Published public var fileProviderDomainError: String? = nil
 
     // MARK: - Port Forwarding & ProxyJump
     public let customPortForwardingManager: (any PortForwardingManaging)?
@@ -182,8 +190,10 @@ final class AppContainer: ObservableObject {
         reconnectCoordinator: ReconnectCoordinator? = nil,
         sftpRepository: (any SFTPRepository)? = nil,
         portForwardingManager: (any PortForwardingManaging)? = nil,
-        hostResolver: LiveSSHTransport.HostResolver? = nil
+        hostResolver: LiveSSHTransport.HostResolver? = nil,
+        fileProviderHelper: FileProviderManagerHelper = .shared
     ) {
+        self.fileProviderHelper = fileProviderHelper
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
             ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
@@ -307,6 +317,13 @@ final class AppContainer: ObservableObject {
         Task { [weak self] in
             await self?.loadDirectory(at: RemotePath("/home/dev"))
         }
+
+        Task { [weak self] in
+            await self?.syncSharedCatalogAndTrust()
+            #if canImport(FileProvider)
+            await self?.refreshRegisteredDomains()
+            #endif
+        }
     }
 
     static func demo(
@@ -325,7 +342,8 @@ final class AppContainer: ObservableObject {
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil,
         sftpRepository: (any SFTPRepository)? = nil,
-        portForwardingManager: (any PortForwardingManaging)? = nil
+        portForwardingManager: (any PortForwardingManaging)? = nil,
+        fileProviderHelper: FileProviderManagerHelper = .shared
     ) -> AppContainer {
         let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
         let demoTranscriber = transcriber ?? DemoTranscriber()
@@ -358,7 +376,8 @@ final class AppContainer: ObservableObject {
                 jitter: ReconnectCoordinator.zeroJitter
             ),
             sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true),
-            portForwardingManager: portForwardingManager ?? DemoPortForwardingManager()
+            portForwardingManager: portForwardingManager ?? DemoPortForwardingManager(),
+            fileProviderHelper: fileProviderHelper
         )
     }
 
@@ -933,10 +952,7 @@ final class AppContainer: ObservableObject {
         guard let challenge = pendingTrustChallenge, let host = pendingTrustHost else { return }
         if permanently {
             await trustStore.save(challenge)
-            #if canImport(FileProvider)
-            let records = await trustStore.allRecords()
-            try? FileProviderManagerHelper.shared.exportTrustedHostKeysToSharedContainer(records: records)
-            #endif
+            await syncSharedCatalogAndTrust()
         } else {
             await trustStore.trustOnce(challenge)
         }
@@ -2854,7 +2870,7 @@ final class AppContainer: ObservableObject {
         } else {
             updatedHost.forwardingRules.append(rule)
         }
-        try await catalog.save(updatedHost)
+        try await saveHost(updatedHost)
         if activeHost?.id == host.id {
             activeHost = updatedHost
             await stopForwarding(ruleID: rule.id)
@@ -2868,7 +2884,7 @@ final class AppContainer: ObservableObject {
         await stopForwarding(ruleID: ruleID)
         var updatedHost = (activeHost?.id == host.id ? activeHost! : host)
         updatedHost.forwardingRules.removeAll { $0.id == ruleID }
-        try await catalog.save(updatedHost)
+        try await saveHost(updatedHost)
         if activeHost?.id == host.id {
             activeHost = updatedHost
         }
@@ -2901,5 +2917,104 @@ final class AppContainer: ObservableObject {
     public func resolveBastionNames(for host: Host) async -> [String] {
         let hops = await resolveBastionHops(for: host)
         return hops.map { $0.0.name }
+    }
+
+    // MARK: - Host Management & Shared Catalog Sync
+
+    public func syncSharedCatalogAndTrust() async {
+        let snapshot = await catalog.snapshot()
+        let records = await trustStore.allRecords()
+        #if canImport(FileProvider)
+        try? fileProviderHelper.syncSharedState(snapshot: snapshot, trustRecords: records)
+        #endif
+    }
+
+    public func saveHost(_ host: Host) async throws {
+        try await catalog.save(host)
+        await syncSharedCatalogAndTrust()
+    }
+
+    public func deleteHost(id: UUID) async throws {
+        try await catalog.delete(id: id)
+        await syncSharedCatalogAndTrust()
+    }
+
+    // MARK: - File Provider Domains
+
+    public func registerFileProviderDomain(for host: Host) async throws {
+        if case .mosh = host.connection {
+            let err = FileProviderManagerError.unsupportedMoshHost(host.name)
+            self.fileProviderDomainError = err.localizedDescription
+            throw err
+        }
+        do {
+            await syncSharedCatalogAndTrust()
+            try await fileProviderHelper.registerDomain(for: host)
+            self.fileProviderDomainError = nil
+            await refreshRegisteredDomains()
+        } catch {
+            self.fileProviderDomainError = error.localizedDescription
+            throw error
+        }
+    }
+
+    public func unregisterFileProviderDomain(for host: Host) async throws {
+        do {
+            try await fileProviderHelper.unregisterDomain(for: host)
+            self.fileProviderDomainError = nil
+            await refreshRegisteredDomains()
+        } catch {
+            self.fileProviderDomainError = error.localizedDescription
+            throw error
+        }
+    }
+
+    public func refreshRegisteredDomains() async {
+        #if canImport(FileProvider)
+        do {
+            let domains = try await fileProviderHelper.registeredDomains()
+            self.registeredFileProviderDomainIDs = Set(domains.map(\.identifier.rawValue))
+        } catch {
+            // Silently ignore if query fails in simulator/unentitled environment
+        }
+        #endif
+    }
+
+    // MARK: - Vault Backup & Sync
+
+    public func exportVaultBackup(passphrase: String) async throws -> Data {
+        let snapshot = await catalog.snapshot()
+        let service = EncryptedVaultService()
+        return try service.exportBackupData(
+            catalog: snapshot,
+            preferences: VaultPreferences(
+                defaultTerminalFont: nil,
+                defaultTerminalFontSize: nil,
+                voiceProvider: selectedVoiceProviderID,
+                voiceAutoPunctuation: true,
+                customSettings: [:]
+            ),
+            passphrase: passphrase
+        )
+    }
+
+    public func previewVaultBackup(data: Data, passphrase: String) throws -> VaultPayload {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let backup = try? decoder.decode(EncryptedVaultBackup.self, from: data) else {
+            throw VaultBackupError.corruptedPayload("Invalid backup file format.")
+        }
+        let service = EncryptedVaultService()
+        return try service.restoreBackup(backup: backup, passphrase: passphrase)
+    }
+
+    public func restoreCatalog(from snapshot: CatalogSnapshot, mode: RestoreMode) async {
+        switch mode {
+        case .merge:
+            await catalog.merge(with: snapshot)
+        case .replace:
+            await catalog.replace(with: snapshot)
+        }
+        await syncSharedCatalogAndTrust()
     }
 }

@@ -98,7 +98,7 @@ struct HostListView: View {
                 .onDelete { offsets in
                     let ids = offsets.map { filtered[$0].id }
                     Task {
-                        for id in ids { try? await container.catalog.delete(id: id) }
+                        for id in ids { try? await container.deleteHost(id: id) }
                         await reload()
                     }
                 }
@@ -739,7 +739,7 @@ struct HostEditorView: View {
         guard let host = buildHost() else { return }
         Task {
             do {
-                try await container.catalog.save(host)
+                try await container.saveHost(host)
                 dismiss()
             } catch { }
         }
@@ -2907,12 +2907,27 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("settings-voice-navigation-link")
             }
+            Section("File Provider & Sync") {
+                NavigationLink {
+                    FileProviderSettingsView().environmentObject(container)
+                } label: {
+                    Label("File Provider Domains", systemImage: "folder.badge.gearshape")
+                }
+                .accessibilityIdentifier("settings-fileprovider-navigation-link")
+
+                NavigationLink {
+                    VaultBackupView().environmentObject(container)
+                } label: {
+                    Label("Vault Backup & Restore", systemImage: "lock.shield")
+                }
+                .accessibilityIdentifier("settings-vault-backup-navigation-link")
+            }
             Section("Security") {
                 Toggle("Require biometric presence (hook)", isOn: .constant(false))
                 Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill")
             }
             Section("Capabilities") {
-                Text("ProxyJump, forwarding, SFTP, and live SSH active. Mosh and non-tmux multiplexers: not enabled in this build. WhisperKit and Apple Speech voice transcription: active.")
+                Text("Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, and encrypted vault backup active. On-device WhisperKit and Apple Speech voice active. Full Mosh SSP encryption and physical device TestFlight validation pending.")
                     .font(.caption)
             }
             Section("Privacy") {
