@@ -1165,6 +1165,117 @@ public protocol HealthChecking: Sendable { func check(_ host: Host) async -> Hea
 public struct DemoHealthChecker: HealthChecking { public init() {}; public func check(_ host: Host) async -> HealthState { .unknown } }
 public protocol ForwardingService: Sendable { func start(_ rule: ForwardingRule, for host: Host) async throws; func stop(_ rule: ForwardingRule) async }
 public struct UnavailableForwardingService: ForwardingService { public init() {}; public func start(_ rule: ForwardingRule, for host: Host) async throws { throw TransportError.unsupported }; public func stop(_ rule: ForwardingRule) async {} }
+
+public protocol PortForwardingManaging: Sendable {
+    func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState
+    func stopForwarding(ruleID: UUID) async throws
+    func stopAll() async
+    func activeSessions() async -> [ForwardingSessionState]
+    func sessionState(for ruleID: UUID) async -> ForwardingSessionState?
+    func sessionStatesStream() async -> AsyncStream<[ForwardingSessionState]>
+}
+
+public actor UnavailablePortForwardingManager: PortForwardingManaging {
+    public init() {}
+    public func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState {
+        throw TransportError.unsupported
+    }
+    public func stopForwarding(ruleID: UUID) async throws {}
+    public func stopAll() async {}
+    public func activeSessions() async -> [ForwardingSessionState] { [] }
+    public func sessionState(for ruleID: UUID) async -> ForwardingSessionState? { nil }
+    public func sessionStatesStream() async -> AsyncStream<[ForwardingSessionState]> {
+        AsyncStream { $0.finish() }
+    }
+}
+
+public actor DemoPortForwardingManager: PortForwardingManaging, ForwardingService {
+    private var sessions: [UUID: ForwardingSessionState] = [:]
+    private var continuations: [UUID: AsyncStream<[ForwardingSessionState]>.Continuation] = [:]
+
+    public init(initialSessions: [ForwardingSessionState] = []) {
+        for session in initialSessions {
+            self.sessions[session.ruleID] = session
+        }
+    }
+
+    public func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState {
+        let boundPort = rule.localPort == 0 ? UInt16.random(in: 20000...60000) : rule.localPort
+        let state = ForwardingSessionState(
+            ruleID: rule.id,
+            rule: rule,
+            status: .active,
+            boundPort: boundPort,
+            activeConnectionsCount: 1,
+            bytesSent: 128,
+            bytesReceived: 256,
+            startedAt: Date(),
+            lastActivityAt: Date()
+        )
+        sessions[rule.id] = state
+        broadcast()
+        return state
+    }
+
+    public func stopForwarding(ruleID: UUID) async throws {
+        if var state = sessions[ruleID] {
+            state.status = .stopped
+            state.activeConnectionsCount = 0
+            sessions[ruleID] = state
+            broadcast()
+        }
+    }
+
+    public func stopAll() async {
+        for (id, var state) in sessions {
+            state.status = .stopped
+            state.activeConnectionsCount = 0
+            sessions[id] = state
+        }
+        broadcast()
+    }
+
+    public func activeSessions() async -> [ForwardingSessionState] {
+        Array(sessions.values.filter { $0.status == .active || $0.status == .starting })
+    }
+
+    public func sessionState(for ruleID: UUID) async -> ForwardingSessionState? {
+        sessions[ruleID]
+    }
+
+    public func sessionStatesStream() async -> AsyncStream<[ForwardingSessionState]> {
+        let id = UUID()
+        return AsyncStream { continuation in
+            self.continuations[id] = continuation
+            continuation.yield(Array(self.sessions.values))
+            continuation.onTermination = { [weak self] _ in
+                Task { [weak self] in
+                    await self?.removeContinuation(id: id)
+                }
+            }
+        }
+    }
+
+    private func removeContinuation(id: UUID) {
+        continuations.removeValue(forKey: id)
+    }
+
+    private func broadcast() {
+        let current = Array(sessions.values)
+        for cont in continuations.values {
+            cont.yield(current)
+        }
+    }
+
+    public func start(_ rule: ForwardingRule, for host: Host) async throws {
+        let pfRule = PortForwardingRule(from: rule)
+        _ = try await startForwarding(rule: pfRule)
+    }
+
+    public func stop(_ rule: ForwardingRule) async {
+        try? await stopForwarding(ruleID: rule.id)
+    }
+}
 public protocol SyncService: Sendable { func synchronize() async throws }
 public struct UnavailableSyncService: SyncService { public init() {}; public func synchronize() async throws { throw TransportError.unsupported } }
 

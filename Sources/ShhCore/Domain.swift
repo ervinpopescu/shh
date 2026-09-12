@@ -59,7 +59,94 @@ public struct SSHOptions: Codable, Hashable, Sendable {
     }
 }
 public struct MoshOptions: Codable, Hashable, Sendable { public init() {} }
-public struct ProxyJumpOptions: Codable, Hashable, Sendable { public var hopHostIDs: [UUID]; public init(hopHostIDs: [UUID] = []) { self.hopHostIDs = hopHostIDs } }
+
+public struct ProxyJumpEndpoint: Codable, Hashable, Sendable {
+    public var hostname: String
+    public var port: UInt16
+    public var username: String
+    public var identityID: UUID?
+
+    public init(hostname: String, port: UInt16 = 22, username: String, identityID: UUID? = nil) {
+        self.hostname = hostname
+        self.port = port
+        self.username = username
+        self.identityID = identityID
+    }
+}
+
+public enum ProxyJumpHop: Codable, Hashable, Sendable {
+    case hostID(UUID)
+    case endpoint(ProxyJumpEndpoint)
+}
+
+public struct ProxyJumpConfig: Codable, Hashable, Sendable {
+    public var hops: [ProxyJumpHop]
+
+    public init(hops: [ProxyJumpHop] = []) {
+        self.hops = hops
+    }
+
+    public init(hostIDs: [UUID]) {
+        self.hops = hostIDs.map { .hostID($0) }
+    }
+
+    public init(endpoints: [ProxyJumpEndpoint]) {
+        self.hops = endpoints.map { .endpoint($0) }
+    }
+
+    public var hostIDs: [UUID] {
+        hops.compactMap {
+            switch $0 {
+            case .hostID(let id): return id
+            case .endpoint: return nil
+            }
+        }
+    }
+}
+
+public struct ProxyJumpOptions: Codable, Hashable, Sendable {
+    public var config: ProxyJumpConfig
+    public var sshOptions: SSHOptions
+
+    public var hopHostIDs: [UUID] {
+        get { config.hostIDs }
+        set { config = ProxyJumpConfig(hostIDs: newValue) }
+    }
+
+    public init(config: ProxyJumpConfig, sshOptions: SSHOptions = SSHOptions()) {
+        self.config = config
+        self.sshOptions = sshOptions
+    }
+
+    public init(hopHostIDs: [UUID] = [], sshOptions: SSHOptions = SSHOptions()) {
+        self.config = ProxyJumpConfig(hostIDs: hopHostIDs)
+        self.sshOptions = sshOptions
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case config, sshOptions, hopHostIDs
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let config = try container.decodeIfPresent(ProxyJumpConfig.self, forKey: .config) {
+            self.config = config
+        } else if let hopHostIDs = try container.decodeIfPresent([UUID].self, forKey: .hopHostIDs) {
+            self.config = ProxyJumpConfig(hostIDs: hopHostIDs)
+        } else {
+            self.config = ProxyJumpConfig()
+        }
+        self.sshOptions = try container.decodeIfPresent(SSHOptions.self, forKey: .sshOptions) ?? SSHOptions()
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(config, forKey: .config)
+        try container.encode(config.hostIDs, forKey: .hopHostIDs)
+        try container.encode(sshOptions, forKey: .sshOptions)
+    }
+}
+
 public enum ConnectionProfile: Codable, Hashable, Sendable { case ssh(SSHOptions); case mosh(MoshOptions); case proxyJump(ProxyJumpOptions) }
 
 public enum HealthState: Codable, Hashable, Sendable {
@@ -94,6 +181,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     public var tmuxPreferences: HostTmuxPreferences
     public var voicePolicy: HostVoicePolicy
     public var isProduction: Bool
+    public var forwardingRules: [PortForwardingRule]
 
     public var isVoiceEnabled: Bool {
         voicePolicy.isEnabled
@@ -125,7 +213,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         defaultTmuxSession: String? = nil,
         autoAttachTmux: Bool = false,
         voicePolicy: HostVoicePolicy = .disabled,
-        isProduction: Bool? = nil
+        isProduction: Bool? = nil,
+        forwardingRules: [PortForwardingRule] = []
     ) throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "host name") }
         guard !hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "hostname") }
@@ -135,6 +224,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.groupID = groupID; self.tagIDs = tagIDs; self.identityID = identityID; self.connection = connection
         self.health = health; self.lastUsedAt = lastUsedAt
         self.voicePolicy = voicePolicy
+        self.forwardingRules = forwardingRules
         let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
         self.isProduction = isProduction ?? inferredProd
         if defaultTmuxSession != nil || autoAttachTmux {
@@ -152,7 +242,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, hostname, port, username, groupID, tagIDs, identityID, connection, health, lastUsedAt
         case tmuxPreferences, defaultTmuxSession, autoAttachTmux, autoAttach
-        case voicePolicy, isProduction
+        case voicePolicy, isProduction, forwardingRules
     }
 
     public init(from decoder: Decoder) throws {
@@ -171,6 +261,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.voicePolicy = try container.decodeIfPresent(HostVoicePolicy.self, forKey: .voicePolicy) ?? .disabled
         let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
         self.isProduction = (try? container.decodeIfPresent(Bool.self, forKey: .isProduction)) ?? inferredProd
+        self.forwardingRules = (try? container.decodeIfPresent([PortForwardingRule].self, forKey: .forwardingRules)) ?? []
 
         if let prefs = try container.decodeIfPresent(HostTmuxPreferences.self, forKey: .tmuxPreferences) {
             self.tmuxPreferences = prefs
@@ -201,6 +292,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         try container.encode(autoAttachTmux, forKey: .autoAttachTmux)
         try container.encode(voicePolicy, forKey: .voicePolicy)
         try container.encode(isProduction, forKey: .isProduction)
+        try container.encode(forwardingRules, forKey: .forwardingRules)
     }
 }
 
@@ -242,6 +334,169 @@ public struct ForwardingRule: Identifiable, Codable, Hashable, Sendable {
     public var requiresNonLoopbackApproval: Bool { bindAddress != "127.0.0.1" && bindAddress != "::1" && bindAddress.lowercased() != "localhost" }
 }
 
+public enum PortForwardingType: String, Codable, CaseIterable, Sendable {
+    case local
+    case remote
+    case dynamic
+}
+
+public struct PortForwardingRule: Identifiable, Codable, Hashable, Sendable {
+    public let id: UUID
+    public var name: String
+    public var type: PortForwardingType
+    public var localHost: String
+    public var localPort: UInt16
+    public var remoteHost: String?
+    public var remotePort: UInt16?
+    public var enabled: Bool
+
+    public var isEnabled: Bool {
+        get { enabled }
+        set { enabled = newValue }
+    }
+
+    public init(
+        id: UUID = UUID(),
+        name: String = "",
+        type: PortForwardingType,
+        localHost: String = "127.0.0.1",
+        localPort: UInt16,
+        remoteHost: String? = nil,
+        remotePort: UInt16? = nil,
+        enabled: Bool = true
+    ) throws {
+        guard !localHost.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ShhValidationError.invalidBindAddress
+        }
+        if type == .local {
+            guard let rHost = remoteHost?.trimmingCharacters(in: .whitespacesAndNewlines), !rHost.isEmpty else {
+                throw ShhValidationError.invalidDestination
+            }
+            guard let rPort = remotePort, rPort > 0 else {
+                throw ShhValidationError.invalidDestination
+            }
+        } else if type == .remote {
+            guard let rHost = remoteHost?.trimmingCharacters(in: .whitespacesAndNewlines), !rHost.isEmpty else {
+                throw ShhValidationError.invalidDestination
+            }
+            guard remotePort != nil else {
+                throw ShhValidationError.invalidDestination
+            }
+        }
+        self.id = id
+        self.name = name.isEmpty ? "\(type.rawValue) :\(localPort)" : name
+        self.type = type
+        self.localHost = localHost
+        self.localPort = localPort
+        self.remoteHost = remoteHost
+        self.remotePort = remotePort
+        self.enabled = enabled
+    }
+
+    public init(from rule: ForwardingRule, name: String = "", enabled: Bool = true) {
+        self.id = rule.id
+        self.name = name.isEmpty ? "\(rule.mode.rawValue) :\(rule.bindPort)" : name
+        switch rule.mode {
+        case .local: self.type = .local
+        case .remote: self.type = .remote
+        case .dynamicSOCKS: self.type = .dynamic
+        }
+        self.localHost = rule.bindAddress
+        self.localPort = rule.bindPort
+        self.remoteHost = rule.destinationHost
+        self.remotePort = rule.destinationPort
+        self.enabled = enabled
+    }
+
+    public func toForwardingRule() throws -> ForwardingRule {
+        let mode: ForwardingMode
+        switch type {
+        case .local: mode = .local
+        case .remote: mode = .remote
+        case .dynamic: mode = .dynamicSOCKS
+        }
+        return try ForwardingRule(
+            id: id,
+            mode: mode,
+            bindAddress: localHost,
+            bindPort: localPort,
+            destinationHost: remoteHost,
+            destinationPort: remotePort
+        )
+    }
+
+    public var requiresNonLoopbackApproval: Bool {
+        localHost != "127.0.0.1" && localHost != "::1" && localHost.lowercased() != "localhost"
+    }
+}
+
+public struct PortForwardingProfile: Identifiable, Codable, Hashable, Sendable {
+    public let id: UUID
+    public var name: String
+    public var hostID: UUID?
+    public var rules: [PortForwardingRule]
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        hostID: UUID? = nil,
+        rules: [PortForwardingRule] = []
+    ) {
+        self.id = id
+        self.name = name
+        self.hostID = hostID
+        self.rules = rules
+    }
+}
+
+public enum ForwardingStatus: Codable, Hashable, Sendable {
+    case starting
+    case active
+    case paused
+    case failed(reason: String)
+    case stopped
+}
+
+public struct ForwardingSessionState: Identifiable, Codable, Hashable, Sendable {
+    public let id: UUID
+    public var ruleID: UUID
+    public var rule: PortForwardingRule
+    public var status: ForwardingStatus
+    public var boundPort: UInt16?
+    public var activeConnectionsCount: Int
+    public var bytesSent: Int64
+    public var bytesReceived: Int64
+    public var startedAt: Date?
+    public var lastActivityAt: Date?
+    public var errorDescription: String?
+
+    public init(
+        id: UUID = UUID(),
+        ruleID: UUID,
+        rule: PortForwardingRule,
+        status: ForwardingStatus = .starting,
+        boundPort: UInt16? = nil,
+        activeConnectionsCount: Int = 0,
+        bytesSent: Int64 = 0,
+        bytesReceived: Int64 = 0,
+        startedAt: Date? = nil,
+        lastActivityAt: Date? = nil,
+        errorDescription: String? = nil
+    ) {
+        self.id = id
+        self.ruleID = ruleID
+        self.rule = rule
+        self.status = status
+        self.boundPort = boundPort
+        self.activeConnectionsCount = activeConnectionsCount
+        self.bytesSent = bytesSent
+        self.bytesReceived = bytesReceived
+        self.startedAt = startedAt
+        self.lastActivityAt = lastActivityAt
+        self.errorDescription = errorDescription
+    }
+}
+
 public struct Snippet: Identifiable, Codable, Hashable, Sendable {
     public let id: UUID; public var name: String; public var body: String; public var argumentSchema: [String]; public let createdAt: Date
     public init(id: UUID = UUID(), name: String, body: String, argumentSchema: [String] = [], createdAt: Date = Date()) throws {
@@ -267,9 +522,9 @@ public enum RemoteMultiplexer: String, Codable, CaseIterable, Sendable { case tm
 public enum CapabilityAvailability: Codable, Hashable, Sendable { case available; case unavailable(reason: String) }
 public struct CapabilityMatrix: Codable, Hashable, Sendable {
     public var mosh: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
-    public var proxyJump: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
-    public var forwarding: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
-    public var sftp: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
+    public var proxyJump: CapabilityAvailability = .available
+    public var forwarding: CapabilityAvailability = .available
+    public var sftp: CapabilityAvailability = .available
     public var tmux: CapabilityAvailability = .unavailable(reason: "Not enabled in this build")
     public init() {}
 }
