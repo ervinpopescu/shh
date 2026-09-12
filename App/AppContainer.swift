@@ -5,6 +5,13 @@ import ShhTerminal
 import ShhVoice
 import SwiftUI
 
+private final class VoiceInterruptionBridge: @unchecked Sendable {
+    var onInterruption: (@Sendable () -> Void)?
+    func trigger() {
+        onInterruption?()
+    }
+}
+
 @MainActor
 final class AppContainer: ObservableObject {
     let catalog: InMemoryCatalog
@@ -54,6 +61,7 @@ final class AppContainer: ObservableObject {
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
     private var tmuxRefreshGeneration: Int = 0
+    private var voiceTranscriptionGeneration: Int = 0
 
     var isDemo: Bool {
         transport is DemoSSHTransport
@@ -127,7 +135,16 @@ final class AppContainer: ObservableObject {
         self.voiceRegistry = resolvedRegistry
         self.selectedVoiceProviderID = resolvedRegistry.selectedProviderID
 
-        self.voiceRecorder = voiceRecorder ?? AudioCaptureRecorder()
+        let bridge = VoiceInterruptionBridge()
+        if let recorder = voiceRecorder {
+            self.voiceRecorder = recorder
+        } else {
+            self.voiceRecorder = AudioCaptureRecorder(
+                onInterruption: {
+                    bridge.trigger()
+                }
+            )
+        }
         self.voiceRouter = voiceRouter
         self.transcriber = transcriber ?? resolvedRegistry.activeTranscriber()
         self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
@@ -137,6 +154,12 @@ final class AppContainer: ObservableObject {
         self.reachabilityMonitor = monitor
         let coordinator = reconnectCoordinator ?? ReconnectCoordinator()
         self.reconnectCoordinator = coordinator
+
+        bridge.onInterruption = { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.cancelVoiceRecording()
+            }
+        }
 
         Task { [weak self] in
             await coordinator.setStateChangeHandler { [weak self] newState in
@@ -1200,6 +1223,8 @@ final class AppContainer: ObservableObject {
             throw AudioRecorderError.deviceUnavailable(reason: "No active host")
         }
 
+        voiceTranscriptionGeneration += 1
+        let gen = voiceTranscriptionGeneration
         let effectiveMode = mode ?? defaultVoiceMode
         isRecordingVoice = false
         isSlideToCancelActive = false
@@ -1211,6 +1236,9 @@ final class AppContainer: ObservableObject {
         do {
             handle = try await voiceRecorder.stop()
         } catch {
+            guard voiceTranscriptionGeneration == gen else {
+                throw TranscriptionError.cancelled
+            }
             isTranscribingVoice = false
             speechState = .idle
             voiceErrorMessage = error.localizedDescription
@@ -1223,13 +1251,20 @@ final class AppContainer: ObservableObject {
         }
 
         do {
+            guard voiceTranscriptionGeneration == gen && isTranscribingVoice else {
+                throw TranscriptionError.cancelled
+            }
             try Task.checkCancellation()
             let transcriber = activeTranscriber
             let transcript = try await transcriber.transcribe(recording: handle) { [weak self] fraction in
                 Task { @MainActor [weak self] in
-                    self?.voiceProgressFraction = fraction
-                    self?.speechState = .transcribingWithProgress(fractionCompleted: fraction)
+                    guard let self, self.voiceTranscriptionGeneration == gen, self.isTranscribingVoice else { return }
+                    self.voiceProgressFraction = fraction
+                    self.speechState = .transcribingWithProgress(fractionCompleted: fraction)
                 }
+            }
+            guard voiceTranscriptionGeneration == gen && isTranscribingVoice else {
+                throw TranscriptionError.cancelled
             }
             try Task.checkCancellation()
 
@@ -1247,15 +1282,24 @@ final class AppContainer: ObservableObject {
             self.isTranscribingVoice = false
             return preview
         } catch is CancellationError {
+            guard voiceTranscriptionGeneration == gen else {
+                throw TranscriptionError.cancelled
+            }
             self.isTranscribingVoice = false
             self.speechState = .cancelled
             throw TranscriptionError.cancelled
         } catch let err as TranscriptionError {
+            guard voiceTranscriptionGeneration == gen else {
+                throw TranscriptionError.cancelled
+            }
             self.isTranscribingVoice = false
             self.speechState = (err == .cancelled) ? .cancelled : .failed(err)
             self.voiceErrorMessage = err.localizedDescription
             throw err
         } catch {
+            guard voiceTranscriptionGeneration == gen else {
+                throw TranscriptionError.cancelled
+            }
             self.isTranscribingVoice = false
             let err = TranscriptionError.transcriptionFailed(reason: error.localizedDescription)
             self.speechState = .failed(err)
@@ -1265,6 +1309,7 @@ final class AppContainer: ObservableObject {
     }
 
     func cancelVoiceRecording() async {
+        voiceTranscriptionGeneration += 1
         isRecordingVoice = false
         isSlideToCancelActive = false
         isTranscribingVoice = false
@@ -1274,6 +1319,7 @@ final class AppContainer: ObservableObject {
     }
 
     func resetVoiceState() {
+        voiceTranscriptionGeneration += 1
         isRecordingVoice = false
         isSlideToCancelActive = false
         isTranscribingVoice = false

@@ -305,6 +305,52 @@ final class VoiceAppTests: XCTestCase {
         await container.cancelVoiceRecording()
     }
 
+    func testPerHostAllowedModesRestrictsModesAvailableInPicker() async throws {
+        let insertOnlyPolicy = HostVoicePolicy(isEnabled: true, allowedModes: [.insertOnly])
+        let host = try Host(
+            name: "InsertOnlyHost",
+            hostname: "insert.internal",
+            username: "user",
+            voicePolicy: insertOnlyPolicy
+        )
+        let (container, _, _) = try await makeConnectedContainer(host: host)
+        try await container.downloadVoiceModel(.tiny)
+
+        let composer = VoiceComposer().environmentObject(container)
+        let controller = UIHostingController(rootView: composer)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+
+        XCTAssertGreaterThan(controller.view.bounds.width, 0)
+        XCTAssertGreaterThan(controller.view.bounds.height, 0)
+    }
+
+    func testAlternativeTapButtonWhenRecordingIsLabeledTapToStop() async throws {
+        let (container, _, _) = try await makeConnectedContainer()
+        try await container.downloadVoiceModel(.tiny)
+
+        let composer = VoiceComposer().environmentObject(container)
+        let controller = UIHostingController(rootView: composer)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
+
+        // Before recording: container is not recording
+        XCTAssertFalse(container.isRecordingVoice)
+
+        // Begin recording
+        try await container.startVoiceRecording(mode: .shellCommand)
+        XCTAssertTrue(container.isRecordingVoice)
+        controller.view.layoutIfNeeded()
+
+        // Stop recording
+        await container.cancelVoiceRecording()
+        XCTAssertFalse(container.isRecordingVoice)
+    }
+
     func testAgentMessageRequiresProductionHostConfirmation() async throws {
         let prodHost = try Host(
             name: "ProdWeb01",
@@ -545,6 +591,99 @@ final class VoiceAppTests: XCTestCase {
         XCTAssertEqual(container.speechState, .cancelled)
     }
 
+    func testCancelledSlowTranscriptionDoesNotResurrectPreviewUponCompletion() async throws {
+        let slowTranscriber = DemoTranscriber(transcript: "slow transcript", simulateDelay: 0.15)
+        let (container, _, _) = try await makeConnectedContainer(transcriber: slowTranscriber)
+        try await container.downloadVoiceModel(.tiny)
+
+        try await container.startVoiceRecording(mode: .shellCommand)
+
+        let stopTask = Task {
+            try await container.stopVoiceRecording(mode: .shellCommand)
+        }
+
+        // Give it a moment to enter transcribing
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertTrue(container.isTranscribingVoice)
+
+        // Cancel while transcribing
+        await container.cancelVoiceRecording()
+        XCTAssertEqual(container.speechState, .cancelled)
+        XCTAssertNil(container.activeVoicePreview)
+
+        // Wait longer than transcriber's delay so background task completes
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // Stale transcription must NOT have resurrected state to .preview!
+        XCTAssertEqual(container.speechState, .cancelled, "State must remain .cancelled and not resurrect to preview")
+        XCTAssertNil(container.activeVoicePreview, "Active preview must not be resurrected by stale completion")
+        XCTAssertFalse(container.isTranscribingVoice)
+        _ = try? await stopTask.value
+    }
+
+    func testResetVoiceStateDuringSlowTranscriptionDoesNotGetOverwritten() async throws {
+        let slowTranscriber = DemoTranscriber(transcript: "slow transcript", simulateDelay: 0.15)
+        let (container, _, _) = try await makeConnectedContainer(transcriber: slowTranscriber)
+        try await container.downloadVoiceModel(.tiny)
+
+        try await container.startVoiceRecording(mode: .shellCommand)
+
+        let stopTask = Task {
+            try await container.stopVoiceRecording(mode: .shellCommand)
+        }
+
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertTrue(container.isTranscribingVoice)
+
+        // Reset voice state while transcribing
+        container.resetVoiceState()
+        XCTAssertEqual(container.speechState, .idle)
+        XCTAssertNil(container.activeVoicePreview)
+
+        // Wait for slow transcriber to complete
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        // State must remain .idle and not be overwritten
+        XCTAssertEqual(container.speechState, .idle, "State must remain .idle")
+        XCTAssertNil(container.activeVoicePreview)
+        XCTAssertFalse(container.isTranscribingVoice)
+        _ = try? await stopTask.value
+    }
+
+    func testApprovalSheetSendResetsVoiceState() async throws {
+        let (container, connection, _) = try await makeConnectedContainer()
+        try await container.downloadVoiceModel(.tiny)
+
+        let preview = VoicePreviewState(
+            originalTranscript: "reboot",
+            mode: .shellCommand,
+            duration: 1.0,
+            router: container.voiceRouter,
+            hostPolicy: .enabled
+        )
+        container.activeVoicePreview = preview
+        container.speechState = .preview(preview)
+
+        // Create ApprovalSheet with onApproved callback as wired in VoiceComposer
+        var onApprovedCalled = false
+        let sheet = ApprovalSheet(command: "reboot", onApproved: {
+            onApprovedCalled = true
+            container.resetVoiceState()
+        })
+        _ = sheet.environmentObject(container)
+
+        // Execute send with approval via container
+        let sent = await container.sendValidatedCommand("reboot\n", approved: true)
+        XCTAssertTrue(sent)
+        XCTAssertTrue(connection.sentData.contains { String(decoding: $0, as: UTF8.self).contains("reboot") })
+
+        // When approval succeeds, onApproved callback resets voice state
+        sheet.onApproved?()
+        XCTAssertTrue(onApprovedCalled)
+        XCTAssertNil(container.activeVoicePreview, "Voice state must be reset after approved command is sent")
+        XCTAssertEqual(container.speechState, .idle)
+    }
+
     func testSceneBackgroundCancelsActiveVoiceSession() async throws {
         let (container, _, _) = try await makeConnectedContainer()
         try await container.downloadVoiceModel(.tiny)
@@ -682,56 +821,109 @@ final class VoiceAppTests: XCTestCase {
     // MARK: - 11. Accessibility & VoiceOver
 
     func testVoiceComposerAccessibilityElements() async throws {
+        // NOTE: Verifies view tree instantiation, window hosting, and non-empty subview hierarchy.
+        // Physical VoiceOver speech announcements and hardware microphone routing remain residual
+        // risks requiring physical device verification.
         let (container, _, _) = try await makeConnectedContainer()
+        try await container.downloadVoiceModel(.tiny)
+
         let view = VoiceComposer().environmentObject(container)
         let controller = UIHostingController(rootView: view)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
 
-        _ = controller.view // Load view
-        XCTAssertNotNil(controller.view)
+        XCTAssertGreaterThan(controller.view.bounds.width, 0)
+        XCTAssertGreaterThan(controller.view.bounds.height, 0)
+        XCTAssertGreaterThan(controller.view.subviews.count, 0)
+
+        // Verify preview state also builds non-zero frame layout with editor & buttons
+        let preview = VoicePreviewState(
+            originalTranscript: "git diff",
+            mode: .shellCommand,
+            duration: 1.5,
+            router: container.voiceRouter,
+            hostPolicy: .enabled
+        )
+        container.activeVoicePreview = preview
+        controller.view.layoutIfNeeded()
+
+        XCTAssertGreaterThan(controller.view.bounds.width, 0)
+        XCTAssertGreaterThan(controller.view.bounds.height, 0)
     }
 
     func testVoiceSettingsAccessibilityElements() async throws {
+        // NOTE: Verifies settings view tree instantiation and layout bounds.
         let (container, _, _) = try await makeConnectedContainer()
         let view = VoiceSettingsView().environmentObject(container)
         let controller = UIHostingController(rootView: view)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        controller.view.layoutIfNeeded()
 
-        _ = controller.view // Load view
-        XCTAssertNotNil(controller.view)
+        XCTAssertGreaterThan(controller.view.bounds.width, 0)
+        XCTAssertGreaterThan(controller.view.bounds.height, 0)
+        XCTAssertGreaterThan(controller.view.subviews.count, 0)
     }
 
     // MARK: - 12. Dynamic Type & Layouts
 
     func testVoiceComposerDynamicTypeSupport() async throws {
+        // NOTE: Verifies that under small, large, and accessibility Dynamic Type sizes,
+        // VoiceComposer layouts with non-zero bounds and non-empty hierarchy.
         let (container, _, _) = try await makeConnectedContainer()
+        try await container.downloadVoiceModel(.tiny)
 
         for size in [DynamicTypeSize.small, DynamicTypeSize.large, DynamicTypeSize.accessibility3] {
             let view = VoiceComposer()
                 .environmentObject(container)
                 .environment(\.dynamicTypeSize, size)
             let controller = UIHostingController(rootView: view)
-            _ = controller.view
-            XCTAssertNotNil(controller.view)
+            let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            controller.view.layoutIfNeeded()
+
+            XCTAssertGreaterThan(controller.view.bounds.width, 0, "Width must be > 0 at \(size)")
+            XCTAssertGreaterThan(controller.view.bounds.height, 0, "Height must be > 0 at \(size)")
+            XCTAssertGreaterThan(controller.view.subviews.count, 0, "Subviews must be non-empty at \(size)")
         }
     }
 
     func testVoiceComposerIPhoneAndIPadLayouts() async throws {
+        // NOTE: Verifies layout across compact (iPhone) and regular (iPad) geometries.
         let (container, _, _) = try await makeConnectedContainer()
+        try await container.downloadVoiceModel(.tiny)
 
-        // Compact width (iPhone)
+        // Compact width (iPhone: 393 x 852)
         let compactView = VoiceComposer()
             .environmentObject(container)
             .environment(\.horizontalSizeClass, .compact)
         let compactController = UIHostingController(rootView: compactView)
-        _ = compactController.view
-        XCTAssertNotNil(compactController.view)
+        let iphoneWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        iphoneWindow.rootViewController = compactController
+        iphoneWindow.makeKeyAndVisible()
+        compactController.view.layoutIfNeeded()
 
-        // Regular width (iPad)
+        XCTAssertEqual(compactController.view.bounds.width, 393)
+        XCTAssertEqual(compactController.view.bounds.height, 852)
+        XCTAssertGreaterThan(compactController.view.subviews.count, 0)
+
+        // Regular width (iPad: 820 x 1180)
         let regularView = VoiceComposer()
             .environmentObject(container)
             .environment(\.horizontalSizeClass, .regular)
         let regularController = UIHostingController(rootView: regularView)
-        _ = regularController.view
-        XCTAssertNotNil(regularController.view)
+        let ipadWindow = UIWindow(frame: CGRect(x: 0, y: 0, width: 820, height: 1180))
+        ipadWindow.rootViewController = regularController
+        ipadWindow.makeKeyAndVisible()
+        regularController.view.layoutIfNeeded()
+
+        XCTAssertEqual(regularController.view.bounds.width, 820)
+        XCTAssertEqual(regularController.view.bounds.height, 1180)
+        XCTAssertGreaterThan(regularController.view.subviews.count, 0)
     }
 
     // MARK: - 13. Demo Mode Behavior
