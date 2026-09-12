@@ -96,6 +96,23 @@ final class ShhCoreTests: XCTestCase {
         XCTAssertEqual(policy.classify("tmux display-message -p '#(date)'"), .reviewRequired)
     }
 
+    func testCommandPolicyInspectsMoshServerArguments() {
+        let policy = CommandPolicy()
+        // Destructive commands after -- must be blocked
+        XCTAssertEqual(policy.classify("mosh-server new -- rm -rf /"), .blocked)
+        XCTAssertEqual(policy.classify("mosh-server new -- tmux kill-server"), .blocked)
+        XCTAssertEqual(policy.classify("mosh-server new -- dd if=/dev/zero of=/dev/sda"), .blocked)
+        XCTAssertFalse(policy.canSend("mosh-server new -- rm -rf /", approved: true))
+
+        // Destructive commands as positional arguments without -- must also be blocked
+        XCTAssertEqual(policy.classify("mosh-server new rm -rf /"), .blocked)
+
+        // Non-destructive commands should require review, not be blocked
+        XCTAssertEqual(policy.classify("mosh-server new -s -c 256"), .reviewRequired)
+        XCTAssertEqual(policy.classify("mosh-server new -- ls -la"), .reviewRequired)
+        XCTAssertTrue(policy.canSend("mosh-server new -- ls -la", approved: true))
+    }
+
     func testCommandPolicyIgnoresOnlyTrailingLineEndings() {
         let policy = CommandPolicy()
         XCTAssertTrue(policy.canSend("printf hello\n", approved: false))

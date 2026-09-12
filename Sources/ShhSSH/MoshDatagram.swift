@@ -44,8 +44,8 @@ public struct MoshDatagram: Equatable, Sendable {
     public static func decode(from data: Data) -> MoshDatagram? {
         guard data.count >= 17 else { return nil }
         guard let kind = Kind(rawValue: data[0]) else { return nil }
-        let seq = data.subdata(in: 1..<9).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
-        let ts = data.subdata(in: 9..<17).withUnsafeBytes { $0.load(as: UInt64.self).bigEndian }
+        let seq = data.subdata(in: 1..<9).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).bigEndian }
+        let ts = data.subdata(in: 9..<17).withUnsafeBytes { $0.loadUnaligned(as: UInt64.self).bigEndian }
         let payload = data.count > 17 ? data.subdata(in: 17..<data.count) : Data()
         return MoshDatagram(kind: kind, sequenceNumber: seq, timestamp: ts, payload: payload)
     }
@@ -214,12 +214,22 @@ public final class LiveMoshDatagramChannel: MoshDatagramChannel, @unchecked Send
             guard !isCancelled, let conn = connection else { return }
             conn.receiveMessage { [weak self] content, _, _, error in
                 guard let self else { return }
+                let (isActiveConnection, channelCancelled) = self.lock.withLock {
+                    (self.connection === conn, self.isCancelled)
+                }
+                guard isActiveConnection, !channelCancelled else {
+                    return
+                }
+
                 if let data = content, !data.isEmpty {
                     _ = self.lock.withLock {
                         self.streamContinuation?.yield(data)
                     }
                 }
                 if let error {
+                    if case .posix(let code) = error, code == .ECANCELED {
+                        return
+                    }
                     self.lock.withLock {
                         self.streamContinuation?.finish(throwing: error)
                     }

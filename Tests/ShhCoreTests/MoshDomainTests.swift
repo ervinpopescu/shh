@@ -306,4 +306,104 @@ final class MoshDomainTests: XCTestCase {
 
         await connection.close()
     }
+
+    func testMoshSessionKeyEqualityAndHashingComparesRawBytes() {
+        let key1 = MoshSessionKey(base64: "token-abc-123")
+        let key2 = MoshSessionKey(base64: "token-abc-123")
+        let key3 = MoshSessionKey(base64: "different-token")
+
+        XCTAssertEqual(key1, key2)
+        XCTAssertNotEqual(key1, key3)
+        XCTAssertEqual(key1.hashValue, key2.hashValue)
+
+        key1.zeroize()
+        XCTAssertNotEqual(key1, key2)
+
+        key2.zeroize()
+        XCTAssertEqual(key1, key2)
+    }
+
+    func testDemoMoshTransportUnknownKeyRequiresApproval() async throws {
+        struct RejectEvaluator: HostTrustEvaluator {
+            func status(for challenge: HostKeyChallenge) async -> TrustStatus { .unknown }
+            func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision { .reject }
+        }
+
+        let transport = DemoMoshTransport()
+        let host = try Host(
+            name: "Demo Mosh Host",
+            hostname: "mosh.demo.local",
+            port: 22,
+            username: "demo",
+            connection: .mosh(MoshOptions())
+        )
+
+        do {
+            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: RejectEvaluator())
+            XCTFail("Expected hostKeyApprovalRequired")
+        } catch let error as TransportError {
+            guard case .hostKeyApprovalRequired(let challenge) = error else {
+                XCTFail("Expected .hostKeyApprovalRequired, got \(error)")
+                return
+            }
+            XCTAssertEqual(challenge.hostname, "mosh.demo.local")
+        }
+    }
+
+    func testDemoMoshTransportStrictHostKeyCheckingRejectsUnknownKey() async throws {
+        struct RejectEvaluator: HostTrustEvaluator {
+            func status(for challenge: HostKeyChallenge) async -> TrustStatus { .unknown }
+            func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision { .reject }
+        }
+
+        let transport = DemoMoshTransport()
+        let host = try Host(
+            name: "Demo Mosh Host",
+            hostname: "mosh.demo.local",
+            port: 22,
+            username: "demo",
+            connection: .mosh(MoshOptions(sshOptions: SSHOptions(strictHostKeyChecking: .trustedOnly)))
+        )
+
+        do {
+            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: RejectEvaluator())
+            XCTFail("Expected remoteFailure")
+        } catch let error as TransportError {
+            guard case .remoteFailure(let reason) = error else {
+                XCTFail("Expected .remoteFailure, got \(error)")
+                return
+            }
+            XCTAssertEqual(reason, "Host key is not trusted")
+        }
+    }
+
+    func testDemoMoshTransportChangedKeyThrowsHostKeyChanged() async throws {
+        struct ChangedEvaluator: HostTrustEvaluator {
+            func status(for challenge: HostKeyChallenge) async -> TrustStatus {
+                .changed(oldFingerprint: "SHA256:old-fingerprint-999")
+            }
+            func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision { .reject }
+        }
+
+        let transport = DemoMoshTransport()
+        let host = try Host(
+            name: "Demo Mosh Host",
+            hostname: "mosh.demo.local",
+            port: 22,
+            username: "demo",
+            connection: .mosh(MoshOptions())
+        )
+
+        do {
+            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: ChangedEvaluator())
+            XCTFail("Expected hostKeyChanged")
+        } catch let error as TransportError {
+            guard case .hostKeyChanged(let old, let new) = error else {
+                XCTFail("Expected .hostKeyChanged, got \(error)")
+                return
+            }
+            XCTAssertEqual(old, "SHA256:old-fingerprint-999")
+            XCTAssertEqual(new, "SHA256:demo-mosh-fingerprint")
+        }
+    }
 }

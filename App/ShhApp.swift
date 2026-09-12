@@ -502,6 +502,12 @@ struct HostEditorView: View {
                                     .accessibilityIdentifier("host-editor-mosh-port-end-field")
                                     .accessibilityLabel("Mosh end port")
                             }
+                            if !isMoshPortRangeValid {
+                                Text("Port numbers must be between 1 and 65535.")
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                                    .accessibilityIdentifier("host-editor-mosh-port-range-error")
+                            }
                         }
 
                         Picker("Prediction Mode", selection: $moshPredictionMode) {
@@ -662,9 +668,10 @@ struct HostEditorView: View {
         }
     }
 
-    private func save() {
-        guard isTmuxPreferenceValid else { return }
-        if connectionType == .proxyJump && bastionHops.isEmpty { return }
+    func buildHost() -> Host? {
+        guard isTmuxPreferenceValid else { return nil }
+        guard isMoshPortRangeValid else { return nil }
+        if connectionType == .proxyJump && bastionHops.isEmpty { return nil }
         let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
         let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
         var allowedModes: Set<VoiceInputMode> = []
@@ -678,6 +685,8 @@ struct HostEditorView: View {
         if case .ssh(let opts) = existing?.connection {
             existingSSH = opts
         } else if case .proxyJump(let opts) = existing?.connection {
+            existingSSH = opts.sshOptions
+        } else if case .mosh(let opts) = existing?.connection {
             existingSSH = opts.sshOptions
         } else {
             existingSSH = SSHOptions()
@@ -709,21 +718,25 @@ struct HostEditorView: View {
             profile = .ssh(existingSSH)
         }
 
-        guard let portNumber = UInt16(port),
-              let host = try? Host(
-                  id: existing?.id ?? UUID(),
-                  name: name,
-                  hostname: hostname,
-                  port: portNumber,
-                  username: username,
-                  identityID: identityID,
-                  connection: profile,
-                  defaultTmuxSession: sessionPref,
-                  autoAttachTmux: autoAttachTmux,
-                  voicePolicy: voicePolicy,
-                  isProduction: isProductionHost,
-                  forwardingRules: forwardingRules
-              ) else { return }
+        guard let portNumber = UInt16(port) else { return nil }
+        return try? Host(
+            id: existing?.id ?? UUID(),
+            name: name,
+            hostname: hostname,
+            port: portNumber,
+            username: username,
+            identityID: identityID,
+            connection: profile,
+            defaultTmuxSession: sessionPref,
+            autoAttachTmux: autoAttachTmux,
+            voicePolicy: voicePolicy,
+            isProduction: isProductionHost,
+            forwardingRules: forwardingRules
+        )
+    }
+
+    func save() {
+        guard let host = buildHost() else { return }
         Task {
             do {
                 try await container.catalog.save(host)
@@ -1113,33 +1126,33 @@ struct SessionView: View {
                 .accessibilityIdentifier("session-forwarders-indicator")
             }
 
-            if let moshState = container.moshState {
+            if let moshState = container.moshState, moshState.isRoaming {
                 Text("•")
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
-                if moshState.isRoaming {
-                    Label("Network Roaming - Re-syncing", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .accessibilityLabel("Network roaming re-syncing")
-                        .accessibilityIdentifier("mosh-roaming-indicator")
-                } else if let port = container.moshSessionPort {
-                    Label("Connected via Mosh (UDP :\(port))", systemImage: "bolt.horizontal.fill")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .accessibilityLabel("Connected via Mosh UDP port \(port)")
-                        .accessibilityIdentifier("mosh-connected-indicator")
-                }
-            } else if let port = container.moshSessionPort, container.activeSession?.state == .connected {
+                Label("Network Roaming - Re-syncing", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .accessibilityLabel("Network roaming re-syncing")
+                    .accessibilityIdentifier("mosh-roaming-indicator")
+            } else if container.activeSession?.state == .connected,
+                      (container.moshState == nil || container.moshState?.isConnected == true),
+                      let port = container.moshSessionPort {
                 Text("•")
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
                 Label("Connected via Mosh (UDP :\(port))", systemImage: "bolt.horizontal.fill")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .accessibilityLabel("Connected via Mosh UDP port \(port)")
                     .accessibilityIdentifier("mosh-connected-indicator")
-            } else if let errorMsg = container.forwardingErrorMessage {
+            }
+
+            if let errorMsg = container.forwardingErrorMessage {
                 Text("•")
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)

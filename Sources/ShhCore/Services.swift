@@ -845,6 +845,14 @@ public struct CommandPolicy: Sendable {
             }
             return risk
         }
+        if executable == "mosh-server" {
+            let risk = moshServerRisk(arguments)
+            if risk == .blocked { return .blocked }
+            if words.prefix(executableIndex).contains(where: { commandName($0) == "sudo" }) {
+                return .reviewRequired
+            }
+            return risk
+        }
         if executable == "python" || executable == "python3" || executable == "perl" || executable == "ruby" || executable == "node" {
             return .reviewRequired
         }
@@ -1093,6 +1101,39 @@ public struct CommandPolicy: Sendable {
         default:
             return .reviewRequired
         }
+    }
+
+    private func moshServerRisk(_ arguments: [String]) -> CommandRisk {
+        var nestedCmd: String?
+        if let dashDashIndex = arguments.firstIndex(of: "--"), dashDashIndex + 1 < arguments.count {
+            nestedCmd = arguments.dropFirst(dashDashIndex + 1).joined(separator: " ")
+        } else {
+            var idx = 0
+            while idx < arguments.count {
+                let arg = arguments[idx]
+                if arg == "new" {
+                    idx += 1
+                    continue
+                }
+                if ["-p", "-i", "-c", "-l"].contains(arg) {
+                    idx += 2
+                    continue
+                }
+                if arg.hasPrefix("-") {
+                    idx += 1
+                    continue
+                }
+                nestedCmd = arguments.dropFirst(idx).joined(separator: " ")
+                break
+            }
+        }
+
+        if let nestedCmd, !nestedCmd.isEmpty {
+            if classify(nestedCmd) == .blocked {
+                return .blocked
+            }
+        }
+        return .reviewRequired
     }
 
     private func herdrPaneRunRisk(nonOptionOperands: [String], allArguments: [String]) -> CommandRisk {
