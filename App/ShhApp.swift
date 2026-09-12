@@ -1387,6 +1387,8 @@ struct MultiplexerPicker: View {
 
                 if selected == .tmux {
                     tmuxContent
+                } else if selected == .herdr {
+                    herdrContent
                 } else {
                     deferredMultiplexerContent
                 }
@@ -1399,28 +1401,49 @@ struct MultiplexerPicker: View {
                         .accessibilityLabel("Close multiplexer sheet")
                         .accessibilityIdentifier("multiplexer-done-button")
                 }
-                if selected == .tmux && container.activeSession?.state == .connected {
+                if (selected == .tmux || selected == .herdr) && container.activeSession?.state == .connected {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(action: {
-                            Task { await container.refreshTmuxState() }
+                            Task {
+                                if selected == .tmux {
+                                    await container.refreshTmuxState()
+                                } else if selected == .herdr {
+                                    await container.refreshHerdrState()
+                                }
+                            }
                         }) {
-                            if container.isProbingTmux {
+                            if (selected == .tmux && container.isProbingTmux) || (selected == .herdr && container.isProbingHerdr) {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
                                 Image(systemName: "arrow.clockwise")
                             }
                         }
-                        .disabled(container.isProbingTmux)
-                        .accessibilityLabel("Refresh tmux sessions")
-                        .accessibilityIdentifier("refresh-tmux-button")
+                        .disabled((selected == .tmux && container.isProbingTmux) || (selected == .herdr && container.isProbingHerdr))
+                        .accessibilityLabel(selected == .tmux ? "Refresh tmux sessions" : "Refresh Herdr workspaces")
+                        .accessibilityIdentifier(selected == .tmux ? "refresh-tmux-button" : "refresh-herdr-button")
                     }
                 }
             }
             .task {
                 loadHostPreferences()
                 if container.activeSession?.state == .connected {
-                    await container.refreshTmuxState()
+                    if selected == .tmux {
+                        await container.refreshTmuxState()
+                    } else if selected == .herdr {
+                        await container.refreshHerdrState()
+                    }
+                }
+            }
+            .onChange(of: selected) { _, newSelection in
+                if container.activeSession?.state == .connected {
+                    Task {
+                        if newSelection == .tmux {
+                            await container.refreshTmuxState()
+                        } else if newSelection == .herdr {
+                            await container.refreshHerdrState()
+                        }
+                    }
                 }
             }
         }
@@ -1630,16 +1653,21 @@ struct MultiplexerPicker: View {
     }
 
     @ViewBuilder
+    private var herdrContent: some View {
+        HerdrAgentCardsView()
+    }
+
+    @ViewBuilder
     private var deferredMultiplexerContent: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
                 Label("\(selected.rawValue.capitalized) is not enabled", systemImage: "clock.arrow.circlepath")
                     .font(.headline)
                     .foregroundStyle(.secondary)
-                Text("Multiplexer adapter \(selected.rawValue.capitalized) is visibly unavailable and deferred in this build. Tmux is the supported remote multiplexer.")
+                Text("Multiplexer adapter \(selected.rawValue.capitalized) is visibly unavailable and deferred in this build. Tmux and Herdr are the supported remote multiplexers.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                Text("Zellij, Byobu, Screen, and Herdr remain deferred pending terminal multiplexing contracts.")
+                Text("Zellij, Byobu, and Screen remain deferred pending terminal multiplexing contracts.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1713,6 +1741,813 @@ struct MultiplexerPicker: View {
                 autoAttachTmux: autoAttach,
                 defaultTmuxSession: trimmed.isEmpty ? nil : trimmed
             )
+        }
+    }
+}
+
+// MARK: - Herdr UI Components
+
+struct HerdrAgentStateBadge: View {
+    let state: HerdrAgentState
+
+    var body: some View {
+        HStack(spacing: 4) {
+            badgeIcon
+            Text(badgeTitle)
+                .font(.caption2.bold())
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .background(badgeColor.opacity(0.12))
+        .foregroundStyle(badgeColor)
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .stroke(badgeColor.opacity(0.3), lineWidth: 1)
+        )
+        .accessibilityLabel(accessibilityDescription)
+        .accessibilityIdentifier("agent-state-badge-\(state.statusName)")
+    }
+
+    @ViewBuilder
+    private var badgeIcon: some View {
+        switch state {
+        case .idle:
+            Image(systemName: "pause.circle.fill")
+                .font(.caption2)
+        case .working:
+            ProgressView()
+                .controlSize(.mini)
+                .tint(.blue)
+        case .blocked:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.caption2)
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.caption2)
+        }
+    }
+
+    private var badgeTitle: String {
+        switch state {
+        case .idle: return "Idle"
+        case .working: return "Working"
+        case .blocked: return "Blocked"
+        case .completed: return "Completed"
+        }
+    }
+
+    private var badgeColor: Color {
+        switch state {
+        case .idle: return .secondary
+        case .working: return .blue
+        case .blocked: return .orange
+        case .completed: return .green
+        }
+    }
+
+    private var accessibilityDescription: String {
+        switch state {
+        case .idle:
+            return "Agent status: Idle"
+        case .working:
+            return "Agent status: Working"
+        case .blocked(let reason):
+            return reason.isEmpty ? "Agent status: Blocked" : "Agent status: Blocked. Reason: \(reason)"
+        case .completed(let summary):
+            return summary.isEmpty ? "Agent status: Completed" : "Agent status: Completed. \(summary)"
+        }
+    }
+}
+
+struct HerdrAgentCardView: View {
+    let pane: HerdrPane
+    let onReadOutput: () -> Void
+    let onSendCommand: () -> Void
+    let onSplitPane: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Header: Pane Title + ID and State Badge
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(pane.label.isEmpty ? pane.id : pane.label)
+                        .font(.headline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    if !pane.label.isEmpty && pane.label != pane.id {
+                        Text(pane.id)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+                Spacer()
+                HerdrAgentStateBadge(state: pane.agentState)
+            }
+
+            // State-specific reason or summary
+            switch pane.agentState {
+            case .blocked(let reason) where !reason.isEmpty:
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "hand.raised.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(6)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(6)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Blocked reason: \(reason)")
+                .accessibilityIdentifier("pane-blocked-reason-\(pane.id)")
+            case .completed(let summary) where !summary.isEmpty:
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "text.badge.checkmark")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                    Text(summary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(6)
+                .background(Color.green.opacity(0.1))
+                .cornerRadius(6)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Completed summary: \(summary)")
+                .accessibilityIdentifier("pane-completed-summary-\(pane.id)")
+            default:
+                EmptyView()
+            }
+
+            // Current Command if present
+            if let cmd = pane.currentCommand, !cmd.isEmpty {
+                HStack(spacing: 6) {
+                    Image(systemName: "terminal")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text(cmd)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.primary)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Current command: \(cmd)")
+                .accessibilityIdentifier("pane-command-\(pane.id)")
+            }
+
+            // Last Activity if present
+            if let lastActivity = pane.lastActivity {
+                HStack(spacing: 4) {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    Text("Active \(formatRelativeDate(lastActivity))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Active \(formatRelativeDate(lastActivity))")
+            }
+
+            Divider()
+
+            // Card Actions: Read Output, Send Command, Split Pane
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    actionButtons
+                }
+                VStack(spacing: 6) {
+                    actionButtons
+                }
+            }
+        }
+        .padding(12)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .cornerRadius(12)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color(uiColor: .separator).opacity(0.5), lineWidth: 1)
+        )
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(cardAccessibilitySummary)
+        .accessibilityIdentifier("herdr-agent-card-\(pane.id)")
+    }
+
+    @ViewBuilder
+    private var actionButtons: some View {
+        Button(action: onReadOutput) {
+            Label("Output", systemImage: "text.alignleft")
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Read recent output for pane \(pane.label.isEmpty ? pane.id : pane.label)")
+        .accessibilityHint("Opens sheet displaying unwrapped output")
+        .accessibilityIdentifier("pane-read-output-\(pane.id)")
+
+        Button(action: onSendCommand) {
+            Label("Command", systemImage: "terminal")
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Send command to pane \(pane.label.isEmpty ? pane.id : pane.label)")
+        .accessibilityHint("Opens dialog to enter and execute command")
+        .accessibilityIdentifier("pane-send-command-\(pane.id)")
+
+        Button(action: onSplitPane) {
+            Label("Split", systemImage: "rectangle.split.2x1")
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
+        .accessibilityLabel("Split pane \(pane.label.isEmpty ? pane.id : pane.label)")
+        .accessibilityHint("Splits this pane vertically")
+        .accessibilityIdentifier("pane-split-\(pane.id)")
+    }
+
+    private var cardAccessibilitySummary: String {
+        let name = pane.label.isEmpty ? pane.id : pane.label
+        return "Agent pane \(name), ID \(pane.id), status: \(pane.agentState.statusName)"
+    }
+
+    private func formatRelativeDate(_ date: Date) -> String {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+}
+
+struct HerdrOutputSheet: View {
+    @EnvironmentObject private var container: AppContainer
+    @Environment(\.dismiss) private var dismiss
+    let pane: HerdrPane
+    @State private var output: String = ""
+    @State private var isLoading: Bool = true
+    @State private var errorMessage: String? = nil
+    @State private var copied: Bool = false
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 0) {
+                if isLoading {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                        Text("Reading recent output...")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("herdr-output-loading")
+                } else if let error = errorMessage {
+                    VStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.largeTitle)
+                            .foregroundStyle(.red)
+                        Text(error)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                        Button("Retry") {
+                            Task { await loadOutput() }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("herdr-output-error")
+                } else if output.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "text.alignleft")
+                            .font(.largeTitle)
+                            .foregroundStyle(.secondary)
+                        Text("No recent output available.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .accessibilityIdentifier("herdr-output-empty")
+                } else {
+                    ScrollView([.horizontal, .vertical]) {
+                        Text(output)
+                            .font(.system(.footnote, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                            .padding()
+                    }
+                    .accessibilityLabel("Recent output for pane \(pane.label.isEmpty ? pane.id : pane.label): \(output)")
+                    .accessibilityIdentifier("herdr-output-text")
+                }
+            }
+            .navigationTitle("Output: \(pane.label.isEmpty ? pane.id : pane.label)")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                        .accessibilityIdentifier("herdr-output-done-button")
+                }
+                ToolbarItemGroup(placement: .confirmationAction) {
+                    Button(action: {
+                        UIPasteboard.general.string = output
+                        copied = true
+                        Task {
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                            copied = false
+                        }
+                    }) {
+                        Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(output.isEmpty || isLoading)
+                    .accessibilityLabel(copied ? "Copied" : "Copy output")
+                    .accessibilityIdentifier("herdr-output-copy-button")
+
+                    Button(action: {
+                        Task { await loadOutput() }
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .disabled(isLoading)
+                    .accessibilityLabel("Refresh output")
+                    .accessibilityIdentifier("herdr-output-refresh-button")
+                }
+            }
+            .task {
+                await loadOutput()
+            }
+        }
+        .accessibilityIdentifier("herdr-output-sheet")
+    }
+
+    private func loadOutput() async {
+        isLoading = true
+        errorMessage = nil
+        do {
+            output = try await container.readHerdrPaneOutput(paneID: pane.id)
+            isLoading = false
+        } catch {
+            errorMessage = error.localizedDescription
+            isLoading = false
+        }
+    }
+}
+
+struct HerdrSendCommandSheet: View {
+    @EnvironmentObject private var container: AppContainer
+    @Environment(\.dismiss) private var dismiss
+    let pane: HerdrPane
+    @State private var command: String = ""
+    @State private var isExecuting: Bool = false
+    @State private var executionError: String? = nil
+
+    private var commandRisk: CommandRisk {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return .safe }
+        let rendered = HerdrCommand.paneRun(pane: pane.id, command: trimmed).renderedCommand
+        return CommandPolicy().classify(rendered)
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Target Pane") {
+                    HStack {
+                        Text("Pane")
+                        Spacer()
+                        Text(pane.label.isEmpty ? pane.id : pane.label)
+                            .foregroundStyle(.secondary)
+                    }
+                    HStack {
+                        Text("Pane ID")
+                        Spacer()
+                        Text(pane.id)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                Section("Command") {
+                    TextField("Enter command (e.g. cargo test, npm start)", text: $command)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityLabel("Command to run in pane")
+                        .accessibilityIdentifier("herdr-command-input-field")
+
+                    // Real-time Policy Evaluation Banner
+                    if !command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        switch commandRisk {
+                        case .blocked:
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "xmark.octagon.fill")
+                                    .foregroundStyle(.red)
+                                Text("Blocked: Destructive command rejected by safety policy.")
+                                    .font(.caption)
+                                    .foregroundStyle(.red)
+                            }
+                            .accessibilityIdentifier("herdr-command-blocked-warning")
+                        case .reviewRequired:
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "exclamationmark.shield.fill")
+                                    .foregroundStyle(.orange)
+                                Text("Review required: Command executes remotely in agent pane. Tap Run to approve.")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                            }
+                            .accessibilityIdentifier("herdr-command-review-notice")
+                        case .safe:
+                            HStack(alignment: .top, spacing: 6) {
+                                Image(systemName: "checkmark.shield.fill")
+                                    .foregroundStyle(.green)
+                                Text("Safe: Command passed safety review.")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                            }
+                            .accessibilityIdentifier("herdr-command-safe-notice")
+                        }
+                    }
+                }
+
+                if let err = executionError {
+                    Section {
+                        Text(err)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("herdr-command-execution-error")
+                    }
+                }
+            }
+            .navigationTitle("Send Command")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .accessibilityIdentifier("herdr-command-cancel-button")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Run") {
+                        Task { await runCommand() }
+                    }
+                    .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || commandRisk == .blocked || isExecuting)
+                    .accessibilityLabel("Execute command in pane")
+                    .accessibilityIdentifier("herdr-command-run-button")
+                }
+            }
+        }
+        .accessibilityIdentifier("herdr-send-command-sheet")
+    }
+
+    private func runCommand() async {
+        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        isExecuting = true
+        executionError = nil
+        let result = await container.runHerdrPaneCommand(paneID: pane.id, command: trimmed, approved: true)
+        isExecuting = false
+        if result.success {
+            dismiss()
+        } else {
+            executionError = result.error ?? "Failed to execute command"
+        }
+    }
+}
+
+struct HerdrCreateWorkspaceSheet: View {
+    @EnvironmentObject private var container: AppContainer
+    @Environment(\.dismiss) private var dismiss
+    @State private var label: String = ""
+    @State private var cwd: String = "."
+    @State private var isCreating: Bool = false
+    @State private var errorMessage: String? = nil
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Workspace Details") {
+                    TextField("Workspace Label (e.g. backend, web)", text: $label)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityLabel("Workspace label")
+                        .accessibilityIdentifier("herdr-new-workspace-label")
+
+                    TextField("Working Directory (e.g. /home/dev/project)", text: $cwd)
+                        .font(.system(.body, design: .monospaced))
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityLabel("Working directory")
+                        .accessibilityIdentifier("herdr-new-workspace-cwd")
+                }
+
+                if let error = errorMessage {
+                    Section {
+                        Text(error)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("herdr-create-workspace-error")
+                    }
+                }
+            }
+            .navigationTitle("Create Workspace")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .accessibilityIdentifier("herdr-create-workspace-cancel-button")
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        Task { await createWorkspace() }
+                    }
+                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating)
+                    .accessibilityLabel("Create workspace")
+                    .accessibilityIdentifier("herdr-create-workspace-confirm-button")
+                }
+            }
+        }
+        .accessibilityIdentifier("herdr-create-workspace-sheet")
+    }
+
+    private func createWorkspace() async {
+        isCreating = true
+        errorMessage = nil
+        let result = await container.createHerdrWorkspace(label: label, cwd: cwd)
+        isCreating = false
+        if result.success {
+            dismiss()
+        } else {
+            errorMessage = result.error ?? "Failed to create workspace"
+        }
+    }
+}
+
+struct HerdrAgentCardsView: View {
+    @EnvironmentObject private var container: AppContainer
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    var isStandalone: Bool = false
+
+    @State private var selectedOutputPane: HerdrPane?
+    @State private var selectedCommandPane: HerdrPane?
+    @State private var showCreateWorkspace: Bool = false
+
+    var body: some View {
+        if isStandalone {
+            NavigationStack {
+                Form {
+                    cardsContent
+                }
+                .navigationTitle("Herdr Agents")
+                .navigationBarTitleDisplayMode(.inline)
+            }
+            .sheet(item: $selectedOutputPane) { pane in
+                HerdrOutputSheet(pane: pane)
+                    .environmentObject(container)
+            }
+            .sheet(item: $selectedCommandPane) { pane in
+                HerdrSendCommandSheet(pane: pane)
+                    .environmentObject(container)
+            }
+            .sheet(isPresented: $showCreateWorkspace) {
+                HerdrCreateWorkspaceSheet()
+                    .environmentObject(container)
+            }
+            .onAppear {
+                if container.activeSession?.state == .connected {
+                    container.startHerdrPolling()
+                }
+            }
+            .onDisappear {
+                container.stopHerdrPolling()
+            }
+        } else {
+            cardsContent
+                .sheet(item: $selectedOutputPane) { pane in
+                    HerdrOutputSheet(pane: pane)
+                        .environmentObject(container)
+                }
+                .sheet(item: $selectedCommandPane) { pane in
+                    HerdrSendCommandSheet(pane: pane)
+                        .environmentObject(container)
+                }
+                .sheet(isPresented: $showCreateWorkspace) {
+                    HerdrCreateWorkspaceSheet()
+                        .environmentObject(container)
+                }
+                .onAppear {
+                    if container.activeSession?.state == .connected {
+                        container.startHerdrPolling()
+                    }
+                }
+                .onDisappear {
+                    container.stopHerdrPolling()
+                }
+        }
+    }
+
+    @ViewBuilder
+    private var cardsContent: some View {
+        // Reconnect banner if reconnecting
+        if container.reconnectState.isReconnecting {
+            Section {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Reconnecting to remote host...")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") {
+                        Task { await container.cancelReconnect() }
+                    }
+                    .font(.caption.bold())
+                }
+            }
+        }
+
+        // Live Status & Version
+        Section("Herdr Status") {
+            HStack {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        switch container.herdrAvailability {
+                        case .available(let version):
+                            Text(version)
+                                .font(.body.weight(.medium))
+                            Text(container.isPollingHerdr ? "Polling active" : "Ready")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        case .unavailable(let reason):
+                            Text("Unavailable")
+                                .font(.body.weight(.medium))
+                            Text(reason)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } icon: {
+                    if container.herdrAvailability.isAvailable {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Spacer()
+
+                if container.herdrAvailability.isAvailable {
+                    Button(action: {
+                        if container.isPollingHerdr {
+                            container.stopHerdrPolling()
+                        } else {
+                            container.startHerdrPolling()
+                        }
+                    }) {
+                        HStack(spacing: 4) {
+                            if container.isPollingHerdr {
+                                ProgressView()
+                                    .controlSize(.mini)
+                            } else {
+                                Image(systemName: "play.circle")
+                            }
+                            Text(container.isPollingHerdr ? "Polling" : "Poll")
+                                .font(.caption.bold())
+                        }
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(container.isPollingHerdr ? Color.accentColor.opacity(0.15) : Color(uiColor: .tertiarySystemFill))
+                        .cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(container.isPollingHerdr ? "Stop live polling" : "Start live polling")
+                    .accessibilityIdentifier("herdr-polling-toggle-button")
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(herdrStatusAccessibilityLabel)
+            .accessibilityIdentifier("herdr-status-row")
+
+            if let error = container.herdrError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityLabel("Herdr error: \(error)")
+                    .accessibilityIdentifier("herdr-error-message")
+            }
+        }
+
+        // Workspaces & Agent Cards
+        if container.herdrAvailability.isAvailable {
+            Section {
+                HStack {
+                    Text("Workspaces")
+                        .font(.headline)
+                    Spacer()
+                    Button(action: { showCreateWorkspace = true }) {
+                        Label("New Workspace", systemImage: "plus")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Create new workspace")
+                    .accessibilityIdentifier("herdr-new-workspace-button")
+                }
+            }
+
+            if container.herdrWorkspaces.isEmpty {
+                Section {
+                    VStack(spacing: 8) {
+                        Text("No Herdr workspaces found.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Button("Create Workspace") {
+                            showCreateWorkspace = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
+                    .accessibilityIdentifier("herdr-empty-workspaces-label")
+                }
+            } else {
+                ForEach(container.herdrWorkspaces) { workspace in
+                    Section {
+                        VStack(alignment: .leading, spacing: 12) {
+                            // Workspace Header
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(workspace.label.isEmpty ? workspace.id : workspace.label)
+                                        .font(.headline)
+                                    if !workspace.cwd.isEmpty {
+                                        Text(workspace.cwd)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
+                                Spacer()
+                                Text("\(workspace.panes.count) \(workspace.panes.count == 1 ? "agent" : "agents")")
+                                    .font(.caption2.bold())
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color(uiColor: .tertiarySystemFill))
+                                    .cornerRadius(4)
+                            }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel("Workspace \(workspace.label.isEmpty ? workspace.id : workspace.label), \(workspace.panes.count) agents, directory: \(workspace.cwd)")
+                            .accessibilityIdentifier("workspace-header-\(workspace.id)")
+
+                            // Panes Layout
+                            if workspace.panes.isEmpty {
+                                Text("No agent panes in this workspace.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if horizontalSizeClass == .regular {
+                                LazyVGrid(
+                                    columns: [GridItem(.adaptive(minimum: 300, maximum: 500), spacing: 12)],
+                                    spacing: 12
+                                ) {
+                                    ForEach(workspace.panes) { pane in
+                                        HerdrAgentCardView(
+                                            pane: pane,
+                                            onReadOutput: { selectedOutputPane = pane },
+                                            onSendCommand: { selectedCommandPane = pane },
+                                            onSplitPane: {
+                                                Task { await container.splitHerdrPane(paneID: pane.id) }
+                                            }
+                                        )
+                                    }
+                                }
+                            } else {
+                                VStack(spacing: 12) {
+                                    ForEach(workspace.panes) { pane in
+                                        HerdrAgentCardView(
+                                            pane: pane,
+                                            onReadOutput: { selectedOutputPane = pane },
+                                            onSendCommand: { selectedCommandPane = pane },
+                                            onSplitPane: {
+                                                Task { await container.splitHerdrPane(paneID: pane.id) }
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+        }
+    }
+
+    private var herdrStatusAccessibilityLabel: String {
+        switch container.herdrAvailability {
+        case .available(let version):
+            return "Herdr \(version), \(container.isPollingHerdr ? "polling active" : "ready")"
+        case .unavailable(let reason):
+            return "Herdr unavailable: \(reason)"
         }
     }
 }
