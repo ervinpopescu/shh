@@ -112,6 +112,8 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - FileProviderExtension
+      - path: Resources/PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: ShhCore
         product: ShhCore
