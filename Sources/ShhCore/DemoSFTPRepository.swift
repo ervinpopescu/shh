@@ -218,12 +218,22 @@ public actor DemoSFTPRepository: SFTPRepository, RemoteFileRepository {
         guard let parentNode = nodes[path.description] else {
             throw SFTPRepositoryError.notFound(path: path.description)
         }
-        guard parentNode.entryType == .directory else {
+        var targetNode = parentNode
+        var depth = 0
+        while targetNode.entryType == .symlink, let target = targetNode.symlinkTarget, depth < 10 {
+            let targetPath = target.hasPrefix("/") ? RemotePath(target) : targetNode.path.parent.appending(target)
+            guard let resolved = nodes[targetPath.description] else {
+                throw SFTPRepositoryError.notFound(path: target)
+            }
+            targetNode = resolved
+            depth += 1
+        }
+        guard targetNode.entryType == .directory else {
             throw SFTPRepositoryError.notADirectory(path: path.description)
         }
 
         let directChildren = nodes.values.filter { node in
-            node.path != path && node.path.parent == path
+            node.path != targetNode.path && node.path.parent == targetNode.path
         }
 
         return directChildren.map { $0.toRemoteFile() }.sorted { lhs, rhs in
@@ -239,7 +249,17 @@ public actor DemoSFTPRepository: SFTPRepository, RemoteFileRepository {
         guard let node = nodes[path.description] else {
             throw SFTPRepositoryError.notFound(path: path.description)
         }
-        return node.toRemoteFile()
+        var targetNode = node
+        var depth = 0
+        while targetNode.entryType == .symlink, let target = targetNode.symlinkTarget, depth < 10 {
+            let targetPath = target.hasPrefix("/") ? RemotePath(target) : targetNode.path.parent.appending(target)
+            guard let resolved = nodes[targetPath.description] else {
+                break
+            }
+            targetNode = resolved
+            depth += 1
+        }
+        return targetNode.toRemoteFile()
     }
 
     public func readFile(at path: RemotePath) async throws -> Data {
@@ -247,10 +267,20 @@ public actor DemoSFTPRepository: SFTPRepository, RemoteFileRepository {
         guard let node = nodes[path.description] else {
             throw SFTPRepositoryError.notFound(path: path.description)
         }
-        guard node.entryType != .directory else {
+        var targetNode = node
+        var depth = 0
+        while targetNode.entryType == .symlink, let target = targetNode.symlinkTarget, depth < 10 {
+            let targetPath = target.hasPrefix("/") ? RemotePath(target) : targetNode.path.parent.appending(target)
+            guard let resolved = nodes[targetPath.description] else {
+                throw SFTPRepositoryError.notFound(path: target)
+            }
+            targetNode = resolved
+            depth += 1
+        }
+        guard targetNode.entryType != .directory else {
             throw SFTPRepositoryError.isDirectory(path: path.description)
         }
-        return node.data ?? Data()
+        return targetNode.data ?? Data()
     }
 
     public func writeFile(
