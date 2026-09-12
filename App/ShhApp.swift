@@ -393,7 +393,7 @@ struct SessionView: View {
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
-        .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium]) }
+        .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
         .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
@@ -680,6 +680,7 @@ struct SessionView: View {
                             container.resetVoiceState()
                             showVoice = true
                         }
+                        .disabled(container.activeSession?.state != .connected)
                         .accessibilityLabel("Push to talk")
                         .accessibilityIdentifier("command-drawer-voice-button")
                     }
@@ -970,6 +971,7 @@ struct ApprovalSheet: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
     let command: String
+    var onApproved: (() -> Void)? = nil
     @State private var approved = false
     private let policy = CommandPolicy()
     var body: some View {
@@ -979,7 +981,19 @@ struct ApprovalSheet: View {
                 Toggle("I approve sending this command", isOn: $approved)
             }
             .navigationTitle("Confirm command")
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Send") { Task { if await container.sendValidatedCommand(command + "\n", approved: true) { dismiss() } } }.disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected) } }
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Send") {
+                        Task {
+                            if await container.sendValidatedCommand(command + "\n", approved: true) {
+                                onApproved?()
+                                dismiss()
+                            }
+                        }
+                    }
+                    .disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected)
+                }
+            }
         }
     }
 }

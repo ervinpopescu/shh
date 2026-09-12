@@ -17,9 +17,19 @@ public struct VoiceComposer: View {
     @State private var showingApproval: Bool = false
     @State private var showingProductionConfirm: Bool = false
     @State private var hasInitialized = false
-    @State private var hasInstalledWhisper: Bool = false
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
+    @State private var startRecordingTask: Task<Void, Never>? = nil
+
+    private var hasInstalledWhisper: Bool {
+        container.voiceModels.contains { $0.state.isReady }
+    }
+
+    private var availableModes: [VoiceInputMode] {
+        let allowed = container.activeHost?.voicePolicy.allowedModes ?? Set(VoiceInputMode.allCases)
+        let filtered = VoiceInputMode.allCases.filter { allowed.contains($0) }
+        return filtered.isEmpty ? VoiceInputMode.allCases : filtered
+    }
 
     public init() {}
 
@@ -38,8 +48,14 @@ public struct VoiceComposer: View {
                     }
                 }
                 .sheet(isPresented: $showingApproval) {
-                    ApprovalSheet(command: previewText.trimmingCharacters(in: .whitespacesAndNewlines))
-                        .environmentObject(container)
+                    ApprovalSheet(
+                        command: (container.activeVoicePreview?.text ?? previewText).trimmingCharacters(in: .whitespacesAndNewlines),
+                        onApproved: {
+                            container.resetVoiceState()
+                            dismiss()
+                        }
+                    )
+                    .environmentObject(container)
                 }
                 .confirmationDialog(
                     "Confirm Production Agent Message",
@@ -62,8 +78,13 @@ public struct VoiceComposer: View {
                 }
                 .task {
                     if !hasInitialized {
-                        selectedMode = container.defaultVoiceMode
-                        hasInstalledWhisper = await container.hasInstalledWhisperModel()
+                        let allowed = container.activeHost?.voicePolicy.allowedModes ?? Set(VoiceInputMode.allCases)
+                        if allowed.contains(container.defaultVoiceMode) {
+                            selectedMode = container.defaultVoiceMode
+                        } else if let firstAllowed = VoiceInputMode.allCases.first(where: { allowed.contains($0) }) {
+                            selectedMode = firstAllowed
+                        }
+                        await container.refreshVoiceModels()
                         hasInitialized = true
                     }
                 }
@@ -206,12 +227,7 @@ public struct VoiceComposer: View {
         downloadProgress = 0.0
         Task {
             do {
-                _ = try await container.voiceModelManager.downloadModel(.tiny) { frac in
-                    Task { @MainActor in
-                        downloadProgress = frac
-                    }
-                }
-                hasInstalledWhisper = await container.hasInstalledWhisperModel()
+                try await container.downloadVoiceModel(.tiny)
                 isDownloadingModel = false
             } catch {
                 isDownloadingModel = false
@@ -271,7 +287,7 @@ public struct VoiceComposer: View {
         VStack(spacing: 24) {
             // Mode selector
             Picker("Mode", selection: $selectedMode) {
-                ForEach(VoiceInputMode.allCases, id: \.self) { mode in
+                ForEach(availableModes, id: \.self) { mode in
                     Text(mode.displayName).tag(mode)
                 }
             }
@@ -362,15 +378,16 @@ public struct VoiceComposer: View {
                 .foregroundStyle(isSlideToCancel ? .red : .secondary)
                 .padding(.top, 4)
                 .accessibilityHidden(true)
-            } else {
-                // VoiceOver alternative toggle button
-                Button(action: toggleVoiceOverRecording) {
-                    Text("Tap to Record")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .accessibilityIdentifier("tap-to-record-alternative")
             }
+
+            // VoiceOver alternative toggle button
+            Button(action: toggleVoiceOverRecording) {
+                Text(container.isRecordingVoice ? "Tap to Stop" : "Tap to Record")
+                    .font(.caption.bold())
+                    .foregroundStyle(container.isRecordingVoice ? .red : .secondary)
+            }
+            .accessibilityLabel(container.isRecordingVoice ? "Stop recording voice command" : "Start recording voice command")
+            .accessibilityIdentifier(container.isRecordingVoice ? "tap-to-stop-alternative" : "tap-to-record-alternative")
 
             // Error banner if any
             if let err = container.voiceErrorMessage {
@@ -388,7 +405,7 @@ public struct VoiceComposer: View {
             Spacer()
 
             // Footer note
-            Text("Audio recordings are stored in memory and deleted immediately after transcription.")
+            Text("Audio recordings are stored in temporary files with 0600 permissions and deleted immediately after transcription.")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
@@ -412,8 +429,10 @@ public struct VoiceComposer: View {
     private func handleDragChanged(_ value: DragGesture.Value) {
         if !isTouchingPTT {
             isTouchingPTT = true
-            if !container.isRecordingVoice {
-                Task { await startRecording() }
+            if !container.isRecordingVoice && startRecordingTask == nil {
+                startRecordingTask = Task {
+                    await startRecording()
+                }
             }
         }
 
@@ -433,7 +452,19 @@ public struct VoiceComposer: View {
 
     private func handleDragEnded(_ value: DragGesture.Value) {
         isTouchingPTT = false
-        if isSlideToCancel {
+        if let task = startRecordingTask {
+            Task {
+                await task.value
+                if container.isRecordingVoice {
+                    if isSlideToCancel {
+                        await container.cancelVoiceRecording()
+                        resetRecordingUI()
+                    } else {
+                        await stopAndTranscribe()
+                    }
+                }
+            }
+        } else if isSlideToCancel {
             // User cancelled via slide-to-cancel!
             Task {
                 await container.cancelVoiceRecording()
@@ -462,10 +493,21 @@ public struct VoiceComposer: View {
 
         do {
             try await container.startVoiceRecording(mode: selectedMode)
+            if !isTouchingPTT {
+                startRecordingTask = nil
+                if isSlideToCancel {
+                    await container.cancelVoiceRecording()
+                    resetRecordingUI()
+                } else {
+                    await stopAndTranscribe()
+                }
+                return
+            }
             startDurationTimer()
         } catch {
             resetRecordingUI()
         }
+        startRecordingTask = nil
     }
 
     private func stopAndTranscribe() async {
@@ -509,76 +551,78 @@ public struct VoiceComposer: View {
 
     @ViewBuilder
     private func editablePreviewView(preview: VoicePreviewState) -> some View {
-        VStack(spacing: 16) {
-            // Mode Selector
-            Picker("Mode", selection: Binding(
-                get: { preview.mode },
-                set: { newMode in
-                    selectedMode = newMode
-                    container.activeVoicePreview?.updateMode(
-                        newMode,
-                        router: container.voiceRouter,
-                        hostPolicy: container.activeHost?.voicePolicy ?? .disabled
-                    )
-                }
-            )) {
-                ForEach(VoiceInputMode.allCases, id: \.self) { mode in
-                    Text(mode.displayName).tag(mode)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal)
-            .accessibilityIdentifier("preview-mode-picker")
-
-            // Status / Decision Badge Card
-            routingDecisionBadge(preview: preview)
-
-            // Editable Text Editor
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Editable Transcript")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    if let duration = preview.duration {
-                        Text("Recorded \(String(format: "%.1f", duration))s • Audio deleted")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                TextEditor(text: Binding(
-                    get: { preview.text },
-                    set: { newText in
-                        previewText = newText
-                        container.activeVoicePreview?.updateText(
-                            newText,
+        ScrollView {
+            VStack(spacing: 16) {
+                // Mode Selector
+                Picker("Mode", selection: Binding(
+                    get: { preview.mode },
+                    set: { newMode in
+                        selectedMode = newMode
+                        container.activeVoicePreview?.updateMode(
+                            newMode,
                             router: container.voiceRouter,
                             hostPolicy: container.activeHost?.voicePolicy ?? .disabled
                         )
                     }
-                ))
-                .font(preview.mode == .shellCommand ? .system(.body, design: .monospaced) : .body)
-                .frame(minHeight: 120)
-                .padding(8)
-                .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 8)
-                        .stroke(Color(.separator), lineWidth: 0.5)
-                )
-                .accessibilityIdentifier("preview-transcript-editor")
-                .accessibilityLabel("Editable transcribed text")
-            }
-            .padding(.horizontal)
-
-            Spacer()
-
-            // Primary Action Button based on mode & routing decision
-            actionButtons(preview: preview)
+                )) {
+                    ForEach(availableModes, id: \.self) { mode in
+                        Text(mode.displayName).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
                 .padding(.horizontal)
-                .padding(.bottom, 12)
+                .accessibilityIdentifier("preview-mode-picker")
+
+                // Status / Decision Badge Card
+                routingDecisionBadge(preview: preview)
+
+                // Editable Text Editor
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Editable Transcript")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        if let duration = preview.duration {
+                            Text("Recorded \(String(format: "%.1f", duration))s • Audio deleted")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    TextEditor(text: Binding(
+                        get: { preview.text },
+                        set: { newText in
+                            previewText = newText
+                            container.activeVoicePreview?.updateText(
+                                newText,
+                                router: container.voiceRouter,
+                                hostPolicy: container.activeHost?.voicePolicy ?? .disabled
+                            )
+                        }
+                    ))
+                    .font(preview.mode == .shellCommand ? .system(.body, design: .monospaced) : .body)
+                    .frame(minHeight: 120)
+                    .padding(8)
+                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color(.separator), lineWidth: 0.5)
+                    )
+                    .accessibilityIdentifier("preview-transcript-editor")
+                    .accessibilityLabel("Editable transcribed text")
+                }
+                .padding(.horizontal)
+
+                Spacer()
+
+                // Primary Action Button based on mode & routing decision
+                actionButtons(preview: preview)
+                    .padding(.horizontal)
+                    .padding(.bottom, 12)
+            }
+            .padding(.top, 8)
         }
-        .padding(.top, 8)
         .accessibilityIdentifier("editable-preview-view")
     }
 
