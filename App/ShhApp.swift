@@ -1765,7 +1765,8 @@ struct HerdrAgentStateBadge: View {
             Capsule()
                 .stroke(badgeColor.opacity(0.3), lineWidth: 1)
         )
-        .accessibilityLabel(accessibilityDescription)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Agent status: \(badgeTitle)")
         .accessibilityIdentifier("agent-state-badge-\(state.statusName)")
     }
 
@@ -1805,19 +1806,6 @@ struct HerdrAgentStateBadge: View {
         case .completed: return .green
         }
     }
-
-    private var accessibilityDescription: String {
-        switch state {
-        case .idle:
-            return "Agent status: Idle"
-        case .working:
-            return "Agent status: Working"
-        case .blocked(let reason):
-            return reason.isEmpty ? "Agent status: Blocked" : "Agent status: Blocked. Reason: \(reason)"
-        case .completed(let summary):
-            return summary.isEmpty ? "Agent status: Completed" : "Agent status: Completed. \(summary)"
-        }
-    }
 }
 
 struct HerdrAgentCardView: View {
@@ -1829,21 +1817,19 @@ struct HerdrAgentCardView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // Header: Pane Title + ID and State Badge
-            HStack(alignment: .center) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(pane.label.isEmpty ? pane.id : pane.label)
-                        .font(.headline)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    if !pane.label.isEmpty && pane.label != pane.id {
-                        Text(pane.id)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center) {
+                    headerTitles
+                    Spacer()
+                    HerdrAgentStateBadge(state: pane.agentState)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .layoutPriority(1)
                 }
-                Spacer()
-                HerdrAgentStateBadge(state: pane.agentState)
+                VStack(alignment: .leading, spacing: 6) {
+                    HerdrAgentStateBadge(state: pane.agentState)
+                        .fixedSize(horizontal: true, vertical: false)
+                    headerTitles
+                }
             }
 
             // State-specific reason or summary
@@ -1935,8 +1921,22 @@ struct HerdrAgentCardView: View {
                 .stroke(Color(uiColor: .separator).opacity(0.5), lineWidth: 1)
         )
         .accessibilityElement(children: .contain)
-        .accessibilityLabel(cardAccessibilitySummary)
         .accessibilityIdentifier("herdr-agent-card-\(pane.id)")
+    }
+
+    private var headerTitles: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(pane.label.isEmpty ? pane.id : pane.label)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            if !pane.label.isEmpty && pane.label != pane.id {
+                Text(pane.id)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
     }
 
     @ViewBuilder
@@ -1970,11 +1970,6 @@ struct HerdrAgentCardView: View {
         .accessibilityLabel("Split pane \(pane.label.isEmpty ? pane.id : pane.label)")
         .accessibilityHint("Splits this pane vertically")
         .accessibilityIdentifier("pane-split-\(pane.id)")
-    }
-
-    private var cardAccessibilitySummary: String {
-        let name = pane.label.isEmpty ? pane.id : pane.label
-        return "Agent pane \(name), ID \(pane.id), status: \(pane.agentState.statusName)"
     }
 
     private func formatRelativeDate(_ date: Date) -> String {
@@ -2038,10 +2033,10 @@ struct HerdrOutputSheet: View {
                         Text(output)
                             .font(.system(.footnote, design: .monospaced))
                             .textSelection(.enabled)
+                            .fixedSize(horizontal: true, vertical: false)
                             .frame(maxWidth: .infinity, alignment: .topLeading)
                             .padding()
                     }
-                    .accessibilityLabel("Recent output for pane \(pane.label.isEmpty ? pane.id : pane.label): \(output)")
                     .accessibilityIdentifier("herdr-output-text")
                 }
             }
@@ -2136,6 +2131,12 @@ struct HerdrSendCommandSheet: View {
                         .font(.system(.body, design: .monospaced))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .onSubmit {
+                            let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty && commandRisk != .blocked && !isExecuting {
+                                Task { await runCommand() }
+                            }
+                        }
                         .accessibilityLabel("Command to run in pane")
                         .accessibilityIdentifier("herdr-command-input-field")
 
@@ -2190,11 +2191,18 @@ struct HerdrSendCommandSheet: View {
                         .accessibilityIdentifier("herdr-command-cancel-button")
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Run") {
+                    Button(action: {
                         Task { await runCommand() }
+                    }) {
+                        if isExecuting {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Run")
+                        }
                     }
                     .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || commandRisk == .blocked || isExecuting)
-                    .accessibilityLabel("Execute command in pane")
+                    .accessibilityLabel(isExecuting ? "Executing command" : "Execute command in pane")
                     .accessibilityIdentifier("herdr-command-run-button")
                 }
             }
@@ -2232,6 +2240,12 @@ struct HerdrCreateWorkspaceSheet: View {
                     TextField("Workspace Label (e.g. backend, web)", text: $label)
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .onSubmit {
+                            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty && !isCreating {
+                                Task { await createWorkspace() }
+                            }
+                        }
                         .accessibilityLabel("Workspace label")
                         .accessibilityIdentifier("herdr-new-workspace-label")
 
@@ -2239,6 +2253,12 @@ struct HerdrCreateWorkspaceSheet: View {
                         .font(.system(.body, design: .monospaced))
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
+                        .onSubmit {
+                            let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !trimmed.isEmpty && !isCreating {
+                                Task { await createWorkspace() }
+                            }
+                        }
                         .accessibilityLabel("Working directory")
                         .accessibilityIdentifier("herdr-new-workspace-cwd")
                 }
@@ -2260,11 +2280,18 @@ struct HerdrCreateWorkspaceSheet: View {
                         .accessibilityIdentifier("herdr-create-workspace-cancel-button")
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
+                    Button(action: {
                         Task { await createWorkspace() }
+                    }) {
+                        if isCreating {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Text("Create")
+                        }
                     }
                     .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating)
-                    .accessibilityLabel("Create workspace")
+                    .accessibilityLabel(isCreating ? "Creating workspace" : "Create workspace")
                     .accessibilityIdentifier("herdr-create-workspace-confirm-button")
                 }
             }

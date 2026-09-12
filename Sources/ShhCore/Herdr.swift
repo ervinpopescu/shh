@@ -453,6 +453,7 @@ public enum HerdrParseError: Error, Equatable, Sendable, LocalizedError {
     case invalidJSON(String)
     case missingRequiredField(String)
     case invalidState(String)
+    case executionFailed(String)
 
     public var errorDescription: String? {
         switch self {
@@ -464,6 +465,8 @@ public enum HerdrParseError: Error, Equatable, Sendable, LocalizedError {
             return "Missing required field '\(field)' in Herdr output."
         case .invalidState(let state):
             return "Unknown or invalid Herdr agent state: '\(state)'"
+        case .executionFailed(let message):
+            return "Herdr command failed: \(message)"
         }
     }
 }
@@ -647,10 +650,10 @@ public enum HerdrOutputParser: Sendable {
         if trimmed.hasPrefix("{"), trimmed.hasSuffix("}"),
            let data = trimmed.data(using: .utf8),
            let wrapper = try? JSONDecoder().decode(RecentUnwrappedWrapper.self, from: data) {
-            if let out = wrapper.output { return out }
-            if let text = wrapper.text { return text }
-            if let content = wrapper.content { return content }
-            if let lines = wrapper.lines { return lines.joined(separator: "\n") }
+            if let out = wrapper.output { return out.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let text = wrapper.text { return text.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let content = wrapper.content { return content.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let lines = wrapper.lines { return lines.map { $0.replacingOccurrences(of: "\r\n", with: "\n") }.joined(separator: "\n") }
         }
 
         return clean.replacingOccurrences(of: "\r\n", with: "\n")
