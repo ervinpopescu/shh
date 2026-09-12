@@ -478,6 +478,11 @@ final class VoiceTests: XCTestCase {
         let posixPerms = attrs[.posixPermissions] as? NSNumber
         XCTAssertEqual(posixPerms?.intValue, 0o600, "Secure temporary recording handle must have 0600 permissions")
 
+        #if !os(Linux)
+        let protection = attrs[.protectionKey] as? FileProtectionType
+        XCTAssertEqual(protection, FileProtectionType.complete, "Recording file must have FileProtectionType.complete")
+        #endif
+
         // Write test data
         let testBytes = Data("test-audio-content".utf8)
         try testBytes.write(to: handle.fileURL)
@@ -797,6 +802,19 @@ final class VoiceTests: XCTestCase {
         ]
         XCTAssertEqual(recorderErrors.count, 8)
 
+        for err in recorderErrors {
+            let desc = err.localizedDescription
+            let errDesc = err.errorDescription
+            XCTAssertNotNil(errDesc)
+            XCTAssertFalse(desc.isEmpty)
+            XCTAssertFalse(desc.contains("error 0"), "Localized description must not be raw error code: \(desc)")
+            XCTAssertFalse(desc.contains("error 6"), "Localized description must not be raw error code: \(desc)")
+            XCTAssertFalse(desc.contains("The operation couldn’t be completed"), "Must have meaningful localizedDescription: \(desc)")
+        }
+
+        XCTAssertTrue(AudioRecorderError.permissionDenied.localizedDescription.contains("Microphone access denied"))
+        XCTAssertTrue(AudioRecorderError.recordingTooShort.localizedDescription.contains("too short"))
+
         let hostID = UUID()
         let transcriptionErrors: [TranscriptionError] = [
             .modelUnavailable,
@@ -811,5 +829,16 @@ final class VoiceTests: XCTestCase {
             .unsupported
         ]
         XCTAssertEqual(transcriptionErrors.count, 10)
+
+        for err in transcriptionErrors {
+            let desc = err.localizedDescription
+            let errDesc = err.errorDescription
+            XCTAssertNotNil(errDesc)
+            XCTAssertFalse(desc.isEmpty)
+            XCTAssertFalse(desc.contains("The operation couldn’t be completed"), "Must have meaningful localizedDescription: \(desc)")
+        }
+
+        XCTAssertTrue(TranscriptionError.modelNotInstalled(modelID: "tiny").localizedDescription.contains("not installed"))
+        XCTAssertTrue(TranscriptionError.hostPolicyDisabled(hostID: hostID).localizedDescription.contains("disabled by host policy"))
     }
 }

@@ -170,7 +170,7 @@ public enum VoiceProviderState: Codable, Hashable, Sendable {
 
 // MARK: - Recorder & Transcription Errors
 
-public enum AudioRecorderError: Error, Codable, Hashable, Sendable {
+public enum AudioRecorderError: Error, LocalizedError, Codable, Hashable, Sendable {
     case permissionDenied
     case deviceUnavailable(reason: String)
     case alreadyRecording
@@ -179,9 +179,30 @@ public enum AudioRecorderError: Error, Codable, Hashable, Sendable {
     case captureFailed(reason: String)
     case recordingTooShort
     case cancelled
+
+    public var errorDescription: String? {
+        switch self {
+        case .permissionDenied:
+            return "Microphone access denied. Please enable microphone permissions in iOS Settings."
+        case .deviceUnavailable(let reason):
+            return "Microphone unavailable: \(reason)"
+        case .alreadyRecording:
+            return "A recording is already in progress."
+        case .notRecording:
+            return "No active recording."
+        case .temporaryFileError(let reason):
+            return "Temporary file error: \(reason)"
+        case .captureFailed(let reason):
+            return "Audio capture failed: \(reason)"
+        case .recordingTooShort:
+            return "Recording was too short. Press and hold while speaking."
+        case .cancelled:
+            return "Recording cancelled."
+        }
+    }
 }
 
-public enum TranscriptionError: Error, Codable, Hashable, Sendable {
+public enum TranscriptionError: Error, LocalizedError, Codable, Hashable, Sendable {
     case modelUnavailable
     case cancelled
     case modelNotInstalled(modelID: String)
@@ -192,6 +213,31 @@ public enum TranscriptionError: Error, Codable, Hashable, Sendable {
     case hostPolicyDisabled(hostID: UUID?)
     case timeout
     case unsupported
+
+    public var errorDescription: String? {
+        switch self {
+        case .modelUnavailable:
+            return "Voice model is unavailable."
+        case .cancelled:
+            return "Transcription cancelled."
+        case .modelNotInstalled(let modelID):
+            return "Voice model '\(modelID)' is not installed. Please download it in Voice Settings."
+        case .recorderError(let error):
+            return error.localizedDescription
+        case .audioFileUnreadable(let reason):
+            return "Audio file unreadable: \(reason)"
+        case .unsupportedAudioFormat(let reason):
+            return "Unsupported audio format: \(reason)"
+        case .transcriptionFailed(let reason):
+            return "Transcription failed: \(reason)"
+        case .hostPolicyDisabled:
+            return "Voice input is disabled by host policy."
+        case .timeout:
+            return "Transcription timed out."
+        case .unsupported:
+            return "Voice input is unsupported on this configuration."
+        }
+    }
 }
 
 // MARK: - Voice Progress
@@ -245,7 +291,8 @@ public struct AudioRecordingHandle: Identifiable, Hashable, Sendable {
         let targetURL = dir.appendingPathComponent(filename)
 
         let attributes: [FileAttributeKey: Any] = [
-            .posixPermissions: 0o600
+            .posixPermissions: 0o600,
+            .protectionKey: FileProtectionType.complete
         ]
         let created = FileManager.default.createFile(
             atPath: targetURL.path,
