@@ -31,12 +31,25 @@ final class AppContainer: ObservableObject {
     let restorationStore: any SessionRestorationStore
     let reachabilityMonitor: any ReachabilityMonitoring
     let reconnectCoordinator: ReconnectCoordinator
+    private let didProvideCustomCatalog: Bool
+
+    private static var isRunningInTestEnvironment: Bool {
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
+            ProcessInfo.processInfo.arguments.contains("-XCTest") ||
+            NSClassFromString("XCTestCase") != nil
+    }
+
+    private var isRunningInTestEnvironment: Bool {
+        Self.isRunningInTestEnvironment
+    }
 
     @Published var useLegacyTerminalFallback: Bool
     @Published var activeSession: TerminalSession?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
+    @Published public var lastConnectionFailure: ConnectionFailure?
+    @Published public var catalogUpdateToken: UUID = UUID()
     @Published var reconnectState: ReconnectState = .idle
     @Published var tmuxAvailability: TmuxAvailability = .unavailable(reason: "Not connected")
     @Published var tmuxSessions: [TmuxSessionInfo] = []
@@ -174,8 +187,8 @@ final class AppContainer: ObservableObject {
     }
 
     init(
-        catalog: InMemoryCatalog = InMemoryCatalog(),
-        trustStore: InMemoryTrustStore = InMemoryTrustStore(),
+        catalog: InMemoryCatalog? = nil,
+        trustStore: InMemoryTrustStore? = nil,
         credentialStore: (any CredentialStore)? = nil,
         transport: (any SSHTransport)? = nil,
         moshTransport: (any MoshTransport)? = nil,
@@ -194,23 +207,46 @@ final class AppContainer: ObservableObject {
         fileProviderHelper: FileProviderManagerHelper = .shared
     ) {
         self.fileProviderHelper = fileProviderHelper
+        self.didProvideCustomCatalog = (catalog != nil)
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
         let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
             ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
-        self.catalog = catalog
-        self.trustStore = trustStore
+
+        let resolvedCatalog: InMemoryCatalog
+        if let catalog {
+            resolvedCatalog = catalog
+        } else if !Self.isRunningInTestEnvironment,
+                  let snapshot = fileProviderHelper.loadSharedSnapshot(),
+                  (!snapshot.hosts.isEmpty || !snapshot.identities.isEmpty) {
+            resolvedCatalog = InMemoryCatalog(snapshot: snapshot)
+        } else {
+            resolvedCatalog = InMemoryCatalog(seedDemoData: true)
+        }
+        self.catalog = resolvedCatalog
+
+        let resolvedTrustStore: InMemoryTrustStore
+        if let trustStore {
+            resolvedTrustStore = trustStore
+        } else if !Self.isRunningInTestEnvironment,
+                  let records = fileProviderHelper.loadSharedTrustRecords(),
+                  !records.isEmpty {
+            resolvedTrustStore = InMemoryTrustStore(records: records)
+        } else {
+            resolvedTrustStore = InMemoryTrustStore()
+        }
+        self.trustStore = resolvedTrustStore
         self.credentialStore = resolvedCredentialStore
-        let resolvedHostResolver: LiveSSHTransport.HostResolver = hostResolver ?? { [catalog] (hostID: UUID) async throws -> (Host, IdentityDescriptor?) in
-            let hosts = try await catalog.listHosts()
+        let resolvedHostResolver: LiveSSHTransport.HostResolver = hostResolver ?? { [resolvedCatalog] (hostID: UUID) async throws -> (Host, IdentityDescriptor?) in
+            let hosts = try await resolvedCatalog.listHosts()
             if let bastion = hosts.first(where: { $0.id == hostID }) {
                 var ident: IdentityDescriptor? = nil
                 if let identityID = bastion.identityID {
-                    let idents = try await catalog.identities()
+                    let idents = try await resolvedCatalog.identities()
                     ident = idents.first(where: { $0.id == identityID })
                 }
                 return (bastion, ident)
             }
-            let idents = try await catalog.identities()
+            let idents = try await resolvedCatalog.identities()
             if let ident = idents.first(where: { $0.id == hostID }) {
                 let placeholder = try Host(name: ident.name, hostname: "localhost", username: "unknown")
                 return (placeholder, ident)
@@ -319,10 +355,24 @@ final class AppContainer: ObservableObject {
         }
 
         Task { [weak self] in
+            await self?.loadSharedStateIfNeeded()
             try? await self?.syncSharedCatalogAndTrust()
             #if canImport(FileProvider)
             await self?.refreshRegisteredDomains()
             #endif
+        }
+    }
+
+    func loadSharedStateIfNeeded() async {
+        guard !didProvideCustomCatalog else { return }
+        guard !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil else { return }
+        if let snapshot = fileProviderHelper.loadSharedSnapshot(),
+           (!snapshot.hosts.isEmpty || !snapshot.identities.isEmpty) {
+            await catalog.replace(with: snapshot)
+            catalogUpdateToken = UUID()
+        }
+        if let records = fileProviderHelper.loadSharedTrustRecords(), !records.isEmpty {
+            await trustStore.addRecords(records)
         }
     }
 
@@ -388,10 +438,18 @@ final class AppContainer: ObservableObject {
         switch transportError {
         case .authenticationRequired:
             return "Authentication required."
+        case .missingCredential:
+            return "Saved credential could not be found in Keychain."
+        case .invalidPrivateKey:
+            return "Private key format invalid or unreadable."
         case .timeout:
             return "Connection timed out."
         case .networkUnavailable:
             return "Network unavailable."
+        case .dnsFailure(let detail):
+            return detail.isEmpty ? "DNS resolution failed." : detail
+        case .connectionRefused:
+            return "Connection refused by remote server."
         case .unsupported, .invalidConfiguration:
             return "Unsupported configuration."
         case .cancelled:
@@ -407,6 +465,7 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        lastConnectionFailure = nil
         await cancelVoiceRecording()
         resetVoiceState()
         tmuxRefreshGeneration += 1
@@ -567,6 +626,8 @@ final class AppContainer: ObservableObject {
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
+            let failure = ConnectionFailure.from(error: error, host: host)
+            self.lastConnectionFailure = failure
             let message = Self.statusMessage(for: error)
             terminalText = message
             if !useLegacyTerminalFallback {
@@ -585,7 +646,9 @@ final class AppContainer: ObservableObject {
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
-            let message = "Connection unavailable."
+            let failure = ConnectionFailure.from(error: error, host: host)
+            self.lastConnectionFailure = failure
+            let message = failure.reason
             activeSession?.state = .failed
             terminalText = message
             if !useLegacyTerminalFallback {
@@ -2922,6 +2985,7 @@ final class AppContainer: ObservableObject {
     // MARK: - Host Management & Shared Catalog Sync
 
     public func syncSharedCatalogAndTrust() async throws {
+        guard !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil else { return }
         let snapshot = await catalog.snapshot()
         let records = await trustStore.allRecords()
         #if canImport(FileProvider)
@@ -2931,11 +2995,13 @@ final class AppContainer: ObservableObject {
 
     public func saveHost(_ host: Host) async throws {
         try await catalog.save(host)
+        catalogUpdateToken = UUID()
         try await syncSharedCatalogAndTrust()
     }
 
     public func deleteHost(id: UUID) async throws {
         try await catalog.delete(id: id)
+        catalogUpdateToken = UUID()
         try await syncSharedCatalogAndTrust()
     }
 
@@ -2963,6 +3029,7 @@ final class AppContainer: ObservableObject {
             keychainReference: reference
         )
         try await catalog.save(descriptor)
+        catalogUpdateToken = UUID()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
@@ -2996,6 +3063,7 @@ final class AppContainer: ObservableObject {
             keychainReference: reference
         )
         try await catalog.save(descriptor)
+        catalogUpdateToken = UUID()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
@@ -3018,6 +3086,7 @@ final class AppContainer: ObservableObject {
             keychainReference: reference
         )
         try await catalog.save(descriptor)
+        catalogUpdateToken = UUID()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
@@ -3034,6 +3103,7 @@ final class AppContainer: ObservableObject {
             updated.identityID = nil
             try await catalog.save(updated)
         }
+        catalogUpdateToken = UUID()
         try? await syncSharedCatalogAndTrust()
     }
 
