@@ -211,4 +211,142 @@ final class EncryptedVaultBackupTests: XCTestCase {
             }
         }
     }
+
+    func testVaultMaximumIterationsRejection() async throws {
+        let catalog = InMemoryCatalog(seedDemoData: true)
+        let snapshot = await catalog.snapshot()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+
+        // Iterations above maximum (5_000_000)
+        var highIterations = backup
+        highIterations.kdf.iterations = 5_000_001
+        XCTAssertThrowsError(try service.restoreBackup(backup: highIterations, passphrase: "pw")) { error in
+            XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(5_000_001))
+        }
+
+        // Extremely large iterations (64-bit integer overflow guard)
+        var overflowIterations = backup
+        overflowIterations.kdf.iterations = Int.max
+        XCTAssertThrowsError(try service.restoreBackup(backup: overflowIterations, passphrase: "pw")) { error in
+            XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(Int.max))
+        }
+
+        // Negative iterations
+        var negativeIterations = backup
+        negativeIterations.kdf.iterations = -100
+        XCTAssertThrowsError(try service.restoreBackup(backup: negativeIterations, passphrase: "pw")) { error in
+            XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(-100))
+        }
+    }
+
+    func testVaultMaximumDataSizeBound() async throws {
+        // Construct simulated oversized payload exceeding 50 MB
+        let oversizedData = Data(count: 51 * 1024 * 1024)
+        XCTAssertThrowsError(try service.restoreBackup(data: oversizedData, passphrase: "pw")) { error in
+            guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
+                XCTFail("Expected corruptedPayload, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("50MB") || details.contains("exceeds"))
+        }
+    }
+
+    func testVaultPrematurePBKDF2PreventionOnMalformedSaltNonceTag() async throws {
+        let catalog = InMemoryCatalog(seedDemoData: true)
+        let snapshot = await catalog.snapshot()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+
+        // Short salt (< 16 bytes)
+        var badSalt = backup
+        badSalt.kdf.salt = Data(repeating: 1, count: 15)
+        XCTAssertThrowsError(try service.restoreBackup(backup: badSalt, passphrase: "pw")) { error in
+            guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
+                XCTFail("Expected corruptedPayload for short salt, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("Salt length"))
+        }
+
+        // Invalid nonce (!= 12 bytes)
+        var badNonce = backup
+        badNonce.cipher.nonce = Data(repeating: 2, count: 16)
+        XCTAssertThrowsError(try service.restoreBackup(backup: badNonce, passphrase: "pw")) { error in
+            guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
+                XCTFail("Expected corruptedPayload for invalid nonce, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("nonce"))
+        }
+
+        // Invalid tag (!= 16 bytes)
+        var badTag = backup
+        badTag.cipher.tag = Data(repeating: 3, count: 8)
+        XCTAssertThrowsError(try service.restoreBackup(backup: badTag, passphrase: "pw")) { error in
+            guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
+                XCTFail("Expected corruptedPayload for invalid tag, got \(error)")
+                return
+            }
+            XCTAssertTrue(details.contains("tag"))
+        }
+    }
+
+    func testVaultSecretDetectionInPreferencesAndPuTTY() async throws {
+        let catalog = InMemoryCatalog(seedDemoData: true)
+        let snapshot = await catalog.snapshot()
+
+        // Secret hidden in customSettings preferences
+        var preferencesWithSecret = VaultPreferences()
+        preferencesWithSecret.customSettings["api_key"] = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA..."
+        XCTAssertThrowsError(try service.exportBackup(
+            catalog: snapshot,
+            preferences: preferencesWithSecret,
+            passphrase: "pw",
+            options: testOptions
+        )) { error in
+            XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
+        }
+
+        // PKCS#8 encrypted private key
+        var preferencesWithPKCS8 = VaultPreferences()
+        preferencesWithPKCS8.customSettings["key"] = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFDjBABgkqhkiG9w0BBQ0wMzAbBgkq..."
+        XCTAssertThrowsError(try service.exportBackup(
+            catalog: snapshot,
+            preferences: preferencesWithPKCS8,
+            passphrase: "pw",
+            options: testOptions
+        )) { error in
+            XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
+        }
+
+        // PuTTY private key format
+        var preferencesWithPuTTY = VaultPreferences()
+        preferencesWithPuTTY.customSettings["putty"] = "PuTTY-User-Key-File-2: ssh-rsa\nEncryption: aes256-cbc..."
+        XCTAssertThrowsError(try service.exportBackup(
+            catalog: snapshot,
+            preferences: preferencesWithPuTTY,
+            passphrase: "pw",
+            options: testOptions
+        )) { error in
+            XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
+        }
+    }
+
+    func testVaultRawPassphraseDataOverload() async throws {
+        let catalog = InMemoryCatalog(seedDemoData: true)
+        let snapshot = await catalog.snapshot()
+        var passphraseBytes = Data("scrubbable-passphrase-data".utf8)
+
+        let backup = try service.exportBackup(
+            catalog: snapshot,
+            passphraseData: passphraseBytes,
+            options: testOptions
+        )
+
+        let restored = try service.restoreBackup(backup: backup, passphraseData: passphraseBytes)
+        XCTAssertEqual(restored.catalog.hosts.count, snapshot.hosts.count)
+
+        // Zero out passphrase bytes
+        passphraseBytes.resetBytes(in: 0..<passphraseBytes.count)
+        XCTAssertEqual(passphraseBytes, Data(repeating: 0, count: passphraseBytes.count))
+    }
 }
