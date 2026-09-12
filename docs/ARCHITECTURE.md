@@ -1,7 +1,79 @@
 # Architecture
 
-`App/` contains SwiftUI scenes and the `@MainActor` app container. `ShhCore` is a Foundation-only Swift package containing domain records, policy, terminal primitives, and ports. The app depends on protocols (`SSHTransport`, `CredentialStore`, `RemoteFileRepository`, `LocalTranscriber`) rather than framework or package-specific types.
+Shh is organized into modular packages and targets enforcing clean
+separation of concerns between core domain logic, Apple platform
+adapters, network transports, terminal emulation, and background
+extensions.
 
-`InMemoryCatalog`, `DemoSSHTransport`, `InMemoryTrustStore`, and `Unavailable*` adapters are deterministic implementations for previews, simulator review, and host package tests. They are not claims of production SSH or SFTP support.
+## Layered Modules
 
-Run `xcodegen generate` on macOS to create the iOS project from `project.yml`. Run `swift package dump-package` and `swift test` where Swift is installed. The package declares macOS 13 only as a host-test platform for its Foundation-only core; the generated Xcode project remains iOS-only with no macOS app target. Apple-only Keychain, AVFoundation, and SwiftUI integrations remain at the app boundary.
+### 1. ShhCore (Foundation-Only Core)
+- **Domain & Models:** Host metadata, endpoint configurations,
+  identities with opaque Keychain references, tags, groups, snippets.
+- **Safety Policy:** `CommandPolicy` quote-aware tokenizer and allowlist
+  blocking destructive commands and flagging review-required syntax.
+- **Terminal Primitives:** `ANSIParser`, `TerminalGrid`, and cell models.
+- **Sync & Vault:** `EncryptedVaultService`, `EncryptedVaultBackup`,
+  PBKDF2-HMAC-SHA256 key derivation, AES-256-GCM encryption, secret
+  detection, and replace/merge restore logic.
+- **File Provider Contracts:** Stable item identifiers, metadata
+  contracts, change anchors, and LRU cache eviction rules.
+- **Mosh & Herdr Contracts:** Datagram parsing, command templates, and
+  output parsers.
+
+### 2. ShhSSH (Network & Transports)
+- **Citadel / SwiftNIO SSH:** Live SSH connection management, PTY
+  allocation, remote command execution channels, and host-key callbacks.
+- **ProxyJump Pipeline:** Recursive multi-hop bastion SSH channels.
+- **Port Forwarding:** Local port forwarding, remote port forwarding,
+  and dynamic SOCKS5 server handlers.
+- **Mosh Bootstrap & Transport:** Remote `mosh-server` invocation over
+  SSH and UDP datagram client with network roaming recovery.
+- **Live SFTP:** SFTP channel client for directory navigation, remote
+  file CRUD, atomic upload, and streamed download.
+
+### 3. ShhTerminal (Rendering & Input)
+- **SwiftTerm Engine:** Native terminal view and rendering.
+- **Controller:** Alternate screen buffer coordination, debounced resize
+  handling (150ms window), and bracketed paste encoding.
+
+### 4. ShhVoice (Local Speech Processing)
+- **WhisperKit Transcriber:** On-device CoreML Whisper model
+  management and transcription.
+- **Apple Speech Transcriber:** On-device `SFSpeechRecognizer` fallback.
+- **Audio Recorder:** Secure temporary audio file capture with 0600
+  permissions, file protection, and immediate post-transcription
+  deletion.
+
+### 5. App (SwiftUI & Application Coordination)
+- **`AppContainer`:** `@MainActor` state coordinator binding UI scenes
+  with transport, catalog, audio, forwarding, and trust stores.
+- **File Provider Manager:** `FileProviderManagerHelper` coordinating
+  domain registration, unregistration, and atomic updates to shared App
+  Group storage (`snapshot.json` and `known_hosts.json`).
+- **Vault Backup UI:** `VaultBackupView` managing encrypted backup
+  export, import, preview, replace/merge restore, and security-scoped
+  staging.
+
+### 6. ShhFileProvider (App Extension)
+- **`NSFileProviderReplicatedExtension`:** Exposes remote SFTP files in
+  the iOS Files app.
+- **Operation-Scoped Lifecycle:** SSH/SFTP sessions are opened on demand
+  per operation and torn down promptly, preventing background connection
+  leaks.
+- **Shared App Group Storage:** Loads catalog and known-host records
+  from `catalogs/snapshot.json` and `catalogs/known_hosts.json`.
+- **Cache Eviction:** Bounded LRU cache for materialized files.
+
+## CI Workflow Architecture
+
+GitHub Actions runs on `macos-14` runners with:
+- Automated package resolution and test verification (`swift test`).
+- Project generation via cached XcodeGen (`xcodegen generate`).
+- Generic unsigned iOS builds for `Shh` and `ShhFileProvider`.
+- Dynamic simulator discovery selecting available iPhone and iPad
+  runtimes without hardcoded identifiers.
+- Bounded test execution with log capture and xcresult artifact
+  upload on failure.
+- Least-privilege permissions (`contents: read`) and concurrency
+  cancellation.
