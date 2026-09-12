@@ -413,9 +413,9 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         }
         if let transportError = error as? TransportError {
             switch transportError {
-            case .networkUnavailable, .timeout:
+            case .networkUnavailable, .timeout, .dnsFailure, .connectionRefused:
                 return NSFileProviderError(.serverUnreachable)
-            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired:
+            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired, .missingCredential, .invalidPrivateKey:
                 return NSFileProviderError(.notAuthenticated)
             case .cancelled:
                 return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)

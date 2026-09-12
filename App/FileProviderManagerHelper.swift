@@ -32,7 +32,7 @@ public final class FileProviderManagerHelper: Sendable {
     public static let shared = FileProviderManagerHelper()
 
     public let appGroupIdentifier: String
-    private let customContainerURL: URL?
+    public let customContainerURL: URL?
 
     public typealias DomainAdder = @Sendable (NSFileProviderDomain) async throws -> Void
     public typealias DomainRemover = @Sendable (NSFileProviderDomain) async throws -> Void
@@ -84,6 +84,26 @@ public final class FileProviderManagerHelper: Sendable {
         try trustData.write(to: trustURL, options: .atomic)
 
         return true
+    }
+
+    /// Loads the catalog snapshot from shared App Group directory if available.
+    public func loadSharedSnapshot() -> CatalogSnapshot? {
+        guard let targetBase = containerURL else { return nil }
+        let snapshotURL = targetBase.appendingPathComponent("catalogs/snapshot.json")
+        guard let data = try? Data(contentsOf: snapshotURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(CatalogSnapshot.self, from: data)
+    }
+
+    /// Loads trusted host keys from shared App Group directory if available.
+    public func loadSharedTrustRecords() -> [TrustRecord]? {
+        guard let targetBase = containerURL else { return nil }
+        let trustURL = targetBase.appendingPathComponent("catalogs/known_hosts.json")
+        guard let data = try? Data(contentsOf: trustURL) else { return nil }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode([TrustRecord].self, from: data)
     }
 
     /// Exports the current catalog snapshot into the shared App Group directory.
@@ -215,10 +235,14 @@ public enum FileProviderManagerError: LocalizedError, Equatable {
 public final class FileProviderManagerHelper: Sendable {
     public static let shared = FileProviderManagerHelper()
     public let appGroupIdentifier: String
+    public let customContainerURL: URL?
     public init(appGroupIdentifier: String = "group.com.ervinpopescu.shh", containerURL: URL? = nil) {
         self.appGroupIdentifier = appGroupIdentifier
+        self.customContainerURL = containerURL
     }
     public func syncSharedState(snapshot: CatalogSnapshot, trustRecords: [TrustRecord] = []) throws -> Bool { false }
+    public func loadSharedSnapshot() -> CatalogSnapshot? { nil }
+    public func loadSharedTrustRecords() -> [TrustRecord]? { nil }
     public func exportCatalogToSharedContainer(snapshot: CatalogSnapshot, trustRecords: [TrustRecord] = []) throws {}
     public func exportTrustedHostKeysToSharedContainer(records: [TrustRecord]) throws {}
     public func registerDomain(for host: Host) async throws {}

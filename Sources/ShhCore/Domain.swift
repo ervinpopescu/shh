@@ -574,3 +574,206 @@ public actor InMemorySessionRestorationStore: SessionRestorationStore {
     }
 }
 
+public enum ConnectionStage: String, Codable, Sendable, CaseIterable {
+    case configuration = "Configuration"
+    case credential = "Credential"
+    case dns = "DNS"
+    case tcp = "TCP"
+    case hostKey = "Host Key"
+    case sshNegotiation = "SSH Negotiation"
+    case authentication = "Authentication"
+    case ptyShell = "PTY/Shell"
+    case proxyJump = "ProxyJump/Mosh"
+}
+
+public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
+    public var id: UUID
+    public var stage: ConnectionStage
+    public var reason: String
+    public var technicalDetail: String
+    public var recoveryAction: String
+    public var timestamp: Date
+
+    public init(
+        id: UUID = UUID(),
+        stage: ConnectionStage,
+        reason: String,
+        technicalDetail: String,
+        recoveryAction: String,
+        timestamp: Date = Date()
+    ) {
+        self.id = id
+        self.stage = stage
+        self.reason = reason
+        self.technicalDetail = technicalDetail
+        self.recoveryAction = recoveryAction
+        self.timestamp = timestamp
+    }
+
+    public var copyableDiagnostics: String {
+        let formatter = ISO8601DateFormatter()
+        return """
+        Connection Failure Diagnostics
+        -----------------------------
+        Stage: \(stage.rawValue)
+        Reason: \(reason)
+        Technical Detail: \(technicalDetail)
+        Suggested Action: \(recoveryAction)
+        Timestamp: \(formatter.string(from: timestamp))
+        """
+    }
+
+    public static func from(error: Error, host: Host? = nil) -> ConnectionFailure {
+        if let transportError = error as? TransportError {
+            switch transportError {
+            case .dnsFailure(let detail):
+                return ConnectionFailure(
+                    stage: .dns,
+                    reason: "Could not resolve hostname.",
+                    technicalDetail: detail.isEmpty ? "DNS lookup failed for target host." : detail,
+                    recoveryAction: "Check the host address spelling and your device network/DNS configuration."
+                )
+            case .connectionRefused:
+                return ConnectionFailure(
+                    stage: .tcp,
+                    reason: "Connection refused by remote server.",
+                    technicalDetail: "Remote port refused TCP connection (ECONNREFUSED).",
+                    recoveryAction: "Verify that SSH service is running on the target port and firewall rules permit connections."
+                )
+            case .timeout:
+                return ConnectionFailure(
+                    stage: .tcp,
+                    reason: "Connection timed out reaching host.",
+                    technicalDetail: "TCP handshake timed out or network was unreachable.",
+                    recoveryAction: "Check remote host reachability and network connection."
+                )
+            case .networkUnavailable:
+                return ConnectionFailure(
+                    stage: .tcp,
+                    reason: "Network is unavailable or unreachable.",
+                    technicalDetail: "Network interface is down or target route is unreachable.",
+                    recoveryAction: "Check your Wi-Fi/cellular connection and try again."
+                )
+            case .missingCredential(let reference):
+                let safeRef = reference.prefix(6) + "..."
+                return ConnectionFailure(
+                    stage: .credential,
+                    reason: "Saved credential could not be found in Keychain.",
+                    technicalDetail: "Keychain item (ref: \(safeRef)) was not found or inaccessible.",
+                    recoveryAction: "Re-import or generate a new SSH key for this identity in Key Management."
+                )
+            case .invalidPrivateKey(let detail):
+                return ConnectionFailure(
+                    stage: .credential,
+                    reason: "Private key format invalid or unreadable.",
+                    technicalDetail: detail,
+                    recoveryAction: "Verify key format and ensure it is an unencrypted OpenSSH or PKCS#8 Ed25519 private key."
+                )
+            case .authenticationRequired:
+                return ConnectionFailure(
+                    stage: .authentication,
+                    reason: "Authentication rejected by remote server.",
+                    technicalDetail: "Server rejected public key authentication.",
+                    recoveryAction: "Ensure your public key is added to ~/.ssh/authorized_keys on the remote server."
+                )
+            case .hostKeyChanged(let old, let new):
+                let safeOld = old.prefix(16) + "..."
+                let safeNew = new.prefix(16) + "..."
+                return ConnectionFailure(
+                    stage: .hostKey,
+                    reason: "Host key has changed.",
+                    technicalDetail: "Host key mismatch. Saved: \(safeOld), Received: \(safeNew).",
+                    recoveryAction: "Confirm whether the server was recently reinstalled or rotated its key before trusting."
+                )
+            case .hostKeyApprovalRequired:
+                return ConnectionFailure(
+                    stage: .hostKey,
+                    reason: "Host key verification required.",
+                    technicalDetail: "The server presented an unrecognized host key.",
+                    recoveryAction: "Approve the host key fingerprint to connect."
+                )
+            case .invalidConfiguration:
+                return ConnectionFailure(
+                    stage: .configuration,
+                    reason: "Invalid connection configuration.",
+                    technicalDetail: "Host options or parameters could not be validated.",
+                    recoveryAction: "Review host connection settings in the editor."
+                )
+            case .unsupported:
+                return ConnectionFailure(
+                    stage: .configuration,
+                    reason: "Unsupported connection feature.",
+                    technicalDetail: "The requested auth method or transport feature is not supported.",
+                    recoveryAction: "Check host settings or switch to standard SSH direct connection."
+                )
+            case .cancelled:
+                return ConnectionFailure(
+                    stage: .configuration,
+                    reason: "Connection was cancelled.",
+                    technicalDetail: "The user or system cancelled the connection.",
+                    recoveryAction: "Tap Connect to retry."
+                )
+            case .remoteFailure(let message):
+                let lower = message.lowercased()
+                if lower.contains("pty") || lower.contains("shell") {
+                    return ConnectionFailure(
+                        stage: .ptyShell,
+                        reason: "Remote shell allocation failed.",
+                        technicalDetail: "Server rejected pseudo-terminal or shell initialization request.",
+                        recoveryAction: "Check remote user shell and account permissions."
+                    )
+                }
+                if lower.contains("bastion") || lower.contains("proxyjump") || lower.contains("hop") {
+                    return ConnectionFailure(
+                        stage: .proxyJump,
+                        reason: "ProxyJump bastion connection failed.",
+                        technicalDetail: "Failed to establish SSH connection through intermediate hop.",
+                        recoveryAction: "Verify intermediate bastion host availability and credentials."
+                    )
+                }
+                if lower.contains("mosh") {
+                    return ConnectionFailure(
+                        stage: .proxyJump,
+                        reason: "Mosh session bootstrap failed.",
+                        technicalDetail: "Failed to start or connect to mosh-server.",
+                        recoveryAction: "Ensure mosh-server is installed on remote host and UDP ports are open."
+                    )
+                }
+                return ConnectionFailure(
+                    stage: .sshNegotiation,
+                    reason: "SSH negotiation failed.",
+                    technicalDetail: "Remote failure during protocol handshake: \(Redactor().redact(message))",
+                    recoveryAction: "Verify remote SSH server health, algorithm compatibility, and logs."
+                )
+            }
+        }
+
+        let desc = error.localizedDescription
+        let descr = String(describing: error)
+        let combined = "\(desc) \(descr)".lowercased()
+        if combined.contains("nodename") || combined.contains("servname") || combined.contains("dns") || combined.contains("unknownhost") {
+            return ConnectionFailure(
+                stage: .dns,
+                reason: "Could not resolve hostname.",
+                technicalDetail: "DNS resolution failed for remote host.",
+                recoveryAction: "Check the host address spelling and your network's DNS settings."
+            )
+        }
+        if combined.contains("refused") {
+            return ConnectionFailure(
+                stage: .tcp,
+                reason: "Connection refused by remote server.",
+                technicalDetail: "Target port rejected connection.",
+                recoveryAction: "Verify SSH service is running and accessible."
+            )
+        }
+        return ConnectionFailure(
+            stage: .sshNegotiation,
+            reason: "Connection failed.",
+            technicalDetail: "An unexpected error occurred: \(Redactor().redact(desc))",
+            recoveryAction: "Check network settings and try connecting again."
+        )
+    }
+}
+
+

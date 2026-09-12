@@ -81,14 +81,16 @@ struct RootView: View {
                 }
             }
         }
-        .confirmationDialog("Approve host key?", isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }), titleVisibility: .visible) {
+        .alert(
+            "Approve Host Key?",
+            isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }),
+            presenting: container.pendingTrustChallenge
+        ) { challenge in
             Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
             Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
             Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
-        } message: {
-            if let challenge = container.pendingTrustChallenge {
-                Text("\(challenge.hostname):\(challenge.port)\n\(challenge.algorithm)\n\(challenge.fingerprint)")
-            }
+        } message: { challenge in
+            Text("The host key for \(challenge.hostname):\(challenge.port) is not yet verified.\n\nAlgorithm: \(challenge.algorithm)\nFingerprint: \(challenge.fingerprint)")
         }
     }
     private var capabilityFooter: some View {
@@ -141,6 +143,9 @@ struct HostListView: View {
             if ProcessInfo.processInfo.arguments.contains("--new-host") {
                 showingEditor = true
             }
+        }
+        .onChange(of: container.catalogUpdateToken) { _ in
+            Task { await reload() }
         }
     }
     private func reload() async { hosts = (try? await container.catalog.listHosts()) ?? [] }
@@ -245,20 +250,39 @@ struct HostDetailView: View {
                 LabeledContent("Voice input", value: host.isVoiceEnabled ? "Enabled" : "Disabled (Default)")
                 LabeledContent("Environment", value: host.isProduction ? "Production" : "Standard")
             }
+            if let failure = container.lastConnectionFailure,
+               (container.activeSession?.hostID == host.id || container.activeHost?.id == host.id) {
+                Section {
+                    ConnectionFailureCard(
+                        failure: failure,
+                        onRetry: { Task { await container.connect(to: host) } },
+                        onEdit: { showEditor = true }
+                    )
+                }
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+            }
+
             Section {
                 Button("Connect", systemImage: "bolt.horizontal") { Task { await container.connect(to: host) } }
                     .disabled(isConnectDisabled)
                 Button("Edit", systemImage: "pencil") { showEditor = true }
-                if isFailedForThisHost && !container.terminalText.isEmpty {
-                    Label(container.terminalText, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
             }
         }
         .navigationTitle(host.name)
         .task {
             bastionHops = await container.resolveBastionNames(for: host)
+        }
+        .alert(
+            "Approve Host Key?",
+            isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }),
+            presenting: container.pendingTrustChallenge
+        ) { challenge in
+            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
+            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
+            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
+        } message: { challenge in
+            Text("The host key for \(challenge.hostname):\(challenge.port) is not yet verified.\n\nAlgorithm: \(challenge.algorithm)\nFingerprint: \(challenge.fingerprint)")
         }
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }
@@ -303,6 +327,100 @@ struct HostDetailView: View {
         case .endpoint(let ep):
             return "\(ep.username)@\(ep.hostname):\(ep.port)"
         }
+    }
+}
+
+struct ConnectionFailureCard: View {
+    let failure: ConnectionFailure
+    let onRetry: () -> Void
+    let onEdit: () -> Void
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .font(.title3)
+                Text("Connection failed")
+                    .font(.headline.bold())
+                    .foregroundStyle(.red)
+                Spacer()
+                Text(failure.stage.rawValue)
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.red.opacity(0.12))
+                    .foregroundStyle(.red)
+                    .clipShape(Capsule())
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Why it failed")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(failure.reason)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                if !failure.technicalDetail.isEmpty {
+                    Text(failure.technicalDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("What to try")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(failure.recoveryAction)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Button(action: onRetry) {
+                    Label("Retry", systemImage: "arrow.clockwise")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+
+                Button(action: onEdit) {
+                    Label("Edit Host", systemImage: "pencil")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Spacer()
+
+                Button {
+                    UIPasteboard.general.string = failure.copyableDiagnostics
+                    copied = true
+                    Task {
+                        try? await Task.sleep(nanoseconds: 2_000_000_000)
+                        copied = false
+                    }
+                } label: {
+                    Label(copied ? "Copied!" : "Copy Diagnostics", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+            }
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemGroupedBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.red.opacity(0.25), lineWidth: 1)
+        )
     }
 }
 
@@ -869,6 +987,20 @@ struct SessionView: View {
                     }
                 )
                 Divider()
+            }
+
+            // Connection Failure Banner (if failed)
+            if let failure = container.lastConnectionFailure, container.activeSession?.state == .failed {
+                ConnectionFailureCard(
+                    failure: failure,
+                    onRetry: {
+                        if let host = container.activeHost {
+                            Task { await container.connect(to: host) }
+                        }
+                    },
+                    onEdit: {}
+                )
+                .padding()
             }
 
             // Terminal Surface (Production SwiftTerm or Legacy Fallback)

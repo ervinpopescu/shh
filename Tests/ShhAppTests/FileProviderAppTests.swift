@@ -43,7 +43,13 @@ final class FileProviderAppTests: XCTestCase {
 
     func testFileProviderManagerHelperSharedCatalogExport() async throws {
         #if canImport(FileProvider)
-        let helper = FileProviderManagerHelper(appGroupIdentifier: "group.com.ervinpopescu.shh")
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("FPTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let helper = FileProviderManagerHelper(
+            appGroupIdentifier: "group.com.ervinpopescu.shh",
+            containerURL: tempDir
+        )
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
 

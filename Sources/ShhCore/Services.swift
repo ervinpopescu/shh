@@ -3,7 +3,21 @@ import Foundation
 import Security
 #endif
 
-public enum TransportError: Error, Equatable, Sendable { case invalidConfiguration, authenticationRequired, hostKeyChanged(old: String, new: String), hostKeyApprovalRequired(HostKeyChallenge), timeout, networkUnavailable, unsupported, cancelled, remoteFailure(String) }
+public enum TransportError: Error, Equatable, Sendable {
+    case invalidConfiguration
+    case authenticationRequired
+    case hostKeyChanged(old: String, new: String)
+    case hostKeyApprovalRequired(HostKeyChallenge)
+    case timeout
+    case networkUnavailable
+    case unsupported
+    case cancelled
+    case remoteFailure(String)
+    case dnsFailure(String)
+    case connectionRefused
+    case missingCredential(reference: String)
+    case invalidPrivateKey(detail: String)
+}
 public struct HostKeyChallenge: Sendable, Equatable, Identifiable {
     public var hostname: String
     public var port: UInt16
@@ -451,6 +465,13 @@ public actor InMemoryCatalog: CatalogRepository {
         let group = try? Group(name: "Development", sortOrder: 0); let tag = try? Tag(name: "iPad", color: "teal"); let identity = try? IdentityDescriptor(name: "Demo Key", kind: .privateKey, publicFingerprint: "SHA256:demo", keychainReference: "kc-demo")
         if let group, let tag, let identity, let host = try? Host(name: "Demo Workbox", hostname: "demo.invalid", username: "dev", groupID: group.id, tagIDs: [tag.id], identityID: identity.id) { groupValues[group.id] = group; tagValues[tag.id] = tag; identityValues[identity.id] = identity; hostValues[host.id] = host }
         if let snippet = try? Snippet(name: "List files", body: "ls -la") { snippetValues[snippet.id] = snippet }
+    }
+    public init(snapshot: CatalogSnapshot) {
+        for host in snapshot.hosts { hostValues[host.id] = host }
+        for group in snapshot.groups { groupValues[group.id] = group }
+        for tag in snapshot.tags { tagValues[tag.id] = tag }
+        for identity in snapshot.identities { identityValues[identity.id] = identity }
+        for snippet in snapshot.snippets { snippetValues[snippet.id] = snippet }
     }
     public func listHosts() async throws -> [Host] { hostValues.values.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending } }
     public func save(_ host: Host) async throws { hostValues[host.id] = host }

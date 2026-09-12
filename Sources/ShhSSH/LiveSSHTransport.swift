@@ -965,26 +965,28 @@ public struct LiveSSHTransport: SSHTransport {
 
         switch identity.kind {
         case .password:
+            let data: Data
             do {
-                let data = try await credentialStore.load(reference: identity.keychainReference)
-                guard let password = String(data: data, encoding: .utf8), !password.isEmpty else {
-                    throw TransportError.authenticationRequired
-                }
-                return .password(password)
-            } catch let error as TransportError {
-                throw error
+                data = try await credentialStore.load(reference: identity.keychainReference)
             } catch {
+                throw TransportError.missingCredential(reference: identity.keychainReference)
+            }
+            guard let password = String(data: data, encoding: .utf8), !password.isEmpty else {
                 throw TransportError.authenticationRequired
             }
+            return .password(password)
         case .privateKey:
+            let data: Data
             do {
-                let data = try await credentialStore.load(reference: identity.keychainReference)
+                data = try await credentialStore.load(reference: identity.keychainReference)
+            } catch {
+                throw TransportError.missingCredential(reference: identity.keychainReference)
+            }
+            do {
                 let privateKey = try Ed25519Parser.parse(from: data)
                 return .privateKey(privateKey)
-            } catch let error as TransportError {
-                throw error
             } catch {
-                throw TransportError.authenticationRequired
+                throw TransportError.invalidPrivateKey(detail: "Failed to parse Ed25519 private key from credential")
             }
         case .agent:
             throw TransportError.unsupported
@@ -1006,8 +1008,6 @@ public struct LiveSSHTransport: SSHTransport {
             return .cancelled
         }
 
-        let description = error.localizedDescription.lowercased()
-
         if let channelError = error as? ChannelError {
             switch channelError {
             case .connectTimeout:
@@ -1016,29 +1016,48 @@ public struct LiveSSHTransport: SSHTransport {
                 break
             }
         }
-        if description.contains("timed out") || description.contains("timeout") {
-            return .timeout
-        }
 
         if let posixError = error as? POSIXError {
             switch posixError.code {
-            case .ECONNREFUSED, .EHOSTUNREACH, .ENETUNREACH, .ENETDOWN:
+            case .ECONNREFUSED:
+                return .connectionRefused
+            case .EHOSTUNREACH, .ENETUNREACH, .ENETDOWN:
                 return .networkUnavailable
             case .ETIMEDOUT:
                 return .timeout
             default:
-                return .networkUnavailable
+                break
             }
         }
 
-        if description.contains("connection refused") || description.contains("unreachable") || description.contains("network") {
+        let description = error.localizedDescription.lowercased()
+
+        if description.contains("timed out") || description.contains("timeout") {
+            return .timeout
+        }
+
+        if description.contains("connection refused") {
+            return .connectionRefused
+        }
+
+        if description.contains("nodename nor servname") ||
+            description.contains("unknownhost") ||
+            description.contains("hostname could not be resolved") ||
+            description.contains("name resolution") ||
+            description.contains("eai_") ||
+            description.contains("no address associated") {
+            return .dnsFailure("DNS resolution failed for hostname")
+        }
+
+        if description.contains("unreachable") || description.contains("network is down") || description.contains("network unreachable") {
             return .networkUnavailable
         }
 
-        if description.contains("authentication") || description.contains("auth failed") {
+        if description.contains("authentication") || description.contains("auth failed") || description.contains("permission denied") {
             return .authenticationRequired
         }
 
-        return .remoteFailure(error.localizedDescription)
+        let safeMessage = Redactor().redact(error.localizedDescription)
+        return .remoteFailure(safeMessage)
     }
 }
