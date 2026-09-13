@@ -13,8 +13,11 @@ data, remote execution outputs, voice transcripts, and backup storage.
 - Identity records contain only opaque Keychain references.
 - In-memory keys are zeroed on teardown.
 
-### 2. Trust-On-First-Use (TOFU) Verification
-- Host-key verification occurs prior to credential transmission.
+### 2. Trust-On-First-Use (TOFU) Verification & Transport Isolation
+- Primary SSH transport (`LiveSSHTransport`) is implemented directly with
+  SwiftNIO SSH.
+- Host-key verification occurs prior to credential transmission across
+  all direct, ProxyJump, and exec channels.
 - Fingerprints are canonicalized using SHA-256 over canonical hostname,
   port, and algorithm.
 - Changed host keys are unconditionally rejected and require explicit
@@ -22,6 +25,17 @@ data, remote execution outputs, voice transcripts, and backup storage.
 - Temporary trust approvals apply only to the active connection and are
   never exported to persistent storage. Permanent trust records are
   synchronized atomically to shared App Group storage.
+- Citadel is isolated strictly to the SFTP subsystem repository
+  (`LiveSFTPRepository`) and does not govern the primary SSH terminal
+  handshake or channel pipeline.
+- Full Mosh State Synchronization Protocol (SSP) remains incomplete as
+  a separate future protocol effort and does not affect the complete,
+  production-grade status of the SSH transport.
+- Evaluation boundary honesty: unit, integration, and live-host simulator
+  testing validates implemented protocol behavior, error recovery, and
+  interoperability, but does not substitute for an independent third-party
+  cryptographic security audit or a broad physical-device compatibility
+  matrix.
 
 ### 3. Command Execution & Safety Policy
 - Commands, snippets, Herdr templates, and voice transcripts are treated
