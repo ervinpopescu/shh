@@ -7,17 +7,26 @@
    states.
 2. **Data & Security:** Versioned models, Keychain abstraction seams,
    opaque identity records, and session restoration.
-3. **Live SSH Transport:** Citadel and SwiftNIO SSH integration, PTY
-   allocation, TOFU host-key verification, cancellation, and resize
-   handling.
-4. **Multiplexer Integration:** First-class Tmux control adapter,
-   session listing, creation, attach, and command approval flows.
+3. **Live SSH Transport (SwiftNIO SSH):** Production `LiveSSHTransport`
+   implemented directly with SwiftNIO SSH rather than Citadel. Enforces
+   strict TOFU host-key verification before credential exchange, native
+   password and Ed25519 key authentication (generated and imported
+   OpenSSH, PKCS#8, and raw formats), interactive PTY and shell
+   allocation, debounced window resize handling, isolated exec channels,
+   recursive multi-hop ProxyJump bastions, port forwarding, automatic
+   backoff reconnection, and live-host simulator interoperability.
+4. **Multiplexer Integration:** First-class Tmux control adapter with
+   collision-resistant pipe-delimited format parsing, backward-compatible
+   parsing for legacy and tmux 3.7c underscore-sanitized output, session
+   listing, creation, attach, and command approval flows.
 5. **On-Device Voice AI:** WhisperKit CoreML and Apple Speech
    transcription, push-to-talk recording, preview editing, and zero
    auto-execution policy.
-6. **Remote File Management:** SFTP subsystem repository, directory
-   navigation, streamed upload/download, in-app text editor, and conflict
-   resolution.
+6. **Remote File Management (SFTP Subsystem):** Isolated SFTP subsystem
+   repository (`LiveSFTPRepository`) using Citadel with native password
+   and Ed25519 authentication, directory navigation, streamed
+   upload/download, in-app text editor, structured failure state cards
+   with actionable recovery, and conflict resolution.
 7. **ProxyJump & Port Forwarding:** Recursive multi-hop bastions, local
    port forwarding, remote port forwarding, and dynamic SOCKS5 proxying.
 8. **Herdr Orchestration:** Multi-agent workspace supervisor, pane
@@ -35,9 +44,14 @@
 11. **Physical Device & Provisioning:** Apple Developer portal App Group
     and File Provider entitlement provisioning, device Keychain smoke
     testing, and physical microphone validation.
-12. **Mosh SSP Hardening:** Full State Synchronization Protocol (SSP)
-    cryptographic packet encryption and speculative local echo.
-13. **TestFlight Beta & App Store:** Build automation, TestFlight
+12. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
+    cryptographic packet encryption and speculative local echo (independent
+    of the completed SSH transport).
+13. **Independent Audit & Interoperability Expansion:** Third-party
+    cryptographic security audit and broad physical-device compatibility
+    matrix expansion (current validation covers unit, integration, and
+    live-host simulator suites).
+14. **TestFlight Beta & App Store:** Build automation, TestFlight
     internal and external beta testing, App Store Connect metadata, and
     EAR Category 5 Part 2 export compliance self-classification filing
     (ECCN 5D992.c).
