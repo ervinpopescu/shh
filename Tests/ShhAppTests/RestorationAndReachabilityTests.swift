@@ -134,8 +134,8 @@ final class RestorationAndReachabilityTests: XCTestCase {
 
         // Verify auto-attach command was sent through connection
         let sentStrings = mockConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
-        let hasAttach = sentStrings.contains { $0.contains("attach-session") && $0.contains("'$1'") }
-        XCTAssertTrue(hasAttach, "When autoAttachTmux is true with session ID, attach-session command must be sent")
+        let hasAttach = sentStrings.contains { $0.contains("attach-session") }
+        XCTAssertFalse(hasAttach, "Legacy host defaults must not trigger automatic attachment")
     }
 
     func testAppContainerAutoAttachTmuxCreatesNewSessionIfNameProvided() async throws {
@@ -161,8 +161,42 @@ final class RestorationAndReachabilityTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         let sentStrings = mockConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
-        let hasNewSession = sentStrings.contains { $0.contains("new-session") && $0.contains("'my-work'") }
-        XCTAssertTrue(hasNewSession, "When autoAttachTmux is true with session name, new-session command must be sent")
+        let hasNewSession = sentStrings.contains { $0.contains("new-session") }
+        XCTAssertFalse(hasNewSession, "Automatic restoration must never create a missing session")
+    }
+
+    func testLastUsedSessionTakesPrecedenceOverLegacyHostDefault() async throws {
+        let hostID = UUID()
+        let mockConnection = MockSSHConnection()
+        mockConnection.onExecuteCommand = { command in
+            if command.contains("has-session") { return SSHCommandResult(exitCode: 0, stdout: "") }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let store = InMemorySessionRestorationStore(initial: SessionRestorationMetadata(
+            hostID: hostID,
+            tmuxSessionID: "$7"
+        ))
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(
+            id: hostID,
+            name: "Precedence Host",
+            hostname: "precedence.invalid",
+            username: "dev",
+            defaultTmuxSession: "$1",
+            autoAttachTmux: true
+        )
+
+        await container.connect(to: host)
+        let sentStrings = mockConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
+        XCTAssertTrue(sentStrings.contains { $0.contains("attach-session") && $0.contains("'$7'") })
+        XCTAssertFalse(sentStrings.contains { $0.contains("'$1'") })
     }
 
     // MARK: - Network Reachability & Foreground Triggers

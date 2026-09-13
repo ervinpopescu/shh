@@ -156,12 +156,27 @@ public enum HealthState: Codable, Hashable, Sendable {
 }
 
 public struct HostTmuxPreferences: Codable, Hashable, Sendable {
+    // Kept for decoding older catalogs, but no longer persisted for new data.
     public var defaultSession: String?
     public var autoAttach: Bool
 
     public init(defaultSession: String? = nil, autoAttach: Bool = false) {
         self.defaultSession = defaultSession
         self.autoAttach = autoAttach
+    }
+
+    private enum CodingKeys: String, CodingKey { case defaultSession, autoAttach }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        defaultSession = try container.decodeIfPresent(String.self, forKey: .defaultSession)
+        autoAttach = try container.decodeIfPresent(Bool.self, forKey: .autoAttach) ?? false
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        // A configured default target is legacy state and must not be emitted.
+        try container.encode(autoAttach, forKey: .autoAttach)
     }
 }
 
@@ -287,8 +302,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         try container.encode(health, forKey: .health)
         try container.encodeIfPresent(lastUsedAt, forKey: .lastUsedAt)
         try container.encode(tmuxPreferences, forKey: .tmuxPreferences)
-        try container.encodeIfPresent(defaultTmuxSession, forKey: .defaultTmuxSession)
-        try container.encode(autoAttachTmux, forKey: .autoAttachTmux)
+        // Legacy flattened tmux keys remain decode-only for compatibility.
         try container.encode(voicePolicy, forKey: .voicePolicy)
         try container.encode(isProduction, forKey: .isProduction)
         try container.encode(forwardingRules, forKey: .forwardingRules)

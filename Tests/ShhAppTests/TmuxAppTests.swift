@@ -774,38 +774,15 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.activeHost?.autoAttachTmux, false)
         XCTAssertNil(container.activeHost?.defaultTmuxSession)
 
-        // Valid session name
-        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "my-session")
+        // Legacy target arguments are ignored while auto-attach remains configurable.
+        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "legacy-session")
         XCTAssertEqual(container.activeHost?.autoAttachTmux, true)
-        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "my-session")
+        XCTAssertNil(container.activeHost?.defaultTmuxSession)
         let reloadedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
-        XCTAssertEqual(reloadedHost?.defaultTmuxSession, "my-session")
+        XCTAssertNil(reloadedHost?.defaultTmuxSession)
         XCTAssertEqual(reloadedHost?.autoAttachTmux, true)
 
-        // Valid session ID
-        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "$3")
-        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3")
-
-        // Invalid session name with colon
-        do {
-            try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "invalid:name")
-            XCTFail("Should throw for colon in session name")
-        } catch {
-            XCTAssertTrue(error is TmuxSessionNameError)
-        }
-        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3", "Invalid preference must not mutate activeHost")
-
-        // Invalid session ID format
-        do {
-            try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "$notdigits")
-            XCTFail("Should throw for invalid session ID")
-        } catch {
-            XCTAssertTrue(error is TmuxSessionIDError)
-        }
-        XCTAssertEqual(container.activeHost?.defaultTmuxSession, "$3", "Invalid session ID must not mutate activeHost")
-
-        // Clearing default session with empty string
-        try await container.updateActiveHostPreferences(autoAttachTmux: false, defaultTmuxSession: "   ")
+        try await container.updateActiveHostPreferences(autoAttachTmux: false, defaultTmuxSession: "$3")
         XCTAssertEqual(container.activeHost?.autoAttachTmux, false)
         XCTAssertNil(container.activeHost?.defaultTmuxSession)
     }
