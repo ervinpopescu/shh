@@ -104,8 +104,29 @@ final class ReconnectAndRestorationTests: XCTestCase {
 
         XCTAssertEqual(decoded.id, host.id)
         XCTAssertEqual(decoded.name, "RoundTrip Host")
-        XCTAssertEqual(decoded.defaultTmuxSession, "main")
+        XCTAssertNil(decoded.defaultTmuxSession)
         XCTAssertTrue(decoded.autoAttachTmux)
+        let encodedObject = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertNil(encodedObject["defaultTmuxSession"])
+        XCTAssertNil(encodedObject["autoAttachTmux"])
+        XCTAssertNil((encodedObject["tmuxPreferences"] as? [String: Any])?["defaultSession"])
+    }
+
+    func testLegacyDefaultTargetDecodesButIsNotReemitted() throws {
+        let host = try Host(name: "Legacy Target", hostname: "legacy.invalid", username: "user")
+        let encoder = JSONEncoder()
+        let original = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(host)) as? [String: Any])
+        var legacy = original
+        legacy["defaultTmuxSession"] = "legacy-main"
+        legacy["autoAttachTmux"] = true
+        legacy.removeValue(forKey: "tmuxPreferences")
+        let decoded = try JSONDecoder().decode(Host.self, from: JSONSerialization.data(withJSONObject: legacy))
+        XCTAssertEqual(decoded.defaultTmuxSession, "legacy-main")
+        XCTAssertTrue(decoded.autoAttachTmux)
+        let reencoded = try XCTUnwrap(JSONSerialization.jsonObject(with: encoder.encode(decoded)) as? [String: Any])
+        XCTAssertNil(reencoded["defaultTmuxSession"])
+        XCTAssertNil(reencoded["autoAttachTmux"])
+        XCTAssertNil((reencoded["tmuxPreferences"] as? [String: Any])?["defaultSession"])
     }
 
     // MARK: - Reconnect Coordinator: Backoff & Jitter Bounds

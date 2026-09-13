@@ -434,7 +434,6 @@ struct HostEditorView: View {
     @State private var showingAddRule = false
     @State private var ruleToEdit: PortForwardingRule? = nil
     @State private var allHosts: [Host] = []
-    @State private var defaultTmuxSession: String
     @State private var autoAttachTmux: Bool
     @State private var enableVoice: Bool
     @State private var allowShellCommand: Bool
@@ -490,7 +489,6 @@ struct HostEditorView: View {
         _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
         _forwardingRules = State(initialValue: existing?.forwardingRules ?? [])
 
-        _defaultTmuxSession = State(initialValue: existing?.defaultTmuxSession ?? "")
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
         _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
         let allowed = existing?.voicePolicy.allowedModes ?? Set(VoiceInputMode.allCases)
@@ -717,18 +715,8 @@ struct HostEditorView: View {
                 }
 
                 Section("Tmux preferences") {
-                    Toggle("Auto-attach tmux session", isOn: $autoAttachTmux)
+                    Toggle("Auto-attach last used tmux session", isOn: $autoAttachTmux)
                         .accessibilityIdentifier("host-editor-auto-attach-toggle")
-                    TextField("Default session name/ID", text: $defaultTmuxSession)
-                        .autocorrectionDisabled()
-                        .textInputAutocapitalization(.never)
-                        .accessibilityIdentifier("host-editor-default-session-field")
-                    if let hint = tmuxPreferenceHint {
-                        Text(hint.message)
-                            .font(.caption)
-                            .foregroundStyle(hint.isValid ? Color.secondary : Color.red)
-                            .accessibilityIdentifier("host-editor-session-validation-hint")
-                    }
                 }
                 Section("Voice input policy") {
                     Toggle("Enable voice input", isOn: $enableVoice)
@@ -783,7 +771,7 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || !isTmuxPreferenceValid || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
                         .accessibilityIdentifier("host-editor-save-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
@@ -809,43 +797,9 @@ struct HostEditorView: View {
         return true
     }
 
-    private var isTmuxPreferenceValid: Bool {
-        let trimmed = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return true }
-        if trimmed.hasPrefix("$") {
-            return (try? TmuxSessionID(trimmed)) != nil
-        } else {
-            return (try? TmuxSessionName(trimmed)) != nil
-        }
-    }
-
-    private var tmuxPreferenceHint: (message: String, isValid: Bool)? {
-        let trimmed = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        if trimmed.hasPrefix("$") {
-            if (try? TmuxSessionID(trimmed)) != nil {
-                return ("Valid tmux session ID", true)
-            } else {
-                return ("Invalid session ID: must start with '$' followed by digits (e.g. '$0')", false)
-            }
-        } else {
-            do {
-                _ = try TmuxSessionName(trimmed)
-                return ("Valid tmux session name", true)
-            } catch let error as TmuxSessionNameError {
-                return (error.localizedDescription, false)
-            } catch {
-                return ("Invalid session name", false)
-            }
-        }
-    }
-
     func buildHost() -> Host? {
-        guard isTmuxPreferenceValid else { return nil }
         guard isMoshPortRangeValid else { return nil }
         if connectionType == .proxyJump && bastionHops.isEmpty { return nil }
-        let trimmedSession = defaultTmuxSession.trimmingCharacters(in: .whitespacesAndNewlines)
-        let sessionPref = trimmedSession.isEmpty ? nil : trimmedSession
         var allowedModes: Set<VoiceInputMode> = []
         if allowShellCommand { allowedModes.insert(.shellCommand) }
         if allowAgentMessage { allowedModes.insert(.agentMessage) }
@@ -899,7 +853,6 @@ struct HostEditorView: View {
             username: username,
             identityID: identityID,
             connection: profile,
-            defaultTmuxSession: sessionPref,
             autoAttachTmux: autoAttachTmux,
             voicePolicy: voicePolicy,
             isProduction: isProductionHost,
@@ -1856,9 +1809,7 @@ struct MultiplexerPicker: View {
     @State private var selected = RemoteMultiplexer.tmux
     @State private var newSessionName = ""
     @State private var autoAttach = false
-    @State private var defaultSession = ""
     @State private var hasLoadedPreferences = false
-    @State private var preferenceError: String? = nil
 
     var body: some View {
         NavigationStack {
@@ -2116,29 +2067,13 @@ struct MultiplexerPicker: View {
         // Host Auto-Attach Preference
         if container.activeHost != nil {
             Section("Host Preference") {
-                Toggle("Auto-attach on connect", isOn: $autoAttach)
+                Toggle("Auto-attach last used session on connect", isOn: $autoAttach)
                     .onChange(of: autoAttach) { _, _ in
                         savePreferences()
                     }
                     .accessibilityLabel("Auto-attach to tmux on connect")
                     .accessibilityIdentifier("sheet-auto-attach-toggle")
 
-                TextField("Default session name/ID", text: $defaultSession)
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .onChange(of: defaultSession) { _, _ in
-                        savePreferences()
-                    }
-                    .accessibilityLabel("Default session name or ID")
-                    .accessibilityIdentifier("sheet-default-session-field")
-
-                if let err = preferenceError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .accessibilityLabel("Default session error: \(err)")
-                        .accessibilityIdentifier("default-session-error")
-                }
             }
         }
     }
@@ -2204,33 +2139,15 @@ struct MultiplexerPicker: View {
     private func loadHostPreferences() {
         guard !hasLoadedPreferences, let host = container.activeHost else { return }
         autoAttach = host.autoAttachTmux
-        defaultSession = host.defaultTmuxSession ?? ""
         hasLoadedPreferences = true
     }
 
     private func savePreferences() {
         guard hasLoadedPreferences, container.activeHost != nil else { return }
-        let trimmed = defaultSession.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            if trimmed.hasPrefix("$") {
-                if (try? TmuxSessionID(trimmed)) == nil {
-                    preferenceError = "Invalid session ID format. Must begin with $ followed by digits."
-                    return
-                }
-            } else {
-                do {
-                    _ = try TmuxSessionName(trimmed)
-                } catch {
-                    preferenceError = error.localizedDescription
-                    return
-                }
-            }
-        }
-        preferenceError = nil
         Task {
             try? await container.updateActiveHostPreferences(
                 autoAttachTmux: autoAttach,
-                defaultTmuxSession: trimmed.isEmpty ? nil : trimmed
+                defaultTmuxSession: nil
             )
         }
     }

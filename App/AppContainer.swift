@@ -572,13 +572,18 @@ final class AppContainer: ObservableObject {
             (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
 
-            let targetSession = restoringTmuxSessionID ?? (host.autoAttachTmux ? (host.defaultTmuxSession ?? "default") : nil)
-            let metadata = SessionRestorationMetadata(
-                hostID: host.id,
-                sessionID: session.id,
-                tmuxSessionID: targetSession
+            let targetSession = await automaticTmuxTarget(
+                for: host,
+                explicitTarget: restoringTmuxSessionID
             )
-            try? await restorationStore.save(metadata)
+            if let targetSession {
+                let metadata = SessionRestorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    tmuxSessionID: targetSession
+                )
+                try? await restorationStore.save(metadata)
+            }
 
             // Wire debounced resize callback to active connection
             terminalController.onResize = { [weak self, sessionID = session.id] newSize in
@@ -833,15 +838,17 @@ final class AppContainer: ObservableObject {
             self.enqueueRawInteractive(data, sessionID: sessionID)
         }
 
-        let targetSession = activeTmuxSessionID ?? (host.autoAttachTmux ? (host.defaultTmuxSession ?? "default") : nil)
-        let metadata = SessionRestorationMetadata(
-            hostID: host.id,
-            sessionID: session.id,
-            tmuxSessionID: targetSession
+        let targetSession = await automaticTmuxTarget(
+            for: host,
+            explicitTarget: activeTmuxSessionID
         )
-        try? await restorationStore.save(metadata)
-
         if let target = targetSession {
+            let metadata = SessionRestorationMetadata(
+                hostID: host.id,
+                sessionID: session.id,
+                tmuxSessionID: target
+            )
+            try? await restorationStore.save(metadata)
             await self.handleTmuxTarget(target, on: connection, host: host, session: session)
         }
 
@@ -993,13 +1000,15 @@ final class AppContainer: ObservableObject {
             }
         case .background:
             if let session = activeSession, let host = activeHost, session.state == .connected {
-                let metadata = SessionRestorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    tmuxSessionID: activeTmuxSessionID ?? host.defaultTmuxSession
-                )
-                Task { [weak self] in
-                    try? await self?.restorationStore.save(metadata)
+                if let target = activeTmuxSessionID {
+                    let metadata = SessionRestorationMetadata(
+                        hostID: host.id,
+                        sessionID: session.id,
+                        tmuxSessionID: target
+                    )
+                    Task { [weak self] in
+                        try? await self?.restorationStore.save(metadata)
+                    }
                 }
             }
         default:
@@ -1232,20 +1241,11 @@ final class AppContainer: ObservableObject {
         return activeID == session.sessionID || activeID == session.name
     }
 
-    func updateActiveHostPreferences(autoAttachTmux: Bool, defaultTmuxSession: String?) async throws {
+    func updateActiveHostPreferences(autoAttachTmux: Bool, defaultTmuxSession: String? = nil) async throws {
         guard let host = activeHost else { return }
-        let validatedSession: String?
-        if let session = defaultTmuxSession?.trimmingCharacters(in: .whitespacesAndNewlines), !session.isEmpty {
-            if session.hasPrefix("$") {
-                _ = try TmuxSessionID(session)
-            } else {
-                _ = try TmuxSessionName(session)
-            }
-            validatedSession = session
-        } else {
-            validatedSession = nil
-        }
 
+        // The legacy default target is intentionally ignored. Automatic attachment
+        // is resolved only from the last successfully used restoration target.
         let updatedHost = try Host(
             id: host.id,
             name: host.name,
@@ -1259,13 +1259,28 @@ final class AppContainer: ObservableObject {
             health: host.health,
             lastUsedAt: host.lastUsedAt,
             tmuxPreferences: HostTmuxPreferences(
-                defaultSession: validatedSession,
+                defaultSession: nil,
                 autoAttach: autoAttachTmux
             )
         )
 
         activeHost = updatedHost
         try await catalog.save(updatedHost)
+    }
+
+    private func automaticTmuxTarget(for host: Host, explicitTarget: String?) async -> String? {
+        if let explicitTarget {
+            let trimmed = explicitTarget.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard host.autoAttachTmux,
+              let metadata = try? await restorationStore.load(),
+              metadata?.hostID == host.id,
+              let target = metadata?.tmuxSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !target.isEmpty else {
+            return nil
+        }
+        return target
     }
 
     private func handleTmuxTarget(_ target: String, on connection: any SSHConnection, host: Host, session: TerminalSession) async {
@@ -1317,21 +1332,30 @@ final class AppContainer: ObservableObject {
             }
             _ = await attachTmuxSession(id: trimmed)
         } else if !trimmed.isEmpty {
+            // A remembered name may be attached only if it already exists. Never
+            // create a session during restoration.
+            guard let executor = connection as? SSHCommandExecuting else { return }
+            let result = try? await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
             guard activeSession?.id == session.id,
                   activeSession?.state == .connected,
                   !isExplicitDisconnect,
-                  (self.connection as AnyObject) === (connection as AnyObject) else {
+                  (self.connection as AnyObject) === (connection as AnyObject),
+                  let result,
+                  result.isSuccess else {
                 return
             }
-            _ = await createTmuxSession(name: trimmed)
-        } else {
-            guard activeSession?.id == session.id,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (self.connection as AnyObject) === (connection as AnyObject) else {
+            guard let match = try? TmuxListSessionsParser.parse(result.stdout).first(where: { $0.name == trimmed }) else {
+                activeTmuxSessionID = nil
+                tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
+                let metadata = SessionRestorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    tmuxSessionID: nil
+                )
+                try? await restorationStore.save(metadata)
                 return
             }
-            _ = await createTmuxSession(name: "default")
+            _ = await attachTmuxSession(id: match.sessionID)
         }
     }
 
