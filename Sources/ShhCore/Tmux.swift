@@ -132,34 +132,39 @@ public struct TmuxSessionInfo: Identifiable, Equatable, Hashable, Sendable, Coda
 
 public typealias TmuxSession = TmuxSessionInfo
 
-// MARK: - Tab-delimited List Parser
+// MARK: - List Parser & Errors
 
 public enum TmuxParseError: Error, Equatable, Sendable, LocalizedError {
     case emptyLine
-    case invalidFieldCount(expected: Int, actual: Int, line: String)
+    case invalidFieldCount(expected: Int, actual: Int, line: String = "")
     case invalidSessionID(String)
-    case invalidSessionName(String)
+    case invalidSessionName(String = "")
     case invalidWindowsCount(String)
-    case invalidTimestamp(field: String, value: String)
+    case invalidTimestamp(field: String, value: String = "")
     case invalidAttachedCount(String)
 
     public var errorDescription: String? {
         switch self {
         case .emptyLine:
             return "Line is empty."
-        case .invalidFieldCount(let expected, let actual, let line):
-            return "Expected \(expected) tab-delimited fields, got \(actual) in line: '\(line)'"
+        case .invalidFieldCount(let expected, let actual, _):
+            return "Expected \(expected) delimited fields, got \(actual)."
         case .invalidSessionID(let id):
-            return "Invalid tmux session ID: '\(id)'"
-        case .invalidSessionName(let name):
-            return "Invalid tmux session name: '\(name)'"
+            let safeID = id.hasPrefix("$") && id.dropFirst().allSatisfy(\.isNumber) ? id : "invalid"
+            return "Invalid tmux session ID: '\(safeID)'"
+        case .invalidSessionName:
+            return "Invalid or empty tmux session name."
         case .invalidWindowsCount(let count):
             return "Invalid windows count: '\(count)'"
-        case .invalidTimestamp(let field, let value):
-            return "Invalid timestamp for '\(field)': '\(value)'"
+        case .invalidTimestamp(let field, _):
+            return "Invalid timestamp for '\(field)'."
         case .invalidAttachedCount(let count):
             return "Invalid attached count: '\(count)'"
         }
+    }
+
+    public var recoverySuggestion: String? {
+        "Refresh sessions or verify remote tmux version."
     }
 }
 
@@ -190,35 +195,107 @@ public enum TmuxListSessionsParser {
             throw TmuxParseError.emptyLine
         }
 
-        let fields = sanitized.components(separatedBy: "\t")
-        guard fields.count == 6 else {
-            throw TmuxParseError.invalidFieldCount(expected: 6, actual: fields.count, line: line)
+        let rawSessionID: String
+        let rawName: String
+        let rawWindows: String
+        let rawCreated: String
+        let rawActivity: String
+        let rawAttached: String
+
+        if sanitized.contains("\t") {
+            // Priority 1: Tab-delimited format
+            let fields = sanitized.components(separatedBy: "\t")
+            guard fields.count == 6 else {
+                throw TmuxParseError.invalidFieldCount(expected: 6, actual: fields.count, line: line)
+            }
+            rawSessionID = fields[0]
+            rawName = fields[1]
+            rawWindows = fields[2]
+            rawCreated = fields[3]
+            rawActivity = fields[4]
+            rawAttached = fields[5]
+        } else if sanitized.contains("|") {
+            // Priority 2: Printable pipe-delimited format with explicit escaping (#{q:session_name})
+            let parts = sanitized.components(separatedBy: "|")
+            guard parts.count >= 6 else {
+                throw TmuxParseError.invalidFieldCount(expected: 6, actual: parts.count, line: line)
+            }
+            rawSessionID = parts[0]
+            rawAttached = parts[parts.count - 1]
+            rawActivity = parts[parts.count - 2]
+            rawCreated = parts[parts.count - 3]
+            rawWindows = parts[parts.count - 4]
+
+            let nameParts = parts[1..<(parts.count - 4)]
+            let escapedName = nameParts.joined(separator: "|")
+            rawName = unescapeTmuxQuotedName(escapedName)
+        } else if sanitized.contains("_") {
+            // Priority 3: Legacy underscore-sanitized output (e.g. tmux 3.7c sanitizing tabs to _)
+            // Parse safely from the right: attached, activity, created, windows
+            let parts = sanitized.components(separatedBy: "_")
+            guard parts.count >= 6 else {
+                throw TmuxParseError.invalidFieldCount(expected: 6, actual: parts.count, line: line)
+            }
+            rawAttached = parts[parts.count - 1]
+            rawActivity = parts[parts.count - 2]
+            rawCreated = parts[parts.count - 3]
+            rawWindows = parts[parts.count - 4]
+
+            // Remaining prefix contains session ID and name
+            let prefixParts = parts[0..<(parts.count - 4)]
+            let prefix = prefixParts.joined(separator: "_")
+
+            guard prefix.hasPrefix("$") else {
+                throw TmuxParseError.invalidSessionID(prefix)
+            }
+
+            guard let firstUnderscore = prefix.firstIndex(of: "_") else {
+                throw TmuxParseError.invalidFieldCount(expected: 6, actual: 1, line: line)
+            }
+
+            rawSessionID = String(prefix[..<firstUnderscore])
+            rawName = String(prefix[prefix.index(after: firstUnderscore)...])
+        } else {
+            throw TmuxParseError.invalidFieldCount(expected: 6, actual: 1, line: line)
         }
 
-        let sessionID = fields[0].trimmingCharacters(in: .whitespaces)
-        guard sessionID.hasPrefix("$"), sessionID.count > 1, sessionID.dropFirst().allSatisfy(\.isNumber) else {
+        // Strict Bounds & Field Validation
+        let sessionID = rawSessionID.trimmingCharacters(in: .whitespaces)
+        guard sessionID.hasPrefix("$"), sessionID.count > 1, sessionID.count <= 16,
+              sessionID.dropFirst().allSatisfy(\.isNumber) else {
             throw TmuxParseError.invalidSessionID(sessionID)
         }
 
-        let name = fields[1]
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
             throw TmuxParseError.invalidSessionName(name)
         }
-
-        guard let windows = Int(fields[2].trimmingCharacters(in: .whitespaces)), windows >= 0 else {
-            throw TmuxParseError.invalidWindowsCount(fields[2])
+        guard name.count <= TmuxSessionName.maximumLength else {
+            throw TmuxParseError.invalidSessionName(name)
+        }
+        guard !name.unicodeScalars.contains(where: { scalar in
+            scalar.value < 0x20 || scalar.value == 0x7F || (0x80...0x9F).contains(scalar.value) ||
+            scalar.properties.generalCategory == .control || scalar == "\0" || scalar == "\n" || scalar == "\r"
+        }) else {
+            throw TmuxParseError.invalidSessionName(name)
         }
 
-        guard let createdSeconds = Double(fields[3].trimmingCharacters(in: .whitespaces)) else {
-            throw TmuxParseError.invalidTimestamp(field: "created", value: fields[3])
+        guard let windows = Int(rawWindows.trimmingCharacters(in: .whitespaces)), windows >= 0, windows <= 100_000 else {
+            throw TmuxParseError.invalidWindowsCount(rawWindows)
         }
 
-        guard let activitySeconds = Double(fields[4].trimmingCharacters(in: .whitespaces)) else {
-            throw TmuxParseError.invalidTimestamp(field: "activity", value: fields[4])
+        guard let createdSeconds = Double(rawCreated.trimmingCharacters(in: .whitespaces)),
+              createdSeconds >= 0, createdSeconds <= 4_102_444_800 else {
+            throw TmuxParseError.invalidTimestamp(field: "created", value: rawCreated)
         }
 
-        guard let attached = Int(fields[5].trimmingCharacters(in: .whitespaces)), attached >= 0 else {
-            throw TmuxParseError.invalidAttachedCount(fields[5])
+        guard let activitySeconds = Double(rawActivity.trimmingCharacters(in: .whitespaces)),
+              activitySeconds >= 0, activitySeconds <= 4_102_444_800 else {
+            throw TmuxParseError.invalidTimestamp(field: "activity", value: rawActivity)
+        }
+
+        guard let attached = Int(rawAttached.trimmingCharacters(in: .whitespaces)), attached >= 0, attached <= 100_000 else {
+            throw TmuxParseError.invalidAttachedCount(rawAttached)
         }
 
         return TmuxSessionInfo(
@@ -229,6 +306,25 @@ public enum TmuxListSessionsParser {
             lastActivityAt: Date(timeIntervalSince1970: activitySeconds),
             attachedClients: attached
         )
+    }
+
+    public static func unescapeTmuxQuotedName(_ text: String) -> String {
+        var result = ""
+        var isEscaping = false
+        for char in text {
+            if isEscaping {
+                result.append(char)
+                isEscaping = false
+            } else if char == "\\" {
+                isEscaping = true
+            } else {
+                result.append(char)
+            }
+        }
+        if isEscaping {
+            result.append("\\")
+        }
+        return result
     }
 }
 
@@ -343,10 +439,10 @@ public enum TmuxCommand: Sendable {
     /// Exact probe template: `tmux -V`
     public static let probe: String = "tmux -V"
 
-    /// Tab-delimited format string for list-sessions
-    public static let listSessionsFormat: String = "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_created}\t#{session_activity}\t#{session_attached}"
+    /// Printable collision-resistant delimiter format string with explicit shell escaping for list-sessions
+    public static let listSessionsFormat: String = "#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}"
 
-    /// Exact tab-delimited list-sessions template
+    /// Exact list-sessions command template
     public static let listSessions: String = "tmux list-sessions -F '\(listSessionsFormat)'"
 
     /// Exact has-session template

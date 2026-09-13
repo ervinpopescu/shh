@@ -588,7 +588,7 @@ public struct LiveSSHTransport: SSHTransport {
             if let captured = validator.capturedError {
                 throw captured
             }
-            throw mapError(error)
+            throw Self.mapError(error)
         }
     }
 
@@ -951,7 +951,7 @@ public struct LiveSSHTransport: SSHTransport {
             if let captured = lastValidator?.capturedError {
                 throw captured
             }
-            throw mapError(error)
+            throw Self.mapError(error)
         }
     }
 
@@ -1000,7 +1000,7 @@ public struct LiveSSHTransport: SSHTransport {
         }
     }
 
-    private func mapError(_ error: Error) -> TransportError {
+    static func mapError(_ error: Error) -> TransportError {
         if let transportError = error as? TransportError {
             return transportError
         }

@@ -232,6 +232,135 @@ final class TmuxTests: XCTestCase {
         }
     }
 
+    // MARK: - Tmux 3.7c & Collision-Resistant Delimiters Fixtures
+
+    func testParserSupportsTmux37cUnderscoreSanitizedOutput() throws {
+        // Exact fixture matching tmux 3.7c where tabs are sanitized to underscores
+        let raw = """
+        $1_1-home_2_1789215519_1789303845_0
+        $2_my_work_session_3_1789215519_1789303845_1
+        $10_日本語_作業_1_1789215519_1789303845_0
+        """
+        let sessions = try TmuxListSessionsParser.parse(raw)
+        XCTAssertEqual(sessions.count, 3)
+
+        XCTAssertEqual(sessions[0].sessionID, "$1")
+        XCTAssertEqual(sessions[0].name, "1-home")
+        XCTAssertEqual(sessions[0].windowsCount, 2)
+        XCTAssertEqual(sessions[0].createdAt, Date(timeIntervalSince1970: 1789215519))
+        XCTAssertEqual(sessions[0].lastActivityAt, Date(timeIntervalSince1970: 1789303845))
+        XCTAssertEqual(sessions[0].attachedClients, 0)
+
+        XCTAssertEqual(sessions[1].sessionID, "$2")
+        XCTAssertEqual(sessions[1].name, "my_work_session")
+        XCTAssertEqual(sessions[1].windowsCount, 3)
+        XCTAssertEqual(sessions[1].attachedClients, 1)
+
+        XCTAssertEqual(sessions[2].sessionID, "$10")
+        XCTAssertEqual(sessions[2].name, "日本語_作業")
+        XCTAssertEqual(sessions[2].windowsCount, 1)
+        XCTAssertEqual(sessions[2].attachedClients, 0)
+    }
+
+    func testParserSupportsPipeDelimitedWithExplicitEscaping() throws {
+        let raw = """
+        $1|session\\|with\\|pipes|2|1789215519|1789303845|0
+        $2|session\\ with\\ spaces|1|1789215519|1789303845|1
+        $3|escaped\\\\backslash|3|1789215519|1789303845|0
+        $4|simple_name|1|1789215519|1789303845|0
+        """
+        let sessions = try TmuxListSessionsParser.parse(raw)
+        XCTAssertEqual(sessions.count, 4)
+
+        XCTAssertEqual(sessions[0].sessionID, "$1")
+        XCTAssertEqual(sessions[0].name, "session|with|pipes")
+        XCTAssertEqual(sessions[0].windowsCount, 2)
+
+        XCTAssertEqual(sessions[1].sessionID, "$2")
+        XCTAssertEqual(sessions[1].name, "session with spaces")
+        XCTAssertEqual(sessions[1].attachedClients, 1)
+
+        XCTAssertEqual(sessions[2].sessionID, "$3")
+        XCTAssertEqual(sessions[2].name, "escaped\\backslash")
+
+        XCTAssertEqual(sessions[3].sessionID, "$4")
+        XCTAssertEqual(sessions[3].name, "simple_name")
+    }
+
+    func testParserUnderscoreSanitizedSessionNamesWithMultipleUnderscores() throws {
+        let line = "$0_feature_login_auth_redesign_v2_4_1700000000_1700000010_2"
+        let session = try TmuxListSessionsParser.parseLine(line)
+        XCTAssertEqual(session.sessionID, "$0")
+        XCTAssertEqual(session.name, "feature_login_auth_redesign_v2")
+        XCTAssertEqual(session.windowsCount, 4)
+        XCTAssertEqual(session.createdAt, Date(timeIntervalSince1970: 1700000000))
+        XCTAssertEqual(session.lastActivityAt, Date(timeIntervalSince1970: 1700000010))
+        XCTAssertEqual(session.attachedClients, 2)
+    }
+
+    func testParserRejectsMalformedUnderscoreLines() {
+        // Missing fields (fewer than 5 underscores)
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("$1_name_2_1700000000_0")) { error in
+            guard case TmuxParseError.invalidFieldCount(let expected, let actual, _) = error else {
+                XCTFail("Expected invalidFieldCount, got \(error)")
+                return
+            }
+            XCTAssertEqual(expected, 6)
+            XCTAssertEqual(actual, 5)
+        }
+
+        // Missing session ID prefix '$'
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("1_name_2_1700000000_1700000000_0")) { error in
+            guard case TmuxParseError.invalidSessionID = error else {
+                XCTFail("Expected invalidSessionID, got \(error)")
+                return
+            }
+        }
+
+        // Non-numeric windows in underscore format
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("$1_name_abc_1700000000_1700000000_0")) { error in
+            guard case TmuxParseError.invalidWindowsCount = error else {
+                XCTFail("Expected invalidWindowsCount, got \(error)")
+                return
+            }
+        }
+
+        // Non-numeric timestamp in underscore format
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("$1_name_2_notatime_1700000000_0")) { error in
+            guard case TmuxParseError.invalidTimestamp = error else {
+                XCTFail("Expected invalidTimestamp, got \(error)")
+                return
+            }
+        }
+
+        // Non-numeric attached count in underscore format
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("$1_name_2_1700000000_1700000000_notanumber")) { error in
+            guard case TmuxParseError.invalidAttachedCount = error else {
+                XCTFail("Expected invalidAttachedCount, got \(error)")
+                return
+            }
+        }
+
+        // Empty session name in underscore format
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine("$1__2_1700000000_1700000000_0")) { error in
+            guard case TmuxParseError.invalidSessionName = error else {
+                XCTFail("Expected invalidSessionName, got \(error)")
+                return
+            }
+        }
+    }
+
+    func testParserRejectsOversizedSessionName() {
+        let longName = String(repeating: "a", count: 129)
+        let line = "$0|\(longName)|1|1700000000|1700000000|0"
+        XCTAssertThrowsError(try TmuxListSessionsParser.parseLine(line)) { error in
+            guard case TmuxParseError.invalidSessionName = error else {
+                XCTFail("Expected invalidSessionName, got \(error)")
+                return
+            }
+        }
+    }
+
     // MARK: - Validated Create Names
 
     func testSessionNameRejectsEmptyAndWhitespace() {
@@ -380,14 +509,14 @@ final class TmuxTests: XCTestCase {
         // 1. Probe template: tmux -V
         XCTAssertEqual(TmuxCommand.probe, "tmux -V")
 
-        // 2. Tab-delimited list-sessions fields
+        // 2. Delimited list-sessions fields
         XCTAssertEqual(
             TmuxCommand.listSessionsFormat,
-            "#{session_id}\t#{session_name}\t#{session_windows}\t#{session_created}\t#{session_activity}\t#{session_attached}"
+            "#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}"
         )
         XCTAssertEqual(
             TmuxCommand.listSessions,
-            "tmux list-sessions -F '#{session_id}\t#{session_name}\t#{session_windows}\t#{session_created}\t#{session_activity}\t#{session_attached}'"
+            "tmux list-sessions -F '#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}'"
         )
 
         // 3. Has-session template

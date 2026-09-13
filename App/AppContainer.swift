@@ -114,6 +114,8 @@ final class AppContainer: ObservableObject {
     @Published public var isLoadingDirectory: Bool = false
     @Published public var directoryErrorMessage: String? = nil
     @Published public var sftpErrorMessage: String? = nil
+    @Published public var lastSFTPFailure: ConnectionFailure? = nil
+    private var sftpSetupGeneration: Int = 0
 
     // Sorting & Filtering
     @Published public var sortField: FileSortField = .type
@@ -1024,6 +1026,9 @@ final class AppContainer: ObservableObject {
         }
         pendingTrustChallenge = nil
         pendingTrustHost = nil
+        lastConnectionFailure = nil
+        lastSFTPFailure = nil
+        sftpErrorMessage = nil
         await connect(to: host)
     }
 
@@ -1125,6 +1130,8 @@ final class AppContainer: ObservableObject {
         currentPath = RemotePath("/home/dev")
         directoryErrorMessage = nil
         sftpErrorMessage = nil
+        lastSFTPFailure = nil
+        sftpSetupGeneration += 1
 
         for (_, task) in activeTransferTasks {
             task.cancel()
@@ -1422,7 +1429,12 @@ final class AppContainer: ObservableObject {
                 } catch {
                     tmuxSessions = []
                     isTmuxServerRunning = true
-                    let parseMessage = "Failed to parse tmux sessions: \(error.localizedDescription)"
+                    let parseMessage: String
+                    if let parseError = error as? TmuxParseError {
+                        parseMessage = "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version. (\(parseError.localizedDescription))"
+                    } else {
+                        parseMessage = "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version."
+                    }
                     tmuxError = parseMessage
                     return []
                 }
@@ -2262,12 +2274,20 @@ final class AppContainer: ObservableObject {
             // Mosh connections operate over UDP and do not establish an SFTP subsystem channel
             self.sftpRepository = nil
             self.sftpErrorMessage = nil
+            self.lastSFTPFailure = nil
             return
         }
+
+        sftpSetupGeneration += 1
+        let currentGen = sftpSetupGeneration
+
         if isDemo {
             if sftpRepository == nil {
                 sftpRepository = DemoSFTPRepository(seedDemoData: true)
             }
+            guard sftpSetupGeneration == currentGen else { return }
+            self.sftpErrorMessage = nil
+            self.lastSFTPFailure = nil
             await loadDirectory(at: currentPath)
         } else {
             do {
@@ -2277,13 +2297,29 @@ final class AppContainer: ObservableObject {
                     trustEvaluator: trustStore,
                     credentialStore: credentialStore
                 )
+                guard sftpSetupGeneration == currentGen else {
+                    Task { await repo.close() }
+                    return
+                }
                 self.sftpRepository = repo
                 self.sftpErrorMessage = nil
+                self.lastSFTPFailure = nil
                 await loadDirectory(at: currentPath)
             } catch {
-                self.sftpErrorMessage = "SFTP connection failed: \(error.localizedDescription)"
+                guard sftpSetupGeneration == currentGen else { return }
+                self.sftpRepository = nil
+                let failure = ConnectionFailure.from(error: error, host: host)
+                self.lastSFTPFailure = failure
+                self.sftpErrorMessage = failure.reason
             }
         }
+    }
+
+    public func retrySFTP() async {
+        guard let host = activeHost else { return }
+        self.lastSFTPFailure = nil
+        self.sftpErrorMessage = nil
+        await setupSFTPForHost(host)
     }
 
     public var sortedAndFilteredFiles: [RemoteFile] {
