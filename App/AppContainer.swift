@@ -215,10 +215,14 @@ final class AppContainer: ObservableObject {
         let resolvedCatalog: InMemoryCatalog
         if let catalog {
             resolvedCatalog = catalog
-        } else if !Self.isRunningInTestEnvironment,
-                  let snapshot = fileProviderHelper.loadSharedSnapshot(),
-                  (!snapshot.hosts.isEmpty || !snapshot.identities.isEmpty) {
-            resolvedCatalog = InMemoryCatalog(snapshot: snapshot)
+        } else if !Self.isRunningInTestEnvironment {
+            if let snapshot = fileProviderHelper.loadSharedSnapshot() {
+                resolvedCatalog = InMemoryCatalog(snapshot: snapshot)
+            } else if fileProviderHelper.hasPersistedSnapshot {
+                resolvedCatalog = InMemoryCatalog(seedDemoData: false)
+            } else {
+                resolvedCatalog = InMemoryCatalog(seedDemoData: false)
+            }
         } else {
             resolvedCatalog = InMemoryCatalog(seedDemoData: true)
         }
@@ -366,8 +370,7 @@ final class AppContainer: ObservableObject {
     func loadSharedStateIfNeeded() async {
         guard !didProvideCustomCatalog else { return }
         guard !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil else { return }
-        if let snapshot = fileProviderHelper.loadSharedSnapshot(),
-           (!snapshot.hosts.isEmpty || !snapshot.identities.isEmpty) {
+        if let snapshot = fileProviderHelper.loadSharedSnapshot() {
             await catalog.replace(with: snapshot)
             catalogUpdateToken = UUID()
         }

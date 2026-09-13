@@ -232,6 +232,15 @@ final class TmuxAppTests: XCTestCase {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
         transport.onConnect = { _ in mock }
+        mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe || cmd == "tmux -V" {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if cmd.contains("list-sessions") {
+                return SSHCommandResult(exitCode: 0, stdout: "$1\tworkspace\t1\t1700000000\t1700000000\t1\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
         let store = InMemorySessionRestorationStore()
 
         let container = AppContainer(
