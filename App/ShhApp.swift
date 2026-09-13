@@ -81,17 +81,7 @@ struct RootView: View {
                 }
             }
         }
-        .alert(
-            "Approve Host Key?",
-            isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }),
-            presenting: container.pendingTrustChallenge
-        ) { challenge in
-            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
-            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
-            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
-        } message: { challenge in
-            Text("The host key for \(challenge.hostname):\(challenge.port) is not yet verified.\n\nAlgorithm: \(challenge.algorithm)\nFingerprint: \(challenge.fingerprint)")
-        }
+        .hostKeyApprovalAlert(container: container)
     }
     private var capabilityFooter: some View {
         let surfaceDescription = container.useLegacyTerminalFallback
@@ -272,17 +262,6 @@ struct HostDetailView: View {
         .navigationTitle(host.name)
         .task {
             bastionHops = await container.resolveBastionNames(for: host)
-        }
-        .alert(
-            "Approve Host Key?",
-            isPresented: Binding(get: { container.pendingTrustChallenge != nil }, set: { if !$0 { container.rejectPendingHostKey() } }),
-            presenting: container.pendingTrustChallenge
-        ) { challenge in
-            Button("Trust Once") { Task { await container.approvePendingHostKey(permanently: false) } }
-            Button("Always Trust") { Task { await container.approvePendingHostKey(permanently: true) } }
-            Button("Reject", role: .cancel) { container.rejectPendingHostKey() }
-        } message: { challenge in
-            Text("The host key for \(challenge.hostname):\(challenge.port) is not yet verified.\n\nAlgorithm: \(challenge.algorithm)\nFingerprint: \(challenge.fingerprint)")
         }
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }

@@ -86,6 +86,13 @@ public final class FileProviderManagerHelper: Sendable {
         return true
     }
 
+    /// Returns true if a persisted catalog snapshot file exists on disk.
+    public var hasPersistedSnapshot: Bool {
+        guard let targetBase = containerURL else { return false }
+        let snapshotURL = targetBase.appendingPathComponent("catalogs/snapshot.json")
+        return FileManager.default.fileExists(atPath: snapshotURL.path)
+    }
+
     /// Loads the catalog snapshot from shared App Group directory if available.
     public func loadSharedSnapshot() -> CatalogSnapshot? {
         guard let targetBase = containerURL else { return nil }
