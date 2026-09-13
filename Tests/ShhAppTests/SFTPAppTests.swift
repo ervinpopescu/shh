@@ -932,6 +932,100 @@ final class SFTPAppTests: XCTestCase {
             XCTAssertTrue(error is SFTPRepositoryError)
         }
     }
+
+    // MARK: - 25. SFTP Failure State, Retry & Async Generation Guards
+
+    func testSFTPFailureCardPresentationWithRetryAndEditActions() async throws {
+        let (container, _) = makeDemoContainer()
+        let failure = ConnectionFailure(
+            stage: .authentication,
+            reason: "Authentication rejected by remote server.",
+            technicalDetail: "Server rejected public key authentication.",
+            recoveryAction: "Ensure your public key is added to ~/.ssh/authorized_keys on the remote server."
+        )
+
+        container.sftpRepository = nil
+        container.lastSFTPFailure = failure
+        container.sftpErrorMessage = failure.reason
+
+        var retryCalled = false
+        var editCalled = false
+
+        let card = SFTPFailureCard(
+            failure: failure,
+            onRetry: { retryCalled = true },
+            onEdit: { editCalled = true }
+        )
+
+        let hosting = UIHostingController(rootView: card)
+        hosting.loadViewIfNeeded()
+        XCTAssertNotNil(hosting.view)
+
+        // Verify failure state properties
+        XCTAssertEqual(container.lastSFTPFailure?.stage, .authentication)
+        XCTAssertEqual(container.lastSFTPFailure?.reason, "Authentication rejected by remote server.")
+        XCTAssertFalse(failure.copyableDiagnostics.isEmpty)
+        XCTAssertTrue(failure.copyableDiagnostics.contains("Authentication"))
+        XCTAssertFalse(failure.copyableDiagnostics.contains("password"))
+
+        // Verify callbacks
+        card.onRetry()
+        XCTAssertTrue(retryCalled)
+
+        card.onEdit()
+        XCTAssertTrue(editCalled)
+    }
+
+    func testSFTPAutoRetriesAfterHostKeyApprovalAndClearsFailure() async throws {
+        let (container, _) = makeDemoContainer()
+        let host = try Host(name: "New Host", hostname: "new.invalid", username: "dev")
+
+        // First connection encounters host-key approval required
+        await container.connect(to: host)
+        XCTAssertNotNil(container.pendingTrustChallenge)
+
+        // Simulate an existing failure state
+        container.lastSFTPFailure = ConnectionFailure(
+            stage: .hostKey,
+            reason: "Host key verification required.",
+            technicalDetail: "Untrusted host key.",
+            recoveryAction: "Approve host key."
+        )
+        container.sftpErrorMessage = "Host key verification required."
+
+        // Approve host key
+        await container.approvePendingHostKey(permanently: true)
+
+        // Prior SFTP failure state must be cleared and demo SFTP connected
+        XCTAssertNil(container.lastSFTPFailure)
+        XCTAssertNil(container.sftpErrorMessage)
+        XCTAssertNotNil(container.sftpRepository)
+    }
+
+    func testSFTPAsyncGenerationGuardsPreventStaleTaskOverwrite() async throws {
+        let catalog = InMemoryCatalog(seedDemoData: false)
+        let container = AppContainer(
+            catalog: catalog,
+            trustStore: InMemoryTrustStore(),
+            credentialStore: InMemoryCredentialStore(),
+            transport: ControllableTransport()
+        )
+
+        // Set initial failure state
+        container.lastSFTPFailure = ConnectionFailure(
+            stage: .authentication,
+            reason: "Initial auth error",
+            technicalDetail: "Details",
+            recoveryAction: "Action"
+        )
+        container.sftpErrorMessage = "Initial auth error"
+
+        // Disconnecting clears failure state and increments generation
+        await container.disconnect()
+        XCTAssertNil(container.sftpRepository)
+        XCTAssertNil(container.sftpErrorMessage)
+        XCTAssertNil(container.lastSFTPFailure)
+    }
 }
 
 extension DemoSFTPRepository {

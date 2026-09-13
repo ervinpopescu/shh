@@ -20,6 +20,7 @@ struct FilesView: View {
     @State private var fileToDelete: RemoteFile? = nil
     @State private var fileToMove: RemoteFile? = nil
     @State private var showingFileImporter = false
+    @State private var showingHostEditor = false
     @State private var errorMessage: String? = nil
     @State private var showingErrorAlert = false
 
@@ -48,11 +49,32 @@ struct FilesView: View {
     @ViewBuilder
     private var mainContent: some View {
         if container.sftpRepository == nil {
-            if let error = container.sftpErrorMessage {
+            if let failure = container.lastSFTPFailure {
+                ScrollView {
+                    VStack(spacing: 20) {
+                        Spacer().frame(height: 16)
+                        SFTPFailureCard(
+                            failure: failure,
+                            onRetry: {
+                                Task { await container.retrySFTP() }
+                            },
+                            onEdit: {
+                                showingHostEditor = true
+                            }
+                        )
+                        Spacer()
+                    }
+                }
+                .sheet(isPresented: $showingHostEditor) {
+                    if let host = container.activeHost {
+                        HostEditorView(existing: host).environmentObject(container)
+                    }
+                }
+            } else if let error = container.sftpErrorMessage {
                 ContentUnavailableView(
                     "SFTP Unavailable",
                     systemImage: "exclamationmark.triangle",
-                    description: Text("Failed to initialize SFTP subsystem: \(error)")
+                    description: Text(error)
                 )
             } else {
                 ContentUnavailableView(
@@ -1341,4 +1363,116 @@ struct FileMovePickerSheet: View {
             errorMessage = error.localizedDescription
         }
     }
+}
+
+// MARK: - SFTP Failure Card
+
+struct SFTPFailureCard: View {
+    let failure: ConnectionFailure
+    let onRetry: () -> Void
+    let onEdit: () -> Void
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                    .font(.title3)
+                Text("SFTP Unavailable")
+                    .font(.headline.bold())
+                    .foregroundStyle(.red)
+                Spacer()
+                Text(failure.stage.rawValue)
+                    .font(.caption2.bold())
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.red.opacity(0.12))
+                    .foregroundStyle(.red)
+                    .clipShape(Capsule())
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Why it failed")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(failure.reason)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.primary)
+                if !failure.technicalDetail.isEmpty {
+                    Text(failure.technicalDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("What to try")
+                    .font(.caption.bold())
+                    .foregroundStyle(.secondary)
+                Text(failure.recoveryAction)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider()
+
+            HStack(spacing: 12) {
+                Button(action: onRetry) {
+                    Label("Retry SFTP", systemImage: "arrow.clockwise")
+                        .font(.caption.bold())
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .accessibilityIdentifier("sftp-retry-button")
+
+                Button(action: onEdit) {
+                    Label("Edit Host", systemImage: "pencil")
+                        .font(.caption)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("sftp-edit-host-button")
+
+                Spacer()
+
+                #if canImport(UIKit)
+                Button(action: copyDiagnostics) {
+                    Label(copied ? "Copied" : "Copy Diagnostics", systemImage: copied ? "checkmark" : "doc.on.doc")
+                        .font(.caption2)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier("sftp-copy-diagnostics-button")
+                #endif
+            }
+        }
+        .padding(16)
+        #if canImport(UIKit)
+        .background(Color(UIColor.secondarySystemBackground))
+        #else
+        .background(Color.secondary.opacity(0.1))
+        #endif
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.red.opacity(0.2), lineWidth: 1)
+        )
+        .padding(.horizontal, 20)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("sftp-failure-card")
+    }
+
+    #if canImport(UIKit)
+    private func copyDiagnostics() {
+        UIPasteboard.general.string = failure.copyableDiagnostics
+        copied = true
+        Task {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            copied = false
+        }
+    }
+    #endif
 }

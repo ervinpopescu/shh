@@ -3,7 +3,7 @@ import Foundation
 import Security
 #endif
 
-public enum TransportError: Error, Equatable, Sendable {
+public enum TransportError: Error, Equatable, Sendable, LocalizedError {
     case invalidConfiguration
     case authenticationRequired
     case hostKeyChanged(old: String, new: String)
@@ -17,6 +17,71 @@ public enum TransportError: Error, Equatable, Sendable {
     case connectionRefused
     case missingCredential(reference: String)
     case invalidPrivateKey(detail: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidConfiguration:
+            return "Invalid connection configuration."
+        case .authenticationRequired:
+            return "Authentication required or rejected by remote host."
+        case .hostKeyChanged(let old, let new):
+            let safeOld = old.count > 16 ? String(old.prefix(16)) + "..." : old
+            let safeNew = new.count > 16 ? String(new.prefix(16)) + "..." : new
+            return "Host key has changed (expected: \(safeOld), received: \(safeNew))."
+        case .hostKeyApprovalRequired:
+            return "Host key verification required."
+        case .timeout:
+            return "Connection timed out reaching host."
+        case .networkUnavailable:
+            return "Network is unavailable or unreachable."
+        case .unsupported:
+            return "Unsupported connection feature or authentication method."
+        case .cancelled:
+            return "Connection was cancelled."
+        case .remoteFailure(let message):
+            return "Remote failure: \(message)"
+        case .dnsFailure(let detail):
+            return detail.isEmpty ? "DNS lookup failed for target host." : "DNS lookup failed: \(detail)"
+        case .connectionRefused:
+            return "Connection refused by remote host."
+        case .missingCredential(let reference):
+            let safeRef = reference.count > 8 ? String(reference.prefix(4)) + "..." + String(reference.suffix(4)) : reference
+            return "Saved credential could not be found in Keychain (reference: \(safeRef))."
+        case .invalidPrivateKey(let detail):
+            return "Invalid private key: \(detail)"
+        }
+    }
+
+    public var recoverySuggestion: String? {
+        switch self {
+        case .invalidConfiguration:
+            return "Review host connection settings in the editor."
+        case .authenticationRequired:
+            return "Ensure your credentials are correct and your public key is added to ~/.ssh/authorized_keys."
+        case .hostKeyChanged:
+            return "Confirm whether the server was recently reinstalled or rotated its key before trusting."
+        case .hostKeyApprovalRequired:
+            return "Approve the host key fingerprint to connect."
+        case .timeout:
+            return "Check remote host reachability, firewall rules, and your network connection."
+        case .networkUnavailable:
+            return "Check your Wi-Fi or cellular connection and try again."
+        case .unsupported:
+            return "Switch to a supported authentication method or standard direct SSH connection."
+        case .cancelled:
+            return "Tap Connect to retry."
+        case .remoteFailure:
+            return "Check server logs, account permissions, or remote subsystem configuration."
+        case .dnsFailure:
+            return "Check the host address spelling and your device network/DNS configuration."
+        case .connectionRefused:
+            return "Verify that the SSH service is running on the target port and firewall rules permit connections."
+        case .missingCredential:
+            return "Re-import or generate a new SSH key for this identity in Key Management."
+        case .invalidPrivateKey:
+            return "Verify key format and ensure it is an unencrypted OpenSSH or PKCS#8 Ed25519 private key."
+        }
+    }
 }
 public struct HostKeyChallenge: Sendable, Equatable, Identifiable {
     public var hostname: String
@@ -171,7 +236,7 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
         if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
             result = SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n", stderr: "")
         } else if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
-            let sample = "$0\tdefault\t1\t1700000000\t1700000000\t1\n"
+            let sample = "$0|default|1|1700000000|1700000000|1\n"
             result = SSHCommandResult(exitCode: 0, stdout: sample, stderr: "")
         } else if trimmed.contains("has-session") {
             if trimmed.contains("$0") || trimmed.contains("default") {

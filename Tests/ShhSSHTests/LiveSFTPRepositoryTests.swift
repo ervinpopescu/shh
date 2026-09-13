@@ -248,13 +248,33 @@ final class LiveSFTPRepositoryTests: XCTestCase {
     }
 
     private final class MockAuthDelegate: NIOSSHServerUserAuthenticationDelegate, @unchecked Sendable {
-        var supportedAuthenticationMethods: NIOSSHAvailableUserAuthenticationMethods = [.password]
+        var supportedAuthenticationMethods: NIOSSHAvailableUserAuthenticationMethods = [.password, .publicKey]
+        var expectedPublicKey: NIOSSHPublicKey?
+
+        init(expectedPublicKey: NIOSSHPublicKey? = nil) {
+            self.expectedPublicKey = expectedPublicKey
+        }
 
         func requestReceived(
             request: NIOSSHUserAuthenticationRequest,
             responsePromise: EventLoopPromise<NIOSSHUserAuthenticationOutcome>
         ) {
-            responsePromise.succeed(.success)
+            switch request.request {
+            case .publicKey(let pub):
+                if let expected = expectedPublicKey {
+                    if pub.publicKey == expected {
+                        responsePromise.succeed(.success)
+                    } else {
+                        responsePromise.succeed(.failure)
+                    }
+                } else {
+                    responsePromise.succeed(.success)
+                }
+            case .password:
+                responsePromise.succeed(.success)
+            default:
+                responsePromise.succeed(.failure)
+            }
         }
     }
 
@@ -271,7 +291,10 @@ final class LiveSFTPRepositoryTests: XCTestCase {
         return port
     }
 
-    private func startServer(delegate: MockSFTPDelegate) async throws -> (UInt16, Curve25519.Signing.PublicKey) {
+    private func startServer(
+        delegate: MockSFTPDelegate,
+        authDelegate: (any NIOSSHServerUserAuthenticationDelegate)? = nil
+    ) async throws -> (UInt16, Curve25519.Signing.PublicKey) {
         let elg = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = elg
 
@@ -283,13 +306,48 @@ final class LiveSFTPRepositoryTests: XCTestCase {
             host: "127.0.0.1",
             port: port,
             hostKeys: [nioKey],
-            authenticationDelegate: MockAuthDelegate(),
+            authenticationDelegate: authDelegate ?? MockAuthDelegate(),
             group: elg
         )
         sftpServer.enableSFTP(withDelegate: delegate)
         self.server = sftpServer
 
         return (UInt16(port), hostKey.publicKey)
+    }
+
+    private func connectRepoWithIdentity(
+        port: UInt16,
+        hostPubKey: Curve25519.Signing.PublicKey,
+        identity: IdentityDescriptor?,
+        credStore: any CredentialStore
+    ) async throws -> LiveSFTPRepository {
+        var buffer = ByteBufferAllocator().buffer(capacity: 64)
+        let prefix = "ssh-ed25519"
+        buffer.writeInteger(UInt32(prefix.utf8.count))
+        buffer.writeBytes(prefix.utf8)
+        let keyBytes = Array(hostPubKey.rawRepresentation)
+        buffer.writeInteger(UInt32(keyBytes.count))
+        buffer.writeBytes(keyBytes)
+        let fingerprint = "SHA256:" + Data(SHA256.hash(data: Data(buffer.readableBytesView))).base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "="))
+
+        let trustStore = InMemoryTrustStore()
+        let challenge = HostKeyChallenge(hostname: "127.0.0.1", port: port, algorithm: "ssh-ed25519", fingerprint: fingerprint)
+        await trustStore.save(challenge)
+
+        let host = try ShhCore.Host(
+            name: "Test Host",
+            hostname: "127.0.0.1",
+            port: port,
+            username: "testuser",
+            connection: .ssh(SSHOptions(strictHostKeyChecking: .prompt))
+        )
+
+        return try await LiveSFTPRepository.connect(
+            host: host,
+            identity: identity,
+            trustEvaluator: trustStore,
+            credentialStore: credStore
+        )
     }
 
     private func connectRepo(port: UInt16, hostPubKey: Curve25519.Signing.PublicKey) async throws -> LiveSFTPRepository {
@@ -459,5 +517,99 @@ final class LiveSFTPRepositoryTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: targetURL.path))
 
         await repo.close()
+    }
+
+    func testLiveSFTPRepositoryAuthenticatesWithGeneratedEd25519Key() async throws {
+        let generated = Ed25519Parser.generateKeyPair(comment: "test@device")
+        let nioClientPub = try NIOSSHPublicKey.ed25519(generated.privateKey.publicKey)
+
+        let authDelegate = MockAuthDelegate(expectedPublicKey: nioClientPub)
+        let delegate = MockSFTPDelegate()
+        let (port, hostPubKey) = try await startServer(delegate: delegate, authDelegate: authDelegate)
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data(generated.openSSHPrivateKey.utf8), reference: "kc-gen-key")
+        let identity = try IdentityDescriptor(name: "Generated Key", kind: .privateKey, keychainReference: "kc-gen-key")
+
+        let repo = try await connectRepoWithIdentity(port: port, hostPubKey: hostPubKey, identity: identity, credStore: credStore)
+        let entries = try await repo.listDirectory(at: .root)
+        XCTAssertFalse(entries.isEmpty)
+        await repo.close()
+    }
+
+    func testLiveSFTPRepositoryAuthenticatesWithImportedOpenSSHKey() async throws {
+        let originalKey = Curve25519.Signing.PrivateKey()
+        let openSSH = originalKey.makeSSHRepresentation(comment: "imported-key")
+        let nioClientPub = try NIOSSHPublicKey.ed25519(originalKey.publicKey)
+
+        let authDelegate = MockAuthDelegate(expectedPublicKey: nioClientPub)
+        let delegate = MockSFTPDelegate()
+        let (port, hostPubKey) = try await startServer(delegate: delegate, authDelegate: authDelegate)
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data(openSSH.utf8), reference: "kc-imported-openssh")
+        let identity = try IdentityDescriptor(name: "Imported OpenSSH", kind: .privateKey, keychainReference: "kc-imported-openssh")
+
+        let repo = try await connectRepoWithIdentity(port: port, hostPubKey: hostPubKey, identity: identity, credStore: credStore)
+        let entries = try await repo.listDirectory(at: .root)
+        XCTAssertFalse(entries.isEmpty)
+        await repo.close()
+    }
+
+    func testLiveSFTPRepositoryAuthenticatesWithImportedPKCS8Key() async throws {
+        let pkcs8Pem = """
+        -----BEGIN PRIVATE KEY-----
+        MC4CAQAwBQYDK2VwBCIEIHlloGgivvFqKUn4/KhF+LKFRDZKw91yZc4QKk1+iNIj
+        -----END PRIVATE KEY-----
+        """
+        let parsedKey = try Ed25519Parser.parse(from: pkcs8Pem)
+        let nioClientPub = try NIOSSHPublicKey.ed25519(parsedKey.publicKey)
+
+        let authDelegate = MockAuthDelegate(expectedPublicKey: nioClientPub)
+        let delegate = MockSFTPDelegate()
+        let (port, hostPubKey) = try await startServer(delegate: delegate, authDelegate: authDelegate)
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data(pkcs8Pem.utf8), reference: "kc-pkcs8")
+        let identity = try IdentityDescriptor(name: "Imported PKCS8", kind: .privateKey, keychainReference: "kc-pkcs8")
+
+        let repo = try await connectRepoWithIdentity(port: port, hostPubKey: hostPubKey, identity: identity, credStore: credStore)
+        let entries = try await repo.listDirectory(at: .root)
+        XCTAssertFalse(entries.isEmpty)
+        await repo.close()
+    }
+
+    func testLiveSFTPRepositoryFailsWithAuthenticationRequiredWhenServerRejectsKey() async throws {
+        let otherKey = Curve25519.Signing.PrivateKey()
+        let expectedPub = try NIOSSHPublicKey.ed25519(otherKey.publicKey)
+
+        let authDelegate = MockAuthDelegate(expectedPublicKey: expectedPub)
+        let delegate = MockSFTPDelegate()
+        let (port, hostPubKey) = try await startServer(delegate: delegate, authDelegate: authDelegate)
+
+        let generated = Ed25519Parser.generateKeyPair()
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data(generated.openSSHPrivateKey.utf8), reference: "kc-wrong-key")
+        let identity = try IdentityDescriptor(name: "Wrong Key", kind: .privateKey, keychainReference: "kc-wrong-key")
+
+        do {
+            _ = try await connectRepoWithIdentity(port: port, hostPubKey: hostPubKey, identity: identity, credStore: credStore)
+            XCTFail("Should have thrown authenticationRequired")
+        } catch let error as TransportError {
+            XCTAssertEqual(error, .authenticationRequired)
+        }
+    }
+
+    func testLiveSFTPRepositoryFailsImmediatelyWhenIdentityNil() async throws {
+        let delegate = MockSFTPDelegate()
+        let (port, hostPubKey) = try await startServer(delegate: delegate)
+
+        let credStore = InMemoryCredentialStore()
+        do {
+            _ = try await connectRepoWithIdentity(port: port, hostPubKey: hostPubKey, identity: nil, credStore: credStore)
+            XCTFail("Should have thrown authenticationRequired")
+        } catch let error as TransportError {
+            XCTAssertEqual(error, .authenticationRequired)
+        }
     }
 }

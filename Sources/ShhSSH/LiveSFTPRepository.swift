@@ -47,17 +47,21 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
             trustEvaluator: trustEvaluator
         )
 
-        let userAuthDelegate = LiveSSHUserAuthDelegate(
-            username: host.username,
-            resolveCredential: {
-                try await LiveSSHTransport.resolveAuthenticationCredential(
-                    identity: identity,
-                    credentialStore: credentialStore
-                )
-            }
+        let credential = try await LiveSSHTransport.resolveAuthenticationCredential(
+            identity: identity,
+            credentialStore: credentialStore
         )
 
-        let authMethod = SSHAuthenticationMethod.custom(userAuthDelegate)
+        let authMethod: SSHAuthenticationMethod
+        switch credential {
+        case .password(let password):
+            authMethod = .passwordBased(username: host.username, password: password)
+        case .privateKey(let key):
+            authMethod = .ed25519(username: host.username, privateKey: key)
+        case .none:
+            throw TransportError.authenticationRequired
+        }
+
         let hostKeyValidator = SSHHostKeyValidator.custom(validator)
 
         let client: SSHClient
@@ -72,6 +76,7 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
             )
         } catch {
             if ownsGroup {
+                try? await Task.sleep(nanoseconds: 10_000_000)
                 try? await eventLoopGroup.shutdownGracefully()
             }
             if let captured = validator.capturedError {
@@ -80,12 +85,16 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
             if Task.isCancelled || error is CancellationError {
                 throw TransportError.cancelled
             }
-            throw error
+            if let transportError = error as? TransportError {
+                throw transportError
+            }
+            throw LiveSSHTransport.mapError(error)
         }
 
         if let captured = validator.capturedError {
             try? await client.close()
             if ownsGroup {
+                try? await Task.sleep(nanoseconds: 10_000_000)
                 try? await eventLoopGroup.shutdownGracefully()
             }
             throw captured
@@ -97,12 +106,16 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
         } catch {
             try? await client.close()
             if ownsGroup {
+                try? await Task.sleep(nanoseconds: 10_000_000)
                 try? await eventLoopGroup.shutdownGracefully()
             }
             if Task.isCancelled || error is CancellationError {
                 throw TransportError.cancelled
             }
-            throw error
+            if let transportError = error as? TransportError {
+                throw transportError
+            }
+            throw LiveSSHTransport.mapError(error)
         }
 
         return LiveSFTPRepository(
@@ -124,6 +137,7 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
             try? await sshClient.close()
         }
         if let customGroup {
+            try? await Task.sleep(nanoseconds: 20_000_000)
             try? await customGroup.shutdownGracefully()
         }
     }
