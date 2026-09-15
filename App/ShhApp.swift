@@ -1412,15 +1412,6 @@ struct SessionView: View {
                 .accessibilityIdentifier("open-port-forwarding-button")
                 .accessibilityLabel("Open port forwarding sheet")
 
-                Button(action: {
-                    container.useLegacyTerminalFallback.toggle()
-                }) {
-                    Label(
-                        container.useLegacyTerminalFallback ? "Use SwiftTerm Surface" : "Use Legacy Fallback Surface",
-                        systemImage: "arrow.triangle.2.circlepath"
-                    )
-                }
-
                 Divider()
 
                 Button("Disconnect", role: .destructive) {
@@ -1442,25 +1433,11 @@ struct SessionView: View {
         VStack(spacing: 0) {
             TerminalZoomControls(controller: container.terminalController)
 
-            if container.useLegacyTerminalFallback {
-                ScrollView {
-                    Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText)
-                        .font(.system(size: container.terminalController.terminalFontSize, design: .monospaced))
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                        .padding()
-                }
-                .background(terminalColor(container.terminalTheme.palette.background))
-                .foregroundStyle(terminalColor(container.terminalTheme.palette.foreground))
-                .accessibilityLabel("Fallback terminal output")
-                .accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
-            } else {
-                ShhTerminalView(controller: container.terminalController)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(Color.black)
-                    .accessibilityElement(children: .contain)
-                    .accessibilityLabel("Terminal surface")
-            }
+            ShhTerminalView(controller: container.terminalController)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Terminal surface")
         }
     }
 

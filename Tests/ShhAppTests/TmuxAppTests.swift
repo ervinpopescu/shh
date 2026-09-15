@@ -935,8 +935,7 @@ final class TmuxAppTests: XCTestCase {
         }
 
         let container = AppContainer(
-            transport: transport,
-            useLegacyTerminalFallback: false
+            transport: transport
         )
 
         let host = try Host(name: "Send Fail Host", hostname: "sendfail.test", username: "user")

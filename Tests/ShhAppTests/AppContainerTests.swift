@@ -603,7 +603,7 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.hostID, hostB.id)
     }
 
-    func testRedactionBeforeFeedInProductionAndFallback() async throws {
+    func testRedactionBeforeFeedInProductionSurface() async throws {
         let credStore = InMemoryCredentialStore()
         let secretValue = "super-secret-ssh-token-42"
         try await credStore.save(Data(secretValue.utf8), reference: "ref-secret-token")
@@ -613,8 +613,7 @@ final class AppContainerTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mockConnection }
 
-        // 1. Production surface mode: bytes fed directly to terminalController
-        let prodContainer = AppContainer(credentialStore: credStore, transport: transport, useLegacyTerminalFallback: false)
+        let prodContainer = AppContainer(credentialStore: credStore, transport: transport)
         try await prodContainer.catalog.save(identity)
         let host = try Host(name: "ProdHost", hostname: "prod.invalid", username: "user", identityID: identity.id)
 
@@ -628,44 +627,20 @@ final class AppContainerTests: XCTestCase {
         let prodTranscript = prodContainer.terminalController.currentTranscript(limit: 10)
         XCTAssertFalse(prodTranscript.contains(secretValue), "Raw secret must never enter terminalController buffer")
         XCTAssertTrue(prodTranscript.contains("[REDACTED]"), "Secret must be replaced with [REDACTED] before feed")
-
-        // 2. Fallback surface mode: bytes fed to terminalGrid and terminalText
-        let mockConnectionFallback = MockSSHConnection()
-        let fallbackTransport = ControllableTransport()
-        fallbackTransport.onConnect = { _ in mockConnectionFallback }
-
-        let fallbackContainer = AppContainer(credentialStore: credStore, transport: fallbackTransport, useLegacyTerminalFallback: true)
-        try await fallbackContainer.catalog.save(identity)
-        let fallbackHost = try Host(name: "FallbackHost", hostname: "fallback.invalid", username: "user", identityID: identity.id)
-
-        await fallbackContainer.connect(to: fallbackHost)
-        mockConnectionFallback.emit(.bytes(Data(secretPayload.utf8)))
-        try await Task.sleep(nanoseconds: 50_000_000)
-
-        XCTAssertFalse(fallbackContainer.terminalText.contains(secretValue), "Raw secret must never enter fallback terminalText")
-        XCTAssertTrue(fallbackContainer.terminalText.contains("[REDACTED]"), "Secret must be redacted in fallback terminalText")
     }
 
     func testTerminalSurfaceFallbackSelection() async throws {
-        // Defaults: production surface
+        // Assert that terminal rendering is unified on SwiftTerm production surface
         let defaultContainer = AppContainer()
-        XCTAssertFalse(defaultContainer.useLegacyTerminalFallback, "Default container must use production surface")
+        XCTAssertNotNil(defaultContainer.terminalController, "Default container must use production terminal controller")
 
         let demoContainer = AppContainer.demo()
-        XCTAssertFalse(demoContainer.useLegacyTerminalFallback, "Default demo container must use production surface")
+        XCTAssertNotNil(demoContainer.terminalController, "Demo container must use production terminal controller")
 
-        // Explicit fallback configuration
-        let fallbackContainer = AppContainer(useLegacyTerminalFallback: true)
-        XCTAssertTrue(fallbackContainer.useLegacyTerminalFallback)
-
-        let fallbackDemoContainer = AppContainer.demo(useLegacyTerminalFallback: true)
-        XCTAssertTrue(fallbackDemoContainer.useLegacyTerminalFallback)
-
-        // Runtime toggle
-        fallbackContainer.useLegacyTerminalFallback = false
-        XCTAssertFalse(fallbackContainer.useLegacyTerminalFallback)
-        fallbackContainer.useLegacyTerminalFallback = true
-        XCTAssertTrue(fallbackContainer.useLegacyTerminalFallback)
+        // Terminal output routes directly to production surface
+        defaultContainer.terminalController.feed("Unified Surface Output\r\n")
+        let transcript = defaultContainer.accessibilityTerminalText
+        XCTAssertTrue(transcript.contains("Unified Surface Output"), "Terminal output must route through production terminal controller")
     }
 
     func testPastePolicyBracketedVersusUnbracketed() {
@@ -733,7 +708,7 @@ final class AppContainerTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mockConnection }
 
-        let container = AppContainer(transport: transport, useLegacyTerminalFallback: false)
+        let container = AppContainer(transport: transport)
         let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
 
         // 1. Connect and verify connected
