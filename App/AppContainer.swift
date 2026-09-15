@@ -46,7 +46,6 @@ final class AppContainer: ObservableObject {
         Self.isRunningInTestEnvironment
     }
 
-    @Published var useLegacyTerminalFallback: Bool
     @Published public var appearance: AppearanceSetting
     @Published public var terminalTheme: TerminalThemePreset
     @Published var activeSession: TerminalSession?
@@ -203,9 +202,6 @@ final class AppContainer: ObservableObject {
     }
 
     var accessibilityTerminalText: String {
-        if useLegacyTerminalFallback {
-            return terminalText.isEmpty ? "No terminal output" : terminalText
-        }
         let transcript = terminalController.currentTranscript(limit: 50)
         if transcript.isEmpty {
             return terminalText.isEmpty ? "No terminal output" : terminalText
@@ -224,7 +220,6 @@ final class AppContainer: ObservableObject {
         voiceRegistry: VoiceProviderRegistry? = nil,
         voiceRecorder: (any AudioRecorder)? = nil,
         voiceRouter: VoiceCommandRouter = VoiceCommandRouter(),
-        useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil,
@@ -236,8 +231,6 @@ final class AppContainer: ObservableObject {
         self.fileProviderHelper = fileProviderHelper
         self.didProvideCustomCatalog = (catalog != nil)
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
-        let fallbackArg = ProcessInfo.processInfo.arguments.contains("--legacy-terminal") ||
-            ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
 
         let resolvedCatalog: InMemoryCatalog
         let persistenceState: CatalogPersistenceReadState
@@ -338,7 +331,6 @@ final class AppContainer: ObservableObject {
         }
         self.voiceRouter = voiceRouter
         self.transcriber = transcriber ?? resolvedRegistry.activeTranscriber()
-        self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
         let storedAppearance = AppearanceSetting(
             rawValue: UserDefaults.standard.string(forKey: Self.appearancePreferenceKey) ?? ""
         ) ?? .default
@@ -450,7 +442,6 @@ final class AppContainer: ObservableObject {
         voiceRegistry: VoiceProviderRegistry? = nil,
         voiceRecorder: (any AudioRecorder)? = nil,
         voiceRouter: VoiceCommandRouter = VoiceCommandRouter(),
-        useLegacyTerminalFallback: Bool = false,
         restorationStore: (any SessionRestorationStore)? = nil,
         reachabilityMonitor: (any ReachabilityMonitoring)? = nil,
         reconnectCoordinator: ReconnectCoordinator? = nil,
@@ -481,7 +472,6 @@ final class AppContainer: ObservableObject {
             voiceRegistry: demoRegistry,
             voiceRecorder: demoRecorder,
             voiceRouter: voiceRouter,
-            useLegacyTerminalFallback: useLegacyTerminalFallback,
             restorationStore: restorationStore ?? InMemorySessionRestorationStore(),
             reachabilityMonitor: reachabilityMonitor ?? MockReachabilityMonitor(isReachable: true),
             reconnectCoordinator: reconnectCoordinator ?? ReconnectCoordinator(
@@ -707,9 +697,7 @@ final class AppContainer: ObservableObject {
             self.lastConnectionFailure = failure
             let message = Self.statusMessage(for: error)
             terminalText = message
-            if !useLegacyTerminalFallback {
-                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-            }
+            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
             switch error {
             case .hostKeyApprovalRequired(let challenge):
                 pendingTrustChallenge = challenge
@@ -728,9 +716,7 @@ final class AppContainer: ObservableObject {
             let message = failure.reason
             activeSession?.state = .failed
             terminalText = message
-            if !useLegacyTerminalFallback {
-                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-            }
+            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
         }
     }
 
@@ -750,12 +736,7 @@ final class AppContainer: ObservableObject {
                     switch event {
                     case .bytes(let data):
                         let redactedData = self.redacted(data)
-                        if self.useLegacyTerminalFallback {
-                            self.ansiParser.consume(redactedData, into: &self.terminalGrid)
-                            self.terminalText = self.terminalGrid.transcriptText
-                        } else {
-                            self.terminalController.feed(redactedData)
-                        }
+                        self.terminalController.feed(redactedData)
                     case .closed:
                         self.tmuxRefreshGeneration += 1
                         self.herdrRefreshGeneration += 1
@@ -764,9 +745,7 @@ final class AppContainer: ObservableObject {
                         self.isProbingHerdr = false
                         self.activeSession?.state = .disconnected
                         self.detachCallbacks()
-                        if !self.useLegacyTerminalFallback {
-                            self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
-                        }
+                        self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
                         self.redactor = Redactor()
                         self.forwardingStreamTask?.cancel()
                         self.forwardingStreamTask = nil
@@ -783,9 +762,7 @@ final class AppContainer: ObservableObject {
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
                         self.terminalText += "\n" + message
-                        if !self.useLegacyTerminalFallback {
-                            self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                        }
+                        self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
                         self.redactor = Redactor()
                         self.forwardingStreamTask?.cancel()
                         self.forwardingStreamTask = nil
@@ -807,9 +784,7 @@ final class AppContainer: ObservableObject {
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
                 self.terminalText += "\n" + message
-                if !self.useLegacyTerminalFallback {
-                    self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                }
+                self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
                 self.redactor = Redactor()
                 self.forwardingStreamTask?.cancel()
                 self.forwardingStreamTask = nil
@@ -1221,9 +1196,7 @@ final class AppContainer: ObservableObject {
         } catch {
             let message = "Send failed: \(error.localizedDescription)"
             terminalText += "\n" + message
-            if !useLegacyTerminalFallback {
-                terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-            }
+            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
             return false
         }
     }
