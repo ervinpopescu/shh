@@ -51,6 +51,7 @@ jobs:
             -project Shh.xcodeproj \
             -scheme Shh \
             -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
@@ -60,10 +61,13 @@ jobs:
             -project Shh.xcodeproj \
             -scheme ShhFileProvider \
             -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee xcodebuild-fp.log
+
+          Tests/verify-app-icon.sh build/DerivedData/Build/Products/Debug-iphoneos/Shh.app
 
       - name: Discover and Boot Available Simulators
         id: simulators
