@@ -223,6 +223,11 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
     private let group: EventLoopGroup
     private let lock = NSLock()
     private var listeners: [Int: Channel] = [:]
+    private var _requestCount = 0
+
+    var requestCount: Int {
+        lock.withLock { _requestCount }
+    }
 
     init(group: EventLoopGroup) {
         self.group = group
@@ -233,6 +238,7 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
         handler: NIOSSHHandler,
         promise: EventLoopPromise<GlobalRequest.TCPForwardingResponse>
     ) {
+        lock.withLock { _requestCount += 1 }
         switch request {
         case .listen(let host, let port):
             let bootstrap = ServerBootstrap(group: group)
@@ -301,6 +307,10 @@ final class SSHTestServer: @unchecked Sendable {
     private let lock = NSLock()
     private(set) var port: UInt16 = 0
     let sessionHandler = TestServerSessionChannelHandler()
+
+    var globalRequestCount: Int {
+        globalRequestDelegate?.requestCount ?? 0
+    }
 
     var execMode: TestServerExecMode = .normal
     var execDelay: TimeInterval? = nil

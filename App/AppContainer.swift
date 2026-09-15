@@ -186,6 +186,7 @@ final class AppContainer: ObservableObject {
     // background transition as a disconnected lifecycle boundary and reconnect
     // on the next active transition rather than claiming the socket survived.
     private var isSceneInBackground = false
+    private var isNetworkRecoveryInProgress = false
     private var lifecycleGeneration = 0
     private var backgroundCleanupTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
@@ -583,6 +584,7 @@ final class AppContainer: ObservableObject {
         await pendingBackgroundCleanup?.value
         lifecycleGeneration += 1
         isSceneInBackground = false
+        isNetworkRecoveryInProgress = false
         let connectionGeneration = lifecycleGeneration
         lastConnectionFailure = nil
         await cancelVoiceRecording()
@@ -856,7 +858,8 @@ final class AppContainer: ObservableObject {
     }
 
     private func handleConnectionDrop(host: Host) {
-        guard !isExplicitDisconnect, !isSceneInBackground else { return }
+        guard !isExplicitDisconnect, !isSceneInBackground,
+              !isNetworkRecoveryInProgress else { return }
         Task { [weak self] in
             guard let self else { return }
             await self.reconnectCoordinator.start { [weak self] attempt in
@@ -935,6 +938,7 @@ final class AppContainer: ObservableObject {
             throw TransportError.cancelled
         }
         self.connection = connection
+        isNetworkRecoveryInProgress = false
         (connection as? LiveSSHConnection)?.setRedactor(redactor)
         activeSession?.state = .connected
 
@@ -1000,6 +1004,7 @@ final class AppContainer: ObservableObject {
 
     func cancelReconnect() async {
         isExplicitDisconnect = true
+        isNetworkRecoveryInProgress = false
         lifecycleGeneration += 1
         tmuxRefreshGeneration += 1
         herdrRefreshGeneration += 1
@@ -1077,6 +1082,15 @@ final class AppContainer: ObservableObject {
             } catch {
                 await performFastSessionRecovery()
             }
+        } else if let host = activeHost,
+                  activeSession?.state == .connected,
+                  let oldConnection = connection {
+            // A path/interface change can leave an established TCP socket
+            // half-alive without producing a channel callback. Force the
+            // normal reconnect path, but keep it bounded by the coordinator.
+            handleConnectionDrop(host: host)
+            isNetworkRecoveryInProgress = true
+            await oldConnection.close()
         }
     }
 
@@ -1152,6 +1166,7 @@ final class AppContainer: ObservableObject {
     private func enterBackground() {
         guard !isSceneInBackground else { return }
         isSceneInBackground = true
+        isNetworkRecoveryInProgress = false
         lifecycleGeneration += 1
         let backgroundGeneration = lifecycleGeneration
 
@@ -1272,6 +1287,7 @@ final class AppContainer: ObservableObject {
         await cancelVoiceRecording()
         resetVoiceState()
         isExplicitDisconnect = true
+        isNetworkRecoveryInProgress = false
         lifecycleGeneration += 1
         isSceneInBackground = false
         tmuxRefreshGeneration += 1

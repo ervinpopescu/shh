@@ -173,7 +173,7 @@ final class ReconnectAndRestorationTests: XCTestCase {
         let expectation = expectation(description: "Coordinator reaches exhausted")
         await coordinator.setStateChangeHandler { state in
             if case .exhausted(let attempts) = state {
-                XCTAssertEqual(attempts, 5)
+                XCTAssertEqual(attempts, ReconnectCoordinator.maxAttempts)
                 expectation.fulfill()
             }
         }
@@ -186,9 +186,9 @@ final class ReconnectAndRestorationTests: XCTestCase {
         await fulfillment(of: [expectation], timeout: 2.0)
 
         let history = await attemptsRecorded.get()
-        XCTAssertEqual(history, [1, 2, 3, 4, 5], "Coordinator must execute exactly 5 attempts in sequence before exhausting")
+        XCTAssertEqual(history, Array(1...ReconnectCoordinator.maxAttempts), "Coordinator must execute the configured attempts before exhausting")
         let finalState = await coordinator.state
-        XCTAssertEqual(finalState, .exhausted(attempts: 5))
+        XCTAssertEqual(finalState, .exhausted(attempts: ReconnectCoordinator.maxAttempts))
     }
 
     func testReconnectCoordinatorSuccessHaltsRetries() async {

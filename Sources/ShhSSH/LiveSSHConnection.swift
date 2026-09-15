@@ -12,6 +12,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private let inboundRouter: InboundChildChannelRouter?
     private let lock = NSLock()
     private var isClosed = false
+    private var keepaliveTask: Task<Void, Never>?
     private var bufferedData: [Data] = []
     private var continuations: [UUID: AsyncThrowingStream<TerminalEvent, Error>.Continuation] = [:]
     private var activeExecChannels: [UUID: Channel] = [:]
@@ -37,6 +38,70 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         self.ownsGroup = ownsGroup
         self.redactor = redactor
         self.inboundRouter = inboundRouter
+    }
+
+    /// Starts a cancellable SSH-level liveness probe. NIOSSH 0.3 exposes
+    /// forwarding global requests, but not arbitrary global request messages,
+    /// so use a no-op cancel request rather than writing anything to the PTY.
+    func startSSHKeepalive(interval: TimeInterval, timeout: TimeInterval) {
+        guard interval > 0 else { return }
+        keepaliveTask?.cancel()
+        keepaliveTask = Task { [weak self] in
+            await self?.runKeepalive(interval: interval, timeout: timeout)
+        }
+    }
+
+    private func runKeepalive(interval: TimeInterval, timeout: TimeInterval) async {
+        let delay = UInt64(max(0.1, interval) * 1_000_000_000)
+        while !Task.isCancelled {
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+
+            guard !Task.isCancelled, !lock.withLock({ isClosed }) else { return }
+            do {
+                try await sendKeepaliveProbe(timeout: timeout)
+            } catch let error as TransportError where error == .timeout {
+                // A bounded probe timeout is a real transport failure. Closing
+                // the channel lets AppContainer's normal reconnect path run.
+                handleChannelError(error)
+                return
+            } catch {
+                // Refused or unsupported probes still prove that SSH replied.
+                // Do not disconnect a usable session for server policy.
+            }
+        }
+    }
+
+    private func sendKeepaliveProbe(timeout: TimeInterval) async throws {
+        let requestFuture = parentChannel.eventLoop.flatSubmit {
+            self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { handler in
+                let promise = self.parentChannel.eventLoop.makePromise(
+                    of: GlobalRequest.TCPForwardingResponse?.self
+                )
+                // cancel-tcpip-forward never creates a listener. It is a
+                // harmless global request that receives a protocol response.
+                handler.sendTCPForwardingRequest(
+                    .cancel(host: "127.0.0.1", port: 0),
+                    promise: promise
+                )
+                return promise.futureResult.map { _ in () }
+            }
+        }
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                try await requestFuture.get()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(max(0.1, timeout) * 1_000_000_000))
+                throw TransportError.timeout
+            }
+            _ = try await group.next()
+            group.cancelAll()
+        }
     }
 
     public func setRedactor(_ redactor: Redactor) {
@@ -342,6 +407,8 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     public func close() async {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
             [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
             [Channel],
@@ -403,6 +470,8 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     func handleChannelClosed() {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
             [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
             [Channel],
@@ -449,6 +518,8 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     func handleChannelError(_ error: Error) {
+        keepaliveTask?.cancel()
+        keepaliveTask = nil
         let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
             [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
             [Channel],
@@ -503,6 +574,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     deinit {
+        keepaliveTask?.cancel()
         let (shouldClose, activeChannels, forwardedChannels): (Bool, [Channel], [Channel]) = lock.withLock {
             if !isClosed {
                 isClosed = true
