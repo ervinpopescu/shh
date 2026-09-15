@@ -476,6 +476,48 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertEqual(delivered, engine.currentSize)
     }
 
+    func testThemePreferencePersistsAcrossControllers() {
+        let defaults = UserDefaults(suiteName: "ShhTerminalTests.theme")!
+        defaults.removePersistentDomain(forName: "ShhTerminalTests.theme")
+        let store = UserDefaultsTerminalThemeStore(userDefaults: defaults)
+        let first = ShhTerminalController(themeStore: store)
+        first.setTerminalTheme(.dracula)
+        let restored = ShhTerminalController(themeStore: store)
+        XCTAssertEqual(restored.terminalTheme, .dracula)
+        defaults.removePersistentDomain(forName: "ShhTerminalTests.theme")
+    }
+
+    func testThemeApplicationUpdatesControllerWithoutResettingSize() {
+        final class MockEngine: TerminalEngineBridge {
+            var bracketedPasteMode = false
+            var isAlternateScreenActive = false
+            var currentSize = TerminalSize(columns: 80, rows: 24)
+            var appliedTheme: TerminalThemePreset?
+            func feed(data: Data) {}
+            func feed(text: String) {}
+            func resize(size: TerminalSize) {}
+            func setTheme(_ theme: TerminalThemePreset) { appliedTheme = theme }
+            func changeScrollback(_ limit: Int) {}
+            func findNext(_ term: String) -> Bool { false }
+            func findPrevious(_ term: String) -> Bool { false }
+            func searchMatchSummary(_ term: String) -> (index: Int, total: Int) { (0, 0) }
+            func clearSearch() {}
+            func selectAll() {}
+            func selectNone() {}
+            func getSelection() -> String? { nil }
+            func currentTranscript(limit: Int) -> String { "" }
+        }
+
+        let controller = ShhTerminalController()
+        let engine = MockEngine()
+        controller.attachEngine(engine, firstResponder: nil)
+        controller.setTerminalTheme(.nord)
+
+        XCTAssertEqual(controller.terminalTheme, .nord)
+        XCTAssertEqual(engine.appliedTheme, .nord)
+        XCTAssertEqual(controller.size, TerminalSize(columns: 80, rows: 24))
+    }
+
     func testDetachEngineIdentityProtection() {
         final class TestEngine: TerminalEngineBridge {
             var bracketedPasteMode: Bool = false

@@ -14,6 +14,8 @@ final class EncryptedVaultBackupTests: XCTestCase {
         preferences.defaultTerminalFontSize = 14.0
         preferences.voiceProvider = "apple-speech"
         preferences.customSettings["theme"] = "dark"
+        preferences.appearance = .dark
+        preferences.terminalTheme = .dracula
 
         let passphrase = "correct-horse-battery-staple"
         let backup = try service.exportBackup(
@@ -37,6 +39,8 @@ final class EncryptedVaultBackupTests: XCTestCase {
         XCTAssertEqual(restored.preferences.defaultTerminalFont, "Menlo-Regular")
         XCTAssertEqual(restored.preferences.defaultTerminalFontSize, 14.0)
         XCTAssertEqual(restored.preferences.customSettings["theme"], "dark")
+        XCTAssertEqual(restored.preferences.appearance, .dark)
+        XCTAssertEqual(restored.preferences.terminalTheme, .dracula)
 
         XCTAssertTrue(service.verifyPassphrase(backup: backup, passphrase: passphrase))
     }

@@ -11,19 +11,41 @@ public struct VaultPreferences: Codable, Hashable, Sendable {
     public var voiceProvider: String?
     public var voiceAutoPunctuation: Bool
     public var customSettings: [String: String]
+    public var appearance: AppearanceSetting
+    public var terminalTheme: TerminalThemePreset
 
     public init(
         defaultTerminalFont: String? = nil,
         defaultTerminalFontSize: Double? = nil,
         voiceProvider: String? = nil,
         voiceAutoPunctuation: Bool = true,
-        customSettings: [String: String] = [:]
+        customSettings: [String: String] = [:],
+        appearance: AppearanceSetting = .default,
+        terminalTheme: TerminalThemePreset = .default
     ) {
         self.defaultTerminalFont = defaultTerminalFont
         self.defaultTerminalFontSize = defaultTerminalFontSize
         self.voiceProvider = voiceProvider
         self.voiceAutoPunctuation = voiceAutoPunctuation
         self.customSettings = customSettings
+        self.appearance = appearance
+        self.terminalTheme = terminalTheme
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case defaultTerminalFont, defaultTerminalFontSize, voiceProvider, voiceAutoPunctuation
+        case customSettings, appearance, terminalTheme
+    }
+
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        defaultTerminalFont = try values.decodeIfPresent(String.self, forKey: .defaultTerminalFont)
+        defaultTerminalFontSize = try values.decodeIfPresent(Double.self, forKey: .defaultTerminalFontSize)
+        voiceProvider = try values.decodeIfPresent(String.self, forKey: .voiceProvider)
+        voiceAutoPunctuation = try values.decodeIfPresent(Bool.self, forKey: .voiceAutoPunctuation) ?? true
+        customSettings = try values.decodeIfPresent([String: String].self, forKey: .customSettings) ?? [:]
+        appearance = try values.decodeIfPresent(AppearanceSetting.self, forKey: .appearance) ?? .default
+        terminalTheme = try values.decodeIfPresent(TerminalThemePreset.self, forKey: .terminalTheme) ?? .default
     }
 }
 

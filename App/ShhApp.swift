@@ -23,7 +23,16 @@ struct ShhApp: App {
                 .onChange(of: scenePhase) { _, newPhase in
                     container.handleScenePhaseChange(newPhase)
                 }
+                .preferredColorScheme(preferredColorScheme(for: container.appearance))
         }
+    }
+}
+
+private func preferredColorScheme(for appearance: AppearanceSetting) -> ColorScheme? {
+    switch appearance {
+    case .system: return nil
+    case .light: return .light
+    case .dark: return .dark
     }
 }
 
@@ -906,6 +915,10 @@ struct SessionView: View {
     @State private var showPortForwarding = false
     private let policy = CommandPolicy()
 
+    private func terminalColor(_ value: TerminalColor) -> Color {
+        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Header / Status bar
@@ -1436,8 +1449,8 @@ struct SessionView: View {
                         .textSelection(.enabled)
                         .padding()
                 }
-                .background(Color.black)
-                .foregroundStyle(Color.green)
+                .background(terminalColor(container.terminalTheme.palette.background))
+                .foregroundStyle(terminalColor(container.terminalTheme.palette.foreground))
                 .accessibilityLabel("Fallback terminal output")
                 .accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
             } else {
@@ -3087,10 +3100,64 @@ struct SnippetEditor: View {
     var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
+struct TerminalThemePreview: View {
+    let theme: TerminalThemePreset
+
+    private func color(_ value: TerminalColor) -> Color {
+        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("$ ssh user@host")
+                .font(.system(.body, design: .monospaced).weight(.medium))
+            Text("Connected - ready")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(color(theme.palette.ansi[2]))
+        }
+        .foregroundStyle(color(theme.palette.foreground))
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(color(theme.palette.background), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(alignment: .bottomTrailing) {
+            Circle()
+                .fill(color(theme.palette.cursor))
+                .frame(width: 8, height: 8)
+                .padding(8)
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var container: AppContainer
     var body: some View {
         Form {
+            Section("Appearance") {
+                Picker("Appearance", selection: Binding(
+                    get: { container.appearance },
+                    set: { container.setAppearance($0) }
+                )) {
+                    ForEach(AppearanceSetting.allCases) { appearance in
+                        Text(appearance.displayName).tag(appearance)
+                    }
+                }
+                .accessibilityIdentifier("appearance-picker")
+
+                Picker("Terminal theme", selection: Binding(
+                    get: { container.terminalTheme },
+                    set: { container.setTerminalTheme($0) }
+                )) {
+                    ForEach(TerminalThemePreset.allCases) { theme in
+                        Text(theme.displayName).tag(theme)
+                    }
+                }
+                .accessibilityIdentifier("terminal-theme-picker")
+
+                TerminalThemePreview(theme: container.terminalTheme)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Terminal theme preview")
+                    .accessibilityValue(container.terminalTheme.displayName)
+            }
             Section("SSH Keys & Credentials") {
                 NavigationLink {
                     KeyManagementView().environmentObject(container)
