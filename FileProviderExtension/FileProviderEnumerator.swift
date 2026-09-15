@@ -3,6 +3,100 @@ import Foundation
 import FileProvider
 import ShhCore
 
+/// Thread-safe enumeration observer wrapper guaranteeing callbacks are called at most once.
+final class SafeEnumerationObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didFinish = false
+    private let observer: NSFileProviderEnumerationObserver
+
+    init(_ observer: NSFileProviderEnumerationObserver) {
+        self.observer = observer
+    }
+
+    func didEnumerate(_ items: [NSFileProviderItemProtocol]) {
+        lock.lock()
+        let canCall = !didFinish
+        lock.unlock()
+        if canCall {
+            observer.didEnumerate(items)
+        }
+    }
+
+    func finishEnumerating(upTo page: NSFileProviderPage?) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        lock.unlock()
+        observer.finishEnumerating(upTo: page)
+    }
+
+    func finishEnumeratingWithError(_ error: Error) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        lock.unlock()
+        observer.finishEnumeratingWithError(error)
+    }
+}
+
+/// Thread-safe change observer wrapper guaranteeing callbacks are called at most once.
+final class SafeChangeObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didFinish = false
+    private let observer: NSFileProviderChangeObserver
+
+    init(_ observer: NSFileProviderChangeObserver) {
+        self.observer = observer
+    }
+
+    func didUpdate(_ items: [NSFileProviderItemProtocol]) {
+        lock.lock()
+        let canCall = !didFinish
+        lock.unlock()
+        if canCall {
+            observer.didUpdate(items)
+        }
+    }
+
+    func didDeleteItems(withIdentifiers identifiers: [NSFileProviderItemIdentifier]) {
+        lock.lock()
+        let canCall = !didFinish
+        lock.unlock()
+        if canCall {
+            observer.didDeleteItems(withIdentifiers: identifiers)
+        }
+    }
+
+    func finishEnumeratingChanges(upTo anchor: NSFileProviderSyncAnchor, moreComing: Bool) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        lock.unlock()
+        observer.finishEnumeratingChanges(upTo: anchor, moreComing: moreComing)
+    }
+
+    func finishEnumeratingWithError(_ error: Error) {
+        lock.lock()
+        if didFinish {
+            lock.unlock()
+            return
+        }
+        didFinish = true
+        lock.unlock()
+        observer.finishEnumeratingWithError(error)
+    }
+}
+
+@objc(FileProviderEnumerator)
 public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
     private let containerItemIdentifier: NSFileProviderItemIdentifier
     private let domain: NSFileProviderDomain
@@ -33,43 +127,67 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderEnumerationObserver,
         startingAt page: NSFileProviderPage
     ) {
+        let safeObserver = SafeEnumerationObserver(observer)
         guard !isInvalidated else {
-            observer.finishEnumerating(upTo: nil)
+            safeObserver.finishEnumerating(upTo: nil)
             return
         }
 
         if containerItemIdentifier == .workingSet {
             Task {
+                guard !self.isInvalidated else {
+                    safeObserver.finishEnumerating(upTo: nil)
+                    return
+                }
                 let materialized = await cache.allMetadata().filter(\.isMaterialized).map { FileProviderItem(contract: $0.item) }
-                observer.didEnumerate(materialized)
-                observer.finishEnumerating(upTo: nil)
+                safeObserver.didEnumerate(materialized)
+                safeObserver.finishEnumerating(upTo: nil)
             }
             return
         }
 
         if containerItemIdentifier == .trashContainer {
-            observer.didEnumerate([])
-            observer.finishEnumerating(upTo: nil)
+            safeObserver.didEnumerate([])
+            safeObserver.finishEnumerating(upTo: nil)
             return
         }
+
+        let isRoot = containerItemIdentifier == .rootContainer ||
+            containerItemIdentifier.rawValue == NSFileProviderItemIdentifier.rootContainer.rawValue ||
+            containerItemIdentifier.rawValue == FileProviderItemIdentifier.root.rawValue ||
+            containerItemIdentifier.rawValue == "NSFileProviderRootContainerItemIdentifier"
 
         let targetPath: RemotePath
         let parentContractID: FileProviderItemIdentifier
 
-        if containerItemIdentifier == .rootContainer {
+        if isRoot {
             targetPath = RemotePath("/")
             parentContractID = .root
         } else {
             let contractID = FileProviderItemIdentifier(rawValue: containerItemIdentifier.rawValue)
-            targetPath = contractID.remotePath ?? RemotePath("/")
+            guard let path = contractID.remotePath else {
+                safeObserver.finishEnumeratingWithError(NSFileProviderError(.noSuchItem))
+                return
+            }
+            targetPath = path
             parentContractID = contractID
         }
 
         Task {
+            guard !self.isInvalidated else {
+                safeObserver.finishEnumerating(upTo: nil)
+                return
+            }
+
             do {
                 // Short-lived scoped repository access with 15s timeout
                 let remoteFiles = try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 15.0) { repo in
                     try await repo.listDirectory(at: targetPath)
+                }
+
+                guard !self.isInvalidated else {
+                    safeObserver.finishEnumerating(upTo: nil)
+                    return
                 }
 
                 var items: [FileProviderItem] = []
@@ -85,17 +203,22 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                     items.append(FileProviderItem(contract: contract))
                 }
 
-                observer.didEnumerate(items)
-                observer.finishEnumerating(upTo: nil)
+                safeObserver.didEnumerate(items)
+                safeObserver.finishEnumerating(upTo: nil)
             } catch {
+                guard !self.isInvalidated else {
+                    safeObserver.finishEnumerating(upTo: nil)
+                    return
+                }
+
                 // Fallback to bounded local cache
                 let cachedChildren = await cache.listChildren(parentIdentifier: parentContractID)
                 if !cachedChildren.isEmpty {
                     let items = cachedChildren.map { FileProviderItem(contract: $0) }
-                    observer.didEnumerate(items)
-                    observer.finishEnumerating(upTo: nil)
+                    safeObserver.didEnumerate(items)
+                    safeObserver.finishEnumerating(upTo: nil)
                 } else {
-                    observer.finishEnumeratingWithError(Self.translateError(error))
+                    safeObserver.finishEnumeratingWithError(Self.translateError(error))
                 }
             }
         }
@@ -105,18 +228,24 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
         for observer: NSFileProviderChangeObserver,
         from anchor: NSFileProviderSyncAnchor
     ) {
+        let safeObserver = SafeChangeObserver(observer)
         guard !isInvalidated else {
-            observer.finishEnumeratingChanges(upTo: anchor, moreComing: false)
+            safeObserver.finishEnumeratingChanges(upTo: anchor, moreComing: false)
             return
         }
 
         Task {
+            guard !self.isInvalidated else {
+                safeObserver.finishEnumeratingChanges(upTo: anchor, moreComing: false)
+                return
+            }
+
             let changeAnchor = FileProviderChangeAnchor.decode(from: anchor.rawValue) ?? FileProviderChangeAnchor(generation: 0)
             let currentAnchor = await cache.currentAnchor()
 
             // If anchor generation is in the future, signal expired sync anchor
             if changeAnchor.generation > currentAnchor.generation {
-                observer.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
+                safeObserver.finishEnumeratingWithError(NSFileProviderError(.syncAnchorExpired))
                 return
             }
 
@@ -136,28 +265,41 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
                 }
             }
 
+            guard !self.isInvalidated else {
+                safeObserver.finishEnumeratingChanges(upTo: anchor, moreComing: false)
+                return
+            }
+
             if !updatedItems.isEmpty {
-                observer.didUpdate(updatedItems)
+                safeObserver.didUpdate(updatedItems)
             }
             if !deletedIDs.isEmpty {
-                observer.didDeleteItems(withIdentifiers: deletedIDs)
+                safeObserver.didDeleteItems(withIdentifiers: deletedIDs)
             }
 
             let newSyncAnchor = NSFileProviderSyncAnchor(currentAnchor.encodedData())
-            observer.finishEnumeratingChanges(upTo: newSyncAnchor, moreComing: false)
+            safeObserver.finishEnumeratingChanges(upTo: newSyncAnchor, moreComing: false)
         }
     }
 
     public func currentSyncAnchor(completionHandler: @escaping (NSFileProviderSyncAnchor?) -> Void) {
+        let safeCompletion = SafeOnceCompletion(completionHandler)
         Task {
             let anchor = await cache.currentAnchor()
-            completionHandler(NSFileProviderSyncAnchor(anchor.encodedData()))
+            safeCompletion(NSFileProviderSyncAnchor(anchor.encodedData()))
         }
     }
 
     private static func translateError(_ error: any Error) -> Error {
         if let fpError = error as? NSFileProviderError {
             return fpError
+        }
+        if error is CancellationError {
+            return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSFileProviderErrorDomain || nsError.domain == NSCocoaErrorDomain {
+            return error
         }
         if let sftpError = error as? SFTPRepositoryError {
             switch sftpError {

@@ -465,4 +465,84 @@ final class FileProviderAppTests: XCTestCase {
         XCTAssertEqual(nsError?.code, NSFileProviderError.syncAnchorExpired.rawValue)
         #endif
     }
+
+    func testFileProviderItemLookupRootContainer() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "My Remote Server")
+        let extensionInstance = FileProviderExtension(domain: domain, repositoryProvider: provider)
+
+        // 1. Test .rootContainer
+        let exp1 = expectation(description: "Fetch .rootContainer item")
+        _ = extensionInstance.item(for: .rootContainer, request: NSFileProviderRequest()) { item, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(item)
+            XCTAssertEqual(item?.itemIdentifier, .rootContainer)
+            XCTAssertEqual(item?.parentItemIdentifier, .rootContainer)
+            XCTAssertEqual(item?.filename, "My Remote Server")
+            XCTAssertEqual(item?.contentType, .folder)
+            exp1.fulfill()
+        }
+
+        // 2. Test raw string matching root identifier
+        let exp2 = expectation(description: "Fetch raw root identifier")
+        let rawRootID = NSFileProviderItemIdentifier(FileProviderItemIdentifier.root.rawValue)
+        _ = extensionInstance.item(for: rawRootID, request: NSFileProviderRequest()) { item, error in
+            XCTAssertNil(error)
+            XCTAssertNotNil(item)
+            XCTAssertEqual(item?.itemIdentifier, .rootContainer)
+            XCTAssertEqual(item?.parentItemIdentifier, .rootContainer)
+            XCTAssertEqual(item?.filename, "My Remote Server")
+            exp2.fulfill()
+        }
+
+        await fulfillment(of: [exp1, exp2], timeout: 5.0)
+        #endif
+    }
+
+    func testFileProviderEnumeratorRootContainer() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let cache = FileProviderMetadataCache()
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+
+        let enumerator = FileProviderEnumerator(
+            containerItemIdentifier: .rootContainer,
+            domain: domain,
+            repositoryProvider: provider,
+            cache: cache
+        )
+
+        final class EnumerationObserver: NSObject, NSFileProviderEnumerationObserver, @unchecked Sendable {
+            var items: [NSFileProviderItemProtocol] = []
+            var finished = false
+            var error: Error?
+            func didEnumerate(_ updatedItems: [NSFileProviderItemProtocol]) {
+                items.append(contentsOf: updatedItems)
+            }
+            func finishEnumerating(upTo page: NSFileProviderPage?) {
+                finished = true
+            }
+            func finishEnumeratingWithError(_ error: Error) {
+                self.error = error
+                finished = true
+            }
+        }
+
+        let observer = EnumerationObserver()
+        enumerator.enumerateItems(for: observer, startingAt: NSFileProviderPage(Data()))
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(observer.finished)
+        XCTAssertNil(observer.error)
+        XCTAssertFalse(observer.items.isEmpty)
+        for item in observer.items {
+            XCTAssertEqual(item.parentItemIdentifier, .rootContainer)
+        }
+        #endif
+    }
 }

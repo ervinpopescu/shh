@@ -9,6 +9,7 @@ struct FileProviderSettingsView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var hosts: [Host] = []
     @State private var errorMessage: String? = nil
+    @State private var hostErrors: [UUID: String] = [:]
     @State private var isPerformingOperation = false
     @State private var hostPendingRemoval: Host? = nil
 
@@ -93,6 +94,7 @@ struct FileProviderSettingsView: View {
         #else
         let isRegistered = false
         #endif
+        let hostError = hostErrors[host.id]
 
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -115,6 +117,15 @@ struct FileProviderSettingsView: View {
                         .foregroundStyle(.orange)
                         .clipShape(Capsule())
                         .accessibilityIdentifier("fileprovider-status-mosh-\(host.id)")
+                } else if hostError != nil {
+                    Text("Error")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.red.opacity(0.15))
+                        .foregroundStyle(.red)
+                        .clipShape(Capsule())
+                        .accessibilityIdentifier("fileprovider-status-error-\(host.id)")
                 } else if isRegistered {
                     Text("Active in Files")
                         .font(.caption2.bold())
@@ -132,12 +143,33 @@ struct FileProviderSettingsView: View {
                 }
             }
 
+            if let hostError {
+                Text(hostError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .accessibilityIdentifier("fileprovider-error-text-\(host.id)")
+            }
+
             HStack {
                 if isMosh {
                     Text("Mosh-only hosts do not support File Provider.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 } else if isRegistered {
+                    Button {
+                        Task {
+                            await reregisterDomain(for: host)
+                        }
+                    } label: {
+                        Label("Re-register Domain", systemImage: "arrow.clockwise")
+                            .font(.subheadline)
+                    }
+                    .disabled(isPerformingOperation)
+                    .accessibilityLabel("Re-register domain for \(host.name)")
+                    .accessibilityIdentifier("fileprovider-reregister-button-\(host.id)")
+
+                    Spacer()
+
                     Button(role: .destructive) {
                         hostPendingRemoval = host
                     } label: {
@@ -147,6 +179,18 @@ struct FileProviderSettingsView: View {
                     .disabled(isPerformingOperation)
                     .accessibilityLabel("Remove domain for \(host.name)")
                     .accessibilityIdentifier("fileprovider-remove-button-\(host.id)")
+                } else if hostError != nil {
+                    Button {
+                        Task {
+                            await reregisterDomain(for: host)
+                        }
+                    } label: {
+                        Label("Re-register Domain", systemImage: "arrow.clockwise")
+                            .font(.subheadline)
+                    }
+                    .disabled(isPerformingOperation)
+                    .accessibilityLabel("Re-register domain for \(host.name)")
+                    .accessibilityIdentifier("fileprovider-reregister-button-\(host.id)")
                 } else {
                     Button {
                         Task {
@@ -192,12 +236,41 @@ struct FileProviderSettingsView: View {
 
         isPerformingOperation = true
         errorMessage = nil
+        hostErrors.removeValue(forKey: host.id)
 
         #if canImport(FileProvider)
         do {
             try await container.registerFileProviderDomain(for: host)
             await reload()
         } catch {
+            hostErrors[host.id] = error.localizedDescription
+            errorMessage = error.localizedDescription
+        }
+        #else
+        errorMessage = "File Provider is unavailable on this platform."
+        #endif
+
+        isPerformingOperation = false
+    }
+
+    private func reregisterDomain(for host: Host) async {
+        guard !isMoshHost(host) else {
+            errorMessage = "Host '\(host.name)' uses Mosh-only transport. File Provider requires SSH/SFTP."
+            return
+        }
+
+        isPerformingOperation = true
+        errorMessage = nil
+        hostErrors.removeValue(forKey: host.id)
+
+        #if canImport(FileProvider)
+        do {
+            try? await container.unregisterFileProviderDomain(for: host)
+            try await container.syncSharedCatalogAndTrust()
+            try await container.registerFileProviderDomain(for: host)
+            await reload()
+        } catch {
+            hostErrors[host.id] = error.localizedDescription
             errorMessage = error.localizedDescription
         }
         #else
@@ -210,12 +283,14 @@ struct FileProviderSettingsView: View {
     private func unregisterDomain(for host: Host) async {
         isPerformingOperation = true
         errorMessage = nil
+        hostErrors.removeValue(forKey: host.id)
 
         #if canImport(FileProvider)
         do {
             try await container.unregisterFileProviderDomain(for: host)
             await reload()
         } catch {
+            hostErrors[host.id] = error.localizedDescription
             errorMessage = error.localizedDescription
         }
         #else
