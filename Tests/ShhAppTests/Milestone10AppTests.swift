@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import Shh
 import ShhCore
 import ShhSSH
@@ -541,10 +542,26 @@ final class Milestone10AppTests: XCTestCase {
         let settingsView = SettingsView()
         XCTAssertNotNil(settingsView)
 
+        let terminalThemePickerView = TerminalThemePickerView()
+        XCTAssertNotNil(terminalThemePickerView)
+
         let vaultBackupView = VaultBackupView()
         XCTAssertNotNil(vaultBackupView)
 
         let fileProviderSettingsView = FileProviderSettingsView()
         XCTAssertNotNil(fileProviderSettingsView)
+    }
+
+    func testTerminalThemePickerAndSelection() {
+        let container = AppContainer.demo()
+        let view = TerminalThemePickerView().environmentObject(container)
+        let hostingController = UIHostingController(rootView: view)
+        hostingController.loadViewIfNeeded()
+        XCTAssertNotNil(hostingController.view)
+
+        for theme in TerminalThemePreset.allCases {
+            container.setTerminalTheme(theme)
+            XCTAssertEqual(container.terminalTheme, theme)
+        }
     }
 }

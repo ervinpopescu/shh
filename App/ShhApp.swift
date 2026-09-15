@@ -3107,6 +3107,65 @@ struct SnippetEditor: View {
     var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
 struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
+struct TerminalThemePickerView: View {
+    @EnvironmentObject private var container: AppContainer
+
+    private func color(_ value: TerminalColor) -> Color {
+        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+    }
+
+    private var accentColorIndex: Int { 4 }
+
+    private func chips(for preset: TerminalThemePreset) -> some View {
+        let palette = preset.palette
+        let fg = color(palette.foreground)
+        let bg = color(palette.background)
+        let cursor = color(palette.cursor)
+        let accent = color(palette.ansi.count > accentColorIndex ? palette.ansi[accentColorIndex] : palette.selection)
+
+        return HStack(spacing: 4) {
+            Circle().fill(fg).frame(width: 10, height: 10)
+            Circle().fill(bg).frame(width: 10, height: 10)
+                .overlay(Circle().stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            Circle().fill(cursor).frame(width: 10, height: 10)
+            Circle().fill(accent).frame(width: 10, height: 10)
+        }
+    }
+
+    var body: some View {
+        Form {
+            Section("Preview") {
+                TerminalThemePreview(theme: container.terminalTheme)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel("Terminal theme preview")
+                    .accessibilityValue(container.terminalTheme.displayName)
+            }
+
+            Section("Themes") {
+                ForEach(TerminalThemePreset.allCases) { theme in
+                    Button {
+                        container.setTerminalTheme(theme)
+                    } label: {
+                        HStack {
+                            Text(theme.displayName)
+                                .foregroundStyle(Color.primary)
+                            Spacer()
+                            chips(for: theme)
+                            if theme == container.terminalTheme {
+                                Image(systemName: "checkmark")
+                                    .foregroundStyle(Color.accentColor)
+                                    .fontWeight(.semibold)
+                            }
+                        }
+                    }
+                    .accessibilityIdentifier("theme-row-\(theme.rawValue)")
+                }
+            }
+        }
+        .navigationTitle("Terminal Theme")
+    }
+}
+
 struct TerminalThemePreview: View {
     let theme: TerminalThemePreset
 
@@ -3148,19 +3207,43 @@ struct SettingsView: View {
                         Text(appearance.displayName).tag(appearance)
                     }
                 }
-                .pickerStyle(.menu)
+                .pickerStyle(.segmented)
                 .accessibilityIdentifier("appearance-picker")
 
-                Picker("Terminal theme", selection: Binding(
-                    get: { container.terminalTheme },
-                    set: { container.setTerminalTheme($0) }
-                )) {
-                    ForEach(TerminalThemePreset.allCases) { theme in
-                        Text(theme.displayName).tag(theme)
+                NavigationLink {
+                    TerminalThemePickerView().environmentObject(container)
+                } label: {
+                    HStack {
+                        Text("Terminal Theme")
+                        Spacer()
+                        Text(container.terminalTheme.displayName)
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .pickerStyle(.menu)
-                .accessibilityIdentifier("terminal-theme-picker")
+                .accessibilityIdentifier("terminal-theme-navigation-link")
+
+                HStack {
+                    Text("Quick Theme")
+                    Spacer()
+                    Menu {
+                        Picker("Terminal Theme", selection: Binding(
+                            get: { container.terminalTheme },
+                            set: { container.setTerminalTheme($0) }
+                        )) {
+                            ForEach(TerminalThemePreset.allCases) { theme in
+                                Text(theme.displayName).tag(theme)
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 6) {
+                            Text(container.terminalTheme.displayName)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("terminal-theme-picker")
+                }
 
                 TerminalThemePreview(theme: container.terminalTheme)
                     .accessibilityElement(children: .combine)
