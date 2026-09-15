@@ -20,6 +20,7 @@ public struct VoiceComposer: View {
     @State private var isDownloadingModel: Bool = false
     @State private var downloadProgress: Double = 0.0
     @State private var startRecordingTask: Task<Void, Never>? = nil
+    @State private var showingVoiceSettings: Bool = false
 
     private var hasInstalledWhisper: Bool {
         container.voiceModels.contains { $0.state.isReady }
@@ -75,6 +76,10 @@ public struct VoiceComposer: View {
                     if let host = container.activeHost {
                         Text("Host '\(host.name)' is a production host. Dispatching agent messages sends text directly to the remote shell followed by Enter.")
                     }
+                }
+                .navigationDestination(isPresented: $showingVoiceSettings) {
+                    VoiceSettingsView()
+                        .environmentObject(container)
                 }
                 .task {
                     if !hasInitialized {
@@ -209,13 +214,7 @@ public struct VoiceComposer: View {
                 .padding(.horizontal, 30)
             }
 
-            if let err = container.voiceErrorMessage {
-                Text(err)
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 20)
-            }
+            errorRecoveryView
 
             Spacer()
         }
@@ -390,18 +389,8 @@ public struct VoiceComposer: View {
             .accessibilityLabel(container.isRecordingVoice ? "Stop recording voice command" : "Start recording voice command")
             .accessibilityIdentifier(container.isRecordingVoice ? "tap-to-stop-alternative" : "tap-to-record-alternative")
 
-            // Error banner if any
-            if let err = container.voiceErrorMessage {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
-                    Text(err)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-                .padding(.horizontal)
-                .accessibilityIdentifier("voice-error-banner")
-            }
+            // Error banner & recovery actions if any
+            errorRecoveryView
 
             Spacer()
 
@@ -415,6 +404,47 @@ public struct VoiceComposer: View {
         }
         .padding()
         .accessibilityIdentifier("push-to-talk-view")
+    }
+
+    // MARK: - Error Recovery View
+
+    @ViewBuilder
+    private var errorRecoveryView: some View {
+        if let err = container.voiceErrorMessage {
+            VStack(spacing: 8) {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(err)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .multilineTextAlignment(.leading)
+                }
+                .padding(.horizontal)
+                .accessibilityIdentifier("voice-error-banner")
+
+                HStack(spacing: 12) {
+                    Button {
+                        container.selectVoiceProvider(id: VoiceProviderRegistry.appleSpeechProviderID)
+                    } label: {
+                        Label("Switch to Apple Speech", systemImage: "waveform.and.mic")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .accessibilityIdentifier("switch-to-apple-speech-error-button")
+
+                    Button {
+                        showingVoiceSettings = true
+                    } label: {
+                        Label("Open Voice Settings", systemImage: "gearshape")
+                            .font(.caption.weight(.medium))
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityIdentifier("open-voice-settings-button")
+                }
+                .padding(.horizontal)
+            }
+        }
     }
 
     private var buttonBackgroundColor: Color {

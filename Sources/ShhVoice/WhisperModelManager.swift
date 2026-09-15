@@ -96,19 +96,34 @@ public struct StandardWhisperModelValidator: WhisperModelValidating {
     public init() {}
 
     public func validateModel(at folderURL: URL, tier: WhisperModelTier) throws -> Bool {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: folderURL.path, isDirectory: &isDir), isDir.boolValue else {
+        let candidates: [URL] = [
+            folderURL,
+            folderURL.deletingLastPathComponent()
+                .appendingPathComponent("models", isDirectory: true)
+                .appendingPathComponent("argmaxinc", isDirectory: true)
+                .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+                .appendingPathComponent(tier.defaultModelID, isDirectory: true),
+            folderURL.deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        ]
+
+        guard let validDir = candidates.first(where: { candidate in
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDir) && isDir.boolValue
+        }) else {
             return false
         }
 
-        let contents = try FileManager.default.contentsOfDirectory(atPath: folderURL.path)
+        let contents = try FileManager.default.contentsOfDirectory(atPath: validDir.path)
         guard !contents.isEmpty else {
             return false
         }
 
         // Must contain valid, non-empty files (e.g. config.json or mlmodelc or tokenizer)
         for item in contents {
-            let itemURL = folderURL.appendingPathComponent(item)
+            let itemURL = validDir.appendingPathComponent(item)
             var itemIsDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: itemURL.path, isDirectory: &itemIsDir) {
                 if !itemIsDir.boolValue {
@@ -184,6 +199,7 @@ public actor WhisperModelManager {
         self.validator = validator
         self.downloader = downloader
         self.fileManager = fileManager
+        self.states = [:]
 
         if !fileManager.fileExists(atPath: modelsDirectory.path) {
             try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
@@ -195,7 +211,7 @@ public actor WhisperModelManager {
 
         var initialStates: [WhisperModelTier: VoiceModelState] = [:]
         for tier in WhisperModelTier.allCases {
-            let modelDir = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
+            let modelDir = resolvedModelDirectory(for: tier)
             if fileManager.fileExists(atPath: modelDir.path) {
                 if (try? validator.validateModel(at: modelDir, tier: tier)) == true {
                     let attrs = try? fileManager.attributesOfItem(atPath: modelDir.path)
@@ -240,7 +256,7 @@ public actor WhisperModelManager {
         guard case .installed = state(for: tier) else {
             throw TranscriptionError.modelNotInstalled(modelID: tier.defaultModelID)
         }
-        let modelDir = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        let modelDir = resolvedModelDirectory(for: tier)
         guard try validator.validateModel(at: modelDir, tier: tier) else {
             try? fileManager.removeItem(at: modelDir)
             states[tier] = .notInstalled
@@ -368,7 +384,7 @@ public actor WhisperModelManager {
 
     public func deleteModel(_ tier: WhisperModelTier) throws {
         cancelDownload(tier)
-        let modelDir = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        let modelDir = resolvedModelDirectory(for: tier)
         if fileManager.fileExists(atPath: modelDir.path) {
             try fileManager.removeItem(at: modelDir)
         }
@@ -382,8 +398,24 @@ public actor WhisperModelManager {
         try deleteModel(tier)
     }
 
+    func resolvedModelDirectory(for tier: WhisperModelTier) -> URL {
+        let direct = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        if fileManager.fileExists(atPath: direct.path) {
+            return direct
+        }
+        let hfPath = modelsDirectory
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("argmaxinc", isDirectory: true)
+            .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        if fileManager.fileExists(atPath: hfPath.path) {
+            return hfPath
+        }
+        return direct
+    }
+
     private func cleanupPartialDownload(tier: WhisperModelTier) {
-        let modelDir = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
+        let modelDir = resolvedModelDirectory(for: tier)
         if fileManager.fileExists(atPath: modelDir.path) {
             try? fileManager.removeItem(at: modelDir)
         }
