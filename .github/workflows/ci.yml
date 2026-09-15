@@ -32,6 +32,17 @@ jobs:
             brew install xcodegen
           fi
 
+      - name: Select Xcode 16
+        run: |
+          for xcode in /Applications/Xcode_16*.app; do
+            if [ -d "$xcode" ]; then
+              echo "Selecting $xcode"
+              sudo xcode-select -s "$xcode"
+              break
+            fi
+          done
+          xcodebuild -version
+
       - name: Resolve Swift Packages
         run: |
           swift package resolve
