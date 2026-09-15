@@ -4,6 +4,17 @@ import UIKit
 import SwiftTerm
 import ShhCore
 
+private extension UIColor {
+    convenience init(terminalColor: TerminalColor) {
+        self.init(
+            red: CGFloat(terminalColor.red) / 255,
+            green: CGFloat(terminalColor.green) / 255,
+            blue: CGFloat(terminalColor.blue) / 255,
+            alpha: 1
+        )
+    }
+}
+
 public struct ShhTerminalView: UIViewRepresentable {
     @ObservedObject public var controller: ShhTerminalController
 
@@ -297,6 +308,20 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     func changeScrollback(_ limit: Int) {
         getTerminal().changeScrollback(limit)
+    }
+
+    func setTheme(_ theme: TerminalThemePreset) {
+        let palette = theme.palette
+        nativeForegroundColor = UIColor(terminalColor: palette.foreground)
+        nativeBackgroundColor = UIColor(terminalColor: palette.background)
+        caretColor = UIColor(terminalColor: palette.cursor)
+        caretTextColor = UIColor(terminalColor: palette.background)
+        selectedTextBackgroundColor = UIColor(terminalColor: palette.selection)
+        selectedTextForegroundColor = UIColor(terminalColor: palette.foreground)
+        installColors(palette.ansi.map { color in
+            SwiftTerm.Color(red8: UInt16(color.red), green8: UInt16(color.green), blue8: UInt16(color.blue))
+        })
+        backgroundColor = UIColor(terminalColor: palette.background)
     }
 
     func setFontSize(_ pointSize: Double) {

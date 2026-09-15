@@ -1,5 +1,84 @@
 import Foundation
 
+/// A platform-neutral RGB color used by terminal themes.
+public struct TerminalColor: Codable, Hashable, Sendable {
+    public let red: UInt8
+    public let green: UInt8
+    public let blue: UInt8
+
+    public init(red: UInt8, green: UInt8, blue: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    public init(hex: String) {
+        let normalized = hex.trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "#"))
+        let value = UInt32(normalized, radix: 16) ?? 0
+        self.init(red: UInt8((value >> 16) & 0xff), green: UInt8((value >> 8) & 0xff), blue: UInt8(value & 0xff))
+    }
+
+    public var hex: String { String(format: "#%02X%02X%02X", red, green, blue) }
+}
+
+public struct TerminalThemePalette: Codable, Hashable, Sendable {
+    public let foreground: TerminalColor
+    public let background: TerminalColor
+    public let cursor: TerminalColor
+    public let selection: TerminalColor
+    public let ansi: [TerminalColor]
+
+    public init(foreground: TerminalColor, background: TerminalColor, cursor: TerminalColor, selection: TerminalColor, ansi: [TerminalColor]) {
+        self.foreground = foreground
+        self.background = background
+        self.cursor = cursor
+        self.selection = selection
+        self.ansi = Array(ansi.prefix(16)) + Array(repeating: background, count: max(0, 16 - ansi.count))
+    }
+
+    public var ansiColors: [TerminalColor] { ansi }
+}
+
+public enum TerminalThemePreset: String, CaseIterable, Codable, Hashable, Sendable, Identifiable {
+    case catppuccinMocha, catppuccinLatte, solarizedDark, solarizedLight, nord, dracula
+
+    public static let `default`: TerminalThemePreset = .catppuccinMocha
+    public var id: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .catppuccinMocha: return "Catppuccin Mocha"
+        case .catppuccinLatte: return "Catppuccin Latte"
+        case .solarizedDark: return "Solarized Dark"
+        case .solarizedLight: return "Solarized Light"
+        case .nord: return "Nord"
+        case .dracula: return "Dracula"
+        }
+    }
+
+    public var palette: TerminalThemePalette {
+        switch self {
+        case .catppuccinMocha: return Self.palette("#CDD6F4", "#1E1E2E", "#F5E0DC", "#585B70", ["#45475A", "#F38BA8", "#A6E3A1", "#F9E2AF", "#89B4FA", "#F5C2E7", "#94E2D5", "#BAC2DE", "#585B70", "#F38BA8", "#A6E3A1", "#F9E2AF", "#89B4FA", "#F5C2E7", "#94E2D5", "#A6ADC8"])
+        case .catppuccinLatte: return Self.palette("#4C4F69", "#EFF1F5", "#DC8A78", "#ACB0BE", ["#5C5F77", "#D20F39", "#40A02B", "#DF8E1D", "#1E66F5", "#EA76CB", "#179299", "#6C6F85", "#8C8FA1", "#D20F39", "#40A02B", "#DF8E1D", "#1E66F5", "#EA76CB", "#179299", "#5C5F77"])
+        case .solarizedDark: return Self.palette("#839496", "#002B36", "#93A1A1", "#073642", ["#073642", "#DC322F", "#859900", "#B58900", "#268BD2", "#D33682", "#2AA198", "#EEE8D5", "#002B36", "#CB4B16", "#586E75", "#657B83", "#839496", "#6C71C4", "#93A1A1", "#FDF6E3"])
+        case .solarizedLight: return Self.palette("#657B83", "#FDF6E3", "#586E75", "#EEE8D5", ["#073642", "#DC322F", "#859900", "#B58900", "#268BD2", "#D33682", "#2AA198", "#EEE8D5", "#002B36", "#CB4B16", "#586E75", "#657B83", "#839496", "#6C71C4", "#93A1A1", "#FDF6E3"])
+        case .nord: return Self.palette("#D8DEE9", "#2E3440", "#ECEFF4", "#434C5E", ["#3B4252", "#BF616A", "#A3BE8C", "#EBCB8B", "#81A1C1", "#B48EAD", "#88C0D0", "#E5E9F0", "#4C566A", "#BF616A", "#A3BE8C", "#EBCB8B", "#81A1C1", "#B48EAD", "#8FBCBB", "#ECEFF4"])
+        case .dracula: return Self.palette("#F8F8F2", "#282A36", "#F8F8F2", "#44475A", ["#21222C", "#FF5555", "#50FA7B", "#F1FA8C", "#BD93F9", "#FF79C6", "#8BE9FD", "#F8F8F2", "#6272A4", "#FF6E6E", "#69FF94", "#FFFFA5", "#D6ACFF", "#FF92DF", "#A4FFFF", "#FFFFFF"])
+        }
+    }
+
+    private static func palette(_ foreground: String, _ background: String, _ cursor: String, _ selection: String, _ ansi: [String]) -> TerminalThemePalette {
+        TerminalThemePalette(foreground: TerminalColor(hex: foreground), background: TerminalColor(hex: background), cursor: TerminalColor(hex: cursor), selection: TerminalColor(hex: selection), ansi: ansi.map(TerminalColor.init(hex:)))
+    }
+}
+
+public enum AppearanceSetting: String, CaseIterable, Codable, Hashable, Sendable, Identifiable {
+    case system, light, dark
+    public static let `default`: AppearanceSetting = .system
+    public var id: String { rawValue }
+    public var displayName: String { rawValue.capitalized }
+}
+
 public enum ShhValidationError: Error, Equatable, Sendable {
     case empty(field: String)
     case invalidPort

@@ -51,22 +51,48 @@ public final class UserDefaultsTerminalFontSizeStore: TerminalFontSizeStore {
     }
 }
 
+public protocol TerminalThemeStore: AnyObject {
+    func load() -> TerminalThemePreset?
+    func save(_ theme: TerminalThemePreset)
+}
+
+public final class UserDefaultsTerminalThemeStore: TerminalThemeStore {
+    public static let storageKey = "shh.terminal.theme"
+    private let userDefaults: UserDefaults
+
+    public init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+    }
+
+    public func load() -> TerminalThemePreset? {
+        guard let rawValue = userDefaults.string(forKey: Self.storageKey) else { return nil }
+        return TerminalThemePreset(rawValue: rawValue)
+    }
+
+    public func save(_ theme: TerminalThemePreset) {
+        userDefaults.set(theme.rawValue, forKey: Self.storageKey)
+    }
+}
+
 public struct ShhTerminalConfiguration: Sendable {
     public var scrollbackLimit: Int
     public var resizeDebounceInterval: TimeInterval
     public var initialSize: TerminalSize
     public var initialFontSize: Double
+    public var initialTheme: TerminalThemePreset
 
     public init(
         scrollbackLimit: Int = 5000,
         resizeDebounceInterval: TimeInterval = 0.150,
         initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24),
-        initialFontSize: Double = TerminalFontSize.defaultPointSize
+        initialFontSize: Double = TerminalFontSize.defaultPointSize,
+        initialTheme: TerminalThemePreset = .default
     ) {
         self.scrollbackLimit = max(0, scrollbackLimit)
         self.resizeDebounceInterval = max(0, resizeDebounceInterval)
         self.initialSize = initialSize
         self.initialFontSize = TerminalFontSize.clamped(initialFontSize)
+        self.initialTheme = initialTheme
     }
 }
 
@@ -77,6 +103,7 @@ internal protocol TerminalEngineBridge: AnyObject {
     func feed(data: Data)
     func feed(text: String)
     func resize(size: TerminalSize)
+    func setTheme(_ theme: TerminalThemePreset)
     func setFontSize(_ pointSize: Double)
     func recalculateSize()
     func changeScrollback(_ limit: Int)
@@ -91,6 +118,7 @@ internal protocol TerminalEngineBridge: AnyObject {
 }
 
 internal extension TerminalEngineBridge {
+    func setTheme(_ theme: TerminalThemePreset) {}
     func setFontSize(_ pointSize: Double) {}
     func recalculateSize() {}
 }
@@ -108,9 +136,11 @@ public final class ShhTerminalController: ObservableObject {
 
     public let configuration: ShhTerminalConfiguration
     public let fontSizeStore: any TerminalFontSizeStore
+    public let themeStore: any TerminalThemeStore
 
     @Published public private(set) var size: TerminalSize
     @Published public private(set) var terminalFontSize: Double
+    @Published public private(set) var terminalTheme: TerminalThemePreset
     @Published public private(set) var title: String = ""
     @Published public private(set) var isFirstResponder: Bool = false
 
@@ -153,14 +183,17 @@ public final class ShhTerminalController: ObservableObject {
 
     public init(
         configuration: ShhTerminalConfiguration = ShhTerminalConfiguration(),
-        fontSizeStore: any TerminalFontSizeStore = UserDefaultsTerminalFontSizeStore()
+        fontSizeStore: any TerminalFontSizeStore = UserDefaultsTerminalFontSizeStore(),
+        themeStore: any TerminalThemeStore = UserDefaultsTerminalThemeStore()
     ) {
         self.configuration = configuration
         self.fontSizeStore = fontSizeStore
+        self.themeStore = themeStore
         self.size = configuration.initialSize
         self.terminalFontSize = TerminalFontSize.clamped(
             fontSizeStore.load() ?? configuration.initialFontSize
         )
+        self.terminalTheme = themeStore.load() ?? configuration.initialTheme
 
         self.resizeDebouncer = ResizeDebouncer(
             delay: configuration.resizeDebounceInterval,
@@ -178,6 +211,13 @@ public final class ShhTerminalController: ObservableObject {
 
     public var terminalFontSizePercentage: Int {
         TerminalFontSize.percentage(for: terminalFontSize)
+    }
+
+    public func setTerminalTheme(_ theme: TerminalThemePreset) {
+        guard terminalTheme != theme else { return }
+        terminalTheme = theme
+        themeStore.save(theme)
+        attachedBridge?.setTheme(theme)
     }
 
     public func setTerminalFontSize(_ pointSize: Double) {
@@ -516,6 +556,7 @@ public final class ShhTerminalController: ObservableObject {
         self.attachedBridge = bridge
         self.firstResponderBridge = firstResponder
         bridge.changeScrollback(configuration.scrollbackLimit)
+        bridge.setTheme(terminalTheme)
         bridge.setFontSize(terminalFontSize)
 
         if hasPendingFirstResponderRequest {

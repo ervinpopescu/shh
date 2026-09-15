@@ -46,6 +46,8 @@ final class AppContainer: ObservableObject {
     }
 
     @Published var useLegacyTerminalFallback: Bool
+    @Published public var appearance: AppearanceSetting
+    @Published public var terminalTheme: TerminalThemePreset
     @Published var activeSession: TerminalSession?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
@@ -170,6 +172,9 @@ final class AppContainer: ObservableObject {
         transport is DemoSSHTransport
     }
 
+    private static let appearancePreferenceKey = "shh.appearance"
+    private static let terminalThemePreferenceKey = UserDefaultsTerminalThemeStore.storageKey
+
     public static let whisperProviderID = VoiceProviderRegistry.whisperProviderID
     public static let appleSpeechProviderID = VoiceProviderRegistry.appleSpeechProviderID
 
@@ -179,6 +184,17 @@ final class AppContainer: ObservableObject {
 
     public var selectedProviderDisplayName: String {
         isWhisperSelected ? "WhisperKit" : "Apple Speech"
+    }
+
+    func setAppearance(_ value: AppearanceSetting) {
+        appearance = value
+        UserDefaults.standard.set(value.rawValue, forKey: Self.appearancePreferenceKey)
+    }
+
+    func setTerminalTheme(_ value: TerminalThemePreset) {
+        terminalTheme = value
+        terminalController.setTerminalTheme(value)
+        UserDefaults.standard.set(value.rawValue, forKey: Self.terminalThemePreferenceKey)
     }
 
     var activeTranscriber: any LocalTranscriber {
@@ -322,7 +338,17 @@ final class AppContainer: ObservableObject {
         self.voiceRouter = voiceRouter
         self.transcriber = transcriber ?? resolvedRegistry.activeTranscriber()
         self.useLegacyTerminalFallback = useLegacyTerminalFallback || fallbackArg
-        self.terminalController = ShhTerminalController()
+        let storedAppearance = AppearanceSetting(
+            rawValue: UserDefaults.standard.string(forKey: Self.appearancePreferenceKey) ?? ""
+        ) ?? .default
+        let storedTheme = TerminalThemePreset(
+            rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey) ?? ""
+        ) ?? .default
+        self.appearance = storedAppearance
+        self.terminalTheme = storedTheme
+        self.terminalController = ShhTerminalController(
+            configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
+        )
         self.restorationStore = restorationStore ?? UserDefaultsSessionRestorationStore()
         let monitor = reachabilityMonitor ?? NetworkPathReachabilityMonitor()
         self.reachabilityMonitor = monitor
@@ -3367,7 +3393,9 @@ final class AppContainer: ObservableObject {
                 defaultTerminalFontSize: terminalController.terminalFontSize,
                 voiceProvider: selectedVoiceProviderID,
                 voiceAutoPunctuation: true,
-                customSettings: [:]
+                customSettings: [:],
+                appearance: appearance,
+                terminalTheme: terminalTheme
             ),
             passphrase: passphrase
         )
@@ -3414,8 +3442,12 @@ final class AppContainer: ObservableObject {
         #if canImport(FileProvider)
         await refreshRegisteredDomains()
         #endif
-        if let fontSize = preferences?.defaultTerminalFontSize {
-            terminalController.setTerminalFontSize(fontSize)
+        if let preferences {
+            setAppearance(preferences.appearance)
+            setTerminalTheme(preferences.terminalTheme)
+            if let fontSize = preferences.defaultTerminalFontSize {
+                terminalController.setTerminalFontSize(fontSize)
+            }
         }
     }
 }
