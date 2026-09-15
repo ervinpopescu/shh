@@ -984,6 +984,66 @@ final class AppContainerTests: XCTestCase {
         XCTAssertTrue(container.keepScreenAwake)
         #endif
     }
+
+    // MARK: - Secondary Split Pane Tests
+
+    func testSecondaryPaneModeInitialState() {
+        let container = AppContainer.demo()
+        XCTAssertEqual(container.secondaryPaneMode, .none)
+        XCTAssertNotNil(container.secondaryTerminalController)
+    }
+
+    func testSecondaryPaneTransitionsAndActions() async throws {
+        let container = AppContainer.demo()
+        let host1 = try Host(name: "Primary Server", hostname: "server1.example.com", username: "admin")
+        let host2 = try Host(name: "Database Server", hostname: "server2.example.com", username: "dbuser")
+
+        // 1. Initial state is none
+        XCTAssertEqual(container.secondaryPaneMode, .none)
+
+        // 2. Open secondary SFTP for host1
+        container.openSecondarySFTP(for: host1)
+        XCTAssertEqual(container.secondaryPaneMode, .sftp(host1))
+
+        if case .sftp(let sftpHost) = container.secondaryPaneMode {
+            XCTAssertEqual(sftpHost.id, host1.id)
+            XCTAssertEqual(sftpHost.name, "Primary Server")
+        } else {
+            XCTFail("Expected secondaryPaneMode to be .sftp")
+        }
+
+        // 3. Transition from SFTP to secondary terminal for host2
+        container.openSecondaryTerminal(for: host2)
+        XCTAssertEqual(container.secondaryPaneMode, .terminal(host2))
+
+        if case .terminal(let termHost) = container.secondaryPaneMode {
+            XCTAssertEqual(termHost.id, host2.id)
+            XCTAssertEqual(termHost.name, "Database Server")
+        } else {
+            XCTFail("Expected secondaryPaneMode to be .terminal")
+        }
+
+        // 4. Close secondary pane
+        container.closeSecondaryPane()
+        XCTAssertEqual(container.secondaryPaneMode, .none)
+
+        // 5. Open secondary SFTP again and verify close
+        container.openSecondarySFTP(for: host2)
+        XCTAssertEqual(container.secondaryPaneMode, .sftp(host2))
+        container.closeSecondaryPane()
+        XCTAssertEqual(container.secondaryPaneMode, .none)
+    }
+
+    func testSecondaryTerminalControllerThemeSync() {
+        let container = AppContainer.demo()
+        container.setTerminalTheme(.dracula)
+        XCTAssertEqual(container.terminalTheme, .dracula)
+        XCTAssertEqual(container.terminalController.terminalTheme, .dracula)
+        XCTAssertEqual(container.secondaryTerminalController.terminalTheme, .dracula)
+
+        container.setTerminalTheme(.catppuccinMocha)
+        XCTAssertEqual(container.secondaryTerminalController.terminalTheme, .catppuccinMocha)
+    }
 }
 
 private actor Gate {

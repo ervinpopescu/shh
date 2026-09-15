@@ -1072,8 +1072,12 @@ struct SessionView: View {
                 .padding()
             }
 
-            // Terminal Surface (Production SwiftTerm or Legacy Fallback)
-            terminalSurfaceArea
+            // Terminal Surface (Production SwiftTerm, or iPadOS Side-by-Side Split View)
+            if horizontalSizeClass == .regular && container.secondaryPaneMode != .none {
+                splitPaneArea
+            } else {
+                terminalSurfaceArea
+            }
 
             // Extra-key accessory bar (always accessible above drawer)
             TerminalAccessoryBar(controller: container.terminalController)
@@ -1312,6 +1316,34 @@ struct SessionView: View {
                     }
                     .accessibilityIdentifier("open-telemetry-button")
                     .accessibilityLabel("Open server telemetry monitoring sheet")
+
+                    if horizontalSizeClass == .regular {
+                        Divider()
+
+                        Menu {
+                            Button(action: {
+                                if let host = container.activeHost {
+                                    container.openSecondarySFTP(for: host)
+                                }
+                            }) {
+                                Label("Split with SFTP Browser", systemImage: "folder")
+                            }
+                            .disabled(container.activeHost == nil)
+                            .accessibilityIdentifier("split-with-sftp-button")
+
+                            if container.secondaryPaneMode != .none {
+                                Button(action: {
+                                    container.closeSecondaryPane()
+                                }) {
+                                    Label("Close Split View", systemImage: "xmark")
+                                }
+                                .accessibilityIdentifier("close-split-view-button")
+                            }
+                        } label: {
+                            Label("Split View", systemImage: "rectangle.split.2x1")
+                        }
+                        .accessibilityIdentifier("split-view-menu")
+                    }
 
                     Divider()
 
@@ -1604,6 +1636,111 @@ struct SessionView: View {
         default:
             EmptyView()
         }
+    }
+
+    @ViewBuilder
+    private var splitPaneArea: some View {
+        GeometryReader { geometry in
+            let dividerWidth: CGFloat = 1
+            let paneWidth = max(0, (geometry.size.width - dividerWidth) / 2)
+            HStack(spacing: 0) {
+                // Left pane (50% width): Primary terminal
+                terminalSurfaceArea
+                    .frame(width: paneWidth, height: geometry.size.height)
+
+                // Center divider line: A subtle vertical divider with a drag handle or clean hairline border
+                centerDivider
+                    .frame(width: dividerWidth, height: geometry.size.height)
+
+                // Right pane (50% width): Secondary header bar and content
+                secondaryPaneView
+                    .frame(width: paneWidth, height: geometry.size.height)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var centerDivider: some View {
+        ZStack {
+            Rectangle()
+                .fill(Color(uiColor: .separator))
+                .frame(width: 1)
+            Capsule()
+                .fill(Color.secondary.opacity(0.4))
+                .frame(width: 4, height: 32)
+        }
+        .frame(width: 1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Split pane divider")
+    }
+
+    @ViewBuilder
+    private var secondaryPaneView: some View {
+        VStack(spacing: 0) {
+            // Header bar with title and close button
+            secondaryPaneHeader
+
+            Divider()
+
+            // Content
+            switch container.secondaryPaneMode {
+            case .none:
+                EmptyView()
+            case .sftp(let host):
+                SFTPBrowserView(host: host)
+            case .terminal:
+                ShhTerminalView(controller: container.secondaryTerminalController)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Secondary terminal surface")
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var secondaryPaneTitle: String {
+        switch container.secondaryPaneMode {
+        case .none:
+            return ""
+        case .sftp(let host):
+            return "SFTP: \(host.name)"
+        case .terminal(let host):
+            return "Terminal: \(host.name)"
+        }
+    }
+
+    private var secondaryPaneIcon: String {
+        switch container.secondaryPaneMode {
+        case .sftp:
+            return "folder"
+        case .terminal:
+            return "terminal"
+        case .none:
+            return ""
+        }
+    }
+
+    private var secondaryPaneHeader: some View {
+        HStack(spacing: 8) {
+            Label(secondaryPaneTitle, systemImage: secondaryPaneIcon)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(1)
+            Spacer()
+            Button(action: {
+                container.closeSecondaryPane()
+            }) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.body)
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Close secondary pane")
+            .accessibilityIdentifier("secondary-pane-close-button")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(uiColor: .secondarySystemBackground))
     }
 
     @ViewBuilder
