@@ -23,7 +23,7 @@
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionPointIdentifier</key>
-		<string>com.apple.fileprovider-non-ui</string>
+		<string>com.apple.fileprovider-nonui</string>
 		<key>NSExtensionFileProviderDocumentGroup</key>
 		<string>group.com.ervinpopescu.shh</string>
 		<key>NSExtensionPrincipalClass</key>
