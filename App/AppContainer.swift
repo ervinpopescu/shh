@@ -20,6 +20,12 @@ private final class VoiceInterruptionBridge: @unchecked Sendable {
     }
 }
 
+public enum SecondaryPaneMode: Equatable, Sendable {
+    case none
+    case sftp(Host)
+    case terminal(Host)
+}
+
 @MainActor
 final class AppContainer: ObservableObject {
     let catalog: InMemoryCatalog
@@ -33,6 +39,8 @@ final class AppContainer: ObservableObject {
     let voiceRouter: VoiceCommandRouter
     private let customTranscriber: (any LocalTranscriber)?
     let terminalController: ShhTerminalController
+    public let secondaryTerminalController: ShhTerminalController
+    @Published public var secondaryPaneMode: SecondaryPaneMode = .none
     let restorationStore: any SessionRestorationStore
     let reachabilityMonitor: any ReachabilityMonitoring
     let reconnectCoordinator: ReconnectCoordinator
@@ -217,6 +225,7 @@ final class AppContainer: ObservableObject {
     func setTerminalTheme(_ value: TerminalThemePreset) {
         terminalTheme = value
         terminalController.setTerminalTheme(value)
+        secondaryTerminalController.setTerminalTheme(value)
         UserDefaults.standard.set(value.rawValue, forKey: Self.terminalThemePreferenceKey)
     }
 
@@ -379,6 +388,9 @@ final class AppContainer: ObservableObject {
         self.terminalTheme = storedTheme
         self.keepScreenAwake = storedKeepScreenAwake
         self.terminalController = ShhTerminalController(
+            configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
+        )
+        self.secondaryTerminalController = ShhTerminalController(
             configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
         )
         self.restorationStore = restorationStore ?? UserDefaultsSessionRestorationStore()
@@ -2508,6 +2520,25 @@ final class AppContainer: ObservableObject {
         let success = await sendRawInteractive(bracketed)
         if success { resetVoiceState() }
         return success
+    }
+
+    // MARK: - Secondary Split Pane Management
+
+    public func openSecondarySFTP(for host: Host) {
+        secondaryPaneMode = .sftp(host)
+        if sftpRepository == nil || activeHost?.id != host.id {
+            Task {
+                await setupSFTPForHost(host)
+            }
+        }
+    }
+
+    public func openSecondaryTerminal(for host: Host) {
+        secondaryPaneMode = .terminal(host)
+    }
+
+    public func closeSecondaryPane() {
+        secondaryPaneMode = .none
     }
 
     // MARK: - SFTP & File Management Methods

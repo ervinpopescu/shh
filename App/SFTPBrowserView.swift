@@ -7,6 +7,24 @@ import UIKit
 
 // MARK: - SFTP Browser View
 
+public struct SFTPBrowserView: View {
+    public let host: Host
+    @EnvironmentObject private var container: AppContainer
+
+    public init(host: Host) {
+        self.host = host
+    }
+
+    public var body: some View {
+        FilesView()
+            .task(id: host.id) {
+                if container.sftpRepository == nil || container.activeHost?.id != host.id {
+                    await container.setupSFTPForHost(host)
+                }
+            }
+    }
+}
+
 struct FilesView: View {
     @EnvironmentObject private var container: AppContainer
 
