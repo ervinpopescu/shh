@@ -647,16 +647,9 @@ final class AppContainer: ObservableObject {
 
             let targetSession = await automaticTmuxTarget(
                 for: host,
-                explicitTarget: restoringTmuxSessionID
+                explicitTarget: restoringTmuxSessionID,
+                allowStoredTarget: restoringTmuxSessionID != nil
             )
-            if let targetSession {
-                let metadata = SessionRestorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    tmuxSessionID: targetSession
-                )
-                try? await restorationStore.save(metadata)
-            }
 
             // Wire debounced resize callback to active connection
             terminalController.onResize = { [weak self, sessionID = session.id] newSize in
@@ -928,20 +921,22 @@ final class AppContainer: ObservableObject {
 
         let targetSession = await automaticTmuxTarget(
             for: host,
-            explicitTarget: activeTmuxSessionID
+            explicitTarget: activeTmuxSessionID,
+            allowStoredTarget: true
         )
         if let target = targetSession {
-            let metadata = SessionRestorationMetadata(
-                hostID: host.id,
-                sessionID: session.id,
-                tmuxSessionID: target
-            )
-            try? await restorationStore.save(metadata)
             await self.handleTmuxTarget(target, on: connection, host: host, session: session)
         }
 
-        if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil {
+        let shouldRestoreHerdr = (try? await restorationStore.load())
+            .flatMap { metadata -> LastUsedMultiplexerTarget? in
+                guard metadata.hostID == host.id else { return nil }
+                return lastUsedTarget(from: metadata)
+            }
+            .map { if case .herdr = $0 { return true }; return false } ?? false
+        if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil || shouldRestoreHerdr {
             await refreshHerdrState()
+            await restoreHerdrTargetIfNeeded(for: host, session: session)
         }
 
         let events = await connection.events()
@@ -1123,17 +1118,22 @@ final class AppContainer: ObservableObject {
         let backgroundGeneration = lifecycleGeneration
 
         if let session = activeSession, let host = activeHost {
-            // Persist intent, not terminal bytes or credentials. A nil target
-            // is meaningful: restore the host without inventing a tmux target.
-            let metadata = SessionRestorationMetadata(
-                hostID: host.id,
-                sessionID: session.id,
-                tmuxSessionID: activeTmuxSessionID
-            )
+            // Persist intent, not terminal bytes or credentials. Preserve the
+            // last successful target even when the active attachment is nil.
+            let activeTarget: LastUsedMultiplexerTarget? =
+                activeTmuxSessionID.flatMap { LastUsedMultiplexerTarget.tmuxTarget($0) }
+                ?? activeHerdrWorkspaceID.flatMap { LastUsedMultiplexerTarget.herdrTarget($0) }
             Task { [weak self] in
-                guard let self,
-                      self.lifecycleGeneration == backgroundGeneration,
+                guard let self else { return }
+                let previous = try? await self.restorationStore.load()
+                let target = activeTarget ?? previous.flatMap { self.lastUsedTarget(from: $0) }
+                guard self.lifecycleGeneration == backgroundGeneration,
                       !self.isExplicitDisconnect else { return }
+                let metadata = self.restorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    target: target
+                )
                 try? await self.restorationStore.save(metadata)
             }
             // A suspended app cannot promise that its TCP socket remains usable.
@@ -1165,7 +1165,13 @@ final class AppContainer: ObservableObject {
               let host = hosts.first(where: { $0.id == metadata.hostID }) else {
             return
         }
-        await connect(to: host, restoringTmuxSessionID: metadata.tmuxSessionID)
+        let target: String?
+        if case .tmux(let sessionID) = lastUsedTarget(from: metadata) {
+            target = sessionID
+        } else {
+            target = nil
+        }
+        await connect(to: host, restoringTmuxSessionID: target)
     }
 
     func approvePendingHostKey(permanently: Bool) async {
@@ -1233,10 +1239,19 @@ final class AppContainer: ObservableObject {
         lifecycleGeneration += 1
         isSceneInBackground = false
         tmuxRefreshGeneration += 1
+        if let host = activeHost,
+           let session = activeSession,
+           let target = activeTmuxSessionID.flatMap({ LastUsedMultiplexerTarget.tmuxTarget($0) })
+                ?? activeHerdrWorkspaceID.flatMap({ LastUsedMultiplexerTarget.herdrTarget($0) }) {
+            try? await restorationStore.save(restorationMetadata(
+                hostID: host.id,
+                sessionID: session.id,
+                target: target
+            ))
+        }
         activeHost = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
-        try? await restorationStore.clear()
         detachCallbacks()
         eventTask?.cancel()
         eventTask = nil
@@ -1413,19 +1428,72 @@ final class AppContainer: ObservableObject {
         try await catalog.save(updatedHost)
     }
 
-    private func automaticTmuxTarget(for host: Host, explicitTarget: String?) async -> String? {
+    private func automaticTmuxTarget(
+        for host: Host,
+        explicitTarget: String?,
+        allowStoredTarget: Bool
+    ) async -> String? {
         if let explicitTarget {
             let trimmed = explicitTarget.trimmingCharacters(in: .whitespacesAndNewlines)
-            return trimmed.isEmpty ? nil : trimmed
+            return LastUsedMultiplexerTarget.tmuxTarget(trimmed) == nil ? nil : trimmed
         }
-        guard host.autoAttachTmux,
+        guard allowStoredTarget || host.autoAttachTmux,
               let metadata = try? await restorationStore.load(),
               metadata.hostID == host.id,
-              let target = metadata.tmuxSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !target.isEmpty else {
+              let target = lastUsedTarget(from: metadata),
+              case .tmux(let sessionID) = target else {
             return nil
         }
-        return target
+        return sessionID
+    }
+
+    private func lastUsedTarget(from metadata: SessionRestorationMetadata) -> LastUsedMultiplexerTarget? {
+        if let target = metadata.lastUsedMultiplexerTarget {
+            return target
+        }
+        // Decode old records for compatibility. Host defaults are never read
+        // here, so this cannot revive a default configured on a Host.
+        if let legacy = metadata.tmuxSessionID {
+            return LastUsedMultiplexerTarget.tmuxTarget(legacy)
+        }
+        return nil
+    }
+
+    private func restorationMetadata(
+        hostID: UUID,
+        sessionID: UUID,
+        target: LastUsedMultiplexerTarget?,
+        timestamp: Date = Date()
+    ) -> SessionRestorationMetadata {
+        let tmuxID: String?
+        if case .tmux(let id) = target {
+            tmuxID = id
+        } else {
+            tmuxID = nil
+        }
+        return SessionRestorationMetadata(
+            hostID: hostID,
+            sessionID: sessionID,
+            tmuxSessionID: tmuxID,
+            lastUsedMultiplexerTarget: target,
+            timestamp: timestamp
+        )
+    }
+
+    private func restoreHerdrTargetIfNeeded(for host: Host, session: TerminalSession) async {
+        guard let metadata = try? await restorationStore.load(),
+              metadata.hostID == host.id,
+              let target = lastUsedTarget(from: metadata),
+              case .herdr(let workspaceID) = target else { return }
+        guard activeSession?.id == session.id,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect else { return }
+        guard let workspace = herdrWorkspaces.first(where: { $0.id == workspaceID }) else {
+            activeHerdrWorkspaceID = nil
+            herdrError = "Remembered Herdr workspace is no longer available. Select a workspace to recover it."
+            return
+        }
+        activeHerdrWorkspaceID = workspace.id
     }
 
     private func handleTmuxTarget(_ target: String, on connection: any SSHConnection, host: Host, session: TerminalSession) async {
@@ -1442,13 +1510,7 @@ final class AppContainer: ObservableObject {
                     }
                     if !check.isSuccess {
                         self.activeTmuxSessionID = nil
-                        let metadata = SessionRestorationMetadata(
-                            hostID: host.id,
-                            sessionID: session.id,
-                            tmuxSessionID: nil
-                        )
-                        try? await restorationStore.save(metadata)
-                        self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
+                        self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
                         return
                     }
                 } catch {
@@ -1459,13 +1521,7 @@ final class AppContainer: ObservableObject {
                         return
                     }
                     self.activeTmuxSessionID = nil
-                    let metadata = SessionRestorationMetadata(
-                        hostID: host.id,
-                        sessionID: session.id,
-                        tmuxSessionID: nil
-                    )
-                    try? await restorationStore.save(metadata)
-                    self.tmuxError = "Failed to verify tmux session \(trimmed): \(error.localizedDescription)"
+                    self.tmuxError = "Failed to verify tmux session \(trimmed): \(error.localizedDescription) Select a session to recover it."
                     return
                 }
             }
@@ -1491,13 +1547,7 @@ final class AppContainer: ObservableObject {
             }
             guard let match = try? TmuxListSessionsParser.parse(result.stdout).first(where: { $0.name == trimmed }) else {
                 activeTmuxSessionID = nil
-                tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host."
-                let metadata = SessionRestorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    tmuxSessionID: nil
-                )
-                try? await restorationStore.save(metadata)
+                tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
                 return
             }
             _ = await attachTmuxSession(id: match.sessionID)
@@ -1572,25 +1622,21 @@ final class AppContainer: ObservableObject {
                         if let matched = parsed.first(where: { $0.sessionID == active || $0.name == active }) {
                             if active != matched.sessionID {
                                 activeTmuxSessionID = matched.sessionID
-                                if let host = activeHost {
-                                    let metadata = SessionRestorationMetadata(
+                                if let host = activeHost,
+                                   let target = LastUsedMultiplexerTarget.tmuxTarget(matched.sessionID) {
+                                    try? await restorationStore.save(restorationMetadata(
                                         hostID: host.id,
                                         sessionID: sessionID,
-                                        tmuxSessionID: matched.sessionID
-                                    )
-                                    try? await restorationStore.save(metadata)
+                                        target: target
+                                    ))
                                 }
                             }
                         } else {
+                            // A remote disappearance is recovery state, not a
+                            // failed selection. Keep the last target for an
+                            // explicit recovery attempt.
                             activeTmuxSessionID = nil
-                            if let host = activeHost {
-                                let metadata = SessionRestorationMetadata(
-                                    hostID: host.id,
-                                    sessionID: sessionID,
-                                    tmuxSessionID: nil
-                                )
-                                try? await restorationStore.save(metadata)
-                            }
+                            tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
                         }
                     }
 
@@ -1615,14 +1661,7 @@ final class AppContainer: ObservableObject {
                     tmuxError = nil
                     if activeTmuxSessionID != nil {
                         activeTmuxSessionID = nil
-                        if let host = activeHost {
-                            let metadata = SessionRestorationMetadata(
-                                hostID: host.id,
-                                sessionID: sessionID,
-                                tmuxSessionID: nil
-                            )
-                            try? await restorationStore.save(metadata)
-                        }
+                        tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
                     }
                 } else if combinedErr.contains("no sessions") {
                     tmuxSessions = []
@@ -1630,14 +1669,7 @@ final class AppContainer: ObservableObject {
                     tmuxError = nil
                     if activeTmuxSessionID != nil {
                         activeTmuxSessionID = nil
-                        if let host = activeHost {
-                            let metadata = SessionRestorationMetadata(
-                                hostID: host.id,
-                                sessionID: sessionID,
-                                tmuxSessionID: nil
-                            )
-                            try? await restorationStore.save(metadata)
-                        }
+                        tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
                     }
                 } else {
                     tmuxSessions = []
@@ -1706,14 +1738,7 @@ final class AppContainer: ObservableObject {
             isTmuxServerRunning = false
             if activeTmuxSessionID != nil {
                 activeTmuxSessionID = nil
-                if let host = activeHost {
-                    let metadata = SessionRestorationMetadata(
-                        hostID: host.id,
-                        sessionID: sessionID,
-                        tmuxSessionID: nil
-                    )
-                    try? await restorationStore.save(metadata)
-                }
+                tmuxError = "Tmux is unavailable. Select a session to recover it."
             }
         }
     }
@@ -1752,12 +1777,14 @@ final class AppContainer: ObservableObject {
             activeTmuxSessionID = validatedID.value
             tmuxError = nil
             if let host = activeHost, let session = activeSession {
-                let metadata = SessionRestorationMetadata(
+                guard let target = LastUsedMultiplexerTarget.tmuxTarget(validatedID.value) else {
+                    return false
+                }
+                try? await restorationStore.save(restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
-                    tmuxSessionID: validatedID.value
-                )
-                try? await restorationStore.save(metadata)
+                    target: target
+                ))
             }
             return true
         } else {
@@ -1799,13 +1826,13 @@ final class AppContainer: ObservableObject {
             tmuxRefreshGeneration += 1
             activeTmuxSessionID = validatedName.value
             tmuxError = nil
-            if let host = activeHost, let session = activeSession {
-                let metadata = SessionRestorationMetadata(
+            if let host = activeHost, let session = activeSession,
+               let target = LastUsedMultiplexerTarget.tmuxTarget(validatedName.value) {
+                try? await restorationStore.save(restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
-                    tmuxSessionID: validatedName.value
-                )
-                try? await restorationStore.save(metadata)
+                    target: target
+                ))
             }
             return true
         } else {
@@ -1899,6 +1926,28 @@ final class AppContainer: ObservableObject {
             herdrError = error.localizedDescription
             return []
         }
+    }
+
+    @discardableResult
+    func selectHerdrWorkspace(id: String) async -> Bool {
+        guard let target = LastUsedMultiplexerTarget.herdrTarget(id),
+              activeSession?.state == .connected else {
+            herdrError = "Not connected."
+            return false
+        }
+        guard let workspace = herdrWorkspaces.first(where: { $0.id == id }) else {
+            herdrError = "Herdr workspace is not available. Refresh and select an existing workspace."
+            return false
+        }
+        guard let host = activeHost, let session = activeSession else { return false }
+        activeHerdrWorkspaceID = workspace.id
+        herdrError = nil
+        try? await restorationStore.save(restorationMetadata(
+            hostID: host.id,
+            sessionID: session.id,
+            target: target
+        ))
+        return true
     }
 
     func refreshHerdrState() async {

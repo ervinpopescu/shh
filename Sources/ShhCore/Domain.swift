@@ -611,6 +611,39 @@ public struct TerminalSession: Identifiable, Codable, Hashable, Sendable {
 }
 
 public enum RemoteMultiplexer: String, Codable, CaseIterable, Sendable { case tmux, zellij, byobu, screen, herdr }
+
+/// A validated, secret-free identifier for the last explicitly selected remote
+/// multiplexer target. Deferred adapters intentionally have no target case.
+public enum LastUsedMultiplexerTarget: Codable, Equatable, Hashable, Sendable {
+    case tmux(sessionID: String)
+    case herdr(workspaceID: String)
+
+    public var multiplexer: RemoteMultiplexer {
+        switch self {
+        case .tmux: return .tmux
+        case .herdr: return .herdr
+        }
+    }
+
+    public static func tmuxTarget(_ value: String) -> LastUsedMultiplexerTarget? {
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= 256,
+              !value.unicodeScalars.contains(where: { $0.properties.isWhitespace || $0.value < 0x20 }) else {
+            return nil
+        }
+        return .tmux(sessionID: value)
+    }
+
+    public static func herdrTarget(_ value: String) -> LastUsedMultiplexerTarget? {
+        let value = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty, value.count <= 256,
+              !value.unicodeScalars.contains(where: { $0.properties.isWhitespace || $0.value < 0x20 }) else {
+            return nil
+        }
+        return .herdr(workspaceID: value)
+    }
+}
+
 public enum CapabilityAvailability: Codable, Hashable, Sendable { case available; case unavailable(reason: String) }
 public struct CapabilityMatrix: Codable, Hashable, Sendable {
     public var mosh: CapabilityAvailability = .available
@@ -625,18 +658,22 @@ public struct CapabilityMatrix: Codable, Hashable, Sendable {
 public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable {
     public var hostID: UUID
     public var sessionID: UUID
+    /// Deprecated compatibility field. New code uses lastUsedMultiplexerTarget.
     public var tmuxSessionID: String?
+    public var lastUsedMultiplexerTarget: LastUsedMultiplexerTarget?
     public var timestamp: Date
 
     public init(
         hostID: UUID,
         sessionID: UUID = UUID(),
         tmuxSessionID: String? = nil,
+        lastUsedMultiplexerTarget: LastUsedMultiplexerTarget? = nil,
         timestamp: Date = Date()
     ) {
         self.hostID = hostID
         self.sessionID = sessionID
         self.tmuxSessionID = tmuxSessionID
+        self.lastUsedMultiplexerTarget = lastUsedMultiplexerTarget
         self.timestamp = timestamp
     }
 }

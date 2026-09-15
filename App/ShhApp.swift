@@ -3022,6 +3022,12 @@ struct HerdrAgentCardsView: View {
                                     }
                                 }
                                 Spacer()
+                                Button(container.activeHerdrWorkspaceID == workspace.id ? "Selected" : "Select") {
+                                    Task { _ = await container.selectHerdrWorkspace(id: workspace.id) }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(container.activeHerdrWorkspaceID == workspace.id)
+                                .accessibilityIdentifier("select-herdr-workspace-\(workspace.id)")
                                 Text("\(workspace.panes.count) \(workspace.panes.count == 1 ? "agent" : "agents")")
                                     .font(.caption2.bold())
                                     .padding(.horizontal, 6)
