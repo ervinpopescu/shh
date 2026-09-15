@@ -32,6 +32,8 @@ final class AppContainer: ObservableObject {
     let reachabilityMonitor: any ReachabilityMonitoring
     let reconnectCoordinator: ReconnectCoordinator
     private let didProvideCustomCatalog: Bool
+    private var persistenceWriteBlocked = false
+    @Published public var persistenceReadinessMessage: String? = nil
 
     private static var isRunningInTestEnvironment: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
@@ -215,25 +217,41 @@ final class AppContainer: ObservableObject {
             ProcessInfo.processInfo.environment["SHH_LEGACY_TERMINAL"] == "1"
 
         let resolvedCatalog: InMemoryCatalog
+        let persistenceState: CatalogPersistenceReadState
         if let catalog {
             resolvedCatalog = catalog
-        } else if !Self.isRunningInTestEnvironment {
-            if let snapshot = fileProviderHelper.loadSharedSnapshot() {
+            persistenceState = .notFound
+        } else if !Self.isRunningInTestEnvironment ||
+                    fileProviderHelper.customContainerURL != nil ||
+                    fileProviderHelper.customLocalContainerURL != nil {
+            let result = fileProviderHelper.loadCatalogSnapshot()
+            persistenceState = result.state
+            if let snapshot = result.snapshot {
                 resolvedCatalog = InMemoryCatalog(snapshot: snapshot)
-            } else if fileProviderHelper.hasPersistedSnapshot {
-                resolvedCatalog = InMemoryCatalog(seedDemoData: false)
             } else {
+                // Production never seeds demo data. A failed read is not an empty
+                // persisted catalog and must not be synced back over real data.
                 resolvedCatalog = InMemoryCatalog(seedDemoData: false)
             }
         } else {
-            resolvedCatalog = InMemoryCatalog(seedDemoData: true)
+            // Tests and production use explicit construction paths for demo data.
+            resolvedCatalog = InMemoryCatalog(seedDemoData: false)
+            persistenceState = .notFound
         }
         self.catalog = resolvedCatalog
+        if catalog == nil {
+            self.persistenceWriteBlocked = persistenceState == .invalid || persistenceState == .unavailable
+        }
+        if catalog == nil && !fileProviderHelper.isSharedContainerAvailable {
+            self.persistenceReadinessMessage = "Shared App Group unavailable. Saved hosts remain available from local storage until provisioning is restored."
+        }
 
         let resolvedTrustStore: InMemoryTrustStore
         if let trustStore {
             resolvedTrustStore = trustStore
-        } else if !Self.isRunningInTestEnvironment,
+        } else if (!Self.isRunningInTestEnvironment ||
+                    fileProviderHelper.customContainerURL != nil ||
+                    fileProviderHelper.customLocalContainerURL != nil),
                   let records = fileProviderHelper.loadSharedTrustRecords(),
                   !records.isEmpty {
             resolvedTrustStore = InMemoryTrustStore(records: records)
@@ -361,24 +379,31 @@ final class AppContainer: ObservableObject {
         }
 
         Task { [weak self] in
-            await self?.loadSharedStateIfNeeded()
-            try? await self?.syncSharedCatalogAndTrust()
+            let state = await self?.loadSharedStateIfNeeded()
+            if state == .valid || state == .notFound {
+                try? await self?.syncSharedCatalogAndTrust()
+            }
             #if canImport(FileProvider)
             await self?.refreshRegisteredDomains()
             #endif
         }
     }
 
-    func loadSharedStateIfNeeded() async {
-        guard !didProvideCustomCatalog else { return }
-        guard !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil else { return }
-        if let snapshot = fileProviderHelper.loadSharedSnapshot() {
+    @discardableResult
+    func loadSharedStateIfNeeded() async -> CatalogPersistenceReadState {
+        guard !didProvideCustomCatalog else { return .notFound }
+        guard !isRunningInTestEnvironment ||
+                fileProviderHelper.customContainerURL != nil ||
+                fileProviderHelper.customLocalContainerURL != nil else { return .unavailable }
+        let result = fileProviderHelper.loadCatalogSnapshot()
+        if let snapshot = result.snapshot {
             await catalog.replace(with: snapshot)
             catalogUpdateToken = UUID()
         }
         if let records = fileProviderHelper.loadSharedTrustRecords(), !records.isEmpty {
             await trustStore.addRecords(records)
         }
+        return result.state
     }
 
     static func demo(
@@ -3048,11 +3073,21 @@ final class AppContainer: ObservableObject {
     // MARK: - Host Management & Shared Catalog Sync
 
     public func syncSharedCatalogAndTrust() async throws {
-        guard !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil else { return }
+        guard !isRunningInTestEnvironment ||
+                fileProviderHelper.customContainerURL != nil ||
+                fileProviderHelper.customLocalContainerURL != nil else { return }
         let snapshot = await catalog.snapshot()
         let records = await trustStore.allRecords()
         #if canImport(FileProvider)
-        try fileProviderHelper.syncSharedState(snapshot: snapshot, trustRecords: records)
+        if persistenceWriteBlocked {
+            // Preserve an unreadable shared catalog. Explicit edits are retained
+            // locally until the original shared state can be read safely again.
+            try fileProviderHelper.syncLocalState(snapshot: snapshot, trustRecords: records)
+        } else {
+            try fileProviderHelper.syncSharedState(snapshot: snapshot, trustRecords: records)
+        }
+        #else
+        try fileProviderHelper.syncLocalState(snapshot: snapshot, trustRecords: records)
         #endif
     }
 

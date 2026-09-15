@@ -111,6 +111,16 @@ struct HostListView: View {
     private var filtered: [Host] { hosts.filter { (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.address.localizedCaseInsensitiveContains(search)) && (!healthyOnly || $0.health == .healthy) } }
     var body: some View {
         List {
+            if let persistenceMessage = container.persistenceReadinessMessage {
+                Section {
+                    Label(persistenceMessage, systemImage: "externaldrive.badge.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("persistence-readiness-warning")
+                } header: {
+                    Text("Persistence readiness")
+                }
+            }
             Section("Saved hosts") {
                 ForEach(filtered) { host in
                     NavigationLink(destination: HostDetailView(host: host)) { HostRow(host: host) }
