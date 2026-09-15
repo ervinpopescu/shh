@@ -372,8 +372,14 @@ final class TmuxAppTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mock }
 
+        let hostID = UUID()
+        let store = InMemorySessionRestorationStore(initial: SessionRestorationMetadata(
+            hostID: hostID,
+            tmuxSessionID: "$99"
+        ))
         let container = AppContainer(
             transport: transport,
+            restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
             reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
@@ -387,10 +393,10 @@ final class TmuxAppTests: XCTestCase {
         }
 
         let host = try Host(
+            id: hostID,
             name: "Missing Session Host",
             hostname: "missing.test",
             username: "user",
-            defaultTmuxSession: "$99",
             autoAttachTmux: true
         )
 
@@ -405,10 +411,56 @@ final class TmuxAppTests: XCTestCase {
         let hasAttach = sentStrings.contains { $0.contains("attach-session") && $0.contains("'$99'") }
         XCTAssertFalse(hasAttach, "Missing session must not send failing attach command to PTY")
 
-        // Finding 3: activeTmuxSessionID cleared and restoration metadata persisted with nil tmuxSessionID
+        // The stale target remains available for explicit recovery and is not
+        // replaced by a missing-session failure.
         XCTAssertNil(container.activeTmuxSessionID)
         let savedMetadata = try await container.restorationStore.load()
-        XCTAssertNil(savedMetadata?.tmuxSessionID)
+        XCTAssertEqual(savedMetadata?.tmuxSessionID, "$99")
+    }
+
+    func testFailedAttachPreservesPreviousLastUsedTarget() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Preserve Target Host", hostname: "preserve.test", username: "user")
+        await container.connect(to: host)
+        let firstAttach = await container.attachTmuxSession(id: "$2")
+        XCTAssertTrue(firstAttach)
+
+        mock.onSend = { _ in throw TransportError.remoteFailure("attach failed") }
+        let failedAttach = await container.attachTmuxSession(id: "$3")
+        XCTAssertFalse(failedAttach)
+        let preservedMetadata = try await store.load()
+        XCTAssertEqual(preservedMetadata?.tmuxSessionID, "$2")
+    }
+
+    func testExplicitDisconnectPreservesLastUsedTarget() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Disconnect Target Host", hostname: "disconnect-target.test", username: "user")
+        await container.connect(to: host)
+        let attachSuccess = await container.attachTmuxSession(id: "$4")
+        XCTAssertTrue(attachSuccess)
+        await container.disconnect()
+
+        XCTAssertTrue(container.isExplicitDisconnect)
+        let preservedMetadata = try await store.load()
+        XCTAssertEqual(preservedMetadata?.tmuxSessionID, "$4")
     }
 
     // MARK: - 8. Reconnect Cancellation & Disconnect Races
@@ -494,7 +546,7 @@ final class TmuxAppTests: XCTestCase {
         let sessions = await container.listTmuxSessions()
         XCTAssertEqual(sessions.count, 1)
         XCTAssertEqual(sessions[0].sessionID, "$0")
-        XCTAssertEqual(sessions[0].name, "default")
+        XCTAssertEqual(sessions[0].name, "demo-main")
 
         // Attach in demo mode
         let attached = await container.attachTmuxSession(id: "$0")
@@ -850,7 +902,7 @@ final class TmuxAppTests: XCTestCase {
         _ = await container.listTmuxSessions()
         XCTAssertNil(container.activeTmuxSessionID, "Disappeared session must be cleared")
         var metadata = try await container.restorationStore.load()
-        XCTAssertNil(metadata?.tmuxSessionID)
+        XCTAssertEqual(metadata?.tmuxSessionID, "$0")
 
         // 2. Server stops
         await container.attachTmuxSession(id: "$1")
@@ -870,7 +922,7 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertNil(container.activeTmuxSessionID, "Stopped server must clear activeTmuxSessionID")
         XCTAssertFalse(container.isTmuxServerRunning)
         metadata = try await container.restorationStore.load()
-        XCTAssertNil(metadata?.tmuxSessionID)
+        XCTAssertEqual(metadata?.tmuxSessionID, "$1")
     }
 
     func testValidatedCommandSendFailureFedToProductionTerminalSurface() async throws {

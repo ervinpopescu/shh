@@ -371,12 +371,13 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let host = try Host(
             name: "Lifecycle Host",
             hostname: "lifecycle.invalid",
-            username: "dev",
-            defaultTmuxSession: "$0"
+            username: "dev"
         )
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
+        let attachSuccess = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attachSuccess)
         XCTAssertEqual(container.activeTmuxSessionID, "$0")
 
         container.handleScenePhaseChange(.background)
@@ -451,12 +452,13 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let host = try Host(
             name: "BgHost",
             hostname: "bg.invalid",
-            username: "dev",
-            defaultTmuxSession: "$0"
+            username: "dev"
         )
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
+        let attachSuccess = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attachSuccess)
 
         container.handleScenePhaseChange(ScenePhase.background)
         try await Task.sleep(nanoseconds: 50_000_000)
