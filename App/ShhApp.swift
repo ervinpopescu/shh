@@ -907,11 +907,35 @@ struct SessionView: View {
         Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
     }
 
+    private var connectionStatusColor: Color {
+        switch container.reconnectState {
+        case .waiting, .connecting:
+            return .yellow
+        default:
+            switch container.activeSession?.state {
+            case .connected:
+                return .green
+            case .connecting:
+                return .yellow
+            case .failed, .disconnected, .none:
+                return .red
+            }
+        }
+    }
+
+    private var connectionStatusText: String {
+        switch container.reconnectState {
+        case .waiting:
+            return "Reconnecting"
+        case .connecting:
+            return "Connecting"
+        default:
+            return container.activeSession?.state.rawValue.capitalized ?? "Disconnected"
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header / Status bar
-            sessionHeader
-
             // Live Network Roaming Recovery Indicator Banner
             roamingRecoveryBanner
 
@@ -957,6 +981,186 @@ struct SessionView: View {
             commandDrawer
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(connectionStatusColor)
+                        .frame(width: 8, height: 8)
+                        .accessibilityLabel(connectionStatusText)
+
+                    if let host = container.activeHost {
+                        Text(host.name)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                        Text("\(host.username)@\(host.hostname)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    } else {
+                        Text(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
+                            .font(.subheadline.weight(.semibold))
+                            .lineLimit(1)
+                    }
+
+                    if let moshState = container.moshState, moshState.isRoaming {
+                        Label("Roaming", systemImage: "arrow.triangle.2.circlepath")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                            .accessibilityLabel("Network roaming re-syncing")
+                            .accessibilityIdentifier("mosh-roaming-indicator")
+                    } else if container.activeSession?.state == .connected,
+                              (container.moshState == nil || container.moshState?.isConnected == true),
+                              let port = container.moshSessionPort {
+                        Label("UDP :\(port)", systemImage: "bolt.horizontal.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .accessibilityLabel("Connected via Mosh UDP port \(port)")
+                            .accessibilityIdentifier("mosh-connected-indicator")
+                    }
+
+                    if container.activeForwardersCount > 0 {
+                        Button(action: {
+                            showPortForwarding = true
+                        }) {
+                            Label("\(container.activeForwardersCount)", systemImage: "arrow.triangle.swap")
+                                .font(.caption2.bold())
+                                .foregroundStyle(Color.accentColor)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
+                        .accessibilityIdentifier("session-forwarders-indicator")
+                    }
+
+                    if let errorMsg = container.forwardingErrorMessage {
+                        Button(action: {
+                            showPortForwarding = true
+                        }) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.caption2.bold())
+                                .foregroundStyle(.orange)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Port forwarding alert: \(errorMsg)")
+                        .accessibilityIdentifier("session-forwarders-error-indicator")
+                    }
+                }
+            }
+
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button(action: {
+                    container.resetVoiceState()
+                    showVoice = true
+                }) {
+                    Image(systemName: "mic")
+                        .foregroundStyle(container.activeHost?.isVoiceEnabled == true ? Color.accentColor : Color.secondary)
+                }
+                .accessibilityLabel("Voice command")
+                .accessibilityIdentifier("session-header-voice-button")
+                .disabled(container.activeSession?.state != .connected)
+
+                Button(action: {
+                    isSearchPresented.toggle()
+                    if !isSearchPresented {
+                        searchQuery = ""
+                        container.terminalController.clearSearch()
+                    }
+                }) {
+                    Image(systemName: "magnifyingglass")
+                }
+                .accessibilityLabel(isSearchPresented ? "Close search" : "Search terminal")
+
+                Button(action: {
+                    container.terminalController.recoverFirstResponder()
+                }) {
+                    Image(systemName: "keyboard")
+                        .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
+                }
+                .accessibilityLabel("Recover keyboard focus")
+
+                Menu {
+                    Menu {
+                        Button(action: {
+                            container.terminalController.increaseTerminalFontSize()
+                        }) {
+                            Label("Increase Size (Cmd +)", systemImage: "plus")
+                        }
+                        .disabled(container.terminalController.terminalFontSize >= TerminalFontSize.maximumPointSize)
+
+                        Button(action: {
+                            container.terminalController.decreaseTerminalFontSize()
+                        }) {
+                            Label("Decrease Size (Cmd -)", systemImage: "minus")
+                        }
+                        .disabled(container.terminalController.terminalFontSize <= TerminalFontSize.minimumPointSize)
+
+                        Button(action: {
+                            container.terminalController.resetTerminalFontSize()
+                        }) {
+                            Label("Reset Size (Cmd 0)", systemImage: "arrow.counterclockwise")
+                        }
+                    } label: {
+                        Label("Text Size (\(container.terminalController.terminalFontSizePercentage)%)", systemImage: "textformat.size")
+                    }
+
+                    Divider()
+
+                    Button(action: {
+                        if let selection = container.terminalController.getSelection(), !selection.isEmpty {
+                            UIPasteboard.general.string = selection
+                        }
+                    }) {
+                        Label("Copy Selection", systemImage: "doc.on.doc")
+                    }
+
+                    Button(action: {
+                        container.terminalController.selectAll()
+                    }) {
+                        Label("Select All", systemImage: "selection.pin.in.out")
+                    }
+
+                    Button(action: {
+                        container.terminalController.selectNone()
+                    }) {
+                        Label("Clear Selection", systemImage: "xmark.circle")
+                    }
+
+                    Button(action: handlePasteFromClipboard) {
+                        Label("Paste", systemImage: "doc.on.clipboard")
+                    }
+
+                    Divider()
+
+                    Button(action: {
+                        showMultiplexer = true
+                    }) {
+                        Label("Multiplexer", systemImage: "rectangle.3.group")
+                    }
+                    .accessibilityIdentifier("open-multiplexer-button")
+                    .accessibilityLabel("Open remote multiplexer sheet")
+
+                    Button(action: {
+                        showPortForwarding = true
+                    }) {
+                        Label("Port Forwarding", systemImage: "arrow.triangle.swap")
+                    }
+                    .accessibilityIdentifier("open-port-forwarding-button")
+                    .accessibilityLabel("Open port forwarding sheet")
+
+                    Divider()
+
+                    Button("Disconnect", role: .destructive) {
+                        Task { await container.disconnect() }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .accessibilityLabel("Session tools")
+            }
+        }
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
@@ -1215,230 +1419,13 @@ struct SessionView: View {
         }
     }
 
-    private var sessionHeader: some View {
-        HStack(spacing: 8) {
-            Label(
-                container.activeSession?.state.rawValue.capitalized ?? "Disconnected",
-                systemImage: "circle.fill"
-            )
-            .font(.subheadline)
-            .foregroundStyle(container.activeSession?.state == .connected ? .green : .secondary)
-
-            if !container.terminalController.title.isEmpty {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Text(container.terminalController.title)
-                    .font(.caption)
-                    .lineLimit(1)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let activeTmux = container.activeTmuxSessionID {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Label(activeTmux, systemImage: "rectangle.3.group")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Tmux session \(activeTmux)")
-                    .accessibilityIdentifier("active-tmux-indicator")
-            }
-
-            if let activeHost = container.activeHost,
-               case .proxyJump(let opts) = activeHost.connection,
-               !opts.config.hops.isEmpty {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Label("\(opts.config.hops.count) Hop\(opts.config.hops.count == 1 ? "" : "s")", systemImage: "arrow.triangle.branch")
-                    .font(.caption)
-                    .lineLimit(1)
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("\(opts.config.hops.count) jump bastion hop\(opts.config.hops.count == 1 ? "" : "s")")
-                    .accessibilityIdentifier("session-jump-hops-indicator")
-            }
-
-            if container.activeForwardersCount > 0 {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Button(action: {
-                    showPortForwarding = true
-                }) {
-                    Label("\(container.activeForwardersCount)", systemImage: "arrow.triangle.swap")
-                        .font(.caption.bold())
-                        .foregroundStyle(Color.accentColor)
-                }
-                .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
-                .accessibilityIdentifier("session-forwarders-indicator")
-            }
-
-            if let moshState = container.moshState, moshState.isRoaming {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Label("Network Roaming - Re-syncing", systemImage: "arrow.triangle.2.circlepath")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .accessibilityLabel("Network roaming re-syncing")
-                    .accessibilityIdentifier("mosh-roaming-indicator")
-            } else if container.activeSession?.state == .connected,
-                      (container.moshState == nil || container.moshState?.isConnected == true),
-                      let port = container.moshSessionPort {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Label("Connected via Mosh (UDP :\(port))", systemImage: "bolt.horizontal.fill")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                    .accessibilityLabel("Connected via Mosh UDP port \(port)")
-                    .accessibilityIdentifier("mosh-connected-indicator")
-            }
-
-            if let errorMsg = container.forwardingErrorMessage {
-                Text("•")
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
-                Button(action: {
-                    showPortForwarding = true
-                }) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.caption.bold())
-                        .foregroundStyle(.orange)
-                }
-                .accessibilityLabel("Port forwarding alert: \(errorMsg)")
-                .accessibilityIdentifier("session-forwarders-error-indicator")
-            }
-
-            Spacer()
-
-            // Voice Command Button
-            Button(action: {
-                container.resetVoiceState()
-                showVoice = true
-            }) {
-                Image(systemName: "mic")
-                    .font(.subheadline)
-                    .foregroundStyle(container.activeHost?.isVoiceEnabled == true ? Color.accentColor : Color.secondary)
-            }
-            .accessibilityLabel("Voice command")
-            .accessibilityIdentifier("session-header-voice-button")
-            .disabled(container.activeSession?.state != .connected)
-
-            // Search Toggle
-            Button(action: {
-                isSearchPresented.toggle()
-                if !isSearchPresented {
-                    searchQuery = ""
-                    container.terminalController.clearSearch()
-                }
-            }) {
-                Image(systemName: "magnifyingglass")
-                    .font(.subheadline)
-            }
-            .accessibilityLabel(isSearchPresented ? "Close search" : "Search terminal")
-
-            // Keyboard Focus Recovery Button
-            Button(action: {
-                container.terminalController.recoverFirstResponder()
-            }) {
-                Image(systemName: "keyboard")
-                    .font(.subheadline)
-                    .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
-            }
-            .accessibilityLabel("Recover keyboard focus")
-
-            // Tools Menu
-            Menu {
-                Button(action: {
-                    if let selection = container.terminalController.getSelection(), !selection.isEmpty {
-                        UIPasteboard.general.string = selection
-                    }
-                }) {
-                    Label("Copy Selection", systemImage: "doc.on.doc")
-                }
-
-                Button(action: {
-                    container.terminalController.selectAll()
-                }) {
-                    Label("Select All", systemImage: "selection.pin.in.out")
-                }
-
-                Button(action: {
-                    container.terminalController.selectNone()
-                }) {
-                    Label("Clear Selection", systemImage: "xmark.circle")
-                }
-
-                Button(action: handlePasteFromClipboard) {
-                    Label("Paste from Clipboard", systemImage: "doc.on.clipboard")
-                }
-
-                Divider()
-
-                Menu {
-                    Picker("Terminal Theme", selection: Binding(
-                        get: { container.terminalTheme },
-                        set: { container.setTerminalTheme($0) }
-                    )) {
-                        ForEach(TerminalThemePreset.allCases) { theme in
-                            Text(theme.displayName).tag(theme)
-                        }
-                    }
-                } label: {
-                    Label("Terminal Theme", systemImage: "paintpalette")
-                }
-
-                Button(action: {
-                    showMultiplexer = true
-                }) {
-                    Label("Multiplexer", systemImage: "rectangle.3.group")
-                }
-                .accessibilityIdentifier("open-multiplexer-button")
-                .accessibilityLabel("Open remote multiplexer sheet")
-
-                Button(action: {
-                    showPortForwarding = true
-                }) {
-                    Label("Port Forwarding (\(container.activeForwardersCount))", systemImage: "arrow.triangle.swap")
-                }
-                .accessibilityIdentifier("open-port-forwarding-button")
-                .accessibilityLabel("Open port forwarding sheet")
-
-                Divider()
-
-                Button("Disconnect", role: .destructive) {
-                    Task { await container.disconnect() }
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.subheadline)
-            }
-            .accessibilityLabel("Session tools")
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(Color(.systemBackground))
-    }
-
     @ViewBuilder
     private var terminalSurfaceArea: some View {
-        VStack(spacing: 0) {
-            TerminalZoomControls(controller: container.terminalController)
-
-            ShhTerminalView(controller: container.terminalController)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Terminal surface")
-        }
+        ShhTerminalView(controller: container.terminalController)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.black)
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Terminal surface")
     }
 
     private var commandDrawer: some View {
