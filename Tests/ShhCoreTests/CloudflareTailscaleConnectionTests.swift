@@ -4,18 +4,20 @@ import XCTest
 final class CloudflareTailscaleConnectionTests: XCTestCase {
 
     func testCloudflareAccessOptionsInitAndProperties() {
+        let clientID = "client.access"
+        let keychainReference = "keychain-reference"
         let options = CloudflareAccessOptions(
-            clientID: "abc-123.access",
-            clientSecretKeychainRef: "keychain-ref-cf-1",
+            clientID: clientID,
+            clientSecretKeychainRef: keychainReference,
             tunnelDomain: "ssh.company.internal"
         )
 
-        XCTAssertEqual(options.clientID, "abc-123.access")
-        XCTAssertEqual(options.clientSecretKeychainRef, "keychain-ref-cf-1")
+        XCTAssertEqual(options.clientID, clientID)
+        XCTAssertEqual(options.clientSecretKeychainRef, keychainReference)
         XCTAssertEqual(options.tunnelDomain, "ssh.company.internal")
         XCTAssertEqual(options, CloudflareAccessOptions(
-            clientID: "abc-123.access",
-            clientSecretKeychainRef: "keychain-ref-cf-1",
+            clientID: clientID,
+            clientSecretKeychainRef: keychainReference,
             tunnelDomain: "ssh.company.internal"
         ))
     }
@@ -34,9 +36,11 @@ final class CloudflareTailscaleConnectionTests: XCTestCase {
     }
 
     func testHostWithCloudflareAccessCodableRoundTrip() throws {
+        let clientID = "client.access"
+        let keychainReference = "keychain-reference"
         let cfOpts = CloudflareAccessOptions(
-            clientID: "token-client-id.access",
-            clientSecretKeychainRef: "ref-secret-cf-99",
+            clientID: clientID,
+            clientSecretKeychainRef: keychainReference,
             tunnelDomain: "bastion.corp.net"
         )
         let host = try Host(
@@ -58,8 +62,8 @@ final class CloudflareTailscaleConnectionTests: XCTestCase {
         XCTAssertEqual(decoded.hostname, "bastion.corp.net")
         XCTAssertEqual(decoded.username, "accessuser")
         if case .cloudflareAccess(let decodedCFOpts) = decoded.connection {
-            XCTAssertEqual(decodedCFOpts.clientID, "token-client-id.access")
-            XCTAssertEqual(decodedCFOpts.clientSecretKeychainRef, "ref-secret-cf-99")
+            XCTAssertEqual(decodedCFOpts.clientID, clientID)
+            XCTAssertEqual(decodedCFOpts.clientSecretKeychainRef, keychainReference)
             XCTAssertEqual(decodedCFOpts.tunnelDomain, "bastion.corp.net")
         } else {
             XCTFail("Expected .cloudflareAccess connection profile, got \(decoded.connection)")

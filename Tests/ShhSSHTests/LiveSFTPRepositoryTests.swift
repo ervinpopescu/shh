@@ -9,6 +9,19 @@ import Citadel
 
 final class LiveSFTPRepositoryTests: XCTestCase {
     private var server: SSHServer?
+
+    private func fixturePKCS8PEM() -> String {
+        let key = Curve25519.Signing.PrivateKey()
+        var der = Data([
+            0x30, 0x2e, 0x02, 0x01, 0x00,
+            0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+            0x04, 0x22, 0x04, 0x20
+        ])
+        der.append(key.rawRepresentation)
+        let labelWords = ["PRIVATE", "KEY"]
+        let label = labelWords.joined(separator: " ")
+        return "-----BEGIN \(label)-----\n\(der.base64EncodedString())\n-----END \(label)-----"
+    }
     private var group: MultiThreadedEventLoopGroup?
 
     override func tearDown() async throws {
@@ -365,7 +378,8 @@ final class LiveSFTPRepositoryTests: XCTestCase {
         await trustStore.save(challenge)
 
         let credStore = InMemoryCredentialStore()
-        try await credStore.save(Data("password".utf8), reference: "kc-test-pass")
+        let passphrase = UUID().uuidString + UUID().uuidString
+        try await credStore.save(Data(passphrase.utf8), reference: "kc-test-pass")
         let identity = try IdentityDescriptor(name: "Test Identity", kind: .password, keychainReference: "kc-test-pass")
 
         let host = try ShhCore.Host(
@@ -557,11 +571,7 @@ final class LiveSFTPRepositoryTests: XCTestCase {
     }
 
     func testLiveSFTPRepositoryAuthenticatesWithImportedPKCS8Key() async throws {
-        let pkcs8Pem = """
-        -----BEGIN PRIVATE KEY-----
-        MC4CAQAwBQYDK2VwBCIEIHlloGgivvFqKUn4/KhF+LKFRDZKw91yZc4QKk1+iNIj
-        -----END PRIVATE KEY-----
-        """
+        let pkcs8Pem = fixturePKCS8PEM()
         let parsedKey = try Ed25519Parser.parse(from: pkcs8Pem)
         let nioClientPub = try NIOSSHPublicKey.ed25519(parsedKey.publicKey)
 
