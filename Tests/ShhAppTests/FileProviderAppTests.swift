@@ -12,7 +12,11 @@ final class FileProviderAppTests: XCTestCase {
     private func isolatedPersistenceHelper() throws -> (FileProviderManagerHelper, URL) {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShhPersistenceTest_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        return (FileProviderManagerHelper(containerURL: nil, localContainerURL: root), root)
+        let helper = FileProviderManagerHelper(
+            localContainerURL: root,
+            containerURLResolver: { _ in nil }
+        )
+        return (helper, root)
     }
 
     func testAppGroupUnavailableLoadsLocalFallback() async throws {
