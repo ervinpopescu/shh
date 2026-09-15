@@ -9,7 +9,9 @@ final class SSHExecIntegrationTests: XCTestCase {
 
     private func makeConnectedClient(
         server: SSHTestServer,
-        redactor: Redactor = Redactor()
+        redactor: Redactor = Redactor(),
+        keepaliveInterval: TimeInterval = 30.0,
+        keepaliveTimeout: TimeInterval = 8.0
     ) async throws -> (LiveSSHTransport, LiveSSHConnection) {
         let credStore = InMemoryCredentialStore()
         try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
@@ -24,7 +26,11 @@ final class SSHExecIntegrationTests: XCTestCase {
         )
         await trustStore.save(challenge)
 
-        let transport = LiveSSHTransport(credentialStore: credStore)
+        let transport = LiveSSHTransport(
+            credentialStore: credStore,
+            keepaliveInterval: keepaliveInterval,
+            keepaliveTimeout: keepaliveTimeout
+        )
         let host = try ShhCore.Host(
             name: "Localhost",
             hostname: "127.0.0.1",
@@ -44,6 +50,40 @@ final class SSHExecIntegrationTests: XCTestCase {
     }
 
     // MARK: - 1. Success
+
+    func testIdleKeepaliveDoesNotPolluteTerminalOutput() async throws {
+        let server = SSHTestServer()
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 0.01,
+            keepaliveTimeout: 0.2
+        )
+        addTeardownBlock { await connection.close() }
+        let events = await connection.events()
+        let output = AtomicBox<Data>(Data())
+        let task = Task {
+            for try await event in events {
+                if case .bytes(let bytes) = event {
+                    var current = output.get()
+                    current.append(bytes)
+                    output.set(current)
+                }
+            }
+        }
+        // Drain the normal shell banner before checking probe traffic.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        output.set(Data())
+        try await Task.sleep(nanoseconds: 400_000_000)
+        task.cancel()
+
+        XCTAssertGreaterThan(server.globalRequestCount, 0, "Idle SSH must send a protocol liveness probe")
+        XCTAssertTrue(output.get().isEmpty, "Keepalive packets must never enter PTY output")
+        let result = try await connection.executeCommand("tmux -V")
+        XCTAssertTrue(result.isSuccess, "An idle session must remain usable after keepalive probes")
+    }
 
     func testExecSuccess() async throws {
         let server = SSHTestServer()

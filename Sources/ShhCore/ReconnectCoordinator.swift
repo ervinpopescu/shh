@@ -35,7 +35,7 @@ public typealias ReconnectJitter = @Sendable (_ baseDelay: TimeInterval) -> Time
 public typealias ReconnectConnectAction = @Sendable (_ attempt: Int) async throws -> Void
 
 public actor ReconnectCoordinator {
-    public static let maxAttempts: Int = 5
+    public static let maxAttempts: Int = 8
     public static let maxBackoff: TimeInterval = 32.0
 
     public private(set) var state: ReconnectState = .idle

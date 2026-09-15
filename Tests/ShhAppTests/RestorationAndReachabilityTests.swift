@@ -266,6 +266,36 @@ final class RestorationAndReachabilityTests: XCTestCase {
         XCTAssertEqual(connectCount, 2, "A second connection attempt must have been performed")
     }
 
+    func testAppContainerInterfaceTransitionTriggersReconnect() async throws {
+        let firstConnection = MockSSHConnection()
+        let secondConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return connectCount == 1 ? firstConnection : secondConnection
+        }
+
+        let reachability = MockReachabilityMonitor(isReachable: true, initialInterface: .wifi)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "RoamingHost", hostname: "roaming.invalid", username: "dev")
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        reachability.transitionInterface(to: .cellular)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(connectCount, 2, "An interface transition must recover the SSH session")
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue(firstConnection.isClosed)
+        await container.disconnect()
+    }
+
     func testAppContainerScenePhaseForegroundTriggerReconnect() async throws {
         let mockConnection1 = MockSSHConnection()
         let mockConnection2 = MockSSHConnection()

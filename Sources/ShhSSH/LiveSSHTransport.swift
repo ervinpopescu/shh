@@ -219,24 +219,34 @@ public struct LiveSSHTransport: SSHTransport {
     public typealias HostResolver = @Sendable (UUID) async throws -> (ShhCore.Host, IdentityDescriptor?)
     public let credentialStore: any CredentialStore
     public let hostResolver: HostResolver?
+    public let keepaliveInterval: TimeInterval
+    public let keepaliveTimeout: TimeInterval
     private let customGroup: EventLoopGroup?
 
     public init(
         credentialStore: any CredentialStore = KeychainCredentialStore(),
-        hostResolver: HostResolver? = nil
+        hostResolver: HostResolver? = nil,
+        keepaliveInterval: TimeInterval = 30.0,
+        keepaliveTimeout: TimeInterval = 8.0
     ) {
         self.credentialStore = credentialStore
         self.hostResolver = hostResolver
+        self.keepaliveInterval = max(0, keepaliveInterval)
+        self.keepaliveTimeout = max(0.1, keepaliveTimeout)
         self.customGroup = nil
     }
 
     init(
         credentialStore: any CredentialStore,
         hostResolver: HostResolver? = nil,
-        group: EventLoopGroup?
+        group: EventLoopGroup?,
+        keepaliveInterval: TimeInterval = 30.0,
+        keepaliveTimeout: TimeInterval = 8.0
     ) {
         self.credentialStore = credentialStore
         self.hostResolver = hostResolver
+        self.keepaliveInterval = max(0, keepaliveInterval)
+        self.keepaliveTimeout = max(0.1, keepaliveTimeout)
         self.customGroup = group
     }
 
@@ -641,6 +651,7 @@ public struct LiveSSHTransport: SSHTransport {
         do {
             var bootstrap = ClientBootstrap(group: eventLoopGroup)
                 .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+                .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_KEEPALIVE), value: 1)
                 .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
 
             if options.connectTimeoutSeconds > 0 {
@@ -778,6 +789,7 @@ public struct LiveSSHTransport: SSHTransport {
                 channel.close(promise: nil)
             }
 
+            connection.startSSHKeepalive(interval: keepaliveInterval, timeout: keepaliveTimeout)
             return connection
         } catch {
             if let createdConnection {
@@ -840,6 +852,7 @@ public struct LiveSSHTransport: SSHTransport {
 
             var bootstrap = ClientBootstrap(group: eventLoopGroup)
                 .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
+                .channelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_KEEPALIVE), value: 1)
                 .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
 
             if options.connectTimeoutSeconds > 0 {
@@ -1146,6 +1159,7 @@ public struct LiveSSHTransport: SSHTransport {
                 _ = targetTransportChannel.close()
             }
 
+            connection.startSSHKeepalive(interval: keepaliveInterval, timeout: keepaliveTimeout)
             return connection
         } catch {
             if let createdConnection {
