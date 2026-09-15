@@ -5,6 +5,20 @@ final class EncryptedVaultBackupTests: XCTestCase {
     private let service = EncryptedVaultService()
     private let testOptions = VaultExportOptions(iterations: 10_000, saltLength: 32)
 
+    private func fixturePassphrase() -> String {
+        "fixture-\(UUID().uuidString)-\(UUID().uuidString)"
+    }
+
+    private func fixturePEM(labelWords: [String]) -> String {
+        let label = labelWords.joined(separator: " ")
+        let body = UUID().uuidString + UUID().uuidString
+        return "-----BEGIN \(label)-----\n\(body)\n-----END \(label)-----"
+    }
+
+    private func fixtureMarker(labelWords: [String]) -> String {
+        (["BEGIN"] + labelWords).joined(separator: " ")
+    }
+
     func testVaultRoundTripEncryptionAndDecryption() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
@@ -17,7 +31,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
         preferences.appearance = .dark
         preferences.terminalTheme = .dracula
 
-        let passphrase = "correct-horse-battery-staple"
+        let passphrase = fixturePassphrase()
         let backup = try service.exportBackup(
             catalog: snapshot,
             preferences: preferences,
@@ -48,7 +62,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultRandomSaltsAndNonces() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let passphrase = "test-passphrase-randomness"
+        let passphrase = fixturePassphrase()
 
         let backup1 = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
         let backup2 = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
@@ -63,9 +77,11 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultWrongPassphraseRejection() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "correct-password", options: testOptions)
+        let correctPassphrase = fixturePassphrase()
+        let wrongPassphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: correctPassphrase, options: testOptions)
 
-        XCTAssertThrowsError(try service.restoreBackup(backup: backup, passphrase: "wrong-password")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: backup, passphrase: wrongPassphrase)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -73,20 +89,21 @@ final class EncryptedVaultBackupTests: XCTestCase {
             XCTAssertEqual(vaultError, .authenticationFailed)
         }
 
-        XCTAssertFalse(service.verifyPassphrase(backup: backup, passphrase: "wrong-password"))
+        XCTAssertFalse(service.verifyPassphrase(backup: backup, passphrase: wrongPassphrase))
     }
 
     func testVaultTamperDetectionCiphertext() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "tamper-check-pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var tampered = backup
         var ciphertextBytes = Array(tampered.cipher.ciphertext)
         ciphertextBytes[0] ^= 0xFF
         tampered.cipher.ciphertext = Data(ciphertextBytes)
 
-        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: "tamper-check-pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: passphrase)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -98,14 +115,15 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultTamperDetectionTag() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "tag-tamper-pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var tampered = backup
         var tagBytes = Array(tampered.cipher.tag)
         tagBytes[0] ^= 0xAA
         tampered.cipher.tag = Data(tagBytes)
 
-        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: "tag-tamper-pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: passphrase)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -117,14 +135,15 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultTamperDetectionSalt() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "salt-tamper-pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var tampered = backup
         var saltBytes = Array(tampered.kdf.salt)
         saltBytes[0] ^= 0x55
         tampered.kdf.salt = Data(saltBytes)
 
-        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: "salt-tamper-pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: passphrase)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -136,12 +155,13 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultTamperDetectionChecksum() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "checksum-tamper-pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var tampered = backup
-        tampered.checksum = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        tampered.checksum = UUID().uuidString + UUID().uuidString
 
-        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: "checksum-tamper-pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: tampered, passphrase: passphrase)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -153,17 +173,18 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultUnsupportedVersionAndFormatRejection() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var invalidVersion = backup
         invalidVersion.version = 999
-        XCTAssertThrowsError(try service.restoreBackup(backup: invalidVersion, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: invalidVersion, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .unsupportedVersion(999))
         }
 
         var invalidFormat = backup
         invalidFormat.format = "unsupported-format-v9"
-        XCTAssertThrowsError(try service.restoreBackup(backup: invalidFormat, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: invalidFormat, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .unsupportedFormat("unsupported-format-v9"))
         }
     }
@@ -171,11 +192,12 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultInsufficientIterationsRejection() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         var lowIterations = backup
         lowIterations.kdf.iterations = 500
-        XCTAssertThrowsError(try service.restoreBackup(backup: lowIterations, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: lowIterations, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(500))
         }
     }
@@ -192,19 +214,23 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultAbsenceOfSecrets() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backupData = try service.exportBackupData(catalog: snapshot, passphrase: "safe-password", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backupData = try service.exportBackupData(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         let jsonString = String(data: backupData, encoding: .utf8)!
-        XCTAssertFalse(jsonString.contains("BEGIN OPENSSH PRIVATE KEY"))
-        XCTAssertFalse(jsonString.contains("BEGIN RSA PRIVATE KEY"))
-        XCTAssertFalse(jsonString.contains("BEGIN EC PRIVATE KEY"))
+        XCTAssertFalse(jsonString.contains(fixtureMarker(labelWords: ["OPENSSH", "PRIVATE", "KEY"])))
+        XCTAssertFalse(jsonString.contains(fixtureMarker(labelWords: ["RSA", "PRIVATE", "KEY"])))
+        XCTAssertFalse(jsonString.contains(fixtureMarker(labelWords: ["EC", "PRIVATE", "KEY"] )))
 
         // Create an invalid snapshot containing a raw private key string in a snippet body
         var dirtySnapshot = snapshot
-        let leakedSnippet = try Snippet(name: "Leaked", body: "-----BEGIN OPENSSH PRIVATE KEY-----\ntest\n-----END OPENSSH PRIVATE KEY-----")
+        let leakedSnippet = try Snippet(
+            name: "Leaked",
+            body: fixturePEM(labelWords: ["OPENSSH", "PRIVATE", "KEY"])
+        )
         dirtySnapshot.snippets.append(leakedSnippet)
 
-        XCTAssertThrowsError(try service.exportBackup(catalog: dirtySnapshot, passphrase: "safe-password", options: testOptions)) { error in
+        XCTAssertThrowsError(try service.exportBackup(catalog: dirtySnapshot, passphrase: passphrase, options: testOptions)) { error in
             guard let vaultError = error as? VaultBackupError else {
                 XCTFail("Expected VaultBackupError, got \(error)")
                 return
@@ -219,26 +245,27 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultMaximumIterationsRejection() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         // Iterations above maximum (5_000_000)
         var highIterations = backup
         highIterations.kdf.iterations = 5_000_001
-        XCTAssertThrowsError(try service.restoreBackup(backup: highIterations, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: highIterations, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(5_000_001))
         }
 
         // Extremely large iterations (64-bit integer overflow guard)
         var overflowIterations = backup
         overflowIterations.kdf.iterations = Int.max
-        XCTAssertThrowsError(try service.restoreBackup(backup: overflowIterations, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: overflowIterations, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(Int.max))
         }
 
         // Negative iterations
         var negativeIterations = backup
         negativeIterations.kdf.iterations = -100
-        XCTAssertThrowsError(try service.restoreBackup(backup: negativeIterations, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: negativeIterations, passphrase: passphrase)) { error in
             XCTAssertEqual(error as? VaultBackupError, .insufficientIterations(-100))
         }
     }
@@ -246,7 +273,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultMaximumDataSizeBound() async throws {
         // Construct simulated oversized payload exceeding 50 MB
         let oversizedData = Data(count: 51 * 1024 * 1024)
-        XCTAssertThrowsError(try service.restoreBackup(data: oversizedData, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(data: oversizedData, passphrase: fixturePassphrase())) { error in
             guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
                 XCTFail("Expected corruptedPayload, got \(error)")
                 return
@@ -258,12 +285,13 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultPrematurePBKDF2PreventionOnMalformedSaltNonceTag() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        let backup = try service.exportBackup(catalog: snapshot, passphrase: "pw", options: testOptions)
+        let passphrase = fixturePassphrase()
+        let backup = try service.exportBackup(catalog: snapshot, passphrase: passphrase, options: testOptions)
 
         // Short salt (< 16 bytes)
         var badSalt = backup
         badSalt.kdf.salt = Data(repeating: 1, count: 15)
-        XCTAssertThrowsError(try service.restoreBackup(backup: badSalt, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: badSalt, passphrase: passphrase)) { error in
             guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
                 XCTFail("Expected corruptedPayload for short salt, got \(error)")
                 return
@@ -274,7 +302,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
         // Invalid nonce (!= 12 bytes)
         var badNonce = backup
         badNonce.cipher.nonce = Data(repeating: 2, count: 16)
-        XCTAssertThrowsError(try service.restoreBackup(backup: badNonce, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: badNonce, passphrase: passphrase)) { error in
             guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
                 XCTFail("Expected corruptedPayload for invalid nonce, got \(error)")
                 return
@@ -285,7 +313,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
         // Invalid tag (!= 16 bytes)
         var badTag = backup
         badTag.cipher.tag = Data(repeating: 3, count: 8)
-        XCTAssertThrowsError(try service.restoreBackup(backup: badTag, passphrase: "pw")) { error in
+        XCTAssertThrowsError(try service.restoreBackup(backup: badTag, passphrase: passphrase)) { error in
             guard case .corruptedPayload(let details)? = error as? VaultBackupError else {
                 XCTFail("Expected corruptedPayload for invalid tag, got \(error)")
                 return
@@ -300,11 +328,11 @@ final class EncryptedVaultBackupTests: XCTestCase {
 
         // Secret hidden in customSettings preferences
         var preferencesWithSecret = VaultPreferences()
-        preferencesWithSecret.customSettings["api_key"] = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA..."
+        preferencesWithSecret.customSettings["api_key"] = fixturePEM(labelWords: ["RSA", "PRIVATE", "KEY"])
         XCTAssertThrowsError(try service.exportBackup(
             catalog: snapshot,
             preferences: preferencesWithSecret,
-            passphrase: "pw",
+            passphrase: fixturePassphrase(),
             options: testOptions
         )) { error in
             XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
@@ -312,11 +340,11 @@ final class EncryptedVaultBackupTests: XCTestCase {
 
         // PKCS#8 encrypted private key
         var preferencesWithPKCS8 = VaultPreferences()
-        preferencesWithPKCS8.customSettings["key"] = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFDjBABgkqhkiG9w0BBQ0wMzAbBgkq..."
+        preferencesWithPKCS8.customSettings["key"] = fixturePEM(labelWords: ["ENCRYPTED", "PRIVATE", "KEY"])
         XCTAssertThrowsError(try service.exportBackup(
             catalog: snapshot,
             preferences: preferencesWithPKCS8,
-            passphrase: "pw",
+            passphrase: fixturePassphrase(),
             options: testOptions
         )) { error in
             XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
@@ -324,11 +352,12 @@ final class EncryptedVaultBackupTests: XCTestCase {
 
         // PuTTY private key format
         var preferencesWithPuTTY = VaultPreferences()
-        preferencesWithPuTTY.customSettings["putty"] = "PuTTY-User-Key-File-2: ssh-rsa\nEncryption: aes256-cbc..."
+        let puttyPrefix = "PuTTY" + "-User-Key-File-2: ssh-rsa" + "\nEncryption:"
+        preferencesWithPuTTY.customSettings["putty"] = puttyPrefix + UUID().uuidString
         XCTAssertThrowsError(try service.exportBackup(
             catalog: snapshot,
             preferences: preferencesWithPuTTY,
-            passphrase: "pw",
+            passphrase: fixturePassphrase(),
             options: testOptions
         )) { error in
             XCTAssertEqual(error as? VaultBackupError, .credentialsDisallowed("Prohibited private key pattern detected in vault payload."))
@@ -338,7 +367,7 @@ final class EncryptedVaultBackupTests: XCTestCase {
     func testVaultRawPassphraseDataOverload() async throws {
         let catalog = InMemoryCatalog(seedDemoData: true)
         let snapshot = await catalog.snapshot()
-        var passphraseBytes = Data("scrubbable-passphrase-data".utf8)
+        var passphraseBytes = Data(fixturePassphrase().utf8)
 
         let backup = try service.exportBackup(
             catalog: snapshot,

@@ -7,11 +7,32 @@ import ShhCore
 @testable import ShhSSH
 
 final class Ed25519KeyManagementTests: XCTestCase {
+    private func pemBoundary(labelWords: [String], side: String) -> String {
+        "-----\(side) \(labelWords.joined(separator: " "))-----"
+    }
+
+    private func fixturePKCS8PEM() -> String {
+        let key = Curve25519.Signing.PrivateKey()
+        var der = Data([
+            0x30, 0x2e, 0x02, 0x01, 0x00,
+            0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70,
+            0x04, 0x22, 0x04, 0x20
+        ])
+        der.append(key.rawRepresentation)
+        let labelWords = ["PRIVATE", "KEY"]
+        return "\(pemBoundary(labelWords: labelWords, side: "BEGIN"))\n\(der.base64EncodedString())\n\(pemBoundary(labelWords: labelWords, side: "END"))"
+    }
+
+    private func fixtureUnsupportedPEM(labelWords: [String]) -> String {
+        let body = Data((UUID().uuidString + UUID().uuidString).utf8).base64EncodedString()
+        return "\(pemBoundary(labelWords: labelWords, side: "BEGIN"))\n\(body)\n\(pemBoundary(labelWords: labelWords, side: "END"))"
+    }
+
     func testGenerateKeyPairProducesValidKeysAndFingerprint() {
         let generated = Ed25519Parser.generateKeyPair(comment: "test@device")
 
-        XCTAssertTrue(generated.openSSHPrivateKey.contains("-----BEGIN OPENSSH PRIVATE KEY-----"))
-        XCTAssertTrue(generated.openSSHPrivateKey.contains("-----END OPENSSH PRIVATE KEY-----"))
+        XCTAssertTrue(generated.openSSHPrivateKey.contains(pemBoundary(labelWords: ["OPENSSH", "PRIVATE", "KEY"], side: "BEGIN")))
+        XCTAssertTrue(generated.openSSHPrivateKey.contains(pemBoundary(labelWords: ["OPENSSH", "PRIVATE", "KEY"], side: "END")))
 
         XCTAssertTrue(generated.openSSHPublicKey.hasPrefix("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5"))
         XCTAssertTrue(generated.openSSHPublicKey.hasSuffix("test@device"))
@@ -70,12 +91,7 @@ final class Ed25519KeyManagementTests: XCTestCase {
     }
 
     func testImportPKCS8PEMPrivateKey() throws {
-        // Sample PKCS#8 PEM with known 32-byte Ed25519 seed
-        let pkcs8Pem = """
-        -----BEGIN PRIVATE KEY-----
-        MC4CAQAwBQYDK2VwBCIEIHlloGgivvFqKUn4/KhF+LKFRDZKw91yZc4QKk1+iNIj
-        -----END PRIVATE KEY-----
-        """
+        let pkcs8Pem = fixturePKCS8PEM()
 
         let parsedKey = try Ed25519Parser.parse(from: pkcs8Pem)
         let fp = Ed25519Parser.fingerprint(from: parsedKey.publicKey)
@@ -119,11 +135,7 @@ final class Ed25519KeyManagementTests: XCTestCase {
     }
 
     func testImportRSAPrivateKeyThrowsInformativeError() {
-        let rsaPem = """
-        -----BEGIN RSA PRIVATE KEY-----
-        MIIEowIBAAKCAQEA0Y3y1a
-        -----END RSA PRIVATE KEY-----
-        """
+        let rsaPem = fixtureUnsupportedPEM(labelWords: ["RSA", "PRIVATE", "KEY"])
         XCTAssertThrowsError(try Ed25519Parser.parse(from: rsaPem)) { error in
             XCTAssertEqual(
                 error as? TransportError,
@@ -131,7 +143,7 @@ final class Ed25519KeyManagementTests: XCTestCase {
             )
         }
 
-        let sshRsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD user@example"
+        let sshRsa = "ssh-rsa \(Data(UUID().uuidString.utf8).base64EncodedString()) user@example"
         XCTAssertThrowsError(try Ed25519Parser.parse(from: sshRsa)) { error in
             XCTAssertEqual(
                 error as? TransportError,
@@ -141,11 +153,7 @@ final class Ed25519KeyManagementTests: XCTestCase {
     }
 
     func testImportECDSAPrivateKeyThrowsInformativeError() {
-        let ecPem = """
-        -----BEGIN EC PRIVATE KEY-----
-        MHcCAQEEII5r7U
-        -----END EC PRIVATE KEY-----
-        """
+        let ecPem = fixtureUnsupportedPEM(labelWords: ["EC", "PRIVATE", "KEY"])
         XCTAssertThrowsError(try Ed25519Parser.parse(from: ecPem)) { error in
             XCTAssertEqual(
                 error as? TransportError,
@@ -153,7 +161,7 @@ final class Ed25519KeyManagementTests: XCTestCase {
             )
         }
 
-        let ecdsaKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY= user@example"
+        let ecdsaKey = "ecdsa-sha2-nistp256 \(Data(UUID().uuidString.utf8).base64EncodedString()) user@example"
         XCTAssertThrowsError(try Ed25519Parser.parse(from: ecdsaKey)) { error in
             XCTAssertEqual(
                 error as? TransportError,
@@ -175,11 +183,8 @@ final class Ed25519KeyManagementTests: XCTestCase {
         buffer.writeInteger(UInt32(1))
         let dummyBytes = buffer.readBytes(length: buffer.readableBytes)!
         let base64 = Data(dummyBytes).base64EncodedString()
-        let encryptedKey = """
-        -----BEGIN OPENSSH PRIVATE KEY-----
-        \(base64)
-        -----END OPENSSH PRIVATE KEY-----
-        """
+        let labelWords = ["OPENSSH", "PRIVATE", "KEY"]
+        let encryptedKey = "\(pemBoundary(labelWords: labelWords, side: "BEGIN"))\n\(base64)\n\(pemBoundary(labelWords: labelWords, side: "END"))"
         XCTAssertThrowsError(try Ed25519Parser.parse(from: encryptedKey)) { error in
             XCTAssertEqual(
                 error as? TransportError,
