@@ -4,6 +4,7 @@ import FileProvider
 import UniformTypeIdentifiers
 import ShhCore
 
+@objc(FileProviderItem)
 public final class FileProviderItem: NSObject, NSFileProviderItem {
     public let contract: FileProviderItemContract
 

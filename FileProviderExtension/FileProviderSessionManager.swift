@@ -107,29 +107,57 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
         return snapshot.identities.first(where: { $0.id == identityID })
     }
 
+    private var candidateContainerURLs: [URL] {
+        var urls: [URL] = []
+        if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
+            urls.append(groupURL)
+        }
+        let fallbackStorage = FileProviderStorageManager.shared.containerURL
+        if !urls.contains(fallbackStorage) {
+            urls.append(fallbackStorage)
+        }
+        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let localURL = appSupport.appendingPathComponent("Shh", isDirectory: true)
+            if !urls.contains(localURL) {
+                urls.append(localURL)
+            }
+        }
+        return urls
+    }
+
     private func loadSharedTrustRecords() -> [TrustRecord] {
-        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
-            return []
-        }
-        let knownHostsURL = containerURL.appendingPathComponent("catalogs/known_hosts.json")
-        guard let data = try? Data(contentsOf: knownHostsURL) else {
-            return []
-        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        return (try? decoder.decode([TrustRecord].self, from: data)) ?? []
+        for base in candidateContainerURLs {
+            let knownHostsURL = base.appendingPathComponent("catalogs/known_hosts.json")
+            if let data = try? Data(contentsOf: knownHostsURL),
+               let records = try? decoder.decode([TrustRecord].self, from: data),
+               !records.isEmpty {
+                return records
+            }
+        }
+        return []
     }
 
     private func loadSharedCatalogSnapshot() throws -> CatalogSnapshot {
-        guard let containerURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) else {
-            return CatalogSnapshot()
-        }
-        let catalogURL = containerURL.appendingPathComponent("catalogs/snapshot.json")
-        guard let data = try? Data(contentsOf: catalogURL) else {
-            return CatalogSnapshot()
-        }
         let decoder = JSONDecoder()
-        return (try? decoder.decode(CatalogSnapshot.self, from: data)) ?? CatalogSnapshot()
+        decoder.dateDecodingStrategy = .iso8601
+        for base in candidateContainerURLs {
+            let catalogURL = base.appendingPathComponent("catalogs/snapshot.json")
+            if let data = try? Data(contentsOf: catalogURL),
+               let snapshot = try? decoder.decode(CatalogSnapshot.self, from: data),
+               !snapshot.hosts.isEmpty {
+                return snapshot
+            }
+        }
+        for base in candidateContainerURLs {
+            let catalogURL = base.appendingPathComponent("catalogs/snapshot.json")
+            if let data = try? Data(contentsOf: catalogURL),
+               let snapshot = try? decoder.decode(CatalogSnapshot.self, from: data) {
+                return snapshot
+            }
+        }
+        return CatalogSnapshot()
     }
 }
 

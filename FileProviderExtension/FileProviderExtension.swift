@@ -5,6 +5,25 @@ import UniformTypeIdentifiers
 import ShhCore
 import ShhSSH
 
+/// Thread-safe completion handler wrapper ensuring callback is invoked at most once.
+final class SafeOnceCompletion<T>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var handler: ((T) -> Void)?
+
+    init(_ handler: @escaping (T) -> Void) {
+        self.handler = handler
+    }
+
+    func callAsFunction(_ value: T) {
+        lock.lock()
+        let action = handler
+        handler = nil
+        lock.unlock()
+        action?(value)
+    }
+}
+
+@objc(FileProviderExtension)
 public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension {
     public let domain: NSFileProviderDomain
     public let hostID: UUID
@@ -50,17 +69,23 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         completionHandler: @escaping (NSFileProviderItem?, (any Error)?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
+        let safeCompletion = SafeOnceCompletion<(NSFileProviderItem?, (any Error)?)>(completionHandler)
 
-        if identifier == .rootContainer {
+        let isRoot = identifier == .rootContainer ||
+            identifier.rawValue == NSFileProviderItemIdentifier.rootContainer.rawValue ||
+            identifier.rawValue == FileProviderItemIdentifier.root.rawValue ||
+            identifier.rawValue == "NSFileProviderRootContainerItemIdentifier"
+
+        if isRoot {
             let root = FileProviderItemContract.rootItem(hostID: hostID, hostName: domain.displayName)
-            completionHandler(FileProviderItem(contract: root), nil)
+            safeCompletion((FileProviderItem(contract: root), nil))
             progress.completedUnitCount = 1
             return progress
         }
 
         let contractID = FileProviderItemIdentifier(rawValue: identifier.rawValue)
         guard let remotePath = contractID.remotePath else {
-            completionHandler(nil, NSFileProviderError(.noSuchItem))
+            safeCompletion((nil, NSFileProviderError(.noSuchItem)))
             return progress
         }
 
@@ -68,7 +93,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
             // Check cache first
             if let cached = await cache.getMetadata(for: contractID) {
                 await cache.recordAccess(for: contractID)
-                completionHandler(FileProviderItem(contract: cached.item), nil)
+                safeCompletion((FileProviderItem(contract: cached.item), nil))
                 progress.completedUnitCount = 1
                 return
             }
@@ -86,9 +111,9 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                     fileSizeBytes: remoteFile.size,
                     isMaterialized: false
                 ))
-                completionHandler(FileProviderItem(contract: contract), nil)
+                safeCompletion((FileProviderItem(contract: contract), nil))
             } catch {
-                completionHandler(nil, translateError(error))
+                safeCompletion((nil, translateError(error)))
             }
             progress.completedUnitCount = 1
         }
@@ -109,9 +134,11 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         completionHandler: @escaping (URL?, (any NSFileProviderItem)?, (any Error)?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 100)
+        let safeCompletion = SafeOnceCompletion<(URL?, (any NSFileProviderItem)?, (any Error)?)>(completionHandler)
+
         let contractID = FileProviderItemIdentifier(rawValue: itemIdentifier.rawValue)
         guard let remotePath = contractID.remotePath else {
-            completionHandler(nil, nil, NSFileProviderError(.noSuchItem))
+            safeCompletion((nil, nil, NSFileProviderError(.noSuchItem)))
             return progress
         }
 
@@ -131,16 +158,17 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                     metadata.localRelativePath = nil
                     metadata.lastAccessDate = Date()
                     await cache.storeMetadata(metadata)
-                    completionHandler(targetLocalURL, FileProviderItem(contract: metadata.item), nil)
+                    safeCompletion((targetLocalURL, FileProviderItem(contract: metadata.item), nil))
                 } else {
                     let remoteFile = try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 10.0) { repo in
                         try await repo.fetchAttributes(at: remotePath)
                     }
                     let contract = FileProviderItemContract(remoteFile: remoteFile, hostID: hostID)
-                    completionHandler(targetLocalURL, FileProviderItem(contract: contract), nil)
+                    safeCompletion((targetLocalURL, FileProviderItem(contract: contract), nil))
                 }
             } catch {
-                completionHandler(nil, nil, translateError(error))
+                try? FileManager.default.removeItem(at: targetLocalURL)
+                safeCompletion((nil, nil, translateError(error)))
             }
         }
 
@@ -163,13 +191,20 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         completionHandler: @escaping ((any NSFileProviderItem)?, NSFileProviderItemFields, Bool, (any Error)?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 100)
+        let safeCompletion = SafeOnceCompletion<((any NSFileProviderItem)?, NSFileProviderItemFields, Bool, (any Error)?)>(completionHandler)
+
+        let isParentRoot = itemTemplate.parentItemIdentifier == .rootContainer ||
+            itemTemplate.parentItemIdentifier.rawValue == NSFileProviderItemIdentifier.rootContainer.rawValue ||
+            itemTemplate.parentItemIdentifier.rawValue == FileProviderItemIdentifier.root.rawValue ||
+            itemTemplate.parentItemIdentifier.rawValue == "NSFileProviderRootContainerItemIdentifier"
+
         let parentID = FileProviderItemIdentifier(rawValue: itemTemplate.parentItemIdentifier.rawValue)
-        let parentPath = parentID.remotePath ?? RemotePath("/")
+        let parentPath = isParentRoot ? RemotePath("/") : (parentID.remotePath ?? RemotePath("/"))
         guard !itemTemplate.filename.contains("/") &&
               !itemTemplate.filename.contains("..") &&
               !itemTemplate.filename.isEmpty,
               let itemPath = try? parentPath.appendingSafely(itemTemplate.filename) else {
-            completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+            safeCompletion((nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil)))
             return progress
         }
         let isDirectory = itemTemplate.contentType == .folder
@@ -193,7 +228,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 }
 
                 let contractID = FileProviderItemIdentifier(hostID: hostID, remotePath: itemPath)
-                let parentContractID = itemPath.parent.isRoot ? .root : parentID
+                let parentContractID = itemPath.parent.isRoot ? .root : (isParentRoot ? .root : parentID)
                 let itemContract = FileProviderItemContract(
                     identifier: contractID,
                     parentIdentifier: parentContractID,
@@ -216,9 +251,9 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 _ = await cache.recordChange(itemIdentifier: contractID, type: .added, item: itemContract)
 
                 let item = FileProviderItem(contract: itemContract)
-                completionHandler(item, [], false, nil)
+                safeCompletion((item, [], false, nil))
             } catch {
-                completionHandler(nil, [], false, translateError(error))
+                safeCompletion((nil, [], false, translateError(error)))
             }
         }
 
@@ -241,23 +276,30 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         completionHandler: @escaping ((any NSFileProviderItem)?, NSFileProviderItemFields, Bool, (any Error)?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 100)
+        let safeCompletion = SafeOnceCompletion<((any NSFileProviderItem)?, NSFileProviderItemFields, Bool, (any Error)?)>(completionHandler)
+
         let contractID = FileProviderItemIdentifier(rawValue: item.itemIdentifier.rawValue)
         guard contractID.remotePath != nil else {
-            completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+            safeCompletion((nil, [], false, NSFileProviderError(.noSuchItem)))
             return progress
         }
 
         let task = Task {
             do {
                 guard var activePath = contractID.remotePath else {
-                    completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                    safeCompletion((nil, [], false, NSFileProviderError(.noSuchItem)))
                     return
                 }
+                let isParentRoot = item.parentItemIdentifier == .rootContainer ||
+                    item.parentItemIdentifier.rawValue == NSFileProviderItemIdentifier.rootContainer.rawValue ||
+                    item.parentItemIdentifier.rawValue == FileProviderItemIdentifier.root.rawValue ||
+                    item.parentItemIdentifier.rawValue == "NSFileProviderRootContainerItemIdentifier"
+
                 let parentID = FileProviderItemIdentifier(rawValue: item.parentItemIdentifier.rawValue)
-                var targetParentPath = parentID.remotePath ?? RemotePath("/")
+                var targetParentPath = isParentRoot ? RemotePath("/") : (parentID.remotePath ?? RemotePath("/"))
                 let newFilename = changedFields.contains(.filename) ? item.filename : activePath.lastComponent
                 guard !newFilename.contains("/") && !newFilename.contains("..") && !newFilename.isEmpty else {
-                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+                    safeCompletion((nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil)))
                     return
                 }
 
@@ -266,7 +308,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 }
 
                 guard let destinationPath = try? targetParentPath.appendingSafely(newFilename) else {
-                    completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
+                    safeCompletion((nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil)))
                     return
                 }
 
@@ -288,7 +330,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 }
 
                 let newContractID = FileProviderItemIdentifier(hostID: hostID, remotePath: activePath)
-                let parentContractID = activePath.parent.isRoot ? .root : FileProviderItemIdentifier(hostID: hostID, remotePath: activePath.parent)
+                let parentContractID = activePath.parent.isRoot ? .root : (isParentRoot ? .root : FileProviderItemIdentifier(hostID: hostID, remotePath: activePath.parent))
 
                 if var metadata = await cache.getMetadata(for: contractID) {
                     if newContractID != contractID {
@@ -305,7 +347,7 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                     }
                     await cache.storeMetadata(metadata)
                     _ = await cache.recordChange(itemIdentifier: newContractID, type: .updated, item: metadata.item)
-                    completionHandler(FileProviderItem(contract: metadata.item), [], false, nil)
+                    safeCompletion((FileProviderItem(contract: metadata.item), [], false, nil))
                 } else {
                     let remoteFile = try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 10.0) { repo in
                         try await repo.fetchAttributes(at: activePath)
@@ -319,10 +361,10 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                         isMaterialized: newContents != nil
                     ))
                     _ = await cache.recordChange(itemIdentifier: newContractID, type: .updated, item: contract)
-                    completionHandler(FileProviderItem(contract: contract), [], false, nil)
+                    safeCompletion((FileProviderItem(contract: contract), [], false, nil))
                 }
             } catch {
-                completionHandler(nil, [], false, translateError(error))
+                safeCompletion((nil, [], false, translateError(error)))
             }
         }
 
@@ -343,9 +385,11 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
         completionHandler: @escaping ((any Error)?) -> Void
     ) -> Progress {
         let progress = Progress(totalUnitCount: 1)
+        let safeCompletion = SafeOnceCompletion<((any Error)?)>(completionHandler)
+
         let contractID = FileProviderItemIdentifier(rawValue: identifier.rawValue)
         guard let remotePath = contractID.remotePath else {
-            completionHandler(NSFileProviderError(.noSuchItem))
+            safeCompletion(NSFileProviderError(.noSuchItem))
             return progress
         }
 
@@ -364,9 +408,9 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
 
                 await cache.removeMetadata(for: contractID)
                 _ = await cache.recordChange(itemIdentifier: contractID, type: .deleted, item: nil)
-                completionHandler(nil)
+                safeCompletion(nil)
             } catch {
-                completionHandler(translateError(error))
+                safeCompletion(translateError(error))
             }
             progress.completedUnitCount = 1
         }
@@ -395,6 +439,13 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
     private func translateError(_ error: any Error) -> Error {
         if let fpError = error as? NSFileProviderError {
             return fpError
+        }
+        if error is CancellationError {
+            return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
+        }
+        let nsError = error as NSError
+        if nsError.domain == NSFileProviderErrorDomain || nsError.domain == NSCocoaErrorDomain {
+            return error
         }
         if let sftpError = error as? SFTPRepositoryError {
             switch sftpError {
