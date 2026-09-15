@@ -384,7 +384,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
 
         XCTAssertEqual(container.activeSession?.state, .disconnected)
         XCTAssertTrue(firstConnection.isClosed)
-        let storedMetadata = await store.load()
+        let storedMetadata = try await store.load()
         let metadata = try XCTUnwrap(storedMetadata)
         XCTAssertEqual(metadata.hostID, host.id)
         XCTAssertEqual(metadata.tmuxSessionID, "$0")
