@@ -993,6 +993,7 @@ struct SessionView: View {
     @State private var searchQuery = ""
     @State private var pendingRiskyPaste: String?
     @State private var showPortForwarding = false
+    @State private var showTelemetry = false
     private let policy = CommandPolicy()
 
     private func terminalColor(_ value: TerminalColor) -> Color {
@@ -1281,6 +1282,14 @@ struct SessionView: View {
                     .accessibilityIdentifier("open-port-forwarding-button")
                     .accessibilityLabel("Open port forwarding sheet")
 
+                    Button(action: {
+                        showTelemetry = true
+                    }) {
+                        Label("Server Telemetry", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                    }
+                    .accessibilityIdentifier("open-telemetry-button")
+                    .accessibilityLabel("Open server telemetry monitoring sheet")
+
                     Divider()
 
                     Button("Disconnect", role: .destructive) {
@@ -1295,6 +1304,7 @@ struct SessionView: View {
         .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
+        .sheet(isPresented: $showTelemetry) { ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium]) }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
         .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
@@ -3373,5 +3383,173 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+    }
+}
+
+// MARK: - Server Telemetry UI
+
+struct ServerTelemetryCard: View {
+    let telemetry: ServerTelemetry
+    var onRefresh: (() -> Void)? = nil
+
+    private var cpuPercentage: Double {
+        telemetry.cpuUsagePercentage ?? 0.0
+    }
+
+    private var cpuText: String {
+        if let cpu = telemetry.cpuUsagePercentage {
+            return String(format: "CPU: %.0f%%", cpu)
+        } else {
+            return "CPU: --%"
+        }
+    }
+
+    private var memoryBarPercentage: Double {
+        telemetry.memoryUsagePercentage ?? 0.0
+    }
+
+    private var loadText: String {
+        if let load = telemetry.loadAverage {
+            return String(format: "%.2f, %.2f, %.2f", load.0, load.1, load.2)
+        } else {
+            return "-"
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Label("Server Resources", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Spacer()
+
+                HStack(spacing: 4) {
+                    Image(systemName: "clock")
+                        .font(.caption2)
+                    Text("Up: \(telemetry.formattedUptime)")
+                        .font(.caption2.monospaced())
+                }
+                .foregroundStyle(.secondary)
+
+                if let onRefresh {
+                    Button(action: onRefresh) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Refresh telemetry")
+                    .accessibilityIdentifier("server-telemetry-refresh-button")
+                }
+            }
+
+            // CPU Gauge / Meter
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Label(cpuText, systemImage: "cpu")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    if telemetry.loadAverage != nil {
+                        Text("Load: \(loadText)")
+                            .font(.caption2.monospaced())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.2))
+                        Capsule()
+                            .fill(cpuPercentage > 85 ? Color.red : (cpuPercentage > 60 ? Color.orange : Color.accentColor))
+                            .frame(width: max(0, min(geo.size.width, geo.size.width * (cpuPercentage / 100.0))))
+                    }
+                }
+                .frame(height: 6)
+            }
+
+            // Memory Bar
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Label("RAM: \(telemetry.formattedMemory)", systemImage: "memorychip")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                }
+
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.secondary.opacity(0.2))
+                        Capsule()
+                            .fill(memoryBarPercentage > 90 ? Color.red : (memoryBarPercentage > 75 ? Color.orange : Color.accentColor))
+                            .frame(width: max(0, min(geo.size.width, geo.size.width * (memoryBarPercentage / 100.0))))
+                    }
+                }
+                .frame(height: 6)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color(uiColor: .secondarySystemBackground))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Server Telemetry: \(cpuText), RAM: \(telemetry.formattedMemory), Load: \(loadText), Uptime: \(telemetry.formattedUptime)")
+        .accessibilityIdentifier("server-telemetry-card")
+    }
+}
+
+struct ServerTelemetrySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var container: AppContainer
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 16) {
+                if let host = container.activeHost {
+                    let telemetry = container.latestTelemetry[host.id]
+                    if let telemetry {
+                        ServerTelemetryCard(telemetry: telemetry) {
+                            Task { await container.fetchTelemetry(for: host) }
+                        }
+                    } else {
+                        VStack(spacing: 12) {
+                            ProgressView()
+                            Text("Fetching server telemetry...")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 120)
+                    }
+
+                    Spacer()
+                } else {
+                    Text("No active server connection.")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            .padding()
+            .navigationTitle("Server Telemetry")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+            .task {
+                if let host = container.activeHost {
+                    container.startTelemetryPolling(for: host)
+                    await container.fetchTelemetry(for: host)
+                }
+            }
+        }
     }
 }

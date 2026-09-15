@@ -967,10 +967,30 @@ public struct CommandPolicy: Sendable {
     private static let diskCommands: Set<String> = [
         "blkdiscard", "diskutil", "fdisk", "format", "gdisk", "mkfs", "mkswap", "parted", "sfdisk", "shred", "wipefs"
     ]
+    private static let safeTelemetryScripts: Set<String> = [
+        "cat /proc/loadavg 2>/dev/null; cat /proc/meminfo 2>/dev/null; uptime 2>/dev/null",
+        "cat /proc/loadavg 2>/dev/null; cat /proc/meminfo 2>/dev/null; cat /proc/stat 2>/dev/null; uptime 2>/dev/null",
+        "uptime 2>/dev/null",
+        "cat /proc/loadavg",
+        "cat /proc/meminfo",
+        "cat /proc/stat"
+    ]
 
     public init() {}
 
+    public static func validate(_ command: String) -> CommandRisk {
+        CommandPolicy().validate(command)
+    }
+
+    public func validate(_ command: String) -> CommandRisk {
+        classify(command)
+    }
+
     public func classify(_ command: String) -> CommandRisk {
+        let trimmed = commandWithoutTrailingLineEndings(command).trimmingCharacters(in: .whitespacesAndNewlines)
+        if Self.safeTelemetryScripts.contains(trimmed) {
+            return .safe
+        }
         let lexed = ShellTokenizer.tokenize(commandWithoutTrailingLineEndings(command))
         guard lexed.isBalanced, !lexed.tokens.isEmpty else { return .reviewRequired }
 

@@ -906,4 +906,510 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
     }
 }
 
+// MARK: - Server Telemetry
+
+public struct ServerTelemetry: Codable, Hashable, Sendable, Identifiable {
+    public var id: UUID
+    public var timestamp: Date
+    public var cpuUsagePercentage: Double?
+    public var memoryUsedBytes: Int64?
+    public var memoryTotalBytes: Int64?
+    public var loadAverage: (Double, Double, Double)?
+    public var uptimeSeconds: TimeInterval?
+
+    public init(
+        id: UUID = UUID(),
+        timestamp: Date = Date(),
+        cpuUsagePercentage: Double? = nil,
+        memoryUsedBytes: Int64? = nil,
+        memoryTotalBytes: Int64? = nil,
+        loadAverage: (Double, Double, Double)? = nil,
+        uptimeSeconds: TimeInterval? = nil
+    ) {
+        self.id = id
+        self.timestamp = timestamp
+        self.cpuUsagePercentage = cpuUsagePercentage
+        self.memoryUsedBytes = memoryUsedBytes
+        self.memoryTotalBytes = memoryTotalBytes
+        self.loadAverage = loadAverage
+        self.uptimeSeconds = uptimeSeconds
+    }
+
+    public var memoryUsagePercentage: Double? {
+        guard let used = memoryUsedBytes, let total = memoryTotalBytes, total > 0 else {
+            return nil
+        }
+        return (Double(used) / Double(total)) * 100.0
+    }
+
+    public var formattedUptime: String {
+        guard let uptime = uptimeSeconds, uptime >= 0 else {
+            return "-"
+        }
+        let totalSeconds = Int(uptime)
+        let days = totalSeconds / 86400
+        let hours = (totalSeconds % 86400) / 3600
+        let minutes = (totalSeconds % 3600) / 60
+        let seconds = totalSeconds % 60
+
+        if days > 0 {
+            return "\(days)d \(hours)h"
+        } else if hours > 0 {
+            return "\(hours)h \(minutes)m"
+        } else if minutes > 0 {
+            return "\(minutes)m"
+        } else {
+            return "\(seconds)s"
+        }
+    }
+
+    public var formattedMemory: String {
+        guard let used = memoryUsedBytes, let total = memoryTotalBytes, total > 0 else {
+            return "-"
+        }
+        let usedGB = Double(used) / 1_073_741_824.0
+        let totalGB = Double(total) / 1_073_741_824.0
+        let pct = Int(round((Double(used) / Double(total)) * 100.0))
+
+        if total >= 1_073_741_824 {
+            return String(format: "%.1f / %.1f GB (%d%%)", usedGB, totalGB, pct)
+        } else {
+            let usedMB = Double(used) / 1_048_576.0
+            let totalMB = Double(total) / 1_048_576.0
+            return String(format: "%.0f / %.0f MB (%d%%)", usedMB, totalMB, pct)
+        }
+    }
+
+    public static func == (lhs: ServerTelemetry, rhs: ServerTelemetry) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.timestamp == rhs.timestamp &&
+        lhs.cpuUsagePercentage == rhs.cpuUsagePercentage &&
+        lhs.memoryUsedBytes == rhs.memoryUsedBytes &&
+        lhs.memoryTotalBytes == rhs.memoryTotalBytes &&
+        lhs.loadAverage?.0 == rhs.loadAverage?.0 &&
+        lhs.loadAverage?.1 == rhs.loadAverage?.1 &&
+        lhs.loadAverage?.2 == rhs.loadAverage?.2 &&
+        lhs.uptimeSeconds == rhs.uptimeSeconds
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+        hasher.combine(timestamp)
+        hasher.combine(cpuUsagePercentage)
+        hasher.combine(memoryUsedBytes)
+        hasher.combine(memoryTotalBytes)
+        if let load = loadAverage {
+            hasher.combine(load.0)
+            hasher.combine(load.1)
+            hasher.combine(load.2)
+        } else {
+            hasher.combine(0 as Int)
+        }
+        hasher.combine(uptimeSeconds)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case timestamp
+        case cpuUsagePercentage
+        case memoryUsedBytes
+        case memoryTotalBytes
+        case loadAverage
+        case uptimeSeconds
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(timestamp, forKey: .timestamp)
+        try container.encodeIfPresent(cpuUsagePercentage, forKey: .cpuUsagePercentage)
+        try container.encodeIfPresent(memoryUsedBytes, forKey: .memoryUsedBytes)
+        try container.encodeIfPresent(memoryTotalBytes, forKey: .memoryTotalBytes)
+        if let load = loadAverage {
+            try container.encode([load.0, load.1, load.2], forKey: .loadAverage)
+        }
+        try container.encodeIfPresent(uptimeSeconds, forKey: .uptimeSeconds)
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.id = try container.decode(UUID.self, forKey: .id)
+        self.timestamp = try container.decode(Date.self, forKey: .timestamp)
+        self.cpuUsagePercentage = try container.decodeIfPresent(Double.self, forKey: .cpuUsagePercentage)
+        self.memoryUsedBytes = try container.decodeIfPresent(Int64.self, forKey: .memoryUsedBytes)
+        self.memoryTotalBytes = try container.decodeIfPresent(Int64.self, forKey: .memoryTotalBytes)
+        if let loads = try container.decodeIfPresent([Double].self, forKey: .loadAverage), loads.count >= 3 {
+            self.loadAverage = (loads[0], loads[1], loads[2])
+        } else {
+            self.loadAverage = nil
+        }
+        self.uptimeSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .uptimeSeconds)
+    }
+}
+
+// MARK: - Server Telemetry Parser
+
+public struct ServerTelemetryParser: Sendable {
+    public init() {}
+
+    public func parse(_ rawOutput: String) -> ServerTelemetry {
+        let lines = rawOutput.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        var loadAverage: (Double, Double, Double)?
+        var memoryTotalBytes: Int64?
+        var memoryUsedBytes: Int64?
+        var cpuUsagePercentage: Double?
+        var uptimeSeconds: TimeInterval?
+
+        // 1. Parse /proc/loadavg or uptime load average
+        for line in lines {
+            if let load = parseProcLoadAvg(line) {
+                loadAverage = load
+                break
+            }
+        }
+
+        // 2. Parse /proc/meminfo
+        if let mem = parseProcMeminfo(lines) {
+            memoryTotalBytes = mem.total
+            memoryUsedBytes = mem.used
+        } else if let mem = parseMacOSVmStat(lines) {
+            memoryTotalBytes = mem.total
+            memoryUsedBytes = mem.used
+        }
+
+        // 3. Parse /proc/stat
+        for line in lines {
+            if line.hasPrefix("cpu ") || line.hasPrefix("cpu\t") {
+                if let cpu = parseProcStatLine(line) {
+                    cpuUsagePercentage = cpu
+                    break
+                }
+            }
+        }
+
+        // 4. Parse /proc/uptime or uptime command output
+        for line in lines {
+            if let uptime = parseProcUptime(line) {
+                uptimeSeconds = uptime
+                break
+            }
+            if let uptime = parseUptimeCommandLine(line) {
+                uptimeSeconds = uptime
+                // Fallback load average from uptime line if loadavg was not present
+                if loadAverage == nil, let load = parseUptimeLoadAverage(line) {
+                    loadAverage = load
+                }
+                break
+            }
+        }
+
+        // If loadavg still nil, try extracting from any line with "load average"
+        if loadAverage == nil {
+            for line in lines {
+                if let load = parseUptimeLoadAverage(line) {
+                    loadAverage = load
+                    break
+                }
+            }
+        }
+
+        return ServerTelemetry(
+            timestamp: Date(),
+            cpuUsagePercentage: cpuUsagePercentage,
+            memoryUsedBytes: memoryUsedBytes,
+            memoryTotalBytes: memoryTotalBytes,
+            loadAverage: loadAverage,
+            uptimeSeconds: uptimeSeconds
+        )
+    }
+
+    public func parseLinux(
+        loadavg: String? = nil,
+        meminfo: String? = nil,
+        stat: String? = nil,
+        uptime: String? = nil
+    ) -> ServerTelemetry {
+        var combined = ""
+        if let loadavg { combined += loadavg + "\n" }
+        if let meminfo { combined += meminfo + "\n" }
+        if let stat { combined += stat + "\n" }
+        if let uptime { combined += uptime + "\n" }
+        return parse(combined)
+    }
+
+    public func parseMacOS(
+        vmStat: String? = nil,
+        uptime: String? = nil
+    ) -> ServerTelemetry {
+        var combined = ""
+        if let vmStat { combined += vmStat + "\n" }
+        if let uptime { combined += uptime + "\n" }
+        return parse(combined)
+    }
+
+    // MARK: - Linux /proc Parsers
+
+    private func parseProcLoadAvg(_ line: String) -> (Double, Double, Double)? {
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count >= 3 else { return nil }
+        guard let l1 = Double(tokens[0]), let l2 = Double(tokens[1]), let l3 = Double(tokens[2]) else {
+            return nil
+        }
+        // Additional validation: 4th token in /proc/loadavg is typically thread count like "1/234"
+        if tokens.count >= 4 && tokens[3].contains("/") {
+            return (l1, l2, l3)
+        }
+        // If exact 3 or 5 tokens of numbers
+        if tokens.count == 3 || tokens.count == 5 {
+            return (l1, l2, l3)
+        }
+        return nil
+    }
+
+    private func parseProcMeminfo(_ lines: [String]) -> (total: Int64, used: Int64)? {
+        var memTotalKB: Int64?
+        var memFreeKB: Int64?
+        var memAvailableKB: Int64?
+        var buffersKB: Int64?
+        var cachedKB: Int64?
+
+        for line in lines {
+            let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2 else { continue }
+            let key = parts[0]
+            let valueTokens = parts[1].split(whereSeparator: \.isWhitespace)
+            guard let first = valueTokens.first, let value = Int64(first) else { continue }
+
+            switch key {
+            case "MemTotal":
+                memTotalKB = value
+            case "MemFree":
+                memFreeKB = value
+            case "MemAvailable":
+                memAvailableKB = value
+            case "Buffers":
+                buffersKB = value
+            case "Cached":
+                cachedKB = value
+            default:
+                break
+            }
+        }
+
+        guard let totalKB = memTotalKB, totalKB > 0 else { return nil }
+        let totalBytes = totalKB * 1024
+
+        let availableKB: Int64
+        if let avail = memAvailableKB {
+            availableKB = avail
+        } else if let free = memFreeKB {
+            availableKB = free + (buffersKB ?? 0) + (cachedKB ?? 0)
+        } else {
+            availableKB = 0
+        }
+
+        let usedBytes = max(0, totalBytes - (availableKB * 1024))
+        return (total: totalBytes, used: usedBytes)
+    }
+
+    private func parseProcStatLine(_ line: String) -> Double? {
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count >= 5, tokens[0] == "cpu" else { return nil }
+        // Format: cpu  user nice system idle iowait irq softirq steal guest guest_nice
+        let values = tokens.dropFirst().compactMap { Double($0) }
+        guard values.count >= 4 else { return nil }
+
+        let user = values[0]
+        let nice = values[1]
+        let system = values[2]
+        let idle = values[3]
+        let iowait = values.count > 4 ? values[4] : 0.0
+        let irq = values.count > 5 ? values[5] : 0.0
+        let softirq = values.count > 6 ? values[6] : 0.0
+        let steal = values.count > 7 ? values[7] : 0.0
+
+        let busyTime = user + nice + system + irq + softirq + steal
+        let idleTime = idle + iowait
+        let totalTime = busyTime + idleTime
+
+        guard totalTime > 0 else { return nil }
+        let usage = (busyTime / totalTime) * 100.0
+        return max(0.0, min(100.0, usage))
+    }
+
+    private func parseProcUptime(_ line: String) -> TimeInterval? {
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard tokens.count == 2, let uptime = Double(tokens[0]), let _ = Double(tokens[1]) else {
+            return nil
+        }
+        return uptime >= 0 ? uptime : nil
+    }
+
+    // MARK: - macOS / BSD vm_stat Parser
+
+    private func parseMacOSVmStat(_ lines: [String]) -> (total: Int64, used: Int64)? {
+        var pageSize: Int64 = 4096
+        var pagesFree: Int64?
+        var pagesActive: Int64?
+        var pagesInactive: Int64?
+        var pagesSpeculative: Int64?
+        var pagesWired: Int64?
+        var pagesCompressor: Int64?
+
+        var isVmStat = false
+
+        for line in lines {
+            if line.contains("Mach Virtual Memory Statistics") {
+                isVmStat = true
+                if let sizeRange = line.range(of: "page size of ") {
+                    let rest = line[sizeRange.upperBound...]
+                    let digits = rest.prefix(while: \.isNumber)
+                    if let size = Int64(digits), size > 0 {
+                        pageSize = size
+                    }
+                }
+                continue
+            }
+
+            let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2 else { continue }
+            let key = parts[0].replacingOccurrences(of: "\"", with: "")
+            let valStr = parts[1].trimmingCharacters(in: CharacterSet(charactersIn: ". \t"))
+            guard let val = Int64(valStr) else { continue }
+
+            switch key {
+            case "Pages free":
+                pagesFree = val
+                isVmStat = true
+            case "Pages active":
+                pagesActive = val
+                isVmStat = true
+            case "Pages inactive":
+                pagesInactive = val
+                isVmStat = true
+            case "Pages speculative":
+                pagesSpeculative = val
+            case "Pages wired down":
+                pagesWired = val
+            case "Pages occupied by compressor":
+                pagesCompressor = val
+            default:
+                break
+            }
+        }
+
+        guard isVmStat else { return nil }
+        let free = (pagesFree ?? 0) + (pagesSpeculative ?? 0)
+        let active = pagesActive ?? 0
+        let inactive = pagesInactive ?? 0
+        let wired = pagesWired ?? 0
+        let compressed = pagesCompressor ?? 0
+
+        let totalPages = free + active + inactive + wired + compressed
+        guard totalPages > 0 else { return nil }
+
+        let totalBytes = totalPages * pageSize
+        let usedPages = active + wired + compressed
+        let usedBytes = usedPages * pageSize
+        return (total: totalBytes, used: usedBytes)
+    }
+
+    // MARK: - Uptime Command Line Parser
+
+    private func parseUptimeCommandLine(_ line: String) -> TimeInterval? {
+        guard let upRange = line.range(of: " up ") else { return nil }
+        let afterUp = String(line[upRange.upperBound...])
+
+        // The uptime section ends before ", X user"
+        var uptimeStr = afterUp
+        if let userRange = afterUp.range(of: " user") {
+            let beforeUser = String(afterUp[..<userRange.lowerBound])
+            if let lastComma = beforeUser.lastIndex(of: ",") {
+                uptimeStr = String(beforeUser[..<lastComma]).trimmingCharacters(in: .whitespaces)
+            } else {
+                uptimeStr = beforeUser.trimmingCharacters(in: .whitespaces)
+            }
+        } else if let comma = afterUp.firstIndex(of: ",") {
+            uptimeStr = String(afterUp[..<comma]).trimmingCharacters(in: .whitespaces)
+        }
+
+        return parseUptimeDurationString(uptimeStr)
+    }
+
+    private func parseUptimeDurationString(_ str: String) -> TimeInterval? {
+        let cleaned = str.trimmingCharacters(in: .whitespaces)
+        guard !cleaned.isEmpty else { return nil }
+
+        var totalSeconds: TimeInterval = 0
+        var matched = false
+
+        // Check if string contains comma-separated chunks like "3 days, 4:15" or "10 days, 23 min"
+        let parts = cleaned.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+
+        for part in parts {
+            if part.contains("day") {
+                let digits = part.prefix(while: \.isNumber)
+                if let days = Double(digits) {
+                    totalSeconds += days * 86400
+                    matched = true
+                }
+            } else if part.contains("min") {
+                let digits = part.prefix(while: \.isNumber)
+                if let mins = Double(digits) {
+                    totalSeconds += mins * 60
+                    matched = true
+                }
+            } else if part.contains("hr") || part.contains("hour") {
+                let digits = part.prefix(while: \.isNumber)
+                if let hrs = Double(digits) {
+                    totalSeconds += hrs * 3600
+                    matched = true
+                }
+            } else if part.contains("sec") {
+                let digits = part.prefix(while: \.isNumber)
+                if let secs = Double(digits) {
+                    totalSeconds += secs
+                    matched = true
+                }
+            } else if part.contains(":") {
+                // Time format HH:MM
+                let timeParts = part.split(separator: ":").map(String.init)
+                if timeParts.count == 2, let h = Double(timeParts[0]), let m = Double(timeParts[1]) {
+                    totalSeconds += (h * 3600) + (m * 60)
+                    matched = true
+                } else if timeParts.count == 3, let h = Double(timeParts[0]), let m = Double(timeParts[1]), let s = Double(timeParts[2]) {
+                    totalSeconds += (h * 3600) + (m * 60) + s
+                    matched = true
+                }
+            } else if let num = Double(part) {
+                // Plain seconds or minutes fallback
+                totalSeconds += num
+                matched = true
+            }
+        }
+
+        return matched ? totalSeconds : nil
+    }
+
+    private func parseUptimeLoadAverage(_ line: String) -> (Double, Double, Double)? {
+        let markers = ["load averages:", "load average:", "load:"]
+        for marker in markers {
+            if let range = line.range(of: marker, options: .caseInsensitive) {
+                let after = String(line[range.upperBound...])
+                let tokens = after
+                    .replacingOccurrences(of: ",", with: " ")
+                    .split(whereSeparator: \.isWhitespace)
+                    .compactMap { Double($0) }
+                if tokens.count >= 3 {
+                    return (tokens[0], tokens[1], tokens[2])
+                }
+            }
+        }
+        return nil
+    }
+}
+
 

@@ -14,6 +14,12 @@ public struct SSHCommandResult: Equatable, Hashable, Sendable, Codable {
     }
 
     public var isSuccess: Bool { exitCode == 0 }
+
+    public var output: String {
+        if stdout.isEmpty { return stderr }
+        if stderr.isEmpty { return stdout }
+        return stdout + "\n" + stderr
+    }
 }
 
 public typealias RemoteCommandResult = SSHCommandResult
