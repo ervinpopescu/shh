@@ -322,6 +322,7 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
             SwiftTerm.Color(red8: UInt16(color.red), green8: UInt16(color.green), blue8: UInt16(color.blue))
         })
         backgroundColor = UIColor(terminalColor: palette.background)
+        setNeedsDisplay()
     }
 
     func setFontSize(_ pointSize: Double) {

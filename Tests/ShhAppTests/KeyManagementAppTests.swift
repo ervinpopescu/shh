@@ -34,6 +34,26 @@ final class KeyManagementAppTests: XCTestCase {
         XCTAssertTrue(pubKey?.hasPrefix("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5") == true)
     }
 
+    func testIdentityDetailViewDoesNotTriggerModalErrorWhenKeyMissing() async throws {
+        let container = AppContainer.demo()
+        let missingIdentity = IdentityDescriptor(
+            id: UUID(),
+            name: "Orphaned Key",
+            kind: .privateKey,
+            storageRef: "non-existent-ref",
+            createdAt: Date(),
+            updatedAt: Date()
+        )
+
+        let view = IdentityDetailView(identity: missingIdentity).environmentObject(container)
+        let hostingController = UIHostingController(rootView: view)
+        hostingController.loadViewIfNeeded()
+
+        XCTAssertNotNil(hostingController.view)
+        let pubKey = try? await container.openSSHPublicKey(for: missingIdentity)
+        XCTAssertNil(pubKey)
+    }
+
     func testIdentityEditorViewGenerateMode() async throws {
         let container = AppContainer.demo()
         var createdIdentity: IdentityDescriptor?
