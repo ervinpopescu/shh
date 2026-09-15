@@ -2131,6 +2131,31 @@ struct TerminalAccessoryBar: View {
                     sendKey(.ctrlD)
                 }
 
+                // Symbols (~, /, |, -)
+                AccessoryKeyButton(title: "~") {
+                    sendText("~")
+                }
+                .accessibilityLabel("Tilde")
+                .accessibilityIdentifier("terminal-accessory-tilde-button")
+
+                AccessoryKeyButton(title: "/") {
+                    sendText("/")
+                }
+                .accessibilityLabel("Slash")
+                .accessibilityIdentifier("terminal-accessory-slash-button")
+
+                AccessoryKeyButton(title: "|") {
+                    sendText("|")
+                }
+                .accessibilityLabel("Pipe")
+                .accessibilityIdentifier("terminal-accessory-pipe-button")
+
+                AccessoryKeyButton(title: "-") {
+                    sendText("-")
+                }
+                .accessibilityLabel("Minus")
+                .accessibilityIdentifier("terminal-accessory-minus-button")
+
                 // Arrow keys
                 HStack(spacing: 3) {
                     AccessoryIconButton(systemImage: "arrow.left") {
@@ -2182,6 +2207,13 @@ struct TerminalAccessoryBar: View {
                         .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
                         .contentShape(Rectangle())
                 }
+
+                // Dismiss Keyboard
+                AccessoryIconButton(systemImage: "keyboard.chevron.compact.down") {
+                    _ = controller.resignFirstResponder()
+                }
+                .accessibilityLabel("Dismiss keyboard")
+                .accessibilityIdentifier("terminal-accessory-dismiss-keyboard-button")
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
@@ -2201,6 +2233,13 @@ struct TerminalAccessoryBar: View {
             controller.send(raw: data)
         }
         isCtrlActive = false
+    }
+
+    private func sendText(_ text: String) {
+        controller.send(text: text)
+        if isCtrlActive { isCtrlActive = false }
+        if isAltActive { isAltActive = false }
+        if isShiftActive { isShiftActive = false }
     }
 }
 

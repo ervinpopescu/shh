@@ -145,6 +145,7 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
         super.init(frame: frame, font: nil, options: options)
+        self.inputAccessoryView = nil
         setupTapGesture()
     }
 

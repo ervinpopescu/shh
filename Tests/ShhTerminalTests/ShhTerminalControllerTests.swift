@@ -589,6 +589,7 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertTrue(controller.persistentHostView === hostView)
         XCTAssertTrue(controller.attachedBridge === hostView)
         XCTAssertTrue(hostView.controller === controller)
+        XCTAssertNil(hostView.inputAccessoryView, "hostView inputAccessoryView must be nil to prevent SwiftTerm accessory view")
 
         // 2. Initial visible byte delivery
         controller.feed(Data("Initial visible output\r\n".utf8))
