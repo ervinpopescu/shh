@@ -1425,24 +1425,28 @@ struct SessionView: View {
 
     @ViewBuilder
     private var terminalSurfaceArea: some View {
-        if container.useLegacyTerminalFallback {
-            ScrollView {
-                Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-                    .padding()
-            }
-            .background(Color.black)
-            .foregroundStyle(Color.green)
-            .accessibilityLabel("Fallback terminal output")
-            .accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
-        } else {
-            ShhTerminalView(controller: container.terminalController)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        VStack(spacing: 0) {
+            TerminalZoomControls(controller: container.terminalController)
+
+            if container.useLegacyTerminalFallback {
+                ScrollView {
+                    Text(container.terminalText.isEmpty ? "Terminal output" : container.terminalText)
+                        .font(.system(size: container.terminalController.terminalFontSize, design: .monospaced))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding()
+                }
                 .background(Color.black)
-                .accessibilityElement(children: .contain)
-                .accessibilityLabel("Terminal surface")
+                .foregroundStyle(Color.green)
+                .accessibilityLabel("Fallback terminal output")
+                .accessibilityValue(Text(container.terminalText.isEmpty ? "No terminal output" : container.terminalText))
+            } else {
+                ShhTerminalView(controller: container.terminalController)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .background(Color.black)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("Terminal surface")
+            }
         }
     }
 
@@ -1523,6 +1527,53 @@ struct SessionView: View {
         case .blocked:
             blockedCommand = value
         }
+    }
+}
+
+struct TerminalZoomControls: View {
+    @ObservedObject var controller: ShhTerminalController
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Button {
+                controller.decreaseTerminalFontSize()
+            } label: {
+                Image(systemName: "minus")
+                    .frame(minWidth: 32, minHeight: 32)
+            }
+            .accessibilityLabel("Decrease terminal text size")
+            .accessibilityIdentifier("terminal-zoom-decrease")
+            .disabled(controller.terminalFontSize <= TerminalFontSize.minimumPointSize)
+
+            Button {
+                controller.resetTerminalFontSize()
+            } label: {
+                Text("\(controller.terminalFontSizePercentage)%")
+                    .monospacedDigit()
+                    .frame(minWidth: 56, minHeight: 32)
+            }
+            .accessibilityLabel("Reset terminal text size")
+            .accessibilityValue("\(controller.terminalFontSizePercentage) percent")
+            .accessibilityIdentifier("terminal-zoom-reset")
+
+            Button {
+                controller.increaseTerminalFontSize()
+            } label: {
+                Image(systemName: "plus")
+                    .frame(minWidth: 32, minHeight: 32)
+            }
+            .accessibilityLabel("Increase terminal text size")
+            .accessibilityIdentifier("terminal-zoom-increase")
+            .disabled(controller.terminalFontSize >= TerminalFontSize.maximumPointSize)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(.secondarySystemBackground))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("terminal-zoom-controls")
     }
 }
 

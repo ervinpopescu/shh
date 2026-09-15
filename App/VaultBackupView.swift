@@ -280,7 +280,11 @@ struct VaultBackupView: View {
 
         Task {
             do {
-                try await container.restoreCatalog(from: payload.catalog, mode: mode)
+                try await container.restoreCatalog(
+                    from: payload.catalog,
+                    mode: mode,
+                    preferences: payload.preferences
+                )
                 let modeName = mode == .merge ? "merged" : "replaced"
                 self.importSuccessMessage = "Successfully \(modeName) catalog (\(payload.catalog.hosts.count) hosts restored)."
                 self.showImportModal = false

@@ -126,9 +126,10 @@ public struct ShhTerminalView: UIViewRepresentable {
     }
 }
 
-public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBridge, TerminalFirstResponderBridge {
+public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBridge, TerminalFirstResponderBridge, UIGestureRecognizerDelegate {
     weak var controller: ShhTerminalController?
     private var lastAppliedBoundsSize: CGSize = .zero
+    private var pinchBasePointSize: Double?
 
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
@@ -144,12 +145,40 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap))
         tap.cancelsTouchesInView = false
         addGestureRecognizer(tap)
+
+        let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
+        pinch.cancelsTouchesInView = false
+        pinch.delegate = self
+        addGestureRecognizer(pinch)
     }
 
     @objc private func handleTap() {
         if !isFirstResponder {
             _ = becomeFirstResponder()
         }
+    }
+
+    @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+        switch recognizer.state {
+        case .began:
+            pinchBasePointSize = controller?.terminalFontSize
+        case .changed:
+            guard let controller else { return }
+            controller.applyPinch(scale: recognizer.scale, basePointSize: pinchBasePointSize)
+        case .ended, .cancelled, .failed:
+            pinchBasePointSize = nil
+        default:
+            break
+        }
+    }
+
+    public func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        // Pinch must not steal scrolling, selection, keyboard cursor movement, or
+        // SwiftTerm's own touch handling.
+        true
     }
 
     public override func layoutSubviews() {
@@ -206,6 +235,43 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         }
     }
 
+    // MARK: - Hardware keyboard zoom
+
+    public override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        var handledPress: UIPress?
+        for press in presses {
+            guard let key = press.key,
+                  key.modifierFlags.contains(.command) else { continue }
+            let shortcut: TerminalZoomShortcut?
+            switch key.charactersIgnoringModifiers {
+            case "+", "=":
+                shortcut = .increase
+            case "-", "_":
+                shortcut = .decrease
+            case "0":
+                shortcut = .reset
+            default:
+                shortcut = nil
+            }
+            if let shortcut {
+                _ = controller?.handleZoomShortcut(shortcut)
+                handledPress = press
+                break
+            }
+        }
+
+        // Pass every non-zoom key through to SwiftTerm, including a mixed press
+        // set, so terminal input is never silently discarded.
+        if let handledPress {
+            let passthrough = Set(presses.filter { $0 !== handledPress })
+            if !passthrough.isEmpty {
+                super.pressesBegan(passthrough, with: event)
+            }
+        } else {
+            super.pressesBegan(presses, with: event)
+        }
+    }
+
     // MARK: - TerminalEngineBridge
 
     var bracketedPasteMode: Bool {
@@ -231,6 +297,16 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     func changeScrollback(_ limit: Int) {
         getTerminal().changeScrollback(limit)
+    }
+
+    func setFontSize(_ pointSize: Double) {
+        font = UIFont.monospacedSystemFont(ofSize: CGFloat(pointSize), weight: .regular)
+        setNeedsLayout()
+    }
+
+    func recalculateSize() {
+        setNeedsLayout()
+        layoutIfNeeded()
     }
 
     func findNext(_ term: String) -> Bool {
