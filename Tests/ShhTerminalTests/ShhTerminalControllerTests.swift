@@ -457,8 +457,16 @@ final class ShhTerminalControllerTests: XCTestCase {
             func currentTranscript(limit: Int) -> String { "" }
         }
 
+        final class MemoryFontSizeStore: TerminalFontSizeStore {
+            func load() -> Double? { nil }
+            func save(_ pointSize: Double) {}
+        }
+
         let config = ShhTerminalConfiguration(resizeDebounceInterval: 0.01)
-        let controller = ShhTerminalController(configuration: config)
+        let controller = ShhTerminalController(
+            configuration: config,
+            fontSizeStore: MemoryFontSizeStore()
+        )
         let engine = MockEngine()
         controller.attachEngine(engine, firstResponder: nil)
 
