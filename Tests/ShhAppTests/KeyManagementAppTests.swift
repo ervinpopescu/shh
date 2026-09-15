@@ -36,13 +36,11 @@ final class KeyManagementAppTests: XCTestCase {
 
     func testIdentityDetailViewDoesNotTriggerModalErrorWhenKeyMissing() async throws {
         let container = AppContainer.demo()
-        let missingIdentity = IdentityDescriptor(
+        let missingIdentity = try IdentityDescriptor(
             id: UUID(),
             name: "Orphaned Key",
             kind: .privateKey,
-            storageRef: "non-existent-ref",
-            createdAt: Date(),
-            updatedAt: Date()
+            keychainReference: "non-existent-ref"
         )
 
         let view = IdentityDetailView(identity: missingIdentity).environmentObject(container)
