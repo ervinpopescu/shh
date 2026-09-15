@@ -9,6 +9,77 @@ import FileProvider
 @MainActor
 final class FileProviderAppTests: XCTestCase {
 
+    private func isolatedPersistenceHelper() throws -> (FileProviderManagerHelper, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShhPersistenceTest_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return (FileProviderManagerHelper(containerURL: nil, localContainerURL: root), root)
+    }
+
+    func testAppGroupUnavailableLoadsLocalFallback() async throws {
+        let (helper, root) = try isolatedPersistenceHelper()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let host = try Host(name: "Recovered Host", hostname: "recovered.invalid", username: "user")
+        try helper.syncLocalState(snapshot: CatalogSnapshot(hosts: [host]))
+
+        XCTAssertFalse(helper.isSharedContainerAvailable)
+        let result = helper.loadCatalogSnapshot()
+        XCTAssertEqual(result.state, .valid)
+        XCTAssertEqual(result.snapshot?.hosts.map(\.id), [host.id])
+    }
+
+    func testInvalidPersistedCatalogIsNotOverwrittenByStartup() async throws {
+        let (helper, root) = try isolatedPersistenceHelper()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let snapshotURL = root.appendingPathComponent("catalogs/snapshot.json")
+        try FileManager.default.createDirectory(at: snapshotURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let original = Data("not a catalog".utf8)
+        try original.write(to: snapshotURL)
+
+        _ = AppContainer(transport: LiveSSHTransport(), fileProviderHelper: helper)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(try Data(contentsOf: snapshotURL), original)
+    }
+
+    func testProductionConstructionDoesNotSeedDemoCatalog() async throws {
+        let (helper, root) = try isolatedPersistenceHelper()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let container = AppContainer(transport: DemoSSHTransport(), fileProviderHelper: helper)
+        let hosts = try await container.catalog.listHosts()
+        XCTAssertTrue(hosts.isEmpty, "Only AppContainer.demo may seed Demo Workbox")
+    }
+
+    func testCandidateSnapshotRoundTripsWithoutCredentialMaterial() async throws {
+        let identity = try IdentityDescriptor(name: "Recovered identity", kind: .privateKey, keychainReference: "opaque-reference")
+        let host = try Host(name: "Hetzner", hostname: "recovered.invalid", username: "user", identityID: identity.id)
+        let record = TrustRecord(hostname: host.hostname, port: host.port, keyAlgorithm: "ssh-ed25519", sha256Fingerprint: "SHA256:redacted-test")
+        let snapshot = CatalogSnapshot(hosts: [host], identities: [identity])
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(CatalogSnapshot.self, from: encoder.encode(snapshot))
+        XCTAssertEqual(decoded.hosts.first?.name.lowercased(), "hetzner")
+        XCTAssertEqual(decoded.identities.first?.keychainReference, "opaque-reference")
+        XCTAssertEqual(record.lookupKey, "recovered.invalid:22:ssh-ed25519")
+
+        let mergedCatalog = InMemoryCatalog(snapshot: CatalogSnapshot())
+        await mergedCatalog.merge(with: decoded)
+        XCTAssertEqual(try await mergedCatalog.listHosts().map(\.id), [host.id])
+        XCTAssertEqual(try await mergedCatalog.identities().map(\.id), [identity.id])
+        let mergedTrust = InMemoryTrustStore(records: [record])
+        XCTAssertEqual((await mergedTrust.allRecords()).count, 1)
+    }
+
+    func testHostRemainsWhenReferencedCredentialIsMissing() async throws {
+        let identity = try IdentityDescriptor(name: "Missing identity", kind: .privateKey, keychainReference: "missing-reference")
+        let host = try Host(name: "Preserved Host", hostname: "preserved.invalid", username: "user", identityID: identity.id)
+        let catalog = InMemoryCatalog(snapshot: CatalogSnapshot(hosts: [host], identities: [identity]))
+        let container = AppContainer(catalog: catalog, credentialStore: InMemoryCredentialStore(), transport: DemoSSHTransport())
+        let hosts = try await container.catalog.listHosts()
+        XCTAssertEqual(hosts.map(\.id), [host.id])
+        XCTAssertEqual(try await container.catalog.identities().map(\.id), [identity.id])
+    }
+
     func testVaultBackupAndRestoreFromAppContainerCatalog() async throws {
         let repo = DemoSFTPRepository(seedDemoData: true)
         let container = AppContainer.demo(sftpRepository: repo)
