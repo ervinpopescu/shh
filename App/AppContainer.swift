@@ -1275,8 +1275,8 @@ final class AppContainer: ObservableObject {
         }
         guard host.autoAttachTmux,
               let metadata = try? await restorationStore.load(),
-              metadata?.hostID == host.id,
-              let target = metadata?.tmuxSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
+              metadata.hostID == host.id,
+              let target = metadata.tmuxSessionID?.trimmingCharacters(in: .whitespacesAndNewlines),
               !target.isEmpty else {
             return nil
         }
