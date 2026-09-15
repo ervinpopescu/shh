@@ -4,6 +4,24 @@ import XCTest
 import ShhCore
 import ShhTerminal
 
+private actor LifecycleGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
+    }
+}
+
 @MainActor
 final class RestorationAndReachabilityTests: XCTestCase {
 
@@ -331,6 +349,86 @@ final class RestorationAndReachabilityTests: XCTestCase {
 
         // No new connection attempt must have occurred
         XCTAssertEqual(connectCount, 1, "Explicit disconnect must prevent automatic reconnect triggers")
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+    }
+
+    func testAppContainerBackgroundForegroundReconnectsAndReattachesSafeTarget() async throws {
+        let firstConnection = MockSSHConnection()
+        let secondConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return connectCount == 1 ? firstConnection : secondConnection
+        }
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(
+            name: "Lifecycle Host",
+            hostname: "lifecycle.invalid",
+            username: "dev",
+            defaultTmuxSession: "$0"
+        )
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.activeTmuxSessionID, "$0")
+
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(firstConnection.isClosed)
+        let storedMetadata = await store.load()
+        let metadata = try XCTUnwrap(storedMetadata)
+        XCTAssertEqual(metadata.hostID, host.id)
+        XCTAssertEqual(metadata.tmuxSessionID, "$0")
+
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue(
+            secondConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
+                .contains { $0.contains("attach-session") && $0.contains("'$0'") }
+        )
+    }
+
+    func testStaleForegroundReconnectCannotRestoreAfterExplicitDisconnect() async throws {
+        let gate = LifecycleGate()
+        let firstConnection = MockSSHConnection()
+        let lateConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            if connectCount == 1 { return firstConnection }
+            await gate.wait()
+            return lateConnection
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Stale Host", hostname: "stale.invalid", username: "dev")
+
+        await container.connect(to: host)
+        container.handleScenePhaseChange(.background)
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        await container.disconnect()
+        await gate.open()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(connectCount, 2)
+        XCTAssertTrue(lateConnection.isClosed)
         XCTAssertEqual(container.activeSession?.state, .disconnected)
     }
 
