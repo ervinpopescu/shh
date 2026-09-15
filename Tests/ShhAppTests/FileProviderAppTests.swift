@@ -64,10 +64,13 @@ final class FileProviderAppTests: XCTestCase {
 
         let mergedCatalog = InMemoryCatalog(snapshot: CatalogSnapshot())
         await mergedCatalog.merge(with: decoded)
-        XCTAssertEqual(try await mergedCatalog.listHosts().map(\.id), [host.id])
-        XCTAssertEqual(try await mergedCatalog.identities().map(\.id), [identity.id])
+        let mergedHostIDs = try await mergedCatalog.listHosts().map(\.id)
+        let mergedIdentityIDs = try await mergedCatalog.identities().map(\.id)
+        XCTAssertEqual(mergedHostIDs, [host.id])
+        XCTAssertEqual(mergedIdentityIDs, [identity.id])
         let mergedTrust = InMemoryTrustStore(records: [record])
-        XCTAssertEqual((await mergedTrust.allRecords()).count, 1)
+        let mergedTrustRecords = await mergedTrust.allRecords()
+        XCTAssertEqual(mergedTrustRecords.count, 1)
     }
 
     func testHostRemainsWhenReferencedCredentialIsMissing() async throws {
@@ -77,7 +80,8 @@ final class FileProviderAppTests: XCTestCase {
         let container = AppContainer(catalog: catalog, credentialStore: InMemoryCredentialStore(), transport: DemoSSHTransport())
         let hosts = try await container.catalog.listHosts()
         XCTAssertEqual(hosts.map(\.id), [host.id])
-        XCTAssertEqual(try await container.catalog.identities().map(\.id), [identity.id])
+        let identityIDs = try await container.catalog.identities().map(\.id)
+        XCTAssertEqual(identityIDs, [identity.id])
     }
 
     func testVaultBackupAndRestoreFromAppContainerCatalog() async throws {
