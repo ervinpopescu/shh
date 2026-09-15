@@ -3199,29 +3199,6 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("terminal-theme-navigation-link")
 
-                HStack {
-                    Text("Quick Theme")
-                    Spacer()
-                    Menu {
-                        Picker("Terminal Theme", selection: Binding(
-                            get: { container.terminalTheme },
-                            set: { container.setTerminalTheme($0) }
-                        )) {
-                            ForEach(TerminalThemePreset.allCases) { theme in
-                                Text(theme.displayName).tag(theme)
-                            }
-                        }
-                    } label: {
-                        HStack(spacing: 6) {
-                            Text(container.terminalTheme.displayName)
-                            Image(systemName: "chevron.up.chevron.down")
-                                .font(.caption2)
-                        }
-                    }
-                    .buttonStyle(.bordered)
-                    .accessibilityIdentifier("terminal-theme-picker")
-                }
-
                 TerminalThemePreview(theme: container.terminalTheme)
                     .accessibilityElement(children: .combine)
                     .accessibilityLabel("Terminal theme preview")
