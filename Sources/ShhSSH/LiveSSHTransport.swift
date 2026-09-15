@@ -5,6 +5,12 @@ import NIOPosix
 @preconcurrency import NIOSSH
 import ShhCore
 
+#if swift(>=6.0)
+extension NIOSSHHandler: @retroactive @unchecked Sendable {}
+#else
+extension NIOSSHHandler: @unchecked Sendable {}
+#endif
+
 final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @unchecked Sendable {
     enum Credential: Sendable {
         case password(String)
@@ -473,7 +479,9 @@ public struct LiveSSHTransport: SSHTransport {
                         return inboundRouter.handle(childChannel: childChannel, type: channelType)
                     }
                 )
-                return channel.pipeline.addHandlers([sshHandler, handshakeHandler])
+                return channel.pipeline.addHandler(sshHandler).flatMap {
+                    channel.pipeline.addHandler(handshakeHandler)
+                }
             }
 
             let channel = try await withTaskCancellationHandler {
@@ -658,7 +666,9 @@ public struct LiveSSHTransport: SSHTransport {
                     allocator: channel.allocator,
                     inboundChildChannelInitializer: nil
                 )
-                return channel.pipeline.addHandlers([sshHandler, b1HandshakeHandler])
+                return channel.pipeline.addHandler(sshHandler).flatMap {
+                    channel.pipeline.addHandler(b1HandshakeHandler)
+                }
             }
 
             let b1Channel = try await withTaskCancellationHandler {
@@ -745,7 +755,11 @@ public struct LiveSSHTransport: SSHTransport {
                                     allocator: childChannel.allocator,
                                     inboundChildChannelInitializer: nil
                                 )
-                                return childChannel.pipeline.addHandlers([codec, nestedSSHHandler, hopHandshakeHandler])
+                                return childChannel.pipeline.addHandler(codec).flatMap {
+                                    childChannel.pipeline.addHandler(nestedSSHHandler)
+                                }.flatMap {
+                                    childChannel.pipeline.addHandler(hopHandshakeHandler)
+                                }
                             }
                             return childPromise.futureResult
                         }
@@ -834,7 +848,11 @@ public struct LiveSSHTransport: SSHTransport {
                                 return targetInboundRouter.handle(childChannel: child, type: type)
                             }
                         )
-                        return childChannel.pipeline.addHandlers([codec, nestedSSHHandler, targetHandshakeHandler])
+                        return childChannel.pipeline.addHandler(codec).flatMap {
+                            childChannel.pipeline.addHandler(nestedSSHHandler)
+                        }.flatMap {
+                            childChannel.pipeline.addHandler(targetHandshakeHandler)
+                        }
                     }
                     return childPromise.futureResult
                 }

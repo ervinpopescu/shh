@@ -62,15 +62,28 @@ public final class SystemAudioSessionManager: AudioSessionManaging, @unchecked S
 
     public var recordPermission: AudioRecordPermission {
         #if os(iOS)
-        switch AVAudioSession.sharedInstance().recordPermission {
-        case .granted:
-            return .granted
-        case .denied:
-            return .denied
-        case .undetermined:
-            return .undetermined
-        @unknown default:
-            return .undetermined
+        if #available(iOS 17.0, *) {
+            switch AVAudioApplication.shared.recordPermission {
+            case .granted:
+                return .granted
+            case .denied:
+                return .denied
+            case .undetermined:
+                return .undetermined
+            @unknown default:
+                return .undetermined
+            }
+        } else {
+            switch AVAudioSession.sharedInstance().recordPermission {
+            case .granted:
+                return .granted
+            case .denied:
+                return .denied
+            case .undetermined:
+                return .undetermined
+            @unknown default:
+                return .undetermined
+            }
         }
         #else
         return .granted
