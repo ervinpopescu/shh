@@ -323,7 +323,7 @@ struct IdentityDetailView: View {
                 publicKeyText = pubKey
             }
         } catch {
-            errorMessage = error.localizedDescription
+            // Keep inline warning in the view without presenting a blocking modal alert.
         }
     }
 

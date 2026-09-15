@@ -1383,6 +1383,19 @@ struct SessionView: View {
 
                 Divider()
 
+                Menu {
+                    Picker("Terminal Theme", selection: Binding(
+                        get: { container.terminalTheme },
+                        set: { container.setTerminalTheme($0) }
+                    )) {
+                        ForEach(TerminalThemePreset.allCases) { theme in
+                            Text(theme.displayName).tag(theme)
+                        }
+                    }
+                } label: {
+                    Label("Terminal Theme", systemImage: "paintpalette")
+                }
+
                 Button(action: {
                     showMultiplexer = true
                 }) {
@@ -3135,6 +3148,7 @@ struct SettingsView: View {
                         Text(appearance.displayName).tag(appearance)
                     }
                 }
+                .pickerStyle(.menu)
                 .accessibilityIdentifier("appearance-picker")
 
                 Picker("Terminal theme", selection: Binding(
@@ -3145,6 +3159,7 @@ struct SettingsView: View {
                         Text(theme.displayName).tag(theme)
                     }
                 }
+                .pickerStyle(.menu)
                 .accessibilityIdentifier("terminal-theme-picker")
 
                 TerminalThemePreview(theme: container.terminalTheme)
