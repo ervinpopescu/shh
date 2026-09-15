@@ -324,4 +324,69 @@ final class WhisperModelManagerTests: XCTestCase {
             XCTAssertEqual(m.state, .notInstalled)
         }
     }
+
+    // MARK: - Directory Resolution Tests
+
+    func testResolvedModelDirectoryFindsHuggingFaceAndDirectModels() async throws {
+        let manager = WhisperModelManager(
+            modelsDirectory: tempModelsDir,
+            deviceChecker: MockDeviceChecker(),
+            downloader: MockModelDownloader()
+        )
+
+        // 1. Initially neither exists: should return direct path as default
+        let defaultURL = await manager.resolvedModelDirectory(for: .small)
+        let expectedDirect = tempModelsDir.appendingPathComponent(WhisperModelTier.small.defaultModelID, isDirectory: true)
+        XCTAssertEqual(defaultURL.path, expectedDirect.path)
+
+        // 2. HuggingFace directory hierarchy exists: should resolve to HF path
+        let hfPath = tempModelsDir
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("argmaxinc", isDirectory: true)
+            .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent(WhisperModelTier.small.defaultModelID, isDirectory: true)
+        try FileManager.default.createDirectory(at: hfPath, withIntermediateDirectories: true)
+
+        let resolvedHFURL = await manager.resolvedModelDirectory(for: .small)
+        XCTAssertEqual(resolvedHFURL.path, hfPath.path)
+
+        // 3. Direct directory exists: direct path takes precedence if both exist
+        let directPath = tempModelsDir.appendingPathComponent(WhisperModelTier.small.defaultModelID, isDirectory: true)
+        try FileManager.default.createDirectory(at: directPath, withIntermediateDirectories: true)
+
+        let resolvedDirectURL = await manager.resolvedModelDirectory(for: .small)
+        XCTAssertEqual(resolvedDirectURL.path, directPath.path)
+    }
+
+    func testHuggingFaceModelHierarchyDetectedAsInstalledOnLaunch() async throws {
+        // Setup HuggingFace directory structure simulating WhisperKit download
+        let hfPath = tempModelsDir
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent("argmaxinc", isDirectory: true)
+            .appendingPathComponent("whisperkit-coreml", isDirectory: true)
+            .appendingPathComponent(WhisperModelTier.small.defaultModelID, isDirectory: true)
+        try FileManager.default.createDirectory(at: hfPath, withIntermediateDirectories: true)
+
+        // Populate with WhisperKit assets: config.json and .mlmodelc directories
+        let configData = "{\"model_type\": \"whisper\"}".data(using: .utf8)!
+        FileManager.default.createFile(atPath: hfPath.appendingPathComponent("config.json").path, contents: configData)
+        let mlmodelcDir = hfPath.appendingPathComponent("AudioEncoder.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: mlmodelcDir, withIntermediateDirectories: true)
+
+        // New manager initialized pointing to the directory with HuggingFace assets
+        let manager = WhisperModelManager(
+            modelsDirectory: tempModelsDir,
+            deviceChecker: MockDeviceChecker(),
+            downloader: MockModelDownloader()
+        )
+
+        let state = await manager.state(for: .small)
+        guard case .installed = state else {
+            XCTFail("Expected .installed state for HuggingFace model, got \(state)")
+            return
+        }
+
+        let localURL = try await manager.localModelURL(for: .small)
+        XCTAssertEqual(localURL.path, hfPath.path)
+    }
 }
