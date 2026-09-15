@@ -347,6 +347,10 @@ struct HostDetailView: View {
             return "ProxyJump (\(opts.config.hops.count) hop\(opts.config.hops.count == 1 ? "" : "s"))"
         case .mosh:
             return container.isDemo ? "Mosh (demo adapter)" : "Mosh (UDP)"
+        case .cloudflareAccess:
+            return "Cloudflare Access"
+        case .tailscale:
+            return "Tailscale SSH"
         }
     }
 
@@ -461,6 +465,8 @@ enum HostConnectionType: String, CaseIterable, Identifiable {
     case direct = "Direct SSH"
     case proxyJump = "ProxyJump Bastion"
     case mosh = "Mosh (UDP)"
+    case cloudflareAccess = "Cloudflare Access"
+    case tailscale = "Tailscale SSH"
     var id: String { rawValue }
 }
 
@@ -505,6 +511,16 @@ struct HostEditorView: View {
     @State private var moshPortRangeEnd: String
     @State private var moshPredictionMode: MoshPredictionMode
 
+    // Cloudflare Access settings
+    @State private var cloudflareClientID: String
+    @State private var cloudflareClientSecret: String
+    @State private var cloudflareClientSecretKeychainRef: String
+    @State private var cloudflareTunnelDomain: String
+
+    // Tailscale SSH settings
+    @State private var tailscaleHostname: String
+    @State private var tailscaleCheckHostKey: Bool
+
     init(existing: Host? = nil, prefillService: DiscoveredSSHService? = nil) {
         self.existing = existing
         self.prefillService = prefillService
@@ -532,6 +548,12 @@ struct HostEditorView: View {
             _moshPortRangeStart = State(initialValue: "60001")
             _moshPortRangeEnd = State(initialValue: "60999")
             _moshPredictionMode = State(initialValue: .adaptive)
+            _cloudflareClientID = State(initialValue: "")
+            _cloudflareClientSecret = State(initialValue: "")
+            _cloudflareClientSecretKeychainRef = State(initialValue: "")
+            _cloudflareTunnelDomain = State(initialValue: "")
+            _tailscaleHostname = State(initialValue: "")
+            _tailscaleCheckHostKey = State(initialValue: false)
         } else if case .mosh(let moshOpts) = existing?.connection {
             initialType = .mosh
             initialBastions = []
@@ -540,6 +562,40 @@ struct HostEditorView: View {
             _moshPortRangeStart = State(initialValue: moshOpts.portRange.map { String($0.start) } ?? "60001")
             _moshPortRangeEnd = State(initialValue: moshOpts.portRange.map { String($0.end) } ?? "60999")
             _moshPredictionMode = State(initialValue: moshOpts.predictionMode)
+            _cloudflareClientID = State(initialValue: "")
+            _cloudflareClientSecret = State(initialValue: "")
+            _cloudflareClientSecretKeychainRef = State(initialValue: "")
+            _cloudflareTunnelDomain = State(initialValue: "")
+            _tailscaleHostname = State(initialValue: "")
+            _tailscaleCheckHostKey = State(initialValue: false)
+        } else if case .cloudflareAccess(let cfOpts) = existing?.connection {
+            initialType = .cloudflareAccess
+            initialBastions = []
+            _moshServerCommand = State(initialValue: "mosh-server")
+            _moshUseCustomPortRange = State(initialValue: false)
+            _moshPortRangeStart = State(initialValue: "60001")
+            _moshPortRangeEnd = State(initialValue: "60999")
+            _moshPredictionMode = State(initialValue: .adaptive)
+            _cloudflareClientID = State(initialValue: cfOpts.clientID)
+            _cloudflareClientSecret = State(initialValue: "")
+            _cloudflareClientSecretKeychainRef = State(initialValue: cfOpts.clientSecretKeychainRef)
+            _cloudflareTunnelDomain = State(initialValue: cfOpts.tunnelDomain)
+            _tailscaleHostname = State(initialValue: "")
+            _tailscaleCheckHostKey = State(initialValue: false)
+        } else if case .tailscale(let tsOpts) = existing?.connection {
+            initialType = .tailscale
+            initialBastions = []
+            _moshServerCommand = State(initialValue: "mosh-server")
+            _moshUseCustomPortRange = State(initialValue: false)
+            _moshPortRangeStart = State(initialValue: "60001")
+            _moshPortRangeEnd = State(initialValue: "60999")
+            _moshPredictionMode = State(initialValue: .adaptive)
+            _cloudflareClientID = State(initialValue: "")
+            _cloudflareClientSecret = State(initialValue: "")
+            _cloudflareClientSecretKeychainRef = State(initialValue: "")
+            _cloudflareTunnelDomain = State(initialValue: "")
+            _tailscaleHostname = State(initialValue: tsOpts.tailscaleHostname)
+            _tailscaleCheckHostKey = State(initialValue: tsOpts.checkHostKey)
         } else {
             initialType = .direct
             initialBastions = []
@@ -548,6 +604,12 @@ struct HostEditorView: View {
             _moshPortRangeStart = State(initialValue: "60001")
             _moshPortRangeEnd = State(initialValue: "60999")
             _moshPredictionMode = State(initialValue: .adaptive)
+            _cloudflareClientID = State(initialValue: "")
+            _cloudflareClientSecret = State(initialValue: "")
+            _cloudflareClientSecretKeychainRef = State(initialValue: "")
+            _cloudflareTunnelDomain = State(initialValue: "")
+            _tailscaleHostname = State(initialValue: "")
+            _tailscaleCheckHostKey = State(initialValue: false)
         }
         _connectionType = State(initialValue: initialType)
         _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
@@ -766,6 +828,34 @@ struct HostEditorView: View {
                         }
                         .accessibilityIdentifier("host-editor-mosh-prediction-picker")
                         .accessibilityLabel("Mosh prediction mode picker")
+                    } else if connectionType == .cloudflareAccess {
+                        TextField("Tunnel Domain", text: $cloudflareTunnelDomain, prompt: Text("e.g. ssh.example.com"))
+                            .accessibilityIdentifier("host-editor-cf-tunnel-domain-field")
+                            .accessibilityLabel("Cloudflare Tunnel Domain")
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        TextField("Service Token Client ID", text: $cloudflareClientID, prompt: Text("e.g. xxxxxxxx.access"))
+                            .accessibilityIdentifier("host-editor-cf-client-id-field")
+                            .accessibilityLabel("Cloudflare Access Client ID")
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        SecureField("Service Token Client Secret", text: $cloudflareClientSecret, prompt: Text("Saved securely to Keychain"))
+                            .accessibilityIdentifier("host-editor-cf-client-secret-field")
+                            .accessibilityLabel("Cloudflare Access Client Secret")
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    } else if connectionType == .tailscale {
+                        TextField("Tailscale Hostname or IP", text: $tailscaleHostname, prompt: Text("e.g. node.tailscale.net"))
+                            .accessibilityIdentifier("host-editor-tailscale-hostname-field")
+                            .accessibilityLabel("Tailscale Hostname or IP")
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+
+                        Toggle("Strict Host Key Checking", isOn: $tailscaleCheckHostKey)
+                            .accessibilityIdentifier("host-editor-tailscale-check-key-toggle")
+                            .accessibilityLabel("Check Host Key")
                     }
                 }
 
@@ -903,7 +993,7 @@ struct HostEditorView: View {
         return true
     }
 
-    func buildHost() -> Host? {
+    func buildHost(secretRef: String? = nil) -> Host? {
         guard isMoshPortRangeValid else { return nil }
         if connectionType == .proxyJump && bastionHops.isEmpty { return nil }
         var allowedModes: Set<VoiceInputMode> = []
@@ -946,15 +1036,46 @@ struct HostEditorView: View {
                 predictionMode: moshPredictionMode,
                 sshOptions: existingSSH
             ))
+        } else if connectionType == .cloudflareAccess {
+            let effectiveTunnel = cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+                : cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+            let ref = secretRef ?? (cloudflareClientSecretKeychainRef.isEmpty ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef)
+            profile = .cloudflareAccess(CloudflareAccessOptions(
+                clientID: cloudflareClientID.trimmingCharacters(in: .whitespacesAndNewlines),
+                clientSecretKeychainRef: ref,
+                tunnelDomain: effectiveTunnel
+            ))
+        } else if connectionType == .tailscale {
+            let effectiveTSHostname = tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                ? hostname.trimmingCharacters(in: .whitespacesAndNewlines)
+                : tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+            profile = .tailscale(TailscaleOptions(
+                tailscaleHostname: effectiveTSHostname,
+                checkHostKey: tailscaleCheckHostKey
+            ))
         } else {
             profile = .ssh(existingSSH)
+        }
+
+        let effectiveHostname: String
+        if hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if connectionType == .tailscale {
+                effectiveHostname = tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else if connectionType == .cloudflareAccess {
+                effectiveHostname = cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                effectiveHostname = hostname
+            }
+        } else {
+            effectiveHostname = hostname
         }
 
         guard let portNumber = UInt16(port) else { return nil }
         return try? Host(
             id: existing?.id ?? UUID(),
             name: name,
-            hostname: hostname,
+            hostname: effectiveHostname,
             port: portNumber,
             username: username,
             identityID: identityID,
@@ -967,8 +1088,14 @@ struct HostEditorView: View {
     }
 
     func save() {
-        guard let host = buildHost() else { return }
+        let trimmedSecret = cloudflareClientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
+        let secretRef = cloudflareClientSecretKeychainRef.isEmpty ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef
+
         Task {
+            if connectionType == .cloudflareAccess && !trimmedSecret.isEmpty {
+                try? await container.credentialStore.save(Data(trimmedSecret.utf8), reference: secretRef)
+            }
+            guard let host = buildHost(secretRef: secretRef) else { return }
             do {
                 try await container.saveHost(host)
                 dismiss()

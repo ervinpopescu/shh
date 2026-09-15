@@ -136,6 +136,18 @@ public struct SSHOptions: Codable, Hashable, Sendable {
         self.connectTimeoutSeconds = connectTimeoutSeconds; self.keepAliveSeconds = keepAliveSeconds
         self.compression = compression; self.strictHostKeyChecking = strictHostKeyChecking
     }
+
+    private enum CodingKeys: String, CodingKey {
+        case connectTimeoutSeconds, keepAliveSeconds, compression, strictHostKeyChecking
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.connectTimeoutSeconds = try container.decodeIfPresent(Double.self, forKey: .connectTimeoutSeconds) ?? 15
+        self.keepAliveSeconds = try container.decodeIfPresent(Double.self, forKey: .keepAliveSeconds) ?? 60
+        self.compression = try container.decodeIfPresent(Bool.self, forKey: .compression) ?? false
+        self.strictHostKeyChecking = try container.decodeIfPresent(StrictHostKeyChecking.self, forKey: .strictHostKeyChecking) ?? .prompt
+    }
 }
 
 public struct ProxyJumpEndpoint: Codable, Hashable, Sendable {
@@ -225,7 +237,167 @@ public struct ProxyJumpOptions: Codable, Hashable, Sendable {
     }
 }
 
-public enum ConnectionProfile: Codable, Hashable, Sendable { case ssh(SSHOptions); case mosh(MoshOptions); case proxyJump(ProxyJumpOptions) }
+public struct CloudflareAccessOptions: Codable, Hashable, Sendable {
+    public var clientID: String
+    public var clientSecretKeychainRef: String
+    public var tunnelDomain: String
+
+    public init(
+        clientID: String,
+        clientSecretKeychainRef: String,
+        tunnelDomain: String
+    ) {
+        self.clientID = clientID
+        self.clientSecretKeychainRef = clientSecretKeychainRef
+        self.tunnelDomain = tunnelDomain
+    }
+}
+
+public struct TailscaleOptions: Codable, Hashable, Sendable {
+    public var tailscaleHostname: String
+    public var checkHostKey: Bool
+
+    public init(
+        tailscaleHostname: String,
+        checkHostKey: Bool = false
+    ) {
+        self.tailscaleHostname = tailscaleHostname
+        self.checkHostKey = checkHostKey
+    }
+}
+
+public typealias HostConnectionType = ConnectionProfile
+
+public enum ConnectionProfile: Codable, Hashable, Sendable {
+    case ssh(SSHOptions)
+    case mosh(MoshOptions)
+    case proxyJump(ProxyJumpOptions)
+    case cloudflareAccess(CloudflareAccessOptions)
+    case tailscale(TailscaleOptions)
+
+    public static func standard(_ options: SSHOptions = SSHOptions()) -> ConnectionProfile {
+        .ssh(options)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case ssh
+        case standard
+        case mosh
+        case proxyJump
+        case cloudflareAccess
+        case tailscale
+        case type
+    }
+
+    public init(from decoder: Decoder) throws {
+        if let single = try? decoder.singleValueContainer(), let str = try? single.decode(String.self) {
+            switch str.lowercased() {
+            case "standard", "ssh", "direct":
+                self = .ssh(SSHOptions())
+                return
+            case "mosh":
+                self = .mosh(MoshOptions())
+                return
+            case "proxyjump":
+                self = .proxyJump(ProxyJumpOptions())
+                return
+            case "cloudflareaccess", "cloudflare":
+                self = .cloudflareAccess(CloudflareAccessOptions(clientID: "", clientSecretKeychainRef: "", tunnelDomain: ""))
+                return
+            case "tailscale":
+                self = .tailscale(TailscaleOptions(tailscaleHostname: ""))
+                return
+            default:
+                break
+            }
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        if container.contains(.ssh) {
+            let opts = try container.decodeIfPresent(SSHOptions.self, forKey: .ssh) ?? SSHOptions()
+            self = .ssh(opts)
+            return
+        }
+
+        if container.contains(.standard) {
+            let opts = try container.decodeIfPresent(SSHOptions.self, forKey: .standard) ?? SSHOptions()
+            self = .ssh(opts)
+            return
+        }
+
+        if container.contains(.mosh) {
+            let opts = try container.decode(MoshOptions.self, forKey: .mosh)
+            self = .mosh(opts)
+            return
+        }
+
+        if container.contains(.proxyJump) {
+            let opts = try container.decode(ProxyJumpOptions.self, forKey: .proxyJump)
+            self = .proxyJump(opts)
+            return
+        }
+
+        if container.contains(.cloudflareAccess) {
+            let opts = try container.decode(CloudflareAccessOptions.self, forKey: .cloudflareAccess)
+            self = .cloudflareAccess(opts)
+            return
+        }
+
+        if container.contains(.tailscale) {
+            let opts = try container.decode(TailscaleOptions.self, forKey: .tailscale)
+            self = .tailscale(opts)
+            return
+        }
+
+        if let typeString = try container.decodeIfPresent(String.self, forKey: .type) {
+            switch typeString.lowercased() {
+            case "standard", "ssh", "direct":
+                let opts = (try? container.decodeIfPresent(SSHOptions.self, forKey: .ssh)) ?? SSHOptions()
+                self = .ssh(opts)
+                return
+            case "mosh":
+                let opts = (try? container.decode(MoshOptions.self, forKey: .mosh)) ?? MoshOptions()
+                self = .mosh(opts)
+                return
+            case "proxyjump":
+                let opts = (try? container.decode(ProxyJumpOptions.self, forKey: .proxyJump)) ?? ProxyJumpOptions()
+                self = .proxyJump(opts)
+                return
+            case "cloudflareaccess", "cloudflare":
+                if let opts = try? container.decode(CloudflareAccessOptions.self, forKey: .cloudflareAccess) {
+                    self = .cloudflareAccess(opts)
+                    return
+                }
+            case "tailscale":
+                if let opts = try? container.decode(TailscaleOptions.self, forKey: .tailscale) {
+                    self = .tailscale(opts)
+                    return
+                }
+            default:
+                break
+            }
+        }
+
+        self = .ssh(SSHOptions())
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .ssh(let opts):
+            try container.encode(opts, forKey: .ssh)
+        case .mosh(let opts):
+            try container.encode(opts, forKey: .mosh)
+        case .proxyJump(let opts):
+            try container.encode(opts, forKey: .proxyJump)
+        case .cloudflareAccess(let opts):
+            try container.encode(opts, forKey: .cloudflareAccess)
+        case .tailscale(let opts):
+            try container.encode(opts, forKey: .tailscale)
+        }
+    }
+}
 
 public enum HealthState: Codable, Hashable, Sendable {
     case unknown, checking, healthy, degraded(reason: String), offline
@@ -349,7 +521,18 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.tagIDs = try container.decodeIfPresent(Set<UUID>.self, forKey: .tagIDs) ?? []
         self.identityID = try container.decodeIfPresent(UUID.self, forKey: .identityID)
         self.connection = try container.decodeIfPresent(ConnectionProfile.self, forKey: .connection) ?? .ssh(SSHOptions())
-        self.health = try container.decodeIfPresent(HealthState.self, forKey: .health) ?? .unknown
+        if let state = try? container.decode(HealthState.self, forKey: .health) {
+            self.health = state
+        } else if let str = try? container.decode(String.self, forKey: .health) {
+            switch str.lowercased() {
+            case "healthy": self.health = .healthy
+            case "checking": self.health = .checking
+            case "offline": self.health = .offline
+            default: self.health = .unknown
+            }
+        } else {
+            self.health = .unknown
+        }
         self.lastUsedAt = try container.decodeIfPresent(Date.self, forKey: .lastUsedAt)
         self.voicePolicy = try container.decodeIfPresent(HostVoicePolicy.self, forKey: .voicePolicy) ?? .disabled
         let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")

@@ -174,6 +174,47 @@ private final class InboundEventRouter: @unchecked Sendable {
     }
 }
 
+public struct CloudflareAccessResolvedCredentials: Equatable, Sendable {
+    public let clientID: String
+    public let clientSecret: String?
+
+    public init(clientID: String, clientSecret: String? = nil) {
+        self.clientID = clientID
+        self.clientSecret = clientSecret
+    }
+}
+
+public struct ResolvedTransportTarget: Equatable, Sendable {
+    public let hostname: String
+    public let port: UInt16
+    public let username: String
+    public let options: SSHOptions
+    public let cloudflareHeaders: [String: String]?
+    public let cloudflareCredentials: CloudflareAccessResolvedCredentials?
+    public let tailscaleOptions: TailscaleOptions?
+    public let cloudflareOptions: CloudflareAccessOptions?
+
+    public init(
+        hostname: String,
+        port: UInt16,
+        username: String,
+        options: SSHOptions,
+        cloudflareHeaders: [String: String]? = nil,
+        cloudflareCredentials: CloudflareAccessResolvedCredentials? = nil,
+        tailscaleOptions: TailscaleOptions? = nil,
+        cloudflareOptions: CloudflareAccessOptions? = nil
+    ) {
+        self.hostname = hostname
+        self.port = port
+        self.username = username
+        self.options = options
+        self.cloudflareHeaders = cloudflareHeaders
+        self.cloudflareCredentials = cloudflareCredentials
+        self.tailscaleOptions = tailscaleOptions
+        self.cloudflareOptions = cloudflareOptions
+    }
+}
+
 public struct LiveSSHTransport: SSHTransport {
     public typealias HostResolver = @Sendable (UUID) async throws -> (ShhCore.Host, IdentityDescriptor?)
     public let credentialStore: any CredentialStore
@@ -273,6 +314,59 @@ public struct LiveSSHTransport: SSHTransport {
                 trustEvaluator: trustEvaluator,
                 initialSize: initialSize
             )
+        case .cloudflareAccess(let cfOptions):
+            let target = try await resolveTransportTarget(for: host)
+            let effectiveHost = try ShhCore.Host(
+                id: host.id,
+                name: host.name,
+                hostname: target.hostname,
+                port: target.port,
+                username: host.username,
+                groupID: host.groupID,
+                tagIDs: host.tagIDs,
+                identityID: host.identityID,
+                connection: .cloudflareAccess(cfOptions),
+                health: host.health,
+                lastUsedAt: host.lastUsedAt,
+                tmuxPreferences: host.tmuxPreferences,
+                voicePolicy: host.voicePolicy,
+                isProduction: host.isProduction,
+                forwardingRules: host.forwardingRules
+            )
+            return try await performConnectWithTimeout(
+                host: effectiveHost,
+                identity: identity,
+                trustEvaluator: trustEvaluator,
+                initialSize: initialSize,
+                options: target.options,
+                additionalSecretRefs: [cfOptions.clientSecretKeychainRef]
+            )
+        case .tailscale(let tsOptions):
+            let target = try await resolveTransportTarget(for: host)
+            let effectiveHost = try ShhCore.Host(
+                id: host.id,
+                name: host.name,
+                hostname: target.hostname,
+                port: target.port,
+                username: host.username,
+                groupID: host.groupID,
+                tagIDs: host.tagIDs,
+                identityID: host.identityID,
+                connection: .tailscale(tsOptions),
+                health: host.health,
+                lastUsedAt: host.lastUsedAt,
+                tmuxPreferences: host.tmuxPreferences,
+                voicePolicy: host.voicePolicy,
+                isProduction: host.isProduction,
+                forwardingRules: host.forwardingRules
+            )
+            return try await performConnectWithTimeout(
+                host: effectiveHost,
+                identity: identity,
+                trustEvaluator: trustEvaluator,
+                initialSize: initialSize,
+                options: target.options
+            )
         }
     }
 
@@ -291,6 +385,10 @@ public struct LiveSSHTransport: SSHTransport {
             effectiveOptions = opts
         } else if case .proxyJump(let jumpOpts) = target.connection {
             effectiveOptions = jumpOpts.sshOptions
+        } else if case .cloudflareAccess = target.connection {
+            effectiveOptions = SSHOptions()
+        } else if case .tailscale(let tsOpts) = target.connection {
+            effectiveOptions = SSHOptions(strictHostKeyChecking: tsOpts.checkHostKey ? .trustedOnly : .prompt)
         } else {
             effectiveOptions = SSHOptions()
         }
@@ -314,12 +412,95 @@ public struct LiveSSHTransport: SSHTransport {
         )
     }
 
+    public func resolveTransportTarget(for host: ShhCore.Host) async throws -> ResolvedTransportTarget {
+        try await Self.resolveTransportTarget(for: host, credentialStore: credentialStore)
+    }
+
+    public static func resolveTransportTarget(
+        for host: ShhCore.Host,
+        credentialStore: (any CredentialStore)? = nil
+    ) async throws -> ResolvedTransportTarget {
+        switch host.connection {
+        case .ssh(let opts):
+            return ResolvedTransportTarget(
+                hostname: host.hostname,
+                port: host.port,
+                username: host.username,
+                options: opts
+            )
+        case .proxyJump(let jumpOpts):
+            return ResolvedTransportTarget(
+                hostname: host.hostname,
+                port: host.port,
+                username: host.username,
+                options: jumpOpts.sshOptions
+            )
+        case .mosh(let moshOpts):
+            return ResolvedTransportTarget(
+                hostname: host.hostname,
+                port: host.port,
+                username: host.username,
+                options: moshOpts.sshOptions
+            )
+        case .tailscale(let tsOpts):
+            let trimmed = tsOpts.tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedHostname = trimmed.isEmpty ? host.hostname : trimmed
+            let resolvedPort = host.port != 0 ? host.port : 22
+            let effectiveOptions = SSHOptions(
+                strictHostKeyChecking: tsOpts.checkHostKey ? .trustedOnly : .prompt
+            )
+            return ResolvedTransportTarget(
+                hostname: resolvedHostname,
+                port: resolvedPort,
+                username: host.username,
+                options: effectiveOptions,
+                tailscaleOptions: tsOpts
+            )
+        case .cloudflareAccess(let cfOpts):
+            let trimmed = cfOpts.tunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedHostname = trimmed.isEmpty ? host.hostname : trimmed
+            let resolvedPort = host.port != 0 ? host.port : 22
+
+            var headers: [String: String] = [:]
+            var secretString: String? = nil
+
+            if !cfOpts.clientID.isEmpty {
+                headers["CF-Access-Client-Id"] = cfOpts.clientID
+            }
+
+            if let store = credentialStore, !cfOpts.clientSecretKeychainRef.isEmpty {
+                if let secretData = try? await store.load(reference: cfOpts.clientSecretKeychainRef),
+                   let secret = String(data: secretData, encoding: .utf8),
+                   !secret.isEmpty {
+                    secretString = secret
+                    headers["CF-Access-Client-Secret"] = secret
+                }
+            }
+
+            let credentials = CloudflareAccessResolvedCredentials(
+                clientID: cfOpts.clientID,
+                clientSecret: secretString
+            )
+
+            return ResolvedTransportTarget(
+                hostname: resolvedHostname,
+                port: resolvedPort,
+                username: host.username,
+                options: SSHOptions(),
+                cloudflareHeaders: headers.isEmpty ? nil : headers,
+                cloudflareCredentials: credentials,
+                cloudflareOptions: cfOpts
+            )
+        }
+    }
+
     private func performConnectWithTimeout(
         host: ShhCore.Host,
         identity: IdentityDescriptor?,
         trustEvaluator: any HostTrustEvaluator,
         initialSize: TerminalSize,
-        options: SSHOptions
+        options: SSHOptions,
+        additionalSecretRefs: [String] = []
     ) async throws -> any SSHConnection {
         do {
             if options.connectTimeoutSeconds > 0 {
@@ -330,7 +511,8 @@ public struct LiveSSHTransport: SSHTransport {
                             identity: identity,
                             trustEvaluator: trustEvaluator,
                             initialSize: initialSize,
-                            options: options
+                            options: options,
+                            additionalSecretRefs: additionalSecretRefs
                         )
                     }
                     group.addTask {
@@ -354,7 +536,8 @@ public struct LiveSSHTransport: SSHTransport {
                     identity: identity,
                     trustEvaluator: trustEvaluator,
                     initialSize: initialSize,
-                    options: options
+                    options: options,
+                    additionalSecretRefs: additionalSecretRefs
                 )
             }
         } catch {
@@ -424,7 +607,8 @@ public struct LiveSSHTransport: SSHTransport {
         identity: IdentityDescriptor?,
         trustEvaluator: any HostTrustEvaluator,
         initialSize: TerminalSize,
-        options: SSHOptions
+        options: SSHOptions,
+        additionalSecretRefs: [String] = []
     ) async throws -> any SSHConnection {
         if Task.isCancelled { throw TransportError.cancelled }
 
@@ -541,6 +725,14 @@ public struct LiveSSHTransport: SSHTransport {
                let secretString = String(data: secretData, encoding: .utf8),
                !secretString.isEmpty {
                 redactionSecrets.append(secretString)
+            }
+            for ref in additionalSecretRefs {
+                if !ref.isEmpty,
+                   let secretData = try? await credentialStore.load(reference: ref),
+                   let secretString = String(data: secretData, encoding: .utf8),
+                   !secretString.isEmpty {
+                    redactionSecrets.append(secretString)
+                }
             }
             let redactor = Redactor(secrets: redactionSecrets)
 

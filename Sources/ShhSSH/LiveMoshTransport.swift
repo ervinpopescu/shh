@@ -30,6 +30,12 @@ public final class LiveMoshTransport: MoshTransport, SSHTransport, @unchecked Se
             moshOptions = MoshOptions(sshOptions: sshOpts)
         case .proxyJump(let jumpOpts):
             moshOptions = MoshOptions(sshOptions: jumpOpts.sshOptions)
+        case .cloudflareAccess:
+            // Fallback for mosh bootstrap over Cloudflare Access
+            moshOptions = MoshOptions()
+        case .tailscale:
+            // Fallback for mosh bootstrap over Tailscale
+            moshOptions = MoshOptions()
         }
 
         // Ephemeral host configuration for SSH bootstrap exec
