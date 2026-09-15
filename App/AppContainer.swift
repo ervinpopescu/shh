@@ -150,6 +150,12 @@ final class AppContainer: ObservableObject {
 
     private(set) var activeHost: Host?
     private(set) var isExplicitDisconnect = false
+    // iOS may suspend the process without delivering a transport error. Treat a
+    // background transition as a disconnected lifecycle boundary and reconnect
+    // on the next active transition rather than claiming the socket survived.
+    private var isSceneInBackground = false
+    private var lifecycleGeneration = 0
+    private var backgroundCleanupTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
@@ -495,6 +501,12 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        let pendingBackgroundCleanup = backgroundCleanupTask
+        backgroundCleanupTask = nil
+        await pendingBackgroundCleanup?.value
+        lifecycleGeneration += 1
+        isSceneInBackground = false
+        let connectionGeneration = lifecycleGeneration
         lastConnectionFailure = nil
         await cancelVoiceRecording()
         resetVoiceState()
@@ -578,7 +590,10 @@ final class AppContainer: ObservableObject {
                     initialSize: initialSize
                 )
             }
-            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
+            guard activeSession?.id == session.id,
+                  activeSession?.state == .connecting,
+                  lifecycleGeneration == connectionGeneration,
+                  !isSceneInBackground else {
                 await connection.close()
                 return
             }
@@ -593,6 +608,13 @@ final class AppContainer: ObservableObject {
             }
             // Host key is accepted and connection succeeded; load redaction secret if available
             await loadRedactionSecret(for: host)
+            guard activeSession?.id == session.id,
+                  activeSession?.state == .connecting,
+                  lifecycleGeneration == connectionGeneration,
+                  !isSceneInBackground else {
+                await connection.close()
+                return
+            }
             self.connection = connection
             (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
@@ -702,7 +724,9 @@ final class AppContainer: ObservableObject {
         eventTask = Task { @MainActor [weak self] in
             do {
                 for try await event in events {
-                    guard let self, self.activeSession?.id == session.id else { return }
+                    guard let self,
+                          self.activeSession?.id == session.id,
+                          !self.isSceneInBackground else { return }
                     switch event {
                     case .bytes(let data):
                         let redactedData = self.redacted(data)
@@ -751,7 +775,9 @@ final class AppContainer: ObservableObject {
                     }
                 }
             } catch {
-                guard let self, self.activeSession?.id == session.id else { return }
+                guard let self,
+                      self.activeSession?.id == session.id,
+                      !self.isSceneInBackground else { return }
                 self.tmuxRefreshGeneration += 1
                 self.herdrRefreshGeneration += 1
                 self.stopHerdrPolling()
@@ -775,7 +801,7 @@ final class AppContainer: ObservableObject {
     }
 
     private func handleConnectionDrop(host: Host) {
-        guard !isExplicitDisconnect else { return }
+        guard !isExplicitDisconnect, !isSceneInBackground else { return }
         Task { [weak self] in
             guard let self else { return }
             await self.reconnectCoordinator.start { [weak self] attempt in
@@ -786,9 +812,10 @@ final class AppContainer: ObservableObject {
     }
 
     func performReconnect(to host: Host, attempt: Int) async throws {
-        guard !isExplicitDisconnect else {
+        guard !isExplicitDisconnect, !isSceneInBackground else {
             throw TransportError.cancelled
         }
+        let connectionGeneration = lifecycleGeneration
         guard reachabilityMonitor.isReachable else {
             throw TransportError.networkUnavailable
         }
@@ -826,7 +853,10 @@ final class AppContainer: ObservableObject {
             )
         }
 
-        guard activeSession?.id == session.id, !isExplicitDisconnect else {
+        guard activeSession?.id == session.id,
+              lifecycleGeneration == connectionGeneration,
+              !isExplicitDisconnect,
+              !isSceneInBackground else {
             await connection.close()
             throw TransportError.cancelled
         }
@@ -842,6 +872,13 @@ final class AppContainer: ObservableObject {
         }
 
         await loadRedactionSecret(for: host)
+        guard activeSession?.id == session.id,
+              lifecycleGeneration == connectionGeneration,
+              !isExplicitDisconnect,
+              !isSceneInBackground else {
+            await connection.close()
+            throw TransportError.cancelled
+        }
         self.connection = connection
         (connection as? LiveSSHConnection)?.setRedactor(redactor)
         activeSession?.state = .connected
@@ -906,6 +943,7 @@ final class AppContainer: ObservableObject {
 
     func cancelReconnect() async {
         isExplicitDisconnect = true
+        lifecycleGeneration += 1
         tmuxRefreshGeneration += 1
         herdrRefreshGeneration += 1
         stopHerdrPolling()
@@ -1009,10 +1047,34 @@ final class AppContainer: ObservableObject {
                 await self?.cancelVoiceRecording()
             }
         }
-        guard !isExplicitDisconnect else { return }
         switch phase {
+        case .background:
+            enterBackground()
         case .active:
-            if reconnectState.isReconnecting {
+            let wasInBackground = isSceneInBackground
+            if wasInBackground {
+                // Invalidate a delayed background persistence task before
+                // starting a new connection generation.
+                lifecycleGeneration += 1
+            }
+            isSceneInBackground = false
+            guard !isExplicitDisconnect else { return }
+            if wasInBackground {
+                // The old transport may have survived suspension or may have
+                // been invalidated by the OS. Reconnect in either case and use
+                // the persisted active target when it is still safe to attach.
+                let generation = lifecycleGeneration
+                let cleanupTask = backgroundCleanupTask
+                backgroundCleanupTask = nil
+                Task { [weak self] in
+                    await cleanupTask?.value
+                    guard let self,
+                          self.lifecycleGeneration == generation,
+                          !self.isExplicitDisconnect,
+                          let host = self.activeHost else { return }
+                    self.handleConnectionDrop(host: host)
+                }
+            } else if reconnectState.isReconnecting {
                 Task { [weak self] in
                     guard let self, let host = self.activeHost else { return }
                     await self.reconnectCoordinator.retryNow { [weak self] attempt in
@@ -1023,21 +1085,51 @@ final class AppContainer: ObservableObject {
             } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
                 handleConnectionDrop(host: host)
             }
-        case .background:
-            if let session = activeSession, let host = activeHost, session.state == .connected {
-                if let target = activeTmuxSessionID {
-                    let metadata = SessionRestorationMetadata(
-                        hostID: host.id,
-                        sessionID: session.id,
-                        tmuxSessionID: target
-                    )
-                    Task { [weak self] in
-                        try? await self?.restorationStore.save(metadata)
-                    }
-                }
-            }
         default:
             break
+        }
+    }
+
+    private func enterBackground() {
+        guard !isSceneInBackground else { return }
+        isSceneInBackground = true
+        lifecycleGeneration += 1
+        let backgroundGeneration = lifecycleGeneration
+
+        if let session = activeSession, let host = activeHost {
+            // Persist intent, not terminal bytes or credentials. A nil target
+            // is meaningful: restore the host without inventing a tmux target.
+            let metadata = SessionRestorationMetadata(
+                hostID: host.id,
+                sessionID: session.id,
+                tmuxSessionID: activeTmuxSessionID
+            )
+            Task { [weak self] in
+                guard let self,
+                      self.lifecycleGeneration == backgroundGeneration,
+                      !self.isExplicitDisconnect else { return }
+                try? await self.restorationStore.save(metadata)
+            }
+            // A suspended app cannot promise that its TCP socket remains usable.
+            // Keep the session record and host for foreground restoration, but
+            // classify this transport as disconnected now.
+            activeSession?.state = .disconnected
+        }
+
+        detachCallbacks()
+        eventTask?.cancel()
+        eventTask = nil
+        let oldConnection = connection
+        connection = nil
+        let oldForwardingManager = portForwardingManager
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        forwardingSessions = []
+        reconnectState = .idle
+        backgroundCleanupTask = Task { [weak self] in
+            await self?.reconnectCoordinator.cancel()
+            await oldForwardingManager?.stopAll()
+            await oldConnection?.close()
         }
     }
 
@@ -1112,6 +1204,8 @@ final class AppContainer: ObservableObject {
         await cancelVoiceRecording()
         resetVoiceState()
         isExplicitDisconnect = true
+        lifecycleGeneration += 1
+        isSceneInBackground = false
         tmuxRefreshGeneration += 1
         activeHost = nil
         await reconnectCoordinator.cancel()
