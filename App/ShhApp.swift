@@ -1127,6 +1127,21 @@ struct SessionView: View {
                         }) {
                             Label("Reset Size (Cmd 0)", systemImage: "arrow.counterclockwise")
                         }
+
+                        Divider()
+
+                        ForEach([6, 8, 10, 12, 14, 16, 18], id: \.self) { preset in
+                            Button(action: {
+                                container.terminalController.setTerminalFontSize(Double(preset))
+                            }) {
+                                let percentage = TerminalFontSize.percentage(for: Double(preset))
+                                if Int(container.terminalController.terminalFontSize.rounded()) == preset {
+                                    Label("\(preset) pt (\(percentage)%)", systemImage: "checkmark")
+                                } else {
+                                    Text("\(preset) pt (\(percentage)%)")
+                                }
+                            }
+                        }
                     } label: {
                         Label("Text Size (\(container.terminalController.terminalFontSizePercentage)%)", systemImage: "textformat.size")
                     }

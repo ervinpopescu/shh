@@ -14,9 +14,10 @@ public enum TerminalZoomShortcut: Sendable, Equatable {
 }
 
 public enum TerminalFontSize {
-    public static let minimumPointSize: Double = 10
+    public static let minimumPointSize: Double = 5.0
     public static let maximumPointSize: Double = 32
     public static let defaultPointSize: Double = 14
+    public static let presets: [Int] = [6, 8, 10, 12, 14, 16, 18]
 
     public static func clamped(_ pointSize: Double) -> Double {
         guard pointSize.isFinite else { return defaultPointSize }

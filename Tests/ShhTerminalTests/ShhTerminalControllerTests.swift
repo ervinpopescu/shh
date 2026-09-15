@@ -383,6 +383,16 @@ final class ShhTerminalControllerTests: XCTestCase {
             func save(_ pointSize: Double) { value = pointSize }
         }
 
+        XCTAssertEqual(TerminalFontSize.minimumPointSize, 5.0)
+        XCTAssertEqual(TerminalFontSize.presets, [6, 8, 10, 12, 14, 16, 18])
+        XCTAssertEqual(TerminalFontSize.clamped(5.0), 5.0)
+        XCTAssertEqual(TerminalFontSize.clamped(4.0), 5.0)
+        XCTAssertEqual(TerminalFontSize.clamped(0.0), 5.0)
+        XCTAssertEqual(TerminalFontSize.percentage(for: 5.0), 36)
+        XCTAssertEqual(TerminalFontSize.percentage(for: 6.0), 43)
+        XCTAssertEqual(TerminalFontSize.percentage(for: 8.0), 57)
+        XCTAssertEqual(TerminalFontSize.percentage(for: 14.0), 100)
+
         let store = MemoryStore()
         let controller = ShhTerminalController(fontSizeStore: store)
 
@@ -390,6 +400,11 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.maximumPointSize)
         controller.setTerminalFontSize(1)
         XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.minimumPointSize)
+        XCTAssertEqual(controller.terminalFontSize, 5.0)
+        XCTAssertEqual(controller.terminalFontSizePercentage, 36)
+        controller.setTerminalFontSize(5.0)
+        XCTAssertEqual(controller.terminalFontSize, 5.0)
+        XCTAssertEqual(controller.terminalFontSizePercentage, 36)
         controller.resetTerminalFontSize()
         XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.defaultPointSize)
         XCTAssertEqual(controller.terminalFontSizePercentage, 100)
