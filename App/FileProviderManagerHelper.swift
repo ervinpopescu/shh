@@ -58,6 +58,9 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
     public let appGroupIdentifier: String
     public let customContainerURL: URL?
     public let customLocalContainerURL: URL?
+    public typealias ContainerURLResolver = @Sendable (String) -> URL?
+
+    private let containerURLResolver: ContainerURLResolver
 
     #if canImport(FileProvider)
     public typealias DomainAdder = @Sendable (NSFileProviderDomain) async throws -> Void
@@ -77,6 +80,7 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
         appGroupIdentifier: String = "group.com.ervinpopescu.shh",
         containerURL: URL? = nil,
         localContainerURL: URL? = nil,
+        containerURLResolver: ContainerURLResolver? = nil,
         domainAdder: DomainAdder? = nil,
         domainRemover: DomainRemover? = nil,
         domainLister: DomainLister? = nil
@@ -84,6 +88,9 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
         self.appGroupIdentifier = appGroupIdentifier
         self.customContainerURL = containerURL
         self.customLocalContainerURL = localContainerURL
+        self.containerURLResolver = containerURLResolver ?? { identifier in
+            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+        }
         self.customDomainAdder = domainAdder
         self.customDomainRemover = domainRemover
         self.customDomainLister = domainLister
@@ -91,7 +98,7 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
 
     /// Resolved base container URL for App Group storage.
     public var containerURL: URL? {
-        customContainerURL ?? FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier)
+        customContainerURL ?? containerURLResolver(appGroupIdentifier)
     }
 
     /// Whether the signed process can currently access the shared App Group.
