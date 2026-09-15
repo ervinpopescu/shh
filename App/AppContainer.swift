@@ -357,6 +357,8 @@ final class AppContainer: ObservableObject {
         self.reachabilityMonitor = monitor
         let coordinator = reconnectCoordinator ?? ReconnectCoordinator()
         self.reconnectCoordinator = coordinator
+        let resolvedBonjour = bonjourDiscovery ?? BonjourSSHDiscovery()
+        self.bonjourDiscovery = resolvedBonjour
 
         self.customSFTPRepository = sftpRepository
         if let sftpRepository {
@@ -405,8 +407,6 @@ final class AppContainer: ObservableObject {
         }
         monitor.start()
 
-        let resolvedBonjour = bonjourDiscovery ?? BonjourSSHDiscovery()
-        self.bonjourDiscovery = resolvedBonjour
         resolvedBonjour.$discoveredServices
             .assign(to: &$discoveredSSHServices)
 
