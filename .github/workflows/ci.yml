@@ -50,6 +50,7 @@ jobs:
 
       - name: Run Core Swift Tests
         run: |
+          set -euo pipefail
           swift test 2>&1 | tee swift-test.log
 
       - name: Generate Xcode Project
@@ -58,6 +59,7 @@ jobs:
 
       - name: Build Generic iOS Targets (Unsigned)
         run: |
+          set -euo pipefail
           xcodebuild build \
             -project Shh.xcodeproj \
             -scheme Shh \
@@ -117,6 +119,7 @@ jobs:
       - name: Run iPhone Simulator Tests
         if: steps.simulators.outputs.iphone_id != ''
         run: |
+          set -euo pipefail
           xcodebuild test \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
@@ -127,6 +130,7 @@ jobs:
       - name: Run iPad Simulator Tests
         if: steps.simulators.outputs.ipad_id != ''
         run: |
+          set -euo pipefail
           xcodebuild test \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
