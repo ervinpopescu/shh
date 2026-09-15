@@ -889,6 +889,7 @@ struct PendingCommand: Identifiable {
 }
 
 struct SessionView: View {
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @EnvironmentObject private var container: AppContainer
     @State private var command = ""
     @State private var pendingSnippet: Snippet?
@@ -994,10 +995,12 @@ struct SessionView: View {
                         Text(host.name)
                             .font(.subheadline.weight(.semibold))
                             .lineLimit(1)
-                        Text("\(host.username)@\(host.hostname)")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
+                        if horizontalSizeClass != .compact {
+                            Text("\(host.username)@\(host.hostname)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                     } else {
                         Text(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
                             .font(.subheadline.weight(.semibold))
@@ -1051,6 +1054,27 @@ struct SessionView: View {
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
+                if horizontalSizeClass != .compact {
+                    Button(action: {
+                        isSearchPresented.toggle()
+                        if !isSearchPresented {
+                            searchQuery = ""
+                            container.terminalController.clearSearch()
+                        }
+                    }) {
+                        Image(systemName: "magnifyingglass")
+                    }
+                    .accessibilityLabel(isSearchPresented ? "Close search" : "Search terminal")
+
+                    Button(action: {
+                        container.terminalController.recoverFirstResponder()
+                    }) {
+                        Image(systemName: "keyboard")
+                            .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
+                    }
+                    .accessibilityLabel("Recover keyboard focus")
+                }
+
                 Button(action: {
                     container.resetVoiceState()
                     showVoice = true
@@ -1062,26 +1086,27 @@ struct SessionView: View {
                 .accessibilityIdentifier("session-header-voice-button")
                 .disabled(container.activeSession?.state != .connected)
 
-                Button(action: {
-                    isSearchPresented.toggle()
-                    if !isSearchPresented {
-                        searchQuery = ""
-                        container.terminalController.clearSearch()
-                    }
-                }) {
-                    Image(systemName: "magnifyingglass")
-                }
-                .accessibilityLabel(isSearchPresented ? "Close search" : "Search terminal")
-
-                Button(action: {
-                    container.terminalController.recoverFirstResponder()
-                }) {
-                    Image(systemName: "keyboard")
-                        .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
-                }
-                .accessibilityLabel("Recover keyboard focus")
-
                 Menu {
+                    if horizontalSizeClass == .compact {
+                        Button(action: {
+                            isSearchPresented.toggle()
+                            if !isSearchPresented {
+                                searchQuery = ""
+                                container.terminalController.clearSearch()
+                            }
+                        }) {
+                            Label("Search Terminal", systemImage: "magnifyingglass")
+                        }
+
+                        Button(action: {
+                            container.terminalController.recoverFirstResponder()
+                        }) {
+                            Label("Recover Keyboard Focus", systemImage: "keyboard")
+                        }
+
+                        Divider()
+                    }
+
                     Menu {
                         Button(action: {
                             container.terminalController.increaseTerminalFontSize()

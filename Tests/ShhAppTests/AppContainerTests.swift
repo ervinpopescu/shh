@@ -769,6 +769,16 @@ final class AppContainerTests: XCTestCase {
         let sessionView = SessionView().environmentObject(container)
         _ = sessionView
 
+        let compactSessionView = SessionView()
+            .environmentObject(container)
+            .environment(\.horizontalSizeClass, .compact)
+        _ = compactSessionView
+
+        let regularSessionView = SessionView()
+            .environmentObject(container)
+            .environment(\.horizontalSizeClass, .regular)
+        _ = regularSessionView
+
         let accessoryBar = TerminalAccessoryBar(controller: container.terminalController)
         _ = accessoryBar
 
