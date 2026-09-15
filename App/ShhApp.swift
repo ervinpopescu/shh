@@ -76,7 +76,6 @@ struct RootView: View {
                 }
             }
             .navigationTitle("Shh")
-            .safeAreaInset(edge: .bottom) { capabilityFooter }
         } detail: {
             NavigationStack {
                 switch section ?? .hosts {
@@ -91,17 +90,6 @@ struct RootView: View {
             }
         }
         .hostKeyApprovalAlert(container: container)
-    }
-    private var capabilityFooter: some View {
-        let surfaceDescription = container.useLegacyTerminalFallback
-            ? "Legacy terminal fallback surface active."
-            : "SwiftTerm production terminal surface active."
-        return VStack(alignment: .leading, spacing: 4) {
-            Text(container.isDemo ? "Offline demo mode" : "Live SSH mode").font(.caption.bold())
-            Text(container.isDemo
-                ? "SSH and Mosh adapters active in offline demo mode. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh UDP active. Local voice AI active."
-                : "Live SSH transport active. \(surfaceDescription) SFTP active. ProxyJump and forwarding active. Mosh UDP active. Local voice AI active.").font(.caption2).foregroundStyle(.secondary)
-        }.padding().frame(maxWidth: .infinity, alignment: .leading).background(.thinMaterial)
     }
 }
 
