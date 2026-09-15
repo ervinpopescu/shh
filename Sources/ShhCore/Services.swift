@@ -360,7 +360,37 @@ public struct DemoSSHTransport: SSHTransport {
 }
 
 public protocol CredentialStore: Sendable { func save(_ secret: Data, reference: String) async throws; func load(reference: String) async throws -> Data; func delete(reference: String) async throws }
-public enum KeychainError: Error, Equatable, Sendable { case unavailable; case status(Int32) }
+public enum KeychainError: Error, Equatable, Sendable, LocalizedError {
+    case unavailable
+    case status(Int32)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unavailable:
+            return "Keychain storage is unavailable on this device."
+        case .status(let code):
+            #if canImport(Security)
+            if code == errSecItemNotFound {
+                return "The credential was not found in the Keychain."
+            }
+            #else
+            if code == -25300 {
+                return "The credential was not found in the Keychain."
+            }
+            #endif
+            if code == -34018 {
+                return "Keychain access group entitlement is missing."
+            }
+            #if canImport(Security)
+            if let cfMessage = SecCopyErrorMessageString(code, nil) {
+                let message = cfMessage as String
+                return "\(message) (\(code))"
+            }
+            #endif
+            return "Keychain operation failed with error code \(code)."
+        }
+    }
+}
 #if canImport(Security)
 public struct KeychainCredentialStore: CredentialStore {
     public static let baseSharedAccessGroup = "group.com.ervinpopescu.shh"
@@ -424,7 +454,7 @@ public struct KeychainCredentialStore: CredentialStore {
         query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
         _ = SecItemDelete(baseQuery(reference: reference) as CFDictionary)
         var status = SecItemAdd(query as CFDictionary, nil)
-        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+        if status != errSecSuccess && accessGroup != nil {
             var fallbackQuery = query
             fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
             _ = SecItemDelete(fallbackQuery as CFDictionary)
@@ -434,22 +464,23 @@ public struct KeychainCredentialStore: CredentialStore {
     }
     public func load(reference: String) async throws -> Data {
         var query = baseQuery(reference: reference)
-        query[kSecReturnData] = true
+        query[kSecReturnData] = kCFBooleanTrue as Any
         query[kSecMatchLimit] = kSecMatchLimitOne
         var result: CFTypeRef?
         var status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+        if status != errSecSuccess && accessGroup != nil {
             var fallbackQuery = query
             fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
             status = SecItemCopyMatching(fallbackQuery as CFDictionary, &result)
         }
-        guard status == errSecSuccess, let data = result as? Data else { throw KeychainError.status(status) }
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+        guard let data = result as? Data else { throw KeychainError.unavailable }
         return data
     }
     public func delete(reference: String) async throws {
         let query = baseQuery(reference: reference)
         var status = SecItemDelete(query as CFDictionary)
-        if status == -34018 /* errSecMissingEntitlement */ && accessGroup != nil {
+        if status != errSecSuccess && status != errSecItemNotFound && accessGroup != nil {
             var fallbackQuery = query
             fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
             status = SecItemDelete(fallbackQuery as CFDictionary)

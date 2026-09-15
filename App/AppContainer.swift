@@ -1,4 +1,5 @@
 import Foundation
+import Crypto
 #if canImport(FileProvider)
 import FileProvider
 #endif
@@ -3279,14 +3280,18 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    public func createEd25519Identity(name: String, comment: String? = nil) async throws -> IdentityDescriptor {
+    public func createEd25519Identity(
+        name: String,
+        comment: String? = nil,
+        keyPair: (privateKey: Curve25519.Signing.PrivateKey, openSSHPrivateKey: String, openSSHPublicKey: String, fingerprint: String)? = nil
+    ) async throws -> IdentityDescriptor {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
             throw ShhValidationError.empty(field: "identity name")
         }
         let commentValue = comment?.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveComment = (commentValue?.isEmpty == false) ? (commentValue ?? trimmedName) : trimmedName
-        let generated = Ed25519Parser.generateKeyPair(comment: effectiveComment)
+        let generated = keyPair ?? Ed25519Parser.generateKeyPair(comment: effectiveComment)
         let reference = "id-\(UUID().uuidString)"
         try await credentialStore.save(Data(generated.openSSHPrivateKey.utf8), reference: reference)
         let descriptor = try IdentityDescriptor(

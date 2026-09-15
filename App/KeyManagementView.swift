@@ -634,16 +634,18 @@ struct IdentityEditorView: View {
         Task {
             defer { isProcessing = false }
             do {
+                let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
                 let trimmedComment = comment.trimmingCharacters(in: .whitespacesAndNewlines)
                 let effectiveComment = trimmedComment.isEmpty ? nil : trimmedComment
+                let keyComment = effectiveComment ?? trimmedName
+                let generated = Ed25519Parser.generateKeyPair(comment: keyComment)
                 let identity = try await container.createEd25519Identity(
                     name: name,
-                    comment: effectiveComment
+                    comment: effectiveComment,
+                    keyPair: generated
                 )
                 newlyCreatedIdentity = identity
-                if let pubKey = try await container.openSSHPublicKey(for: identity) {
-                    generatedPublicKey = pubKey
-                }
+                generatedPublicKey = generated.openSSHPublicKey
                 onCreated?(identity)
             } catch {
                 errorMessage = error.localizedDescription
