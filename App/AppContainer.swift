@@ -8,6 +8,7 @@ import ShhSSH
 import ShhTerminal
 import ShhVoice
 import SwiftUI
+import Combine
 
 private final class VoiceInterruptionBridge: @unchecked Sendable {
     var onInterruption: (@Sendable () -> Void)?
@@ -139,6 +140,10 @@ final class AppContainer: ObservableObject {
     @Published public var isPreviewLoading: Bool = false
     @Published public var previewErrorMessage: String? = nil
 
+    // MARK: - Local Network Bonjour Discovery
+    public let bonjourDiscovery: BonjourSSHDiscovery
+    @Published public var discoveredSSHServices: [DiscoveredSSHService] = []
+
     @Published public var activeEditingFile: RemoteFile? = nil
     @Published public var editingFileContent: String = ""
     @Published public var isSavingFile: Bool = false
@@ -226,7 +231,8 @@ final class AppContainer: ObservableObject {
         sftpRepository: (any SFTPRepository)? = nil,
         portForwardingManager: (any PortForwardingManaging)? = nil,
         hostResolver: LiveSSHTransport.HostResolver? = nil,
-        fileProviderHelper: FileProviderManagerHelper = .shared
+        fileProviderHelper: FileProviderManagerHelper = .shared,
+        bonjourDiscovery: BonjourSSHDiscovery? = nil
     ) {
         self.fileProviderHelper = fileProviderHelper
         self.didProvideCustomCatalog = (catalog != nil)
@@ -395,6 +401,11 @@ final class AppContainer: ObservableObject {
         }
         monitor.start()
 
+        let resolvedBonjour = bonjourDiscovery ?? BonjourSSHDiscovery()
+        self.bonjourDiscovery = resolvedBonjour
+        resolvedBonjour.$discoveredServices
+            .assign(to: &$discoveredSSHServices)
+
         Task { [weak self] in
             await self?.refreshVoiceModels()
         }
@@ -447,7 +458,8 @@ final class AppContainer: ObservableObject {
         reconnectCoordinator: ReconnectCoordinator? = nil,
         sftpRepository: (any SFTPRepository)? = nil,
         portForwardingManager: (any PortForwardingManaging)? = nil,
-        fileProviderHelper: FileProviderManagerHelper = .shared
+        fileProviderHelper: FileProviderManagerHelper = .shared,
+        bonjourDiscovery: BonjourSSHDiscovery? = nil
     ) -> AppContainer {
         let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
         let demoTranscriber = transcriber ?? DemoTranscriber()
@@ -480,7 +492,8 @@ final class AppContainer: ObservableObject {
             ),
             sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true),
             portForwardingManager: portForwardingManager ?? DemoPortForwardingManager(),
-            fileProviderHelper: fileProviderHelper
+            fileProviderHelper: fileProviderHelper,
+            bonjourDiscovery: bonjourDiscovery
         )
     }
 

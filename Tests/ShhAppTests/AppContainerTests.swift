@@ -882,6 +882,20 @@ final class AppContainerTests: XCTestCase {
         let updatedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
         XCTAssertNil(updatedHost?.identityID)
     }
+
+    func testBonjourDiscoveryForwarding() async {
+        let container = AppContainer.demo()
+        XCTAssertNotNil(container.bonjourDiscovery)
+        XCTAssertTrue(container.discoveredSSHServices.isEmpty)
+
+        let service = DiscoveredSSHService(name: "test-rpi", hostname: "test-rpi.local", port: 22)
+        container.bonjourDiscovery.updateDiscoveredServices([service])
+
+        XCTAssertEqual(container.discoveredSSHServices.count, 1)
+        XCTAssertEqual(container.discoveredSSHServices.first?.name, "test-rpi")
+        XCTAssertEqual(container.discoveredSSHServices.first?.hostname, "test-rpi.local")
+        XCTAssertEqual(container.discoveredSSHServices.first?.port, 22)
+    }
 }
 
 private actor Gate {

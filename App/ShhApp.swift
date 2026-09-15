@@ -1,4 +1,5 @@
 import ShhCore
+import ShhSSH
 import ShhTerminal
 import SwiftUI
 
@@ -99,6 +100,7 @@ struct HostListView: View {
     @State private var search = ""
     @State private var showingEditor = false
     @State private var healthyOnly = false
+    @State private var selectedDiscoveredService: DiscoveredSSHService? = nil
 
     init() {
         if ProcessInfo.processInfo.arguments.contains("--new-host") {
@@ -118,6 +120,42 @@ struct HostListView: View {
                     Text("Persistence readiness")
                 }
             }
+            if !container.discoveredSSHServices.isEmpty {
+                Section {
+                    ForEach(container.discoveredSSHServices) { service in
+                        Button {
+                            selectedDiscoveredService = service
+                            showingEditor = true
+                        } label: {
+                            HStack {
+                                Image(systemName: "network")
+                                    .foregroundStyle(.tint)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(service.name)
+                                        .font(.headline)
+                                        .foregroundStyle(.primary)
+                                    Text("\(service.hostname):\(service.port)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Image(systemName: "plus.circle")
+                                    .foregroundStyle(.tint)
+                            }
+                        }
+                        .accessibilityIdentifier("discovered-host-\(service.id)")
+                    }
+                } header: {
+                    HStack {
+                        Text("Discovered on Local Network")
+                        if container.bonjourDiscovery.isSearching {
+                            Spacer()
+                            ProgressView()
+                                .scaleEffect(0.7)
+                        }
+                    }
+                }
+            }
             Section("Saved hosts") {
                 ForEach(filtered) { host in
                     NavigationLink(destination: HostDetailView(host: host)) { HostRow(host: host) }
@@ -134,7 +172,16 @@ struct HostListView: View {
         .navigationTitle("Hosts")
         .searchable(text: $search, prompt: "Search hosts, groups, tags")
         .toolbar { Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") { Toggle("Healthy only", isOn: $healthyOnly) }; Button("Add", systemImage: "plus") { showingEditor = true } }
-        .sheet(isPresented: $showingEditor, onDismiss: { Task { await reload() } }) { HostEditorView().environmentObject(container) }
+        .sheet(isPresented: $showingEditor, onDismiss: {
+            selectedDiscoveredService = nil
+            Task { await reload() }
+        }) { HostEditorView(prefillService: selectedDiscoveredService).environmentObject(container) }
+        .onAppear {
+            container.bonjourDiscovery.startDiscovery()
+        }
+        .onDisappear {
+            container.bonjourDiscovery.stopDiscovery()
+        }
         .task {
             await reload()
             if ProcessInfo.processInfo.arguments.contains("--new-host") {
@@ -430,6 +477,7 @@ struct HostEditorView: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
     let existing: Host?
+    let prefillService: DiscoveredSSHService?
     @State private var name: String
     @State private var hostname: String
     @State private var username: String
@@ -457,12 +505,13 @@ struct HostEditorView: View {
     @State private var moshPortRangeEnd: String
     @State private var moshPredictionMode: MoshPredictionMode
 
-    init(existing: Host? = nil) {
+    init(existing: Host? = nil, prefillService: DiscoveredSSHService? = nil) {
         self.existing = existing
-        _name = State(initialValue: existing?.name ?? "")
-        _hostname = State(initialValue: existing?.hostname ?? "")
+        self.prefillService = prefillService
+        _name = State(initialValue: prefillService?.name ?? existing?.name ?? "")
+        _hostname = State(initialValue: prefillService?.hostname ?? existing?.hostname ?? "")
         _username = State(initialValue: existing?.username ?? "")
-        _port = State(initialValue: String(existing?.port ?? 22))
+        _port = State(initialValue: String(prefillService?.port ?? existing?.port ?? 22))
         _identityID = State(initialValue: existing?.identityID)
 
         let initialType: HostConnectionType
@@ -519,6 +568,42 @@ struct HostEditorView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if !container.discoveredSSHServices.isEmpty {
+                    Section {
+                        ForEach(container.discoveredSSHServices) { service in
+                            Button {
+                                name = service.name
+                                hostname = service.hostname
+                                port = String(service.port)
+                            } label: {
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(service.name)
+                                            .font(.headline)
+                                            .foregroundStyle(.primary)
+                                        Text("\(service.hostname):\(service.port)")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "arrow.down.circle")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                            .accessibilityIdentifier("discovered-service-\(service.id)")
+                        }
+                    } header: {
+                        HStack {
+                            Text("Discovered on Local Network")
+                            if container.bonjourDiscovery.isSearching {
+                                Spacer()
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                            }
+                        }
+                    }
+                }
+
                 Section("Host metadata") {
                     TextField("Name", text: $name)
                         .autocorrectionDisabled()
@@ -792,6 +877,12 @@ struct HostEditorView: View {
                     .accessibilityIdentifier("host-editor-dismiss-keyboard-button")
                 }
             }
+        }
+        .onAppear {
+            container.bonjourDiscovery.startDiscovery()
+        }
+        .onDisappear {
+            container.bonjourDiscovery.stopDiscovery()
         }
         .editorSheetPresentation()
     }
