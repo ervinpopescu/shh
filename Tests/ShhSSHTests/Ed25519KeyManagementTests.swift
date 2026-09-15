@@ -104,11 +104,87 @@ final class Ed25519KeyManagementTests: XCTestCase {
                 XCTFail("Expected TransportError, got \(error)")
                 return
             }
-            XCTAssertEqual(transportError, .invalidConfiguration)
+            XCTAssertEqual(
+                transportError,
+                .invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
+            )
         }
 
         XCTAssertThrowsError(try Ed25519Parser.parse(from: "")) { error in
-            XCTAssertEqual(error as? TransportError, .invalidConfiguration)
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
+            )
+        }
+    }
+
+    func testImportRSAPrivateKeyThrowsInformativeError() {
+        let rsaPem = """
+        -----BEGIN RSA PRIVATE KEY-----
+        MIIEowIBAAKCAQEA0Y3y1a
+        -----END RSA PRIVATE KEY-----
+        """
+        XCTAssertThrowsError(try Ed25519Parser.parse(from: rsaPem)) { error in
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "RSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            )
+        }
+
+        let sshRsa = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD user@example"
+        XCTAssertThrowsError(try Ed25519Parser.parse(from: sshRsa)) { error in
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "RSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            )
+        }
+    }
+
+    func testImportECDSAPrivateKeyThrowsInformativeError() {
+        let ecPem = """
+        -----BEGIN EC PRIVATE KEY-----
+        MHcCAQEEII5r7U
+        -----END EC PRIVATE KEY-----
+        """
+        XCTAssertThrowsError(try Ed25519Parser.parse(from: ecPem)) { error in
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "ECDSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            )
+        }
+
+        let ecdsaKey = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY= user@example"
+        XCTAssertThrowsError(try Ed25519Parser.parse(from: ecdsaKey)) { error in
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "ECDSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            )
+        }
+    }
+
+    func testImportEncryptedOpenSSHPrivateKeyThrowsInformativeError() {
+        var buffer = ByteBuffer()
+        buffer.writeString("openssh-key-v1\0")
+        let cipher = "aes256-ctr"
+        buffer.writeInteger(UInt32(cipher.utf8.count))
+        buffer.writeString(cipher)
+        let kdf = "bcrypt"
+        buffer.writeInteger(UInt32(kdf.utf8.count))
+        buffer.writeString(kdf)
+        buffer.writeInteger(UInt32(0))
+        buffer.writeInteger(UInt32(1))
+        let dummyBytes = buffer.readBytes(length: buffer.readableBytes)!
+        let base64 = Data(dummyBytes).base64EncodedString()
+        let encryptedKey = """
+        -----BEGIN OPENSSH PRIVATE KEY-----
+        \(base64)
+        -----END OPENSSH PRIVATE KEY-----
+        """
+        XCTAssertThrowsError(try Ed25519Parser.parse(from: encryptedKey)) { error in
+            XCTAssertEqual(
+                error as? TransportError,
+                .invalidPrivateKey(detail: "Passphrase-encrypted OpenSSH keys are not yet supported. Please import an unencrypted Ed25519 key.")
+            )
         }
     }
 }

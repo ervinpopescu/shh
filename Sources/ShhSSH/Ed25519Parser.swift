@@ -13,14 +13,23 @@ public enum Ed25519Parser {
     public static func parse(from data: Data) throws -> Curve25519.Signing.PrivateKey {
         if let text = String(data: data, encoding: .utf8) {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.contains("-----BEGIN RSA PRIVATE KEY-----") || trimmed.contains("ssh-rsa") {
+                throw TransportError.invalidPrivateKey(detail: "RSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            }
+            if trimmed.contains("-----BEGIN EC PRIVATE KEY-----") || trimmed.contains("ecdsa-") {
+                throw TransportError.invalidPrivateKey(detail: "ECDSA private keys are not currently supported. Please use an Ed25519 key or password.")
+            }
             if trimmed.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+                if let cipher = openSSHCipherName(text: trimmed), cipher != "none" {
+                    throw TransportError.invalidPrivateKey(detail: "Passphrase-encrypted OpenSSH keys are not yet supported. Please import an unencrypted Ed25519 key.")
+                }
                 if let parsed = parseOpenSSHDirect(text: trimmed) {
                     return parsed
                 }
                 if let key = try? Curve25519.Signing.PrivateKey(sshEd25519: trimmed) {
                     return key
                 }
-                throw TransportError.invalidConfiguration
+                throw TransportError.invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
             }
             if trimmed.contains("-----BEGIN PRIVATE KEY-----") {
                 let base64Body = trimmed
@@ -51,7 +60,7 @@ public enum Ed25519Parser {
                 do {
                     return try Curve25519.Signing.PrivateKey(rawRepresentation: decoded)
                 } catch {
-                    throw TransportError.invalidConfiguration
+                    throw TransportError.invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
                 }
             }
             if trimmed.count == 64 && trimmed.allSatisfy(\.isHexDigit) {
@@ -74,13 +83,26 @@ public enum Ed25519Parser {
             do {
                 return try Curve25519.Signing.PrivateKey(rawRepresentation: data)
             } catch {
-                throw TransportError.invalidConfiguration
+                throw TransportError.invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
             }
         }
         if let key = try? Curve25519.Signing.PrivateKey(sshEd25519: data) {
             return key
         }
-        throw TransportError.invalidConfiguration
+        throw TransportError.invalidPrivateKey(detail: "Could not parse Ed25519 private key. Ensure the entire key block is included.")
+    }
+
+    private static func openSSHCipherName(text: String) -> String? {
+        let base64Body = text
+            .components(separatedBy: .newlines)
+            .filter { !$0.hasPrefix("-----") && !$0.isEmpty }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let data = Data(base64Encoded: base64Body) else { return nil }
+        var buffer = ByteBuffer(data: data)
+        guard buffer.readString(length: 15) == "openssh-key-v1\0" else { return nil }
+        guard let cipherBytes = readSSHStringBytes(from: &buffer) else { return nil }
+        return String(bytes: cipherBytes, encoding: .utf8)
     }
 
     private static func readSSHStringBytes(from buffer: inout ByteBuffer) -> [UInt8]? {
