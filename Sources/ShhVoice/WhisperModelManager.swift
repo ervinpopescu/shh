@@ -199,7 +199,6 @@ public actor WhisperModelManager {
         self.validator = validator
         self.downloader = downloader
         self.fileManager = fileManager
-        self.states = [:]
 
         if !fileManager.fileExists(atPath: modelsDirectory.path) {
             try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
@@ -211,7 +210,7 @@ public actor WhisperModelManager {
 
         var initialStates: [WhisperModelTier: VoiceModelState] = [:]
         for tier in WhisperModelTier.allCases {
-            let modelDir = resolvedModelDirectory(for: tier)
+            let modelDir = Self.resolvedModelDirectory(in: modelsDirectory, fileManager: fileManager, for: tier)
             if fileManager.fileExists(atPath: modelDir.path) {
                 if (try? validator.validateModel(at: modelDir, tier: tier)) == true {
                     let attrs = try? fileManager.attributesOfItem(atPath: modelDir.path)
@@ -398,7 +397,7 @@ public actor WhisperModelManager {
         try deleteModel(tier)
     }
 
-    func resolvedModelDirectory(for tier: WhisperModelTier) -> URL {
+    public static func resolvedModelDirectory(in modelsDirectory: URL, fileManager: FileManager = .default, for tier: WhisperModelTier) -> URL {
         let direct = modelsDirectory.appendingPathComponent(tier.defaultModelID, isDirectory: true)
         if fileManager.fileExists(atPath: direct.path) {
             return direct
@@ -412,6 +411,10 @@ public actor WhisperModelManager {
             return hfPath
         }
         return direct
+    }
+
+    func resolvedModelDirectory(for tier: WhisperModelTier) -> URL {
+        Self.resolvedModelDirectory(in: modelsDirectory, fileManager: fileManager, for: tier)
     }
 
     private func cleanupPartialDownload(tier: WhisperModelTier) {

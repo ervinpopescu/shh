@@ -242,24 +242,27 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
     ) -> Progress {
         let progress = Progress(totalUnitCount: 100)
         let contractID = FileProviderItemIdentifier(rawValue: item.itemIdentifier.rawValue)
-        guard let remotePath = contractID.remotePath else {
+        guard contractID.remotePath != nil else {
             completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
             return progress
         }
 
         let task = Task {
             do {
-                var currentPath = remotePath
+                guard var activePath = contractID.remotePath else {
+                    completionHandler(nil, [], false, NSFileProviderError(.noSuchItem))
+                    return
+                }
                 let parentID = FileProviderItemIdentifier(rawValue: item.parentItemIdentifier.rawValue)
                 var targetParentPath = parentID.remotePath ?? RemotePath("/")
-                let newFilename = changedFields.contains(.filename) ? item.filename : currentPath.lastComponent
+                let newFilename = changedFields.contains(.filename) ? item.filename : activePath.lastComponent
                 guard !newFilename.contains("/") && !newFilename.contains("..") && !newFilename.isEmpty else {
                     completionHandler(nil, [], false, NSError(domain: NSCocoaErrorDomain, code: NSFileWriteInvalidFileNameError, userInfo: nil))
                     return
                 }
 
                 if !changedFields.contains(.parentItemIdentifier) {
-                    targetParentPath = currentPath.parent
+                    targetParentPath = activePath.parent
                 }
 
                 guard let destinationPath = try? targetParentPath.appendingSafely(newFilename) else {
@@ -268,30 +271,30 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                 }
 
                 // Handle rename / reparent if destination differs from source
-                if destinationPath != currentPath {
+                if destinationPath != activePath {
                     try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 30.0) { repo in
-                        try await repo.rename(from: currentPath, to: destinationPath)
+                        try await repo.rename(from: activePath, to: destinationPath)
                     }
-                    currentPath = destinationPath
+                    activePath = destinationPath
                 }
 
                 // Handle new content upload if provided
                 if let newContents {
                     try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 60.0) { repo in
-                        try await repo.upload(from: newContents, to: currentPath) { transferProgress in
+                        try await repo.upload(from: newContents, to: activePath) { transferProgress in
                             progress.completedUnitCount = Int64(transferProgress.fractionCompleted * 100.0)
                         }
                     }
                 }
 
-                let newContractID = FileProviderItemIdentifier(hostID: hostID, remotePath: currentPath)
-                let parentContractID = currentPath.parent.isRoot ? .root : FileProviderItemIdentifier(hostID: hostID, remotePath: currentPath.parent)
+                let newContractID = FileProviderItemIdentifier(hostID: hostID, remotePath: activePath)
+                let parentContractID = activePath.parent.isRoot ? .root : FileProviderItemIdentifier(hostID: hostID, remotePath: activePath.parent)
 
                 if var metadata = await cache.getMetadata(for: contractID) {
                     if newContractID != contractID {
                         await cache.removeMetadata(for: contractID)
                     }
-                    metadata.remotePath = currentPath
+                    metadata.remotePath = activePath
                     metadata.item.identifier = newContractID
                     metadata.item.parentIdentifier = parentContractID
                     metadata.item.filename = newFilename
@@ -305,12 +308,12 @@ public class FileProviderExtension: NSObject, NSFileProviderReplicatedExtension 
                     completionHandler(FileProviderItem(contract: metadata.item), [], false, nil)
                 } else {
                     let remoteFile = try await repositoryProvider.withRepository(hostID: hostID, timeoutSeconds: 10.0) { repo in
-                        try await repo.fetchAttributes(at: currentPath)
+                        try await repo.fetchAttributes(at: activePath)
                     }
                     let contract = FileProviderItemContract(remoteFile: remoteFile, hostID: hostID)
                     await cache.storeMetadata(FileProviderCacheMetadata(
                         hostID: hostID,
-                        remotePath: currentPath,
+                        remotePath: activePath,
                         item: contract,
                         fileSizeBytes: remoteFile.size,
                         isMaterialized: newContents != nil
