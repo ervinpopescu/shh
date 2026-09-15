@@ -1002,6 +1002,7 @@ struct SessionView: View {
     @State private var pendingRiskyPaste: String?
     @State private var showPortForwarding = false
     @State private var showTelemetry = false
+    @State private var isZenMode: Bool = false
     private let policy = CommandPolicy()
 
     private func terminalColor(_ value: TerminalColor) -> Color {
@@ -1083,6 +1084,8 @@ struct SessionView: View {
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(isZenMode ? .hidden : .visible, for: .navigationBar)
+        .navigationBarHidden(isZenMode)
         .toolbar {
             ToolbarItem(placement: .principal) {
                 HStack(spacing: 6) {
@@ -1275,6 +1278,18 @@ struct SessionView: View {
                     Divider()
 
                     Button(action: {
+                        withAnimation {
+                            isZenMode = true
+                        }
+                    }) {
+                        Label("Zen Mode (Full Screen)", systemImage: "arrow.up.left.and.arrow.down.right")
+                    }
+                    .accessibilityIdentifier("open-zen-mode-button")
+                    .accessibilityLabel("Enter Zen Mode full screen")
+
+                    Divider()
+
+                    Button(action: {
                         showMultiplexer = true
                     }) {
                         Label("Multiplexer", systemImage: "rectangle.3.group")
@@ -1336,6 +1351,29 @@ struct SessionView: View {
             }
         } message: {
             Text("The remote session does not have bracketed paste enabled. Pasting multiple lines may execute commands immediately without confirmation.")
+        }
+        .overlay(alignment: .topTrailing) {
+            if isZenMode {
+                Button(action: {
+                    withAnimation {
+                        isZenMode = false
+                    }
+                }) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.primary.opacity(0.85))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .shadow(color: .black.opacity(0.15), radius: 4, x: 0, y: 2)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 8)
+                .padding(.trailing, 12)
+                .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                .accessibilityIdentifier("exit-zen-mode-button")
+                .accessibilityLabel("Exit Zen Mode")
+            }
         }
         .onAppear {
             container.terminalController.onRiskyPasteRequested = { text in
@@ -3311,6 +3349,21 @@ struct SettingsView: View {
     @EnvironmentObject private var container: AppContainer
     var body: some View {
         Form {
+            Section("Terminal Preferences") {
+                Toggle(isOn: $container.keepScreenAwake) {
+                    Label {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Keep Screen Awake")
+                            Text("Prevent display from sleeping during active SSH sessions")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "sun.max.fill")
+                    }
+                }
+                .accessibilityIdentifier("settings-keep-screen-awake-toggle")
+            }
             Section("Appearance") {
                 Picker("Appearance", selection: Binding(
                     get: { container.appearance },

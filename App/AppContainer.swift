@@ -3,6 +3,9 @@ import Crypto
 #if canImport(FileProvider)
 import FileProvider
 #endif
+#if canImport(UIKit)
+import UIKit
+#endif
 import ShhCore
 import ShhSSH
 import ShhTerminal
@@ -49,7 +52,17 @@ final class AppContainer: ObservableObject {
 
     @Published public var appearance: AppearanceSetting
     @Published public var terminalTheme: TerminalThemePreset
-    @Published var activeSession: TerminalSession?
+    @Published public var keepScreenAwake: Bool {
+        didSet {
+            UserDefaults.standard.set(keepScreenAwake, forKey: Self.keepScreenAwakePreferenceKey)
+            updateIdleTimerState()
+        }
+    }
+    @Published var activeSession: TerminalSession? {
+        didSet {
+            updateIdleTimerState()
+        }
+    }
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
@@ -183,6 +196,7 @@ final class AppContainer: ObservableObject {
 
     private static let appearancePreferenceKey = "shh.appearance"
     private static let terminalThemePreferenceKey = UserDefaultsTerminalThemeStore.storageKey
+    public static let keepScreenAwakePreferenceKey = "shh.preferences.keepScreenAwake"
 
     public static let whisperProviderID = VoiceProviderRegistry.whisperProviderID
     public static let appleSpeechProviderID = VoiceProviderRegistry.appleSpeechProviderID
@@ -204,6 +218,19 @@ final class AppContainer: ObservableObject {
         terminalTheme = value
         terminalController.setTerminalTheme(value)
         UserDefaults.standard.set(value.rawValue, forKey: Self.terminalThemePreferenceKey)
+    }
+
+    public func setKeepScreenAwake(_ enabled: Bool) {
+        keepScreenAwake = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.keepScreenAwakePreferenceKey)
+        updateIdleTimerState()
+    }
+
+    private func updateIdleTimerState() {
+        #if canImport(UIKit)
+        let shouldDisable = keepScreenAwake && activeSession?.state == .connected
+        UIApplication.shared.isIdleTimerDisabled = shouldDisable
+        #endif
     }
 
     var activeTranscriber: any LocalTranscriber {
@@ -347,8 +374,10 @@ final class AppContainer: ObservableObject {
         let storedTheme = TerminalThemePreset(
             rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey) ?? ""
         ) ?? .default
+        let storedKeepScreenAwake = UserDefaults.standard.object(forKey: Self.keepScreenAwakePreferenceKey) as? Bool ?? true
         self.appearance = storedAppearance
         self.terminalTheme = storedTheme
+        self.keepScreenAwake = storedKeepScreenAwake
         self.terminalController = ShhTerminalController(
             configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
         )
@@ -427,6 +456,8 @@ final class AppContainer: ObservableObject {
             await self?.refreshRegisteredDomains()
             #endif
         }
+
+        updateIdleTimerState()
     }
 
     @discardableResult
@@ -973,6 +1004,8 @@ final class AppContainer: ObservableObject {
         networkRoamingState = nil
         await connection?.close()
         connection = nil
+        activeSession?.state = .disconnected
+        updateIdleTimerState()
     }
 
     func retryReconnect() async {
@@ -1314,6 +1347,7 @@ final class AppContainer: ObservableObject {
         }
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
+        updateIdleTimerState()
     }
 
     private func detachCallbacks() {

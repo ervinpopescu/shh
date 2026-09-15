@@ -4,6 +4,9 @@ import Crypto
 import ShhCore
 import ShhSSH
 import ShhTerminal
+#if canImport(UIKit)
+import UIKit
+#endif
 
 final class CountingCredentialStore: CredentialStore, @unchecked Sendable {
     private let inner = InMemoryCredentialStore()
@@ -895,6 +898,91 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(container.discoveredSSHServices.first?.name, "test-rpi")
         XCTAssertEqual(container.discoveredSSHServices.first?.hostname, "test-rpi.local")
         XCTAssertEqual(container.discoveredSSHServices.first?.port, 22)
+    }
+
+    func testKeepScreenAwakePersistenceAndDefaults() {
+        let key = AppContainer.keepScreenAwakePreferenceKey
+        let originalValue = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let originalValue {
+                UserDefaults.standard.set(originalValue, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
+
+        // Test default value is true when no key is in UserDefaults
+        UserDefaults.standard.removeObject(forKey: key)
+        let container1 = AppContainer.demo()
+        XCTAssertTrue(container1.keepScreenAwake, "keepScreenAwake must default to true")
+
+        // Test setting to false persists to UserDefaults
+        container1.setKeepScreenAwake(false)
+        XCTAssertFalse(container1.keepScreenAwake)
+        XCTAssertEqual(UserDefaults.standard.bool(forKey: key), false)
+
+        // Test initializing new container reads persisted false
+        let container2 = AppContainer.demo()
+        XCTAssertFalse(container2.keepScreenAwake)
+
+        // Test setting back to true persists
+        container2.setKeepScreenAwake(true)
+        XCTAssertTrue(container2.keepScreenAwake)
+        XCTAssertEqual(UserDefaults.standard.bool(forKey: key), true)
+    }
+
+    func testKeepScreenAwakeIdleTimerStateEvaluation() async throws {
+        let key = AppContainer.keepScreenAwakePreferenceKey
+        let originalValue = UserDefaults.standard.object(forKey: key)
+        defer {
+            if let originalValue {
+                UserDefaults.standard.set(originalValue, forKey: key)
+            } else {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+            #if canImport(UIKit)
+            UIApplication.shared.isIdleTimerDisabled = false
+            #endif
+        }
+
+        let container = AppContainer.demo()
+        let host = try Host(name: "Demo Host", hostname: "demo.invalid", username: "dev")
+        let challenge = HostKeyChallenge(hostname: "demo.invalid", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        await container.trustStore.save(challenge)
+
+        #if canImport(UIKit)
+        // 1. Initially disconnected: idle timer is not disabled
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled)
+
+        // 2. Connect with keepScreenAwake == true: idle timer disabled
+        container.setKeepScreenAwake(true)
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue(UIApplication.shared.isIdleTimerDisabled, "Idle timer must be disabled during active SSH session when keepScreenAwake is true")
+
+        // 3. Toggle keepScreenAwake to false while connected: idle timer restored to enabled
+        container.setKeepScreenAwake(false)
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled, "Idle timer must not be disabled when keepScreenAwake is false")
+
+        // 4. Toggle keepScreenAwake back to true while connected: idle timer disabled again
+        container.setKeepScreenAwake(true)
+        XCTAssertTrue(UIApplication.shared.isIdleTimerDisabled, "Idle timer must be disabled when keepScreenAwake is turned back on")
+
+        // 5. Disconnect: idle timer restored to enabled (isIdleTimerDisabled == false)
+        await container.disconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled, "Idle timer must not be disabled after disconnect")
+
+        // 6. Connect again, then cancel reconnect: idle timer must not be disabled
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue(UIApplication.shared.isIdleTimerDisabled)
+        await container.cancelReconnect()
+        XCTAssertFalse(UIApplication.shared.isIdleTimerDisabled, "Idle timer must not be disabled after cancelReconnect")
+        #else
+        container.setKeepScreenAwake(true)
+        XCTAssertTrue(container.keepScreenAwake)
+        #endif
     }
 }
 
