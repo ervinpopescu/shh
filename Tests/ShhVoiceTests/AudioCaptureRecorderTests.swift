@@ -127,6 +127,65 @@ final class AudioCaptureRecorderTests: XCTestCase {
         }
     }
 
+    final class ControlledAudioRecorderSleeper: AudioRecorderSleeper, @unchecked Sendable {
+        private let lock = NSLock()
+        private let startedContinuation: AsyncStream<Void>.Continuation
+        private var releaseContinuation: CheckedContinuation<Void, Error>?
+        private var releaseRequested = false
+        let started: AsyncStream<Void>
+
+        init() {
+            let (started, continuation) = AsyncStream<Void>.makeStream()
+            self.started = started
+            self.startedContinuation = continuation
+        }
+
+        func sleep(for _: TimeInterval) async throws {
+            startedContinuation.yield(())
+            try await withCheckedThrowingContinuation { continuation in
+                lock.lock()
+                if releaseRequested {
+                    lock.unlock()
+                    continuation.resume()
+                } else {
+                    releaseContinuation = continuation
+                    lock.unlock()
+                }
+            }
+        }
+
+        func waitUntilStarted() async {
+            for await _ in started {
+                return
+            }
+        }
+
+        func release() {
+            lock.lock()
+            let continuation = releaseContinuation
+            releaseContinuation = nil
+            if continuation == nil {
+                releaseRequested = true
+            }
+            lock.unlock()
+            continuation?.resume()
+        }
+    }
+
+    private func eventually(
+        timeoutNanoseconds: UInt64 = 1_000_000_000,
+        condition: @escaping @Sendable () async -> Bool
+    ) async -> Bool {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if await condition() {
+                return true
+            }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return await condition()
+    }
+
     // MARK: - Lifecycle & Deletion Tests
 
     func testHappyPathRecordingLifecycleAndGuaranteedCleanup() async throws {
@@ -473,6 +532,7 @@ final class AudioCaptureRecorderTests: XCTestCase {
         let engine = MockAudioRecordingEngine()
         let factory = MockAudioRecordingEngineFactory(engine: engine)
         let notifier = MockAudioLifecycleNotifier()
+        let sleeper = ControlledAudioRecorderSleeper()
 
         let createdBox = Box<AudioRecordingHandle?>(nil)
         let recorder = AudioCaptureRecorder(
@@ -480,6 +540,7 @@ final class AudioCaptureRecorderTests: XCTestCase {
             sessionManager: session,
             engineFactory: factory,
             lifecycleNotifier: notifier,
+            timeoutSleeper: sleeper,
             tempFileFactory: {
                 let h = try AudioRecordingHandle.createTemporary(fileExtension: "wav")
                 let data = VoiceAudioFormat.createSyntheticWavData(duration: 0.5)
@@ -492,12 +553,23 @@ final class AudioCaptureRecorderTests: XCTestCase {
         try await recorder.start()
         XCTAssertTrue(createdBox.value!.exists)
 
-        // Wait for maxDuration timeout to fire
-        try await Task.sleep(nanoseconds: 120_000_000)
+        // Release the injected timer only after the timeout task is known to be waiting.
+        await sleeper.waitUntilStarted()
+        sleeper.release()
 
-        let isRec = await recorder.isRecording
-        XCTAssertFalse(isRec)
+        let cleanupCompleted = await eventually {
+            let isRecording = await recorder.isRecording
+            let timeoutTaskIsActive = await recorder.hasActiveMaxDurationTask
+            return !isRecording && !createdBox.value!.exists && !timeoutTaskIsActive
+        }
+        XCTAssertTrue(cleanupCompleted, "Timeout cleanup did not complete before the hard deadline")
+        let isRecordingAfterTimeout = await recorder.isRecording
+        XCTAssertFalse(isRecordingAfterTimeout)
         XCTAssertFalse(createdBox.value!.exists, "Exceeding max duration must clean up file")
+        XCTAssertEqual(engine.stopCallCount, 1, "Timeout must stop recording exactly once")
+        XCTAssertEqual(session.deactivateCallCount, 1, "Timeout must deactivate audio exactly once")
+        let timeoutTaskIsActiveAfterCleanup = await recorder.hasActiveMaxDurationTask
+        XCTAssertFalse(timeoutTaskIsActiveAfterCleanup, "Timeout task must be torn down")
     }
 
     func testRecordingTooShortThrowsAndDeletesFile() async throws {

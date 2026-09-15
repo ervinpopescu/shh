@@ -43,6 +43,19 @@ public protocol AudioRecordingEngineFactory: Sendable {
     func makeEngine(url: URL, settings: [String: Any]) throws -> any AudioRecordingEngine
 }
 
+public protocol AudioRecorderSleeper: Sendable {
+    func sleep(for duration: TimeInterval) async throws
+}
+
+public struct TaskAudioRecorderSleeper: AudioRecorderSleeper {
+    public init() {}
+
+    public func sleep(for duration: TimeInterval) async throws {
+        let nanos = UInt64(max(0, duration) * 1_000_000_000)
+        try await Task.sleep(nanoseconds: nanos)
+    }
+}
+
 public protocol AudioLifecycleNotifier: Sendable {
     func observe(
         onInterruption: @escaping @Sendable (AudioInterruptionEvent) -> Void,
@@ -245,6 +258,7 @@ public actor AudioCaptureRecorder: AudioRecorder {
     private let sessionManager: any AudioSessionManaging
     private let engineFactory: any AudioRecordingEngineFactory
     private let lifecycleNotifier: any AudioLifecycleNotifier
+    private let timeoutSleeper: any AudioRecorderSleeper
     private let tempFileFactory: @Sendable () throws -> AudioRecordingHandle
     private let onInterruption: (@Sendable () -> Void)?
 
@@ -260,6 +274,7 @@ public actor AudioCaptureRecorder: AudioRecorder {
         sessionManager: any AudioSessionManaging = SystemAudioSessionManager.shared,
         engineFactory: any AudioRecordingEngineFactory = DefaultAudioRecordingEngineFactory(),
         lifecycleNotifier: any AudioLifecycleNotifier = SystemAudioLifecycleNotifier(),
+        timeoutSleeper: any AudioRecorderSleeper = TaskAudioRecorderSleeper(),
         tempFileFactory: (@Sendable () throws -> AudioRecordingHandle)? = nil,
         onInterruption: (@Sendable () -> Void)? = nil
     ) {
@@ -268,6 +283,7 @@ public actor AudioCaptureRecorder: AudioRecorder {
         self.sessionManager = sessionManager
         self.engineFactory = engineFactory
         self.lifecycleNotifier = lifecycleNotifier
+        self.timeoutSleeper = timeoutSleeper
         self.tempFileFactory = tempFileFactory ?? {
             try AudioRecordingHandle.createTemporary(fileExtension: VoiceAudioFormat.fileExtension)
         }
@@ -284,6 +300,10 @@ public actor AudioCaptureRecorder: AudioRecorder {
 
     public var isRecording: Bool {
         activeEngine?.isRecording ?? false
+    }
+
+    internal var hasActiveMaxDurationTask: Bool {
+        maxDurationTask != nil
     }
 
     public func start() async throws {
@@ -365,9 +385,13 @@ public actor AudioCaptureRecorder: AudioRecorder {
 
         // 6. Max duration timeout enforcement
         let maxSec = self.maxDuration
+        let sleeper = self.timeoutSleeper
         self.maxDurationTask = Task { [weak self] in
-            let nanos = UInt64(maxSec * 1_000_000_000)
-            try? await Task.sleep(nanoseconds: nanos)
+            do {
+                try await sleeper.sleep(for: maxSec)
+            } catch {
+                return
+            }
             guard !Task.isCancelled else { return }
             await self?.handleMaxDurationReached()
         }
