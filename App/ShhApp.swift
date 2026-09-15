@@ -511,7 +511,15 @@ struct HostEditorView: View {
         _name = State(initialValue: prefillService?.name ?? existing?.name ?? "")
         _hostname = State(initialValue: prefillService?.hostname ?? existing?.hostname ?? "")
         _username = State(initialValue: existing?.username ?? "")
-        _port = State(initialValue: String(prefillService?.port ?? existing?.port ?? 22))
+        let portValue: Int
+        if let p = prefillService?.port {
+            portValue = Int(p)
+        } else if let p = existing?.port {
+            portValue = Int(p)
+        } else {
+            portValue = 22
+        }
+        _port = State(initialValue: "\(portValue)")
         _identityID = State(initialValue: existing?.identityID)
 
         let initialType: HostConnectionType
