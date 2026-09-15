@@ -151,6 +151,10 @@ final class AppContainer: ObservableObject {
     private(set) var activeEditingHostID: Host.ID? = nil
     private var conflictQueue: [FileTransferConflict] = []
 
+    // Server Telemetry
+    @Published public var latestTelemetry: [UUID: ServerTelemetry] = [:]
+    private var telemetryPollers: [UUID: ServerTelemetryPoller] = [:]
+
     // Directory Cache
     private var directoryCache: [RemotePath: (files: [RemoteFile], timestamp: Date)] = [:]
     private let directoryCacheTTL: TimeInterval = 60.0
@@ -1271,6 +1275,10 @@ final class AppContainer: ObservableObject {
         herdrAvailability = .unavailable(reason: "Not connected")
         herdrError = nil
         activeHerdrWorkspaceID = nil
+
+        // Server Telemetry
+        telemetryPollers.values.forEach { $0.stopPolling() }
+        telemetryPollers.removeAll()
 
         moshStateTask?.cancel()
         moshStateTask = nil
@@ -3489,5 +3497,57 @@ final class AppContainer: ObservableObject {
                 terminalController.setTerminalFontSize(fontSize)
             }
         }
+    }
+
+    // MARK: - Server Telemetry
+
+    public func fetchTelemetry(for host: Host) async {
+        if isDemo {
+            let demo = ServerTelemetry(
+                cpuUsagePercentage: 18.5,
+                memoryUsedBytes: 1_374_389_534,
+                memoryTotalBytes: 4_294_967_296,
+                loadAverage: (0.21, 0.15, 0.10),
+                uptimeSeconds: 388800
+            )
+            latestTelemetry[host.id] = demo
+            return
+        }
+
+        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else { return }
+        let poller = telemetryPollers[host.id] ?? ServerTelemetryPoller(executor: executor)
+        telemetryPollers[host.id] = poller
+        if let telemetry = try? await poller.fetchTelemetry() {
+            latestTelemetry[host.id] = telemetry
+        }
+    }
+
+    public func startTelemetryPolling(for host: Host) {
+        if isDemo {
+            let demo = ServerTelemetry(
+                cpuUsagePercentage: 18.5,
+                memoryUsedBytes: 1_374_389_534,
+                memoryTotalBytes: 4_294_967_296,
+                loadAverage: (0.21, 0.15, 0.10),
+                uptimeSeconds: 388800
+            )
+            latestTelemetry[host.id] = demo
+            return
+        }
+
+        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else { return }
+        let poller = telemetryPollers[host.id] ?? ServerTelemetryPoller(executor: executor)
+        telemetryPollers[host.id] = poller
+
+        poller.startPolling { [weak self] telemetry in
+            Task { @MainActor [weak self] in
+                self?.latestTelemetry[host.id] = telemetry
+            }
+        }
+    }
+
+    public func stopTelemetryPolling(for host: Host) {
+        telemetryPollers[host.id]?.stopPolling()
+        telemetryPollers.removeValue(forKey: host.id)
     }
 }
