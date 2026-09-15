@@ -3364,7 +3364,7 @@ final class AppContainer: ObservableObject {
             catalog: snapshot,
             preferences: VaultPreferences(
                 defaultTerminalFont: nil,
-                defaultTerminalFontSize: nil,
+                defaultTerminalFontSize: terminalController.terminalFontSize,
                 voiceProvider: selectedVoiceProviderID,
                 voiceAutoPunctuation: true,
                 customSettings: [:]
@@ -3383,7 +3383,11 @@ final class AppContainer: ObservableObject {
         return try service.restoreBackup(backup: backup, passphrase: passphrase)
     }
 
-    public func restoreCatalog(from snapshot: CatalogSnapshot, mode: RestoreMode) async throws {
+    public func restoreCatalog(
+        from snapshot: CatalogSnapshot,
+        mode: RestoreMode,
+        preferences: VaultPreferences? = nil
+    ) async throws {
         switch mode {
         case .merge:
             await catalog.merge(with: snapshot)
@@ -3410,5 +3414,8 @@ final class AppContainer: ObservableObject {
         #if canImport(FileProvider)
         await refreshRegisteredDomains()
         #endif
+        if let fontSize = preferences?.defaultTerminalFontSize {
+            terminalController.setTerminalFontSize(fontSize)
+        }
     }
 }

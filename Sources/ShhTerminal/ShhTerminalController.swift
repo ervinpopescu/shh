@@ -7,19 +7,66 @@ import UIKit
 import SwiftUI
 #endif
 
+public enum TerminalZoomShortcut: Sendable, Equatable {
+    case increase
+    case decrease
+    case reset
+}
+
+public enum TerminalFontSize {
+    public static let minimumPointSize: Double = 10
+    public static let maximumPointSize: Double = 32
+    public static let defaultPointSize: Double = 14
+
+    public static func clamped(_ pointSize: Double) -> Double {
+        guard pointSize.isFinite else { return defaultPointSize }
+        return min(max(pointSize, minimumPointSize), maximumPointSize)
+    }
+
+    public static func percentage(for pointSize: Double) -> Int {
+        Int((clamped(pointSize) / defaultPointSize * 100).rounded())
+    }
+}
+
+public protocol TerminalFontSizeStore: AnyObject {
+    func load() -> Double?
+    func save(_ pointSize: Double)
+}
+
+public final class UserDefaultsTerminalFontSizeStore: TerminalFontSizeStore {
+    public static let storageKey = "shh.terminal.fontSize"
+    private let userDefaults: UserDefaults
+
+    public init(userDefaults: UserDefaults = .standard) {
+        self.userDefaults = userDefaults
+    }
+
+    public func load() -> Double? {
+        guard userDefaults.object(forKey: Self.storageKey) != nil else { return nil }
+        return userDefaults.double(forKey: Self.storageKey)
+    }
+
+    public func save(_ pointSize: Double) {
+        userDefaults.set(pointSize, forKey: Self.storageKey)
+    }
+}
+
 public struct ShhTerminalConfiguration: Sendable {
     public var scrollbackLimit: Int
     public var resizeDebounceInterval: TimeInterval
     public var initialSize: TerminalSize
+    public var initialFontSize: Double
 
     public init(
         scrollbackLimit: Int = 5000,
         resizeDebounceInterval: TimeInterval = 0.150,
-        initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24)
+        initialSize: TerminalSize = TerminalSize(columns: 80, rows: 24),
+        initialFontSize: Double = TerminalFontSize.defaultPointSize
     ) {
         self.scrollbackLimit = max(0, scrollbackLimit)
         self.resizeDebounceInterval = max(0, resizeDebounceInterval)
         self.initialSize = initialSize
+        self.initialFontSize = TerminalFontSize.clamped(initialFontSize)
     }
 }
 
@@ -30,6 +77,8 @@ internal protocol TerminalEngineBridge: AnyObject {
     func feed(data: Data)
     func feed(text: String)
     func resize(size: TerminalSize)
+    func setFontSize(_ pointSize: Double)
+    func recalculateSize()
     func changeScrollback(_ limit: Int)
     func findNext(_ term: String) -> Bool
     func findPrevious(_ term: String) -> Bool
@@ -39,6 +88,11 @@ internal protocol TerminalEngineBridge: AnyObject {
     func selectNone()
     func getSelection() -> String?
     func currentTranscript(limit: Int) -> String
+}
+
+internal extension TerminalEngineBridge {
+    func setFontSize(_ pointSize: Double) {}
+    func recalculateSize() {}
 }
 
 internal protocol TerminalFirstResponderBridge: AnyObject {
@@ -53,8 +107,10 @@ public final class ShhTerminalController: ObservableObject {
     public static let defaultResizeDebounceInterval: TimeInterval = 0.150
 
     public let configuration: ShhTerminalConfiguration
+    public let fontSizeStore: any TerminalFontSizeStore
 
     @Published public private(set) var size: TerminalSize
+    @Published public private(set) var terminalFontSize: Double
     @Published public private(set) var title: String = ""
     @Published public private(set) var isFirstResponder: Bool = false
 
@@ -82,6 +138,7 @@ public final class ShhTerminalController: ObservableObject {
     }
 
     private var resizeDebouncer: ResizeDebouncer!
+    private var fontGeometryWorkItem: DispatchWorkItem?
     private var headlessTerminal: SwiftTerm.Terminal?
     private var headlessDelegate: HeadlessBridgeDelegate?
     private var headlessSearchQuery: String = ""
@@ -94,9 +151,16 @@ public final class ShhTerminalController: ObservableObject {
     internal var persistentHostView: ShhInternalTerminalHostView?
     #endif
 
-    public init(configuration: ShhTerminalConfiguration = ShhTerminalConfiguration()) {
+    public init(
+        configuration: ShhTerminalConfiguration = ShhTerminalConfiguration(),
+        fontSizeStore: any TerminalFontSizeStore = UserDefaultsTerminalFontSizeStore()
+    ) {
         self.configuration = configuration
+        self.fontSizeStore = fontSizeStore
         self.size = configuration.initialSize
+        self.terminalFontSize = TerminalFontSize.clamped(
+            fontSizeStore.load() ?? configuration.initialFontSize
+        )
 
         self.resizeDebouncer = ResizeDebouncer(
             delay: configuration.resizeDebounceInterval,
@@ -110,6 +174,65 @@ public final class ShhTerminalController: ObservableObject {
         }
 
         setupHeadlessTerminal()
+    }
+
+    public var terminalFontSizePercentage: Int {
+        TerminalFontSize.percentage(for: terminalFontSize)
+    }
+
+    public func setTerminalFontSize(_ pointSize: Double) {
+        let clampedSize = TerminalFontSize.clamped(pointSize)
+        guard terminalFontSize != clampedSize else { return }
+        terminalFontSize = clampedSize
+        fontSizeStore.save(clampedSize)
+        attachedBridge?.setFontSize(clampedSize)
+        scheduleFontGeometryRecalculation()
+    }
+
+    public func increaseTerminalFontSize() {
+        setTerminalFontSize(terminalFontSize + 1)
+    }
+
+    public func decreaseTerminalFontSize() {
+        setTerminalFontSize(terminalFontSize - 1)
+    }
+
+    public func resetTerminalFontSize() {
+        setTerminalFontSize(TerminalFontSize.defaultPointSize)
+    }
+
+    public func applyPinch(scale: CGFloat, basePointSize: Double? = nil) {
+        guard scale.isFinite, scale > 0 else { return }
+        let base = basePointSize ?? terminalFontSize
+        setTerminalFontSize(base * Double(scale))
+    }
+
+    @discardableResult
+    public func handleZoomShortcut(_ shortcut: TerminalZoomShortcut) -> Bool {
+        switch shortcut {
+        case .increase:
+            increaseTerminalFontSize()
+        case .decrease:
+            decreaseTerminalFontSize()
+        case .reset:
+            resetTerminalFontSize()
+        }
+        return true
+    }
+
+    private func scheduleFontGeometryRecalculation() {
+        fontGeometryWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.attachedBridge?.recalculateSize()
+            guard let bridge = self.attachedBridge else { return }
+            self.handleResize(columns: bridge.currentSize.columns, rows: bridge.currentSize.rows)
+        }
+        fontGeometryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + configuration.resizeDebounceInterval,
+            execute: workItem
+        )
     }
 
     private func setupHeadlessTerminal() {
@@ -183,6 +306,8 @@ public final class ShhTerminalController: ObservableObject {
 
     public func reset() {
         resizeDebouncer.cancel()
+        fontGeometryWorkItem?.cancel()
+        fontGeometryWorkItem = nil
         hasPendingFirstResponderRequest = false
         title = ""
         clearSearch()
@@ -391,6 +516,7 @@ public final class ShhTerminalController: ObservableObject {
         self.attachedBridge = bridge
         self.firstResponderBridge = firstResponder
         bridge.changeScrollback(configuration.scrollbackLimit)
+        bridge.setFontSize(terminalFontSize)
 
         if hasPendingFirstResponderRequest {
             if firstResponder?.requestFirstResponder() == true {

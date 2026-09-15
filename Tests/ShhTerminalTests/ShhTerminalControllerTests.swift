@@ -376,6 +376,106 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertTrue(controller.isFirstResponder)
     }
 
+    func testTerminalFontSizeClampsAndResets() {
+        final class MemoryStore: TerminalFontSizeStore {
+            var value: Double?
+            func load() -> Double? { value }
+            func save(_ pointSize: Double) { value = pointSize }
+        }
+
+        let store = MemoryStore()
+        let controller = ShhTerminalController(fontSizeStore: store)
+
+        controller.setTerminalFontSize(100)
+        XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.maximumPointSize)
+        controller.setTerminalFontSize(1)
+        XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.minimumPointSize)
+        controller.resetTerminalFontSize()
+        XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.defaultPointSize)
+        XCTAssertEqual(controller.terminalFontSizePercentage, 100)
+    }
+
+    func testTerminalFontSizePersistenceAndShortcuts() {
+        final class MemoryStore: TerminalFontSizeStore {
+            var value: Double?
+            func load() -> Double? { value }
+            func save(_ pointSize: Double) { value = pointSize }
+        }
+
+        let store = MemoryStore()
+        let first = ShhTerminalController(fontSizeStore: store)
+        first.handleZoomShortcut(.increase)
+        XCTAssertEqual(store.value, TerminalFontSize.defaultPointSize + 1)
+
+        let restored = ShhTerminalController(fontSizeStore: store)
+        XCTAssertEqual(restored.terminalFontSize, 15)
+        _ = restored.handleZoomShortcut(.decrease)
+        XCTAssertEqual(restored.terminalFontSize, 14)
+        _ = restored.handleZoomShortcut(.reset)
+        XCTAssertEqual(restored.terminalFontSize, 14)
+    }
+
+    func testPinchScalingUsesGestureBaselineAndClamps() {
+        final class MemoryStore: TerminalFontSizeStore {
+            func load() -> Double? { nil }
+            func save(_ pointSize: Double) {}
+        }
+
+        let controller = ShhTerminalController(
+            configuration: ShhTerminalConfiguration(initialFontSize: 14),
+            fontSizeStore: MemoryStore()
+        )
+
+        controller.applyPinch(scale: 1.5, basePointSize: 14)
+        XCTAssertEqual(controller.terminalFontSize, 21)
+        controller.applyPinch(scale: 10, basePointSize: 14)
+        XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.maximumPointSize)
+        controller.applyPinch(scale: 0, basePointSize: 14)
+        XCTAssertEqual(controller.terminalFontSize, TerminalFontSize.maximumPointSize)
+    }
+
+    func testFontChangeRecalculatesGeometryAndDeliversResize() {
+        final class MockEngine: TerminalEngineBridge {
+            var bracketedPasteMode = false
+            var isAlternateScreenActive = false
+            var currentSize = TerminalSize(columns: 100, rows: 30)
+            var appliedFontSize: Double?
+            var recalculationCount = 0
+            func feed(data: Data) {}
+            func feed(text: String) {}
+            func resize(size: TerminalSize) {}
+            func setFontSize(_ pointSize: Double) { appliedFontSize = pointSize }
+            func recalculateSize() { recalculationCount += 1 }
+            func changeScrollback(_ limit: Int) {}
+            func findNext(_ term: String) -> Bool { false }
+            func findPrevious(_ term: String) -> Bool { false }
+            func searchMatchSummary(_ term: String) -> (index: Int, total: Int) { (0, 0) }
+            func clearSearch() {}
+            func selectAll() {}
+            func selectNone() {}
+            func getSelection() -> String? { nil }
+            func currentTranscript(limit: Int) -> String { "" }
+        }
+
+        let config = ShhTerminalConfiguration(resizeDebounceInterval: 0.01)
+        let controller = ShhTerminalController(configuration: config)
+        let engine = MockEngine()
+        controller.attachEngine(engine, firstResponder: nil)
+
+        let exp = expectation(description: "font resize delivered")
+        var delivered: TerminalSize?
+        controller.onResize = { size in
+            delivered = size
+            exp.fulfill()
+        }
+        controller.setTerminalFontSize(18)
+        waitForExpectations(timeout: 1)
+
+        XCTAssertEqual(engine.appliedFontSize, 18)
+        XCTAssertEqual(engine.recalculationCount, 1)
+        XCTAssertEqual(delivered, engine.currentSize)
+    }
+
     func testDetachEngineIdentityProtection() {
         final class TestEngine: TerminalEngineBridge {
             var bracketedPasteMode: Bool = false
