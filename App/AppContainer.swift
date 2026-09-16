@@ -196,7 +196,7 @@ final class AppContainer: ObservableObject {
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
-    private var tmuxRefreshGeneration: Int = 0
+    private(set) var tmuxRefreshGeneration: Int = 0
     private var voiceTranscriptionGeneration: Int = 0
 
     var isDemo: Bool {
@@ -874,6 +874,10 @@ final class AppContainer: ObservableObject {
             throw TransportError.cancelled
         }
         let connectionGeneration = lifecycleGeneration
+        // Keep the last selected target independent from transient tmux refreshes
+        // while the replacement transport is being established.
+        let recoveryTmuxTarget = activeTmuxSessionID
+        activeTmuxSessionID = nil
         guard reachabilityMonitor.isReachable else {
             throw TransportError.networkUnavailable
         }
@@ -937,10 +941,11 @@ final class AppContainer: ObservableObject {
             await connection.close()
             throw TransportError.cancelled
         }
+        let oldConnection = self.connection
         self.connection = connection
-        isNetworkRecoveryInProgress = false
         (connection as? LiveSSHConnection)?.setRedactor(redactor)
         activeSession?.state = .connected
+        await oldConnection?.close()
 
         terminalController.onResize = { [weak self, sessionID = session.id] newSize in
             Task { @MainActor [weak self] in
@@ -961,11 +966,11 @@ final class AppContainer: ObservableObject {
 
         let targetSession = await automaticTmuxTarget(
             for: host,
-            explicitTarget: activeTmuxSessionID,
+            explicitTarget: recoveryTmuxTarget,
             allowStoredTarget: true
         )
         if let target = targetSession {
-            await self.handleTmuxTarget(target, on: connection, host: host, session: session)
+            _ = await self.handleTmuxTarget(target, on: connection, host: host, session: session)
         }
 
         let shouldRestoreHerdr = (try? await restorationStore.load())
@@ -995,6 +1000,9 @@ final class AppContainer: ObservableObject {
         self.portForwardingManager = pfManager
         self.startForwardingMonitoring(manager: pfManager)
         await self.autoStartForwardingRules(for: host, manager: pfManager)
+        // Reconnect completion is intentionally published only after the
+        // remembered tmux target has been attached successfully.
+        isNetworkRecoveryInProgress = false
 
         Task { [weak self] in
             await self?.refreshTmuxState()
@@ -1553,7 +1561,13 @@ final class AppContainer: ObservableObject {
         activeHerdrWorkspaceID = workspace.id
     }
 
-    private func handleTmuxTarget(_ target: String, on connection: any SSHConnection, host: Host, session: TerminalSession) async {
+    @discardableResult
+    private func handleTmuxTarget(
+        _ target: String,
+        on connection: any SSHConnection,
+        host: Host,
+        session: TerminalSession
+    ) async -> Bool {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("$") {
             if let executor = connection as? SSHCommandExecuting {
@@ -1563,36 +1577,36 @@ final class AppContainer: ObservableObject {
                           activeSession?.state == .connected,
                           !isExplicitDisconnect,
                           (self.connection as AnyObject) === (connection as AnyObject) else {
-                        return
+                        return false
                     }
                     if !check.isSuccess {
                         self.activeTmuxSessionID = nil
                         self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
-                        return
+                        return false
                     }
                 } catch {
                     guard activeSession?.id == session.id,
                           activeSession?.state == .connected,
                           !isExplicitDisconnect,
                           (self.connection as AnyObject) === (connection as AnyObject) else {
-                        return
+                        return false
                     }
                     self.activeTmuxSessionID = nil
                     self.tmuxError = "Failed to verify tmux session \(trimmed): \(error.localizedDescription) Select a session to recover it."
-                    return
+                    return false
                 }
             }
             guard activeSession?.id == session.id,
                   activeSession?.state == .connected,
                   !isExplicitDisconnect,
                   (self.connection as AnyObject) === (connection as AnyObject) else {
-                return
+                return false
             }
-            _ = await attachTmuxSession(id: trimmed)
+            return await attachTmuxSession(id: trimmed)
         } else if !trimmed.isEmpty {
             // A remembered name may be attached only if it already exists. Never
             // create a session during restoration.
-            guard let executor = connection as? SSHCommandExecuting else { return }
+            guard let executor = connection as? SSHCommandExecuting else { return false }
             let result = try? await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
             guard activeSession?.id == session.id,
                   activeSession?.state == .connected,
@@ -1600,15 +1614,16 @@ final class AppContainer: ObservableObject {
                   (self.connection as AnyObject) === (connection as AnyObject),
                   let result,
                   result.isSuccess else {
-                return
+                return false
             }
             guard let match = try? TmuxListSessionsParser.parse(result.stdout).first(where: { $0.name == trimmed }) else {
                 activeTmuxSessionID = nil
                 tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
-                return
+                return false
             }
-            _ = await attachTmuxSession(id: match.sessionID)
+            return await attachTmuxSession(id: match.sessionID)
         }
+        return false
     }
 
     @discardableResult
@@ -1651,7 +1666,7 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func listTmuxSessions() async -> [TmuxSessionInfo] {
+    func listTmuxSessions(expectedGeneration: Int? = nil) async -> [TmuxSessionInfo] {
         guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             tmuxSessions = []
@@ -1665,12 +1680,19 @@ final class AppContainer: ObservableObject {
             guard activeSession?.id == sessionID,
                   activeSession?.state == .connected,
                   !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                  (connection as AnyObject) === connObj,
+                  expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
                 return []
             }
             if result.isSuccess {
+                guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                    return []
+                }
                 do {
                     let parsed = try TmuxListSessionsParser.parse(result.stdout)
+                    guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                        return []
+                    }
                     tmuxSessions = parsed
                     isTmuxServerRunning = true
                     tmuxError = nil
@@ -1782,7 +1804,7 @@ final class AppContainer: ObservableObject {
         }
 
         if availability.isAvailable {
-            _ = await listTmuxSessions()
+            _ = await listTmuxSessions(expectedGeneration: generation)
             guard tmuxRefreshGeneration == generation,
                   activeSession?.id == sessionID,
                   activeSession?.state == .connected,

@@ -288,8 +288,9 @@ final class MoshAppTests: XCTestCase {
         // Transition from Wi-Fi to Cellular
         reachability.transitionInterface(to: .cellular, isExpensive: true, isConstrained: false)
 
-        // Allow main actor loop to process roaming notification
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // Wait for the reachability callback rather than guessing how long the
+        // main actor will need under simulator contention.
+        try await eventually { mockMosh.roamingTransitions.count == 1 }
 
         XCTAssertEqual(mockMosh.roamingTransitions.count, 1)
         let firstRoam = mockMosh.roamingTransitions.first
@@ -302,7 +303,7 @@ final class MoshAppTests: XCTestCase {
         // Transition back from Cellular to Wi-Fi
         reachability.transitionInterface(to: .wifi, isExpensive: false, isConstrained: false)
 
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually { mockMosh.roamingTransitions.count == 2 }
 
         XCTAssertEqual(mockMosh.roamingTransitions.count, 2)
         let secondRoam = mockMosh.roamingTransitions.last
@@ -334,6 +335,8 @@ final class MoshAppTests: XCTestCase {
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
+        let attached = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attached)
         XCTAssertEqual(container.activeTmuxSessionID, "$0")
 
         // Record commands sent so far
@@ -341,7 +344,7 @@ final class MoshAppTests: XCTestCase {
 
         // Roam from Wi-Fi to Cellular
         reachability.transitionInterface(to: .cellular, isExpensive: true)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually { mockMosh.roamingTransitions.count == 1 }
 
         // Verify that Mosh handled the roam in-place without re-issuing disruptive "tmux attach" into the running terminal!
         XCTAssertEqual(mockMosh.roamingTransitions.count, 1)
@@ -377,6 +380,8 @@ final class MoshAppTests: XCTestCase {
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
+        let attached = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attached)
         XCTAssertEqual(container.activeTmuxSessionID, "$0")
 
         // Feed some terminal text to dirty the buffer
@@ -389,13 +394,29 @@ final class MoshAppTests: XCTestCase {
 
         // Trigger interface change
         reachability.transitionInterface(to: .cellular)
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await eventually {
+            connectCounter.value == 2 && container.activeTmuxSessionID == "$0"
+        }
 
         // Fast session recovery should re-connect, clean the buffer, and re-attach tmux $0
         XCTAssertEqual(connectCounter.value, 2, "Second connection established via fast recovery")
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertEqual(container.activeTmuxSessionID, "$0", "Tmux reattached cleanly")
-        XCTAssertFalse(container.terminalText.contains("garbage leftover escape sequences"), "Buffer cleaned to prevent corruption")
+        XCTAssertEqual(container.terminalText, "", "Recovery must not retain or duplicate stale terminal output")
+    }
+
+    private func eventually(
+        timeoutNanoseconds: UInt64 = 2_000_000_000,
+        condition: @escaping @MainActor () -> Bool
+    ) async throws {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while !condition() {
+            if DispatchTime.now().uptimeNanoseconds >= deadline {
+                XCTFail("Condition was not met before timeout")
+                return
+            }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
     }
 
     // MARK: - 6. Herdr State Re-syncing After Roaming
@@ -609,7 +630,7 @@ final class MoshAppTests: XCTestCase {
 
         // Roam from Wi-Fi to Cellular
         reachability.transitionInterface(to: .cellular)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually { mockMosh.roamingTransitions.count == 1 }
 
         // Workspaces should NOT be wiped during Mosh roaming
         XCTAssertFalse(container.herdrWorkspaces.isEmpty, "Herdr workspaces must not be emptied during Mosh roaming")
@@ -650,12 +671,103 @@ final class MoshAppTests: XCTestCase {
 
         // Trigger fast session recovery while unreachable
         await container.performFastSessionRecovery()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually { container.reconnectState.isReconnecting }
 
         // Reconnect coordinator should have started rather than being bypassed/frozen
         XCTAssertTrue(container.reconnectState.isReconnecting, "Reconnect coordinator must be active, not frozen")
 
         await container.cancelReconnect()
         XCTAssertEqual(container.reconnectState, .cancelled)
+    }
+
+    // MARK: - 10. Stale Generation Tmux State Protection
+
+    func testStaleGenerationTmuxListingDuringRecoveryIsDiscarded() async throws {
+        let listGate = AsyncGate()
+        let mockMosh1 = ControllableMoshConnection()
+        let mockMosh2 = ControllableMoshConnection()
+        let connectCounter = CounterBox()
+
+        mockMosh1.onExecuteCommand = { cmd in
+            if cmd.contains("list-sessions") {
+                await listGate.wait()
+                return SSHCommandResult(exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000000\t1\n")
+            }
+            if cmd.contains("has-session") {
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        mockMosh2.onExecuteCommand = { cmd in
+            if cmd.contains("has-session") {
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+            if cmd.contains("list-sessions") {
+                return SSHCommandResult(exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in
+            let count = connectCounter.increment()
+            return count == 1 ? mockMosh1 : mockMosh2
+        }
+
+        let reachability = MockReachabilityMonitor(isReachable: true, initialInterface: .wifi)
+        let container = makeContainer(moshTransport: moshTransport, reachability: reachability)
+
+        let host = try Host(
+            name: "Stale Gen Host",
+            hostname: "stale-gen.internal",
+            username: "dev",
+            connection: .mosh(MoshOptions()),
+            defaultTmuxSession: "$0",
+            autoAttachTmux: true
+        )
+
+        await container.connect(to: host)
+        let attached = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attached)
+        XCTAssertEqual(container.activeTmuxSessionID, "$0")
+
+        // Start listTmuxSessions in the current generation, blocked at listGate
+        let startGeneration = container.tmuxRefreshGeneration
+        let listTask = Task {
+            await container.listTmuxSessions(expectedGeneration: startGeneration)
+        }
+
+        // Fast session recovery advances generation and recovers $0 on mockMosh2
+        try await container.performReconnect(to: host, attempt: 1)
+        XCTAssertEqual(container.activeTmuxSessionID, "$0")
+
+        // Unblock the stale query from mockMosh1
+        await listGate.open()
+        let staleResult = await listTask.value
+
+        // Stale result must be discarded and must not overwrite recovered target $0
+        XCTAssertTrue(staleResult.isEmpty, "Stale generation results must be discarded")
+        XCTAssertEqual(container.activeTmuxSessionID, "$0", "Active tmux session ID must not be wiped by stale generation")
+    }
+}
+
+private actor AsyncGate {
+    private var isOpen = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func open() {
+        isOpen = true
+        for continuation in continuations {
+            continuation.resume()
+        }
+        continuations.removeAll()
     }
 }
