@@ -165,6 +165,10 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
         eventContinuation = nil
     }
 
+    public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        return !isClosed && moshState == .connected
+    }
+
     private func startReceiveLoop() {
         receiveTask?.cancel()
         receiveTask = Task { [weak self] in
