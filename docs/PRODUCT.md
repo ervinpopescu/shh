@@ -26,7 +26,11 @@ integration without third-party cloud servers or subscription telemetry.
   support.
 - **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
   buffer support (vim, htop, tmux), ANSI color parser, search drawers,
-  and debounced resize handling.
+  debounced resize handling, and context-aware touch scrolling
+  (preserving native primary scrollback, translating mouse-tracking
+  swipes to wheel events, quantizing alternate-screen navigation keys,
+  and invoking safe multiplexer copy-mode fallback without CLI text
+  injection).
 - **Host & Identity Management:** Host configurations, grouping, tags,
   health status, and opaque Keychain references. Private keys are never
   exposed as raw fields of `Host`. Host connections resolve exact
