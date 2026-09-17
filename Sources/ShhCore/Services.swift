@@ -16,6 +16,10 @@ public enum TransportError: Error, Equatable, Sendable, LocalizedError {
     case dnsFailure(String)
     case connectionRefused
     case missingCredential(reference: String)
+    /// The host references an identity descriptor UUID that is not present in the catalog.
+    case missingIdentity(id: UUID)
+    /// The host references an identity descriptor whose ID or Keychain reference is ambiguous.
+    case identityCollision(id: UUID)
     case invalidPrivateKey(detail: String)
 
     public var errorDescription: String? {
@@ -47,6 +51,10 @@ public enum TransportError: Error, Equatable, Sendable, LocalizedError {
         case .missingCredential(let reference):
             let safeRef = reference.count > 8 ? String(reference.prefix(4)) + "..." + String(reference.suffix(4)) : reference
             return "Saved credential could not be found in Keychain (reference: \(safeRef))."
+        case .missingIdentity(let id):
+            return "The host references a missing identity (ID: \(id.uuidString))."
+        case .identityCollision(let id):
+            return "The host references an ambiguous identity (ID: \(id.uuidString))."
         case .invalidPrivateKey(let detail):
             return "Invalid private key: \(detail)"
         }
@@ -78,6 +86,10 @@ public enum TransportError: Error, Equatable, Sendable, LocalizedError {
             return "Verify that the SSH service is running on the target port and firewall rules permit connections."
         case .missingCredential:
             return "Re-import or generate a new SSH key for this identity in Key Management."
+        case .missingIdentity:
+            return "Edit this host and select an available identity, or restore the missing identity before reconnecting."
+        case .identityCollision:
+            return "Remove duplicate identity records or Keychain references, then select a single identity before reconnecting."
         case .invalidPrivateKey:
             return "Verify key format and ensure it is an unencrypted OpenSSH or PKCS#8 Ed25519 private key."
         }
@@ -626,6 +638,40 @@ public protocol HostRepository: Sendable { func listHosts() async throws -> [Hos
 public protocol CatalogRepository: HostRepository { func groups() async throws -> [Group]; func tags() async throws -> [Tag]; func identities() async throws -> [IdentityDescriptor]; func snippets() async throws -> [Snippet]; func save(_ group: Group) async throws; func save(_ tag: Tag) async throws; func save(_ identity: IdentityDescriptor) async throws; func save(_ snippet: Snippet) async throws; func deleteIdentity(id: UUID) async throws }
 public struct StoreMetadata: Codable, Hashable, Sendable { public static let currentSchemaVersion = 1; public var schemaVersion: Int; public init(schemaVersion: Int = StoreMetadata.currentSchemaVersion) { self.schemaVersion = schemaVersion } }
 public struct CatalogSnapshot: Codable, Sendable { public var metadata: StoreMetadata; public var hosts: [Host]; public var groups: [Group]; public var tags: [Tag]; public var identities: [IdentityDescriptor]; public var snippets: [Snippet]; public init(metadata: StoreMetadata = StoreMetadata(), hosts: [Host] = [], groups: [Group] = [], tags: [Tag] = [], identities: [IdentityDescriptor] = [], snippets: [Snippet] = []) { self.metadata = metadata; self.hosts = hosts; self.groups = groups; self.tags = tags; self.identities = identities; self.snippets = snippets } }
+
+/// Metadata-only reconciliation result for catalogs loaded after an app,
+/// signing, or migration change. It deliberately does not remove descriptors
+/// or alter host references: stale references must remain visible and produce
+/// an actionable diagnostic instead of selecting another identity.
+public struct IdentityCatalogReconciliation: Equatable, Sendable {
+    public let missingHostIdentityIDs: Set<UUID>
+    public let duplicateNames: Set<String>
+    /// Identity IDs that cannot safely be used because either the ID or its
+    /// opaque Keychain reference is shared by multiple descriptors.
+    public let duplicateIdentityIDs: Set<UUID>
+    public let duplicateKeychainReferences: Set<String>
+
+    public init(hosts: [Host], identities: [IdentityDescriptor]) {
+        let groupedIDs = Dictionary(grouping: identities, by: \.id)
+        let groupedReferences = Dictionary(grouping: identities, by: \.keychainReference)
+        let identityIDs = Set(groupedIDs.keys)
+        missingHostIdentityIDs = Set(hosts.compactMap { host in
+            guard let identityID = host.identityID, !identityIDs.contains(identityID) else { return nil }
+            return identityID
+        })
+        let grouped = Dictionary(grouping: identities, by: { $0.name.lowercased() })
+        duplicateNames = Set(grouped.compactMap { $0.value.count > 1 ? $0.key : nil })
+        duplicateKeychainReferences = Set(groupedReferences.compactMap { $0.value.count > 1 ? $0.key : nil })
+        duplicateIdentityIDs = Set(groupedIDs.compactMap { key, values in
+            values.count > 1 ? key : nil
+        }).union(
+            groupedReferences.values
+                .filter { $0.count > 1 }
+                .flatMap { $0.map(\.id) }
+        )
+    }
+}
+
 public actor InMemoryCatalog: CatalogRepository {
     private var hostValues: [UUID: Host] = [:]; private var groupValues: [UUID: Group] = [:]; private var tagValues: [UUID: Tag] = [:]; private var identityValues: [UUID: IdentityDescriptor] = [:]; private var snippetValues: [UUID: Snippet] = [:]
     public init(seedDemoData: Bool = true) {
