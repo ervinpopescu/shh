@@ -3,6 +3,7 @@ import Foundation
 import Network
 #endif
 
+/// Represents an SSH service discovered on the local network via Bonjour.
 public struct DiscoveredSSHService: Identifiable, Hashable, Sendable, Codable {
     public let id: String
     public let name: String
@@ -30,17 +31,15 @@ public struct DiscoveredSSHService: Identifiable, Hashable, Sendable, Codable {
         let effectiveDomain = domainTrimmed.isEmpty ? "local" : domainTrimmed
 
         let resolvedHostname: String
-        if let hostname, !hostname.isEmpty {
-            resolvedHostname = hostname
-        } else if name.lowercased().hasSuffix(".\(effectiveDomain.lowercased())") || name.lowercased().hasSuffix(".local") {
-            resolvedHostname = name
+        if let hostname {
+            let normalizedHostname = Self.normalizedHostname(hostname)
+            if !normalizedHostname.isEmpty {
+                resolvedHostname = normalizedHostname
+            } else {
+                resolvedHostname = Self.fallbackHostname(name: name, domain: effectiveDomain)
+            }
         } else {
-            let sanitized = name
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .components(separatedBy: .whitespaces)
-                .filter { !$0.isEmpty }
-                .joined(separator: "-")
-            resolvedHostname = "\(sanitized).\(effectiveDomain)"
+            resolvedHostname = Self.fallbackHostname(name: name, domain: effectiveDomain)
         }
 
         self.name = name
@@ -48,6 +47,28 @@ public struct DiscoveredSSHService: Identifiable, Hashable, Sendable, Codable {
         self.port = port
         self.domain = normalizedDomain
         self.id = id ?? name
+    }
+
+    /// Strips leading and trailing whitespace and FQDN root dots from advertised
+    /// mDNS hostnames (e.g., "server.local." -> "server.local").
+    public static func normalizedHostname(_ hostname: String) -> String {
+        hostname
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private static func fallbackHostname(name: String, domain: String) -> String {
+        let normalizedName = normalizedHostname(name)
+        if normalizedName.lowercased().hasSuffix(".\(domain.lowercased())") ||
+            normalizedName.lowercased().hasSuffix(".local") {
+            return normalizedName
+        }
+
+        let sanitized = normalizedName
+            .components(separatedBy: .whitespaces)
+            .filter { !$0.isEmpty }
+            .joined(separator: "-")
+        return sanitized.isEmpty ? domain : "\(sanitized).\(domain)"
     }
 
     #if canImport(Network)
@@ -106,6 +127,101 @@ extension DiscoveredSSHService {
 }
 
 #if canImport(Network)
+/// The resolved network endpoint information for an advertised Bonjour SSH service.
+public struct BonjourServiceResolution: Equatable, Sendable {
+    /// The resolved advertised mDNS hostname without trailing dots.
+    public let hostname: String?
+    /// The resolved port number.
+    public let port: Int?
+
+    public init(hostname: String? = nil, port: Int? = nil) {
+        self.hostname = hostname
+        self.port = port
+    }
+}
+
+/// A mechanism for resolving a Bonjour service to its advertised mDNS hostname and port.
+public protocol BonjourServiceResolving: AnyObject, Sendable {
+    /// Resolves the service, returning the advertised hostname and port, or `nil` if resolution fails or is cancelled.
+    func resolve() async -> BonjourServiceResolution?
+    /// Cancels any in-flight resolution.
+    func cancel()
+}
+
+/// Resolves a Bonjour `_ssh._tcp` service via `NetService` on the main RunLoop to determine its advertised mDNS hostname.
+private final class NetServiceBonjourResolver: NSObject, BonjourServiceResolving, NetServiceDelegate, @unchecked Sendable {
+    private let service: NetService
+    private let timeout: TimeInterval
+    private let lock = NSLock()
+    private var isCancelled = false
+    private var continuation: CheckedContinuation<BonjourServiceResolution?, Never>?
+
+    init(name: String, type: String, domain: String, timeout: TimeInterval = 5.0) {
+        self.service = NetService(
+            domain: domain,
+            type: type.hasSuffix(".") ? type : type + ".",
+            name: name
+        )
+        self.timeout = timeout
+        super.init()
+        self.service.delegate = self
+    }
+
+    func resolve() async -> BonjourServiceResolution? {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<BonjourServiceResolution?, Never>) in
+                let shouldStart = lock.withLock {
+                    guard !self.isCancelled && !Task.isCancelled && self.continuation == nil else { return false }
+                    self.continuation = continuation
+                    return true
+                }
+                guard shouldStart else {
+                    continuation.resume(returning: nil)
+                    return
+                }
+                service.schedule(in: .main, forMode: .default)
+                service.resolve(withTimeout: timeout)
+            }
+        } onCancel: {
+            cancel()
+        }
+    }
+
+    func cancel() {
+        let continuation = lock.withLock { () -> CheckedContinuation<BonjourServiceResolution?, Never>? in
+            isCancelled = true
+            service.stop()
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: nil)
+    }
+
+    func netServiceDidResolveAddress(_ sender: NetService) {
+        sender.stop()
+        let hostname = sender.hostName.flatMap(DiscoveredSSHService.normalizedHostname)
+        finish(BonjourServiceResolution(hostname: hostname, port: sender.port > 0 ? sender.port : nil))
+    }
+
+    func netService(_ sender: NetService, didNotResolve errorDict: [String: NSNumber]) {
+        sender.stop()
+        finish(nil)
+    }
+
+    private func finish(_ result: BonjourServiceResolution?) {
+        let continuation = lock.withLock { () -> CheckedContinuation<BonjourServiceResolution?, Never>? in
+            defer { self.continuation = nil }
+            return self.continuation
+        }
+        continuation?.resume(returning: result)
+    }
+
+    deinit {
+        service.stop()
+        finish(nil)
+    }
+}
+
 public protocol BonjourServiceBrowsing: AnyObject, Sendable {
     func start(
         queue: DispatchQueue,
@@ -145,6 +261,7 @@ public final class LiveBonjourServiceBrowser: BonjourServiceBrowsing, @unchecked
 }
 #endif
 
+/// Discovers SSH services on the local network using Bonjour (`_ssh._tcp`) and resolves advertised mDNS hostnames.
 @MainActor
 public final class BonjourSSHDiscovery: ObservableObject {
     @Published public private(set) var discoveredServices: [DiscoveredSSHService] = []
@@ -153,13 +270,22 @@ public final class BonjourSSHDiscovery: ObservableObject {
     #if canImport(Network)
     private var browser: (any BonjourServiceBrowsing)?
     private let browserFactory: @Sendable () -> any BonjourServiceBrowsing
+    private let resolverFactory: @Sendable (String, String, String) -> any BonjourServiceResolving
     private let queue: DispatchQueue
+    private var resolutionTasks: [String: Task<Void, Never>] = [:]
+    private var resolvers: [String: any BonjourServiceResolving] = [:]
+    private var resolutions: [String: BonjourServiceResolution] = [:]
 
+    /// Creates a discovery coordinator with optional custom browser and resolver factories for testing.
     public init(
         browserFactory: (@Sendable () -> any BonjourServiceBrowsing)? = nil,
+        resolverFactory: (@Sendable (String, String, String) -> any BonjourServiceResolving)? = nil,
         queue: DispatchQueue = DispatchQueue(label: "com.ervinpopescu.shh.bonjour-discovery", qos: .utility)
     ) {
         self.browserFactory = browserFactory ?? { LiveBonjourServiceBrowser() }
+        self.resolverFactory = resolverFactory ?? { name, type, domain in
+            NetServiceBonjourResolver(name: name, type: type, domain: domain)
+        }
         self.queue = queue
     }
 
@@ -171,20 +297,16 @@ public final class BonjourSSHDiscovery: ObservableObject {
         self.browser = browser
 
         browser.start(queue: queue) { [weak self] endpoints in
-            let services = endpoints.compactMap { DiscoveredSSHService(endpoint: $0) }
-            let deduplicated = DiscoveredSSHService.deduplicate(services)
             Task { @MainActor [weak self] in
-                guard let self, self.isSearching else { return }
-                self.discoveredServices = deduplicated
+                self?.handleBrowserResults(endpoints)
             }
         } onStateChanged: { [weak self] state in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 switch state {
-                case .cancelled:
+                case .cancelled, .failed:
                     self.isSearching = false
-                case .failed:
-                    self.isSearching = false
+                    self.cancelResolutions()
                 default:
                     break
                 }
@@ -193,14 +315,126 @@ public final class BonjourSSHDiscovery: ObservableObject {
     }
 
     public func stopDiscovery() {
-        guard isSearching || browser != nil else { return }
+        guard isSearching || browser != nil || !resolutionTasks.isEmpty else { return }
         isSearching = false
         browser?.cancel()
         browser = nil
+        cancelResolutions()
+        resolutions.removeAll()
     }
 
     public func updateDiscoveredServices(_ services: [DiscoveredSSHService]) {
         self.discoveredServices = DiscoveredSSHService.deduplicate(services)
+    }
+
+    private func handleBrowserResults(_ endpoints: [NWEndpoint]) {
+        guard isSearching else { return }
+
+        var services: [DiscoveredSSHService] = []
+        var targets: [(key: String, name: String, type: String, domain: String)] = []
+        var seenTargetKeys = Set<String>()
+
+        for endpoint in endpoints {
+            switch endpoint {
+            case let .service(name, type, domain, _):
+                let targetDomain = domain.isEmpty ? "local." : (domain.hasSuffix(".") ? domain : domain + ".")
+                let key = "\(name)|\(type)|\(targetDomain)"
+                if seenTargetKeys.insert(key).inserted {
+                    targets.append((key: key, name: name, type: type, domain: targetDomain))
+                }
+
+                if let resolution = resolutions[key] {
+                    let resolvedHostname = resolution.hostname
+                        .map(DiscoveredSSHService.normalizedHostname)
+                        .flatMap { $0.isEmpty ? nil : $0 }
+                    let resolvedPort = resolution.port.flatMap { $0 > 0 ? $0 : nil } ?? 22
+                    services.append(DiscoveredSSHService(
+                        id: endpoint.debugDescription,
+                        name: name,
+                        hostname: resolvedHostname,
+                        port: resolvedPort,
+                        domain: targetDomain
+                    ))
+                } else if let service = DiscoveredSSHService(endpoint: endpoint) {
+                    services.append(service)
+                }
+            default:
+                if let service = DiscoveredSSHService(endpoint: endpoint) {
+                    services.append(service)
+                }
+            }
+        }
+
+        discoveredServices = DiscoveredSSHService.deduplicate(services)
+
+        let activeKeys = Set(targets.map { $0.key })
+        for key in resolutionTasks.keys where !activeKeys.contains(key) {
+            resolvers[key]?.cancel()
+            resolutionTasks[key]?.cancel()
+            resolvers[key] = nil
+            resolutionTasks[key] = nil
+        }
+        resolutions = resolutions.filter { activeKeys.contains($0.key) }
+
+        for target in targets where resolutionTasks[target.key] == nil && resolutions[target.key] == nil {
+            let resolver = resolverFactory(target.name, target.type, target.domain)
+            resolvers[target.key] = resolver
+            let task = Task { [weak self] in
+                let resolution = await resolver.resolve()
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    guard let self else { return }
+                    if self.isSearching, let resolution {
+                        self.apply(resolution, for: target.key, name: target.name, domain: target.domain)
+                    } else {
+                        self.resolutionTasks[target.key] = nil
+                        self.resolvers[target.key] = nil
+                    }
+                }
+            }
+            resolutionTasks[target.key] = task
+        }
+    }
+
+    private func cancelResolutions() {
+        for resolver in resolvers.values {
+            resolver.cancel()
+        }
+        for task in resolutionTasks.values {
+            task.cancel()
+        }
+        resolvers.removeAll()
+        resolutionTasks.removeAll()
+    }
+
+    private func apply(
+        _ resolution: BonjourServiceResolution,
+        for targetKey: String,
+        name: String,
+        domain: String
+    ) {
+        defer {
+            resolutionTasks[targetKey] = nil
+            resolvers[targetKey] = nil
+        }
+        resolutions[targetKey] = resolution
+
+        let resolvedHostname = resolution.hostname
+            .map(DiscoveredSSHService.normalizedHostname)
+            .flatMap { $0.isEmpty ? nil : $0 }
+        let resolvedPort = resolution.port.flatMap { $0 > 0 ? $0 : nil }
+
+        let updated = discoveredServices.map { current -> DiscoveredSSHService in
+            guard current.name == name && current.domain == domain else { return current }
+            return DiscoveredSSHService(
+                id: current.id,
+                name: current.name,
+                hostname: resolvedHostname ?? current.hostname,
+                port: resolvedPort ?? current.port,
+                domain: current.domain
+            )
+        }
+        discoveredServices = DiscoveredSSHService.deduplicate(updated)
     }
 
     #else
@@ -217,6 +451,12 @@ public final class BonjourSSHDiscovery: ObservableObject {
     deinit {
         #if canImport(Network)
         browser?.cancel()
+        for resolver in resolvers.values {
+            resolver.cancel()
+        }
+        for task in resolutionTasks.values {
+            task.cancel()
+        }
         #endif
     }
 }
