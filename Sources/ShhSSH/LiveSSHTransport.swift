@@ -5,12 +5,6 @@ import NIOPosix
 @preconcurrency import NIOSSH
 import ShhCore
 
-#if swift(>=6.0)
-extension NIOSSHHandler: @retroactive @unchecked Sendable {}
-#else
-extension NIOSSHHandler: @unchecked Sendable {}
-#endif
-
 final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @unchecked Sendable {
     enum Credential: Sendable {
         case password(String)
