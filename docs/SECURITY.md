@@ -12,6 +12,20 @@ data, remote execution outputs, voice transcripts, and backup storage.
   `Host` records or written to disk.
 - Identity records contain only opaque Keychain references.
 - In-memory keys are zeroed on teardown.
+- On physical devices, Keychain queries strictly enforce the shared
+  access group (`group.com.ervinpopescu.shh`) and never broaden query
+  scope; unsigned simulator environments use a scoped fallback without
+  weakening device protections.
+- Host connections resolve identities strictly by exact descriptor
+  UUID, deferring credential store queries until after host-key
+  acceptance. Missing descriptors or ambiguous collisions trigger
+  actionable failures rather than silently degrading into password
+  authentication or arbitrary keys.
+- Deleting an identity descriptor performs reference-counted cleanup:
+  when multiple descriptors share a Keychain reference, the secret is
+  retained for surviving descriptors.
+- Terminal log and scrollback redaction unconditionally protects all
+  readable credential secrets regardless of catalog collision status.
 
 ### 2. Trust-On-First-Use (TOFU) Verification & Transport Isolation
 - Primary SSH transport (`LiveSSHTransport`) is implemented directly with

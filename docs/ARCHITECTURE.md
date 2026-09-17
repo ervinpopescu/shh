@@ -9,7 +9,13 @@ extensions.
 
 ### 1. ShhCore (Foundation-Only Core)
 - **Domain & Models:** Host metadata, endpoint configurations,
-  identities with opaque Keychain references, tags, groups, snippets.
+  identities with opaque Keychain references, tags, groups, snippets,
+  and metadata-only `IdentityCatalogReconciliation` detecting missing
+  references and colliding identities across catalog mutations.
+- **Keychain Credential Store:** `KeychainCredentialStore` managing
+  isolated private key secrets with serialized access, immediate probe
+  cleanup, and simulator-scoped access group fallback while preserving
+  strict device entitlement scoping.
 - **Safety Policy:** `CommandPolicy` quote-aware tokenizer and allowlist
   blocking destructive commands and flagging review-required syntax.
 - **Terminal Primitives:** `ANSIParser`, `TerminalGrid`, and cell models.
@@ -48,6 +54,9 @@ extensions.
 ### 5. App (SwiftUI & Application Coordination)
 - **`AppContainer`:** `@MainActor` state coordinator binding UI scenes
   with transport, catalog, audio, forwarding, and trust stores.
+  Reconciles catalog identity references on mutation and persistence
+  load, resolving exact identities without silent degradation, and
+  managing reference-counted Keychain credential deletion.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
   Group storage (`snapshot.json` and `known_hosts.json`).
