@@ -1,3 +1,4 @@
+#if canImport(XCTest)
 import XCTest
 import Foundation
 #if canImport(Network)
@@ -6,6 +7,30 @@ import Network
 @testable import ShhSSH
 
 #if canImport(Network)
+final class MockBonjourResolver: BonjourServiceResolving, @unchecked Sendable {
+    private let result: BonjourServiceResolution?
+    private let waitsForCancellation: Bool
+    private let lock = NSLock()
+    private(set) var cancelCallCount = 0
+
+    init(result: BonjourServiceResolution?, waitsForCancellation: Bool = false) {
+        self.result = result
+        self.waitsForCancellation = waitsForCancellation
+    }
+
+    func resolve() async -> BonjourServiceResolution? {
+        guard waitsForCancellation else { return result }
+        try? await Task.sleep(nanoseconds: 10_000_000_000)
+        return nil
+    }
+
+    func cancel() {
+        lock.withLock {
+            cancelCallCount += 1
+        }
+    }
+}
+
 final class MockBonjourBrowser: BonjourServiceBrowsing, @unchecked Sendable {
     private let lock = NSLock()
     private var resultsHandler: (@Sendable ([NWEndpoint]) -> Void)?
@@ -116,6 +141,105 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         XCTAssertEqual(hostPortModel?.name, "server.local")
         XCTAssertEqual(hostPortModel?.hostname, "server.local")
         XCTAssertEqual(hostPortModel?.port, 2200)
+        XCTAssertEqual(
+            DiscoveredSSHService(name: "schweiz", hostname: "schweiz.local.").hostname,
+            "schweiz.local"
+        )
+    }
+
+    @MainActor
+    func testBonjourResolutionUsesAdvertisedHostnameAndPort() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(
+            result: BonjourServiceResolution(hostname: "schweiz.local.", port: 2201)
+        )
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+
+        discovery.startDiscovery()
+        browser.simulateResults([
+            NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil)
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(discovery.discoveredServices.count, 1)
+        XCTAssertEqual(discovery.discoveredServices[0].hostname, "schweiz.local")
+        XCTAssertEqual(discovery.discoveredServices[0].port, 2201)
+    }
+
+    @MainActor
+    func testStoppingDiscoveryCancelsBonjourResolution() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(result: nil, waitsForCancellation: true)
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+
+        discovery.startDiscovery()
+        browser.simulateResults([
+            NWEndpoint.service(name: "nas", type: "_ssh._tcp", domain: "local.", interface: nil)
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        discovery.stopDiscovery()
+
+        XCTAssertEqual(resolver.cancelCallCount, 1)
+    }
+
+    @MainActor
+    func testBrowserUpdatePreservesResolvedHostnameWithoutReResolving() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(
+            result: BonjourServiceResolution(hostname: "schweiz.local.", port: 2201)
+        )
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+
+        discovery.startDiscovery()
+        browser.simulateResults([
+            NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil)
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(discovery.discoveredServices.count, 1)
+        XCTAssertEqual(discovery.discoveredServices[0].hostname, "schweiz.local")
+        XCTAssertEqual(discovery.discoveredServices[0].port, 2201)
+
+        browser.simulateResults([
+            NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil),
+            NWEndpoint.service(name: "another", type: "_ssh._tcp", domain: "local.", interface: nil)
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let schweiz = discovery.discoveredServices.first(where: { $0.name == "schweiz" })
+        XCTAssertEqual(schweiz?.hostname, "schweiz.local")
+        XCTAssertEqual(schweiz?.port, 2201)
+    }
+
+    @MainActor
+    func testMultiInterfaceEndpointsResolveWithoutLeaking() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(
+            result: BonjourServiceResolution(hostname: "nas.local.", port: 2222)
+        )
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+
+        discovery.startDiscovery()
+        let ep1 = NWEndpoint.service(name: "nas", type: "_ssh._tcp", domain: "local.", interface: nil)
+        let ep2 = NWEndpoint.service(name: "nas", type: "_ssh._tcp", domain: "local.", interface: nil)
+        browser.simulateResults([ep1, ep2])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(discovery.discoveredServices.count, 1)
+        XCTAssertEqual(discovery.discoveredServices[0].hostname, "nas.local")
+        XCTAssertEqual(discovery.discoveredServices[0].port, 2222)
     }
     #endif
 
@@ -241,3 +365,4 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         XCTAssertEqual(discovery.discoveredServices[1].name, "server1")
     }
 }
+#endif
