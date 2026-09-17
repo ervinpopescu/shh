@@ -59,25 +59,33 @@ public actor DemoAudioRecorder: AudioRecorder {
 public final class DemoTranscriber: LocalTranscriber, @unchecked Sendable {
     private let lock = NSLock()
     private var _transcript: String
-    public var simulateDelay: TimeInterval
-    public var simulateError: Error?
+    private var _simulateDelay: TimeInterval
+    private var _simulateError: Error?
 
     public init(transcript: String = "echo hello from voice", simulateDelay: TimeInterval = 0.05) {
         self._transcript = transcript
-        self.simulateDelay = simulateDelay
+        self._simulateDelay = simulateDelay
+    }
+
+    private func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+
+    public var simulateDelay: TimeInterval {
+        get { withLock { _simulateDelay } }
+        set { withLock { _simulateDelay = newValue } }
+    }
+
+    public var simulateError: Error? {
+        get { withLock { _simulateError } }
+        set { withLock { _simulateError = newValue } }
     }
 
     public var transcript: String {
-        get {
-            lock.lock()
-            defer { lock.unlock() }
-            return _transcript
-        }
-        set {
-            lock.lock()
-            _transcript = newValue
-            lock.unlock()
-        }
+        get { withLock { _transcript } }
+        set { withLock { _transcript = newValue } }
     }
 
     public func setTranscript(_ text: String) {
@@ -85,20 +93,14 @@ public final class DemoTranscriber: LocalTranscriber, @unchecked Sendable {
     }
 
     public func setSimulateError(_ error: Error?) {
-        lock.lock()
-        self.simulateError = error
-        lock.unlock()
+        simulateError = error
     }
 
     public func transcribe(
         recording: AudioRecordingHandle,
         progress: (@Sendable (Double) -> Void)? = nil
     ) async throws -> String {
-        lock.lock()
-        let err = simulateError
-        let delay = simulateDelay
-        let text = _transcript
-        lock.unlock()
+        let (err, delay, text) = withLock { (_simulateError, _simulateDelay, _transcript) }
 
         if let err {
             throw err
@@ -114,10 +116,7 @@ public final class DemoTranscriber: LocalTranscriber, @unchecked Sendable {
     }
 
     public func transcribe(audio: Data) async throws -> String {
-        lock.lock()
-        let err = simulateError
-        let text = _transcript
-        lock.unlock()
+        let (err, text) = withLock { (_simulateError, _transcript) }
 
         if let err {
             throw err
