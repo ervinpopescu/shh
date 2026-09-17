@@ -29,6 +29,12 @@ integration without third-party cloud servers or subscription telemetry.
 - **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
   buffer support (vim, htop, tmux), ANSI color parser, search drawers,
   and debounced resize handling.
+- **Session Lifecycle & Background Keepalive:** Finite iOS background
+  grace period execution via standard UIKit background tasks, keeping
+  active SSH, Mosh, port forwarding, and terminal sessions alive without
+  silent audio or background audio modes. Probes transport responsiveness
+  via keepalive requests upon foreground return before initiating
+  reconnection, enabling instant resumption when connections survive.
 - **Host & Identity Management:** Host configurations, grouping, tags,
   health status, and opaque Keychain references. Private keys are never
   exposed as raw fields of `Host`. Host connections resolve exact
