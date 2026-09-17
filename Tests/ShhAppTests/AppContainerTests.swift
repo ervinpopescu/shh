@@ -4,6 +4,8 @@ import Crypto
 import ShhCore
 import ShhSSH
 import ShhTerminal
+@testable import ShhTerminal
+import SwiftUI
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -788,6 +790,70 @@ final class AppContainerTests: XCTestCase {
         var query = "test"
         let searchBar = TerminalSearchBar(controller: container.terminalController, query: .init(get: { query }, set: { query = $0 }), onClose: {})
         _ = searchBar
+    }
+
+    @MainActor
+    func testTerminalAccessoryBarModifierReactivityAndRendering() async throws {
+        let container = AppContainer.demo()
+        let controller = container.terminalController
+        var outboundData: [Data] = []
+        controller.onOutput = { outboundData.append($0) }
+
+        let barView = TerminalAccessoryBar(controller: controller)
+        let hosting = UIHostingController(rootView: barView)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 60))
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        hosting.view.layoutIfNeeded()
+
+        let evidenceDir = ProcessInfo.processInfo.environment["EVIDENCE_DIR"]
+
+        func captureScreenshot(name: String) {
+            guard let evidenceDir, !evidenceDir.isEmpty, FileManager.default.fileExists(atPath: evidenceDir) else { return }
+            let renderer = UIGraphicsImageRenderer(bounds: hosting.view.bounds)
+            let image = renderer.image { _ in
+                hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
+            }
+            if let data = image.pngData() {
+                let url = URL(fileURLWithPath: evidenceDir).appendingPathComponent("\(name).png")
+                try? data.write(to: url)
+            }
+        }
+
+        // 1. Initial default state: no modifiers active
+        XCTAssertFalse(controller.inputCoordinator.isControlActive)
+        XCTAssertFalse(controller.inputCoordinator.isAltActive)
+        XCTAssertFalse(controller.inputCoordinator.isShiftActive)
+        captureScreenshot(name: "accessory_bar_default")
+
+        // 2. Toggle Ctrl: coordinator becomes active, view hierarchy re-evaluates
+        controller.inputCoordinator.toggleControl()
+        XCTAssertTrue(controller.inputCoordinator.isControlActive)
+        hosting.view.layoutIfNeeded()
+        captureScreenshot(name: "accessory_bar_ctrl_active")
+
+        // 3. Emit Space from keyboard: produces NUL byte (0x00) and clears Ctrl
+        controller.handleOutput(Data(" ".utf8))
+        XCTAssertEqual(outboundData, [Data([0x00])])
+        XCTAssertFalse(controller.inputCoordinator.isControlActive)
+
+        // 4. Toggle Shift: coordinator becomes active, Tab updates
+        controller.inputCoordinator.toggleShift()
+        XCTAssertTrue(controller.inputCoordinator.isShiftActive)
+        hosting.view.layoutIfNeeded()
+        captureScreenshot(name: "accessory_bar_shift_active")
+
+        // 5. Toggle Alt: coordinator becomes active
+        controller.inputCoordinator.toggleAlt()
+        XCTAssertTrue(controller.inputCoordinator.isAltActive)
+        hosting.view.layoutIfNeeded()
+        captureScreenshot(name: "accessory_bar_alt_active")
+
+        // 6. Reset / Clear clears all
+        controller.inputCoordinator.clear()
+        XCTAssertFalse(controller.inputCoordinator.isControlActive)
+        XCTAssertFalse(controller.inputCoordinator.isAltActive)
+        XCTAssertFalse(controller.inputCoordinator.isShiftActive)
     }
 
     func testCreateEd25519IdentityAndRetrievePublicKey() async throws {
