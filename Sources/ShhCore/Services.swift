@@ -392,6 +392,12 @@ public enum KeychainError: Error, Equatable, Sendable, LocalizedError {
     }
 }
 #if canImport(Security)
+private actor KeychainOperationCoordinator {
+    func perform<T: Sendable>(_ operation: @Sendable () throws -> T) rethrows -> T {
+        try operation()
+    }
+}
+
 public struct KeychainCredentialStore: CredentialStore {
     public static let baseSharedAccessGroup = "group.com.ervinpopescu.shh"
 
@@ -420,21 +426,22 @@ public struct KeychainCredentialStore: CredentialStore {
         ]
         var result: CFTypeRef?
         let status = SecItemAdd(query as CFDictionary, &result)
-        if status == errSecSuccess, let dict = result as? [CFString: Any], let accessGroup = dict[kSecAttrAccessGroup] as? String {
-            defer {
-                let deleteQuery: [CFString: Any] = [
-                    kSecClass: kSecClassGenericPassword,
-                    kSecAttrAccount: dummyAccount,
-                    kSecAttrService: "prefixProbeService"
-                ]
-                SecItemDelete(deleteQuery as CFDictionary)
-            }
-            let parts = accessGroup.split(separator: ".", maxSplits: 1)
-            if let teamID = parts.first, !teamID.isEmpty {
-                return "\(teamID)."
-            }
-        }
-        return nil
+        guard status == errSecSuccess else { return nil }
+
+        // Install cleanup as soon as insertion succeeds. Attribute parsing is
+        // best-effort and must never leak the random probe item.
+        let deleteQuery: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrAccount: dummyAccount,
+            kSecAttrService: "prefixProbeService"
+        ]
+        defer { SecItemDelete(deleteQuery as CFDictionary) }
+
+        guard let dict = result as? [CFString: Any],
+              let accessGroup = dict[kSecAttrAccessGroup] as? String else { return nil }
+        let parts = accessGroup.split(separator: ".", maxSplits: 1)
+        guard let teamID = parts.first, !teamID.isEmpty else { return nil }
+        return "\(teamID)."
     }
 
     private let service: String
@@ -443,49 +450,114 @@ public struct KeychainCredentialStore: CredentialStore {
         self.service = service
         self.accessGroup = accessGroup
     }
-    private func baseQuery(reference: String) -> [CFString: Any] {
-        var query: [CFString: Any] = [kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: reference]
-        if let accessGroup { query[kSecAttrAccessGroup] = accessGroup }
-        return query
+    private func query(reference: String, includeAccessGroup: Bool) -> [CFString: Any] {
+        var result: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword,
+            kSecAttrService: service,
+            kSecAttrAccount: reference
+        ]
+        if includeAccessGroup, let accessGroup {
+            result[kSecAttrAccessGroup] = accessGroup
+        }
+        return result
     }
+
+    /// The ungrouped variant is a deliberate simulator compatibility path. An
+    /// unsigned simulator build cannot use the production access group, but a
+    /// later signed build can still be configured with it. Every simulator
+    /// operation therefore considers both variants, with the configured group
+    /// preferred. Device builds never broaden their Keychain query.
+    private func queries(reference: String) -> [[CFString: Any]] {
+        guard accessGroup != nil else { return [query(reference: reference, includeAccessGroup: false)] }
+        if allowsUnsignedSimulatorFallback {
+            return [
+                query(reference: reference, includeAccessGroup: true),
+                query(reference: reference, includeAccessGroup: false)
+            ]
+        }
+        return [query(reference: reference, includeAccessGroup: true)]
+    }
+
+    private var allowsUnsignedSimulatorFallback: Bool {
+        #if targetEnvironment(simulator)
+        return true
+        #else
+        return false
+        #endif
+    }
+
+    private static let operationCoordinator = KeychainOperationCoordinator()
+
+    private static func allowsFallback(for status: OSStatus) -> Bool {
+        status == errSecMissingEntitlement || status == errSecItemNotFound
+    }
+
+    private func saveLocked(_ secret: Data, reference: String) throws {
+        let candidates = queries(reference: reference)
+        // Remove both forms first so a signing change cannot leave two values
+        // for the same opaque reference and make future reads nondeterministic.
+        for (index, candidate) in candidates.enumerated() {
+            let status = SecItemDelete(candidate as CFDictionary)
+            let groupedEntitlementFailure = index == 0 && candidates.count > 1 && status == errSecMissingEntitlement
+            guard status == errSecSuccess || status == errSecItemNotFound || groupedEntitlementFailure else {
+                throw KeychainError.status(status)
+            }
+        }
+
+        var grouped = query(reference: reference, includeAccessGroup: accessGroup != nil)
+        grouped[kSecValueData] = secret
+        grouped[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        var status = SecItemAdd(grouped as CFDictionary, nil)
+        guard status == errSecSuccess ||
+                (accessGroup != nil && allowsUnsignedSimulatorFallback && Self.allowsFallback(for: status)) else {
+            throw KeychainError.status(status)
+        }
+        guard status != errSecSuccess else { return }
+
+        var ungrouped = query(reference: reference, includeAccessGroup: false)
+        ungrouped[kSecValueData] = secret
+        ungrouped[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        status = SecItemAdd(ungrouped as CFDictionary, nil)
+        guard status == errSecSuccess else { throw KeychainError.status(status) }
+    }
+
     public func save(_ secret: Data, reference: String) async throws {
-        var query = baseQuery(reference: reference)
-        query[kSecValueData] = secret
-        query[kSecAttrAccessible] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        _ = SecItemDelete(baseQuery(reference: reference) as CFDictionary)
-        var status = SecItemAdd(query as CFDictionary, nil)
-        if status != errSecSuccess && accessGroup != nil {
-            var fallbackQuery = query
-            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
-            _ = SecItemDelete(fallbackQuery as CFDictionary)
-            status = SecItemAdd(fallbackQuery as CFDictionary, nil)
-        }
-        guard status == errSecSuccess else { throw KeychainError.status(status) }
+        try await Self.operationCoordinator.perform { try self.saveLocked(secret, reference: reference) }
     }
+
+    private func loadLocked(reference: String) throws -> Data {
+        let candidates = queries(reference: reference)
+        for (index, var candidate) in candidates.enumerated() {
+            candidate[kSecReturnData] = kCFBooleanTrue as Any
+            candidate[kSecMatchLimit] = kSecMatchLimitOne
+            var result: CFTypeRef?
+            let status = SecItemCopyMatching(candidate as CFDictionary, &result)
+            if status == errSecSuccess {
+                guard let data = result as? Data else { throw KeychainError.unavailable }
+                return data
+            }
+            let canTryFallback = index == 0 && candidates.count > 1 && Self.allowsFallback(for: status)
+            guard canTryFallback else { throw KeychainError.status(status) }
+        }
+        throw KeychainError.status(errSecItemNotFound)
+    }
+
     public func load(reference: String) async throws -> Data {
-        var query = baseQuery(reference: reference)
-        query[kSecReturnData] = kCFBooleanTrue as Any
-        query[kSecMatchLimit] = kSecMatchLimitOne
-        var result: CFTypeRef?
-        var status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status != errSecSuccess && accessGroup != nil {
-            var fallbackQuery = query
-            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
-            status = SecItemCopyMatching(fallbackQuery as CFDictionary, &result)
-        }
-        guard status == errSecSuccess else { throw KeychainError.status(status) }
-        guard let data = result as? Data else { throw KeychainError.unavailable }
-        return data
+        try await Self.operationCoordinator.perform { try self.loadLocked(reference: reference) }
     }
-    public func delete(reference: String) async throws {
-        let query = baseQuery(reference: reference)
-        var status = SecItemDelete(query as CFDictionary)
-        if status != errSecSuccess && status != errSecItemNotFound && accessGroup != nil {
-            var fallbackQuery = query
-            fallbackQuery.removeValue(forKey: kSecAttrAccessGroup)
-            status = SecItemDelete(fallbackQuery as CFDictionary)
+
+    private func deleteLocked(reference: String) throws {
+        let candidates = queries(reference: reference)
+        for (index, candidate) in candidates.enumerated() {
+            let status = SecItemDelete(candidate as CFDictionary)
+            if status == errSecSuccess || status == errSecItemNotFound { continue }
+            let groupedEntitlementFailure = index == 0 && candidates.count > 1 && status == errSecMissingEntitlement
+            guard groupedEntitlementFailure else { throw KeychainError.status(status) }
         }
-        guard status == errSecSuccess || status == errSecItemNotFound else { throw KeychainError.status(status) }
+    }
+
+    public func delete(reference: String) async throws {
+        try await Self.operationCoordinator.perform { try self.deleteLocked(reference: reference) }
     }
 }
 #else
