@@ -13,8 +13,10 @@ integration without third-party cloud servers or subscription telemetry.
   (supporting generated and imported OpenSSH, PKCS#8, and raw formats),
   interactive PTY and shell channels, debounced terminal resizing,
   isolated non-interactive exec channels, multi-hop ProxyJump bastions,
-  local, remote, and dynamic SOCKS5 forwarding, automatic backoff
-  reconnection, and validated live-host simulator interoperability.
+  local, remote, and dynamic SOCKS5 forwarding, typed transport error
+  mapping (unpacking SwiftNIO dual-stack DNS and socket connection
+  failures while preserving privacy), automatic backoff reconnection, and
+  validated live-host simulator interoperability.
 - **Remote Files & SFTP Subsystem (Citadel Isolation):** Citadel is
   strictly isolated to SFTP subsystem management (`LiveSFTPRepository`)
   and does not govern the primary SSH handshake. Supports native
@@ -37,6 +39,10 @@ integration without third-party cloud servers or subscription telemetry.
   pickers with fingerprint hints, and surfaced as actionable
   diagnostics. Identity deletion preserves shared Keychain secrets for
   surviving descriptors.
+- **Local Network Bonjour Discovery:** Discovers LAN SSH servers (`_ssh._tcp`)
+  via Network.framework `NWBrowser` and resolves advertised mDNS hostnames
+  and ports using `NetService`, stripping trailing dots and preserving
+  resolved services across interface updates for one-tap host configuration.
 - **Tmux Multiplexer:** First-class tmux integration with session
   listing, creation, attach, and exact-command approval sheets. Includes
   collision-resistant pipe-delimited format parsing and backward

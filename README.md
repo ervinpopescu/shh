@@ -21,6 +21,8 @@ backups.
 - **On-Device Voice AI:** WhisperKit and Apple Speech local transcribers
   with push-to-talk recording, editable preview drawers, and strict
   manual send safety policies.
+- **Local Network Discovery:** Bonjour discovery (`_ssh._tcp`) detecting
+  local SSH servers with advertised mDNS hostname and port resolution.
 - **Tunneling & Bastions:** Multi-hop ProxyJump pipeline and port
   forwarding (local, remote, and dynamic SOCKS5).
 - **Herdr Supervision:** Workspace and pane management with structured
