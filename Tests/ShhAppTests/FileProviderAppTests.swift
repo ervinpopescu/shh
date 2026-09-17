@@ -405,6 +405,7 @@ final class FileProviderAppTests: XCTestCase {
         ))
 
         let expectation = expectation(description: "Modify rename item")
+        var completionCount = 0
         _ = extensionInstance.modifyItem(
             renamedItem,
             baseVersion: renamedItem.itemVersion,
@@ -412,18 +413,67 @@ final class FileProviderAppTests: XCTestCase {
             contents: nil,
             request: NSFileProviderRequest()
         ) { modifiedItem, fields, shouldFetch, error in
+            completionCount += 1
             XCTAssertNil(error)
             XCTAssertEqual(modifiedItem?.filename, "renamed.txt")
             expectation.fulfill()
         }
 
         await fulfillment(of: [expectation], timeout: 5.0)
+        XCTAssertEqual(completionCount, 1, "Modify completion must be delivered exactly once")
 
         // Verify remote file was renamed
         let oldFile = try? await demoRepo.fetchAttributes(at: initialPath)
         let newFile = try? await demoRepo.fetchAttributes(at: RemotePath("/home/dev/projects/renamed.txt"))
         XCTAssertNil(oldFile)
         XCTAssertNotNil(newFile)
+        #endif
+    }
+
+    func testFileProviderModifyItemTraversalRejection() async throws {
+        #if canImport(FileProvider)
+        let demoRepo = DemoSFTPRepository(seedDemoData: true)
+        let provider = DemoFileProviderRepositoryProvider(repository: demoRepo)
+        let hostID = UUID()
+        let domain = NSFileProviderDomain(identifier: NSFileProviderDomainIdentifier(hostID.uuidString), displayName: "Test Domain")
+        let extensionInstance = FileProviderExtension(domain: domain, repositoryProvider: provider)
+
+        let initialPath = RemotePath("/home/dev/projects/stay_safe.txt")
+        try await demoRepo.writeFile(data: Data("safe content".utf8), at: initialPath, progress: nil)
+
+        let itemID = FileProviderItemIdentifier(hostID: hostID, remotePath: initialPath)
+        let maliciousRenamedItem = FileProviderItem(contract: FileProviderItemContract(
+            identifier: itemID,
+            parentIdentifier: itemID.parentIdentifier,
+            filename: "../traversal_escape.txt",
+            isDirectory: false,
+            size: 12,
+            contentTypeIdentifier: "public.plain-text"
+        ))
+
+        let expectation = expectation(description: "Modify rename traversal rejected")
+        var completionCount = 0
+        _ = extensionInstance.modifyItem(
+            maliciousRenamedItem,
+            baseVersion: maliciousRenamedItem.itemVersion,
+            changedFields: [.filename],
+            contents: nil,
+            request: NSFileProviderRequest()
+        ) { modifiedItem, fields, shouldFetch, error in
+            completionCount += 1
+            XCTAssertNil(modifiedItem)
+            let nsError = error as? NSError
+            XCTAssertEqual(nsError?.domain, NSCocoaErrorDomain)
+            XCTAssertEqual(nsError?.code, NSFileWriteInvalidFileNameError)
+            expectation.fulfill()
+        }
+
+        await fulfillment(of: [expectation], timeout: 5.0)
+        XCTAssertEqual(completionCount, 1, "Modify completion must be delivered exactly once")
+
+        // Original file must remain intact
+        let originalFile = try? await demoRepo.fetchAttributes(at: initialPath)
+        XCTAssertNotNil(originalFile)
         #endif
     }
 
