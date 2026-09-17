@@ -1,0 +1,8 @@
+review:
+  path_instructions:
+    - path: "Tests/**"
+      instructions: >-
+        Never hardcode developer-specific absolute paths. Do not create or save
+        test evidence files, screenshots, snapshots, logs, transcripts, or
+        artifacts anywhere from repository tests/review work. Tests must not
+        depend on evidence output or fail because evidence is absent.
