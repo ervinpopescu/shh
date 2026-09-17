@@ -5,6 +5,26 @@ import FileProvider
 #endif
 #if canImport(UIKit)
 import UIKit
+
+/// Coordinates finite background execution tasks during scene transitions.
+public protocol BackgroundTaskManaging: AnyObject, Sendable {
+    func beginBackgroundTask(withName name: String?, expirationHandler: (@Sendable () -> Void)?) -> UIBackgroundTaskIdentifier
+    func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier)
+}
+
+/// Default implementation backed by `UIApplication.shared`.
+public final class UIKitBackgroundTaskManager: BackgroundTaskManaging, @unchecked Sendable {
+    public static let shared = UIKitBackgroundTaskManager()
+
+    public func beginBackgroundTask(withName name: String?, expirationHandler: (@Sendable () -> Void)?) -> UIBackgroundTaskIdentifier {
+        UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expirationHandler)
+    }
+
+    public func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier) {
+        guard identifier != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(identifier)
+    }
+}
 #endif
 import ShhCore
 import ShhSSH
@@ -42,6 +62,10 @@ final class AppContainer: ObservableObject {
     public let secondaryTerminalController: ShhTerminalController
     @Published public var secondaryPaneMode: SecondaryPaneMode = .none
     let restorationStore: any SessionRestorationStore
+    #if canImport(UIKit)
+    let backgroundTaskManager: any BackgroundTaskManaging
+    private var currentBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+    #endif
     let reachabilityMonitor: any ReachabilityMonitoring
     let reconnectCoordinator: ReconnectCoordinator
     private let didProvideCustomCatalog: Bool
@@ -186,13 +210,15 @@ final class AppContainer: ObservableObject {
 
     private(set) var activeHost: Host?
     private(set) var isExplicitDisconnect = false
-    // iOS may suspend the process without delivering a transport error. Treat a
-    // background transition as a disconnected lifecycle boundary and reconnect
-    // on the next active transition rather than claiming the socket survived.
+    // iOS manages background execution with finite grace periods via beginBackgroundTask.
+    // While backgrounded, active SSH sessions, NIO channels, and port forwarding remain alive.
+    // If iOS suspends the app (e.g. after the grace period expires), the process cannot
+    // guarantee indefinite background TCP execution without a dedicated background mode.
+    // Upon returning to the foreground (.active), Shh probes the existing connection before
+    // deciding whether to reconnect, preserving the session with zero delay if it survived.
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
     private var lifecycleGeneration = 0
-    private var backgroundCleanupTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
@@ -277,8 +303,12 @@ final class AppContainer: ObservableObject {
         portForwardingManager: (any PortForwardingManaging)? = nil,
         hostResolver: LiveSSHTransport.HostResolver? = nil,
         fileProviderHelper: FileProviderManagerHelper = .shared,
-        bonjourDiscovery: BonjourSSHDiscovery? = nil
+        bonjourDiscovery: BonjourSSHDiscovery? = nil,
+        backgroundTaskManager: (any BackgroundTaskManaging)? = nil
     ) {
+        #if canImport(UIKit)
+        self.backgroundTaskManager = backgroundTaskManager ?? UIKitBackgroundTaskManager.shared
+        #endif
         self.fileProviderHelper = fileProviderHelper
         self.didProvideCustomCatalog = (catalog != nil)
         let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
@@ -599,9 +629,6 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
-        let pendingBackgroundCleanup = backgroundCleanupTask
-        backgroundCleanupTask = nil
-        await pendingBackgroundCleanup?.value
         lifecycleGeneration += 1
         isSceneInBackground = false
         isNetworkRecoveryInProgress = false
@@ -818,8 +845,7 @@ final class AppContainer: ObservableObject {
             do {
                 for try await event in events {
                     guard let self,
-                          self.activeSession?.id == session.id,
-                          !self.isSceneInBackground else { return }
+                          self.activeSession?.id == session.id else { return }
                     switch event {
                     case .bytes(let data):
                         let redactedData = self.redacted(data)
@@ -860,8 +886,7 @@ final class AppContainer: ObservableObject {
                 }
             } catch {
                 guard let self,
-                      self.activeSession?.id == session.id,
-                      !self.isSceneInBackground else { return }
+                      self.activeSession?.id == session.id else { return }
                 self.tmuxRefreshGeneration += 1
                 self.herdrRefreshGeneration += 1
                 self.stopHerdrPolling()
@@ -1160,26 +1185,57 @@ final class AppContainer: ObservableObject {
         case .active:
             let wasInBackground = isSceneInBackground
             if wasInBackground {
-                // Invalidate a delayed background persistence task before
-                // starting a new connection generation.
                 lifecycleGeneration += 1
             }
             isSceneInBackground = false
+            #if canImport(UIKit)
+            endCurrentBackgroundTask()
+            #endif
             guard !isExplicitDisconnect else { return }
+
             if wasInBackground {
-                // The old transport may have survived suspension or may have
-                // been invalidated by the OS. Reconnect in either case and use
-                // the persisted active target when it is still safe to attach.
                 let generation = lifecycleGeneration
-                let cleanupTask = backgroundCleanupTask
-                backgroundCleanupTask = nil
-                Task { [weak self] in
-                    await cleanupTask?.value
+                Task { @MainActor [weak self] in
                     guard let self,
                           self.lifecycleGeneration == generation,
-                          !self.isExplicitDisconnect,
-                          let host = self.activeHost else { return }
-                    self.handleConnectionDrop(host: host)
+                          !self.isExplicitDisconnect else { return }
+
+                    if let session = self.activeSession, session.state == .connected, let conn = self.connection {
+                        // Test if the existing connection survived suspension and is responsive.
+                        let isResponsive = await conn.testResponsiveness(timeout: 2.5)
+                        guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
+
+                        if isResponsive {
+                            // Session is instantly ready with 0 delay and NO reconnect cycle!
+                            self.updateIdleTimerState()
+                            return
+                        } else {
+                            // Connection was severed by OS during deep sleep / suspension.
+                            self.detachCallbacks()
+                            self.eventTask?.cancel()
+                            self.eventTask = nil
+                            let deadConn = self.connection
+                            self.connection = nil
+                            self.forwardingStreamTask?.cancel()
+                            self.forwardingStreamTask = nil
+                            await self.portForwardingManager?.stopAll()
+                            self.forwardingSessions = []
+                            await deadConn?.close()
+                            self.activeSession?.state = .disconnected
+                            if let host = self.activeHost {
+                                self.handleConnectionDrop(host: host)
+                            }
+                        }
+                    } else if self.reconnectState.isReconnecting {
+                        if let host = self.activeHost {
+                            await self.reconnectCoordinator.retryNow { [weak self] attempt in
+                                guard let self else { return }
+                                try await self.performReconnect(to: host, attempt: attempt)
+                            }
+                        }
+                    } else if let host = self.activeHost, (self.activeSession?.state == .failed || self.activeSession?.state == .disconnected) {
+                        self.handleConnectionDrop(host: host)
+                    }
                 }
             } else if reconnectState.isReconnecting {
                 Task { [weak self] in
@@ -1204,9 +1260,9 @@ final class AppContainer: ObservableObject {
         lifecycleGeneration += 1
         let backgroundGeneration = lifecycleGeneration
 
+        // Persist intent immediately so that if the app is suspended or terminated
+        // by the system, the last active target and host are safely preserved.
         if let session = activeSession, let host = activeHost {
-            // Persist intent, not terminal bytes or credentials. Preserve the
-            // last successful target even when the active attachment is nil.
             let activeTarget: LastUsedMultiplexerTarget? =
                 activeTmuxSessionID.flatMap { LastUsedMultiplexerTarget.tmuxTarget($0) }
                 ?? activeHerdrWorkspaceID.flatMap { LastUsedMultiplexerTarget.herdrTarget($0) }
@@ -1223,28 +1279,67 @@ final class AppContainer: ObservableObject {
                 )
                 try? await self.restorationStore.save(metadata)
             }
-            // A suspended app cannot promise that its TCP socket remains usable.
-            // Keep the session record and host for foreground restoration, but
-            // classify this transport as disconnected now.
-            activeSession?.state = .disconnected
         }
 
-        detachCallbacks()
-        eventTask?.cancel()
-        eventTask = nil
-        let oldConnection = connection
-        connection = nil
-        let oldForwardingManager = portForwardingManager
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = nil
-        forwardingSessions = []
-        reconnectState = .idle
-        backgroundCleanupTask = Task { [weak self] in
-            await self?.reconnectCoordinator.cancel()
-            await oldForwardingManager?.stopAll()
-            await oldConnection?.close()
+        // Only acquire a finite background task if we have an active connected session.
+        // During this grace period (~30s to minutes depending on OS policy), the TCP
+        // socket, NIO event loop, port forwarding channels, and terminal stream
+        // remain completely active.
+        #if canImport(UIKit)
+        if activeSession?.state == .connected {
+            endCurrentBackgroundTask()
+            var taskID: UIBackgroundTaskIdentifier = .invalid
+            taskID = backgroundTaskManager.beginBackgroundTask(withName: "com.ervinpopescu.shh.keepalive") { [weak self] in
+                self?.backgroundTaskManager.endBackgroundTask(taskID)
+                Task { @MainActor [weak self] in
+                    self?.handleBackgroundTaskExpiration(taskID: taskID)
+                }
+            }
+            currentBackgroundTaskID = taskID
+        }
+        #endif
+    }
+
+    #if canImport(UIKit)
+    private func handleBackgroundTaskExpiration(taskID: UIBackgroundTaskIdentifier) {
+        if currentBackgroundTaskID == taskID {
+            currentBackgroundTaskID = .invalid
+        }
+
+        // On expiration, save restoration metadata.
+        // In accordance with App Store guidelines, iOS may suspend the process
+        // and indefinite background TCP execution cannot be guaranteed without
+        // an entitled background mode. However, we do NOT proactively close the
+        // socket or cancel the session here; if the OS suspends the app while
+        // keeping the socket open in the kernel, we will probe the existing
+        // connection upon returning to the foreground and avoid reconnecting
+        // if it survived.
+        if let session = activeSession, let host = activeHost {
+            let activeTarget: LastUsedMultiplexerTarget? =
+                activeTmuxSessionID.flatMap { LastUsedMultiplexerTarget.tmuxTarget($0) }
+                ?? activeHerdrWorkspaceID.flatMap { LastUsedMultiplexerTarget.herdrTarget($0) }
+            Task { [weak self] in
+                guard let self else { return }
+                let previous = try? await self.restorationStore.load()
+                let target = activeTarget ?? previous.flatMap { self.lastUsedTarget(from: $0) }
+                let metadata = self.restorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    target: target
+                )
+                try? await self.restorationStore.save(metadata)
+            }
         }
     }
+
+    private func endCurrentBackgroundTask() {
+        let taskID = currentBackgroundTaskID
+        currentBackgroundTaskID = .invalid
+        if taskID != .invalid {
+            backgroundTaskManager.endBackgroundTask(taskID)
+        }
+    }
+    #endif
 
     func restoreLastSession() async {
         guard let metadata = try? await restorationStore.load(),
@@ -1318,6 +1413,9 @@ final class AppContainer: ObservableObject {
     }
 
     func disconnect() async {
+        #if canImport(UIKit)
+        endCurrentBackgroundTask()
+        #endif
         await cancelVoiceRecording()
         resetVoiceState()
         isExplicitDisconnect = true
