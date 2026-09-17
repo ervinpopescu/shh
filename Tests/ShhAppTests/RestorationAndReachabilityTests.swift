@@ -410,16 +410,21 @@ final class RestorationAndReachabilityTests: XCTestCase {
         XCTAssertTrue(attachSuccess)
         XCTAssertEqual(container.activeTmuxSessionID, "$0")
 
+        // 1. Enter background: connection must NOT be proactively disconnected
         container.handleScenePhaseChange(.background)
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertEqual(container.activeSession?.state, .disconnected)
-        XCTAssertTrue(firstConnection.isClosed)
+        XCTAssertEqual(container.activeSession?.state, .connected, "Session must stay connected during background grace period")
+        XCTAssertFalse(firstConnection.isClosed, "Live transport must not be proactively closed on backgrounding")
         let storedMetadata = try await store.load()
         let metadata = try XCTUnwrap(storedMetadata)
         XCTAssertEqual(metadata.hostID, host.id)
         XCTAssertEqual(metadata.tmuxSessionID, "$0")
 
+        // 2. Simulate connection severed by OS during deep sleep
+        firstConnection.isResponsive = false
+
+        // 3. Return to foreground: responsiveness probe detects severed connection and restores target
         container.handleScenePhaseChange(.active)
         try await Task.sleep(nanoseconds: 100_000_000)
 
@@ -429,6 +434,166 @@ final class RestorationAndReachabilityTests: XCTestCase {
             secondConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
                 .contains { $0.contains("attach-session") && $0.contains("'$0'") }
         )
+    }
+
+    // MARK: - Background Grace Period, Expiration & Responsiveness Lifecycle Tests
+
+    func testAppContainerBackgroundTaskAcquisitionAndInstantForegroundResume() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return mockConnection
+        }
+        let bgManager = MockBackgroundTaskManager()
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            backgroundTaskManager: bgManager
+        )
+        let host = try Host(name: "GraceHost", hostname: "grace.invalid", username: "dev")
+
+        // 1. Connect
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(connectCount, 1)
+
+        // 2. Enter background
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Verify background task acquired with exact name
+        XCTAssertEqual(bgManager.beginTaskCallCount, 1)
+        XCTAssertEqual(bgManager.registeredNames.first, "com.ervinpopescu.shh.keepalive")
+        XCTAssertEqual(bgManager.activeIdentifiers.count, 1)
+        XCTAssertEqual(container.activeSession?.state, .connected, "Active session must survive without disconnect")
+        XCTAssertFalse(mockConnection.isClosed, "Connection must remain open in background")
+
+        // 3. Return to foreground while responsive before expiration: INSTANT resume, 0 delay, NO reconnect
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(bgManager.endTaskCallCount, 1, "Background task must be ended upon returning to active")
+        XCTAssertEqual(connectCount, 1, "No reconnect cycle must occur when returning to foreground with responsive socket")
+        XCTAssertEqual(container.activeSession?.state, .connected)
+    }
+
+    func testAppContainerBackgroundTaskExpirationDoesNotProactivelyCloseSocket() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return mockConnection
+        }
+        let bgManager = MockBackgroundTaskManager()
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            backgroundTaskManager: bgManager
+        )
+        let host = try Host(name: "ExpHost", hostname: "exp.invalid", username: "dev")
+
+        await container.connect(to: host)
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(bgManager.beginTaskCallCount, 1)
+
+        // Trigger expiration handler (OS ending finite grace period)
+        bgManager.triggerAllExpirations()
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Expiration MUST end background task
+        XCTAssertEqual(bgManager.endTaskCallCount, 1, "Expiration must immediately end the background task")
+        // But MUST NOT proactively close the socket!
+        XCTAssertFalse(mockConnection.isClosed, "Socket must not be proactively closed upon background task expiration")
+
+        // Restoration metadata must be saved
+        let metadata = try await store.load()
+        XCTAssertEqual(metadata?.hostID, host.id)
+
+        // If the socket survived in OS kernel when coming to foreground:
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(connectCount, 1, "If socket survived in OS, session resumes without reconnect")
+        XCTAssertEqual(container.activeSession?.state, .connected)
+    }
+
+    func testAppContainerForegroundReconnectsWhenConnectionSeveredDuringSleep() async throws {
+        let firstConnection = MockSSHConnection()
+        let secondConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return connectCount == 1 ? firstConnection : secondConnection
+        }
+        let bgManager = MockBackgroundTaskManager()
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            backgroundTaskManager: bgManager
+        )
+        let host = try Host(name: "SeverHost", hostname: "sever.invalid", username: "dev")
+
+        await container.connect(to: host)
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Simulate OS/NAT severing the connection during deep sleep
+        firstConnection.isResponsive = false
+
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        // Probing detected dead connection -> triggers reconnect
+        XCTAssertEqual(connectCount, 2, "Severed connection must trigger reconnect on active transition")
+        XCTAssertEqual(container.activeSession?.state, .connected)
+    }
+
+    func testAppContainerBackgroundWithoutActiveSessionDoesNotAcquireBackgroundTask() async throws {
+        let bgManager = MockBackgroundTaskManager()
+        let container = AppContainer(
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            backgroundTaskManager: bgManager
+        )
+
+        // No active connected session
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(bgManager.beginTaskCallCount, 0, "No background task should be acquired without an active session")
+    }
+
+    func testAppContainerExplicitDisconnectEndsActiveBackgroundTask() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let bgManager = MockBackgroundTaskManager()
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            backgroundTaskManager: bgManager
+        )
+        let host = try Host(name: "DiscHost", hostname: "disc.invalid", username: "dev")
+
+        await container.connect(to: host)
+        container.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(bgManager.beginTaskCallCount, 1)
+
+        await container.disconnect()
+        XCTAssertEqual(bgManager.endTaskCallCount, 1, "Explicit disconnect must end active background task")
     }
 
     func testStaleForegroundReconnectCannotRestoreAfterExplicitDisconnect() async throws {
@@ -451,6 +616,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let host = try Host(name: "Stale Host", hostname: "stale.invalid", username: "dev")
 
         await container.connect(to: host)
+        firstConnection.isResponsive = false
         container.handleScenePhaseChange(.background)
         container.handleScenePhaseChange(.active)
         try await Task.sleep(nanoseconds: 50_000_000)
