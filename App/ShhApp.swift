@@ -2099,18 +2099,21 @@ struct TerminalSearchBar: View {
     }
 }
 
+/// Accessory toolbar positioned above the keyboard providing quick-access terminal
+/// keys and sticky modifiers (Ctrl, Alt, Shift). Modifiers are held in the controller's
+/// `TerminalInputCoordinator` so that soft/hardware keyboard input and accessory buttons
+/// share active modifier state.
 struct TerminalAccessoryBar: View {
     @ObservedObject var controller: ShhTerminalController
-    @State private var isCtrlActive = false
-    @State private var isAltActive = false
-    @State private var isShiftActive = false
+    @ObservedObject private var inputCoordinator: TerminalInputCoordinator
+
+    init(controller: ShhTerminalController) {
+        self.controller = controller
+        self._inputCoordinator = ObservedObject(wrappedValue: controller.inputCoordinator)
+    }
 
     private var activeModifiers: KeyModifiers {
-        var mods: KeyModifiers = []
-        if isCtrlActive { mods.insert(.control) }
-        if isAltActive { mods.insert(.option) }
-        if isShiftActive { mods.insert(.shift) }
-        return mods
+        inputCoordinator.activeModifiers
     }
 
     var body: some View {
@@ -2122,24 +2125,23 @@ struct TerminalAccessoryBar: View {
                 }
 
                 // Tab
-                AccessoryKeyButton(title: isShiftActive ? "⇧Tab" : "Tab") {
-                    sendKey(.tab(shift: isShiftActive))
-                    isShiftActive = false
+                AccessoryKeyButton(title: inputCoordinator.isShiftActive ? "⇧Tab" : "Tab") {
+                    sendKey(.tab(shift: inputCoordinator.isShiftActive))
                 }
 
                 // Sticky Ctrl Toggle
-                AccessoryToggleKeyButton(title: "Ctrl", isActive: isCtrlActive) {
-                    isCtrlActive.toggle()
+                AccessoryToggleKeyButton(title: "Ctrl", isActive: inputCoordinator.isControlActive) {
+                    inputCoordinator.toggleControl()
                 }
 
                 // Sticky Alt/Meta Toggle
-                AccessoryToggleKeyButton(title: "Alt", isActive: isAltActive) {
-                    isAltActive.toggle()
+                AccessoryToggleKeyButton(title: "Alt", isActive: inputCoordinator.isAltActive) {
+                    inputCoordinator.toggleAlt()
                 }
 
                 // Sticky Shift Toggle
-                AccessoryToggleKeyButton(title: "⇧", isActive: isShiftActive) {
-                    isShiftActive.toggle()
+                AccessoryToggleKeyButton(title: "⇧", isActive: inputCoordinator.isShiftActive) {
+                    inputCoordinator.toggleShift()
                 }
 
                 // Ctrl-C
@@ -2243,24 +2245,15 @@ struct TerminalAccessoryBar: View {
     }
 
     private func sendKey(_ key: TerminalKey) {
-        controller.send(key: key)
-        if isCtrlActive { isCtrlActive = false }
-        if isAltActive { isAltActive = false }
-        if isShiftActive { isShiftActive = false }
+        controller.send(accessoryKey: key)
     }
 
     private func sendControl(_ char: Character) {
-        if let data = TerminalKeyEncoder.control(char) {
-            controller.send(raw: data)
-        }
-        isCtrlActive = false
+        controller.send(accessoryKey: .control(char))
     }
 
     private func sendText(_ text: String) {
-        controller.send(text: text)
-        if isCtrlActive { isCtrlActive = false }
-        if isAltActive { isAltActive = false }
-        if isShiftActive { isShiftActive = false }
+        controller.send(accessoryText: text)
     }
 }
 
