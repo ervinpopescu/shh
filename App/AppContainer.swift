@@ -47,6 +47,10 @@ final class AppContainer: ObservableObject {
     private let didProvideCustomCatalog: Bool
     private var persistenceWriteBlocked = false
     @Published public var persistenceReadinessMessage: String? = nil
+    /// Host identity references that do not have a descriptor in the current
+    /// catalog. These are reported for UI diagnostics but never repaired by
+    /// silently selecting another identity.
+    @Published public private(set) var missingHostIdentityIDs: Set<UUID> = []
 
     private static var isRunningInTestEnvironment: Bool {
         ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
@@ -462,6 +466,7 @@ final class AppContainer: ObservableObject {
 
         Task { [weak self] in
             let state = await self?.loadSharedStateIfNeeded()
+            await self?.reconcileCatalogIdentities()
             if state == .valid || state == .notFound {
                 try? await self?.syncSharedCatalogAndTrust()
             }
@@ -471,6 +476,17 @@ final class AppContainer: ObservableObject {
         }
 
         updateIdleTimerState()
+    }
+
+    /// Reconciles host UUID references against catalog descriptors after every
+    /// persistence load. This is intentionally metadata-only and preserves all
+    /// stale host records for user repair.
+    @MainActor
+    public func reconcileCatalogIdentities() async {
+        let hosts = (try? await catalog.listHosts()) ?? []
+        let identities = (try? await catalog.identities()) ?? []
+        let reconciliation = IdentityCatalogReconciliation(hosts: hosts, identities: identities)
+        missingHostIdentityIDs = reconciliation.missingHostIdentityIDs
     }
 
     @discardableResult
@@ -554,6 +570,10 @@ final class AppContainer: ObservableObject {
             return "Authentication required."
         case .missingCredential:
             return "Saved credential could not be found in Keychain."
+        case .missingIdentity:
+            return "The saved host identity is missing. Edit the host and select an available identity."
+        case .identityCollision:
+            return "The saved host identity is ambiguous. Remove duplicate records or references."
         case .invalidPrivateKey:
             return "Private key format invalid or unreadable."
         case .timeout:
@@ -653,18 +673,23 @@ final class AppContainer: ObservableObject {
         activeSession = session
         let initialSize = terminalController.size
         do {
+            // Resolve descriptor by UUID before invoking transport. Never let a
+            // missing descriptor degrade into password auth or an arbitrary
+            // similarly-labelled identity. Credentials are queried only after
+            // host-key acceptance.
+            let selectedIdentity = try await resolveIdentity(for: host)
             let connection: any SSHConnection
             if case .mosh = host.connection {
                 connection = try await moshTransport.connect(
                     host: host,
-                    identity: await identity(for: host),
+                    identity: selectedIdentity,
                     trustEvaluator: trustStore,
                     initialSize: initialSize
                 )
             } else {
                 connection = try await transport.connect(
                     host: host,
-                    identity: await identity(for: host),
+                    identity: selectedIdentity,
                     trustEvaluator: trustStore,
                     initialSize: initialSize
                 )
@@ -899,17 +924,18 @@ final class AppContainer: ObservableObject {
 
         let initialSize = terminalController.size
         let connection: any SSHConnection
+        let selectedIdentity = try await resolveIdentity(for: host)
         if case .mosh = host.connection {
             connection = try await moshTransport.connect(
                 host: host,
-                identity: await identity(for: host),
+                identity: selectedIdentity,
                 trustEvaluator: trustStore,
                 initialSize: initialSize
             )
         } else {
             connection = try await transport.connect(
                 host: host,
-                identity: await identity(for: host),
+                identity: selectedIdentity,
                 trustEvaluator: trustStore,
                 initialSize: initialSize
             )
@@ -1404,13 +1430,26 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    private func identity(for host: Host) async -> IdentityDescriptor? {
-        guard let identityID = host.identityID,
-              let identities = try? await catalog.identities() else { return nil }
-        return identities.first(where: { $0.id == identityID })
+    /// Resolves the exact identity selected by a host without exposing secret
+    /// material or querying credentials before host-key acceptance. The host
+    /// remains unchanged when the descriptor is stale.
+    private func resolveIdentity(for host: Host) async throws -> IdentityDescriptor? {
+        guard let identityID = host.identityID else { return nil }
+        let identities = try await catalog.identities()
+        guard let identity = identities.first(where: { $0.id == identityID }) else {
+            throw TransportError.missingIdentity(id: identityID)
+        }
+        let reconciliation = IdentityCatalogReconciliation(hosts: [host], identities: identities)
+        guard !reconciliation.duplicateIdentityIDs.contains(identityID) else {
+            throw TransportError.identityCollision(id: identityID)
+        }
+        return identity
     }
 
-    private func loadRedactionSecret(for host: Host) async {
+    /// Registers sensitive private key secrets for the host and any intermediate
+    /// ProxyJump bastions with the terminal redactor. All readable credentials are
+    /// protected unconditionally regardless of catalog collision status.
+    func loadRedactionSecret(for host: Host) async {
         redactor = Redactor()
         var secrets: [String] = []
         let identities = (try? await catalog.identities()) ?? []
@@ -2609,7 +2648,7 @@ final class AppContainer: ObservableObject {
             do {
                 let repo = try await LiveSFTPRepository.connect(
                     host: host,
-                    identity: await identity(for: host),
+                    identity: try await resolveIdentity(for: host),
                     trustEvaluator: trustStore,
                     credentialStore: credentialStore
                 )
@@ -3361,12 +3400,14 @@ final class AppContainer: ObservableObject {
     public func saveHost(_ host: Host) async throws {
         try await catalog.save(host)
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try await syncSharedCatalogAndTrust()
     }
 
     public func deleteHost(id: UUID) async throws {
         try await catalog.delete(id: id)
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try await syncSharedCatalogAndTrust()
     }
 
@@ -3399,6 +3440,7 @@ final class AppContainer: ObservableObject {
         )
         try await catalog.save(descriptor)
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
@@ -3433,6 +3475,7 @@ final class AppContainer: ObservableObject {
         )
         try await catalog.save(descriptor)
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
@@ -3456,14 +3499,21 @@ final class AppContainer: ObservableObject {
         )
         try await catalog.save(descriptor)
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try? await syncSharedCatalogAndTrust()
         return descriptor
     }
 
+    /// Deletes an identity descriptor from the catalog, clears references from
+    /// associated hosts, and deletes the underlying Keychain credential only if
+    /// no other identity descriptor shares the same Keychain reference.
     public func deleteIdentity(id: UUID) async throws {
         let identities = try await catalog.identities()
         if let target = identities.first(where: { $0.id == id }) {
-            try? await credentialStore.delete(reference: target.keychainReference)
+            let hasOtherReferences = identities.contains { $0.id != id && $0.keychainReference == target.keychainReference }
+            if !hasOtherReferences {
+                try? await credentialStore.delete(reference: target.keychainReference)
+            }
         }
         try await catalog.deleteIdentity(id: id)
         let hosts = try await catalog.listHosts()
@@ -3473,6 +3523,7 @@ final class AppContainer: ObservableObject {
             try await catalog.save(updated)
         }
         catalogUpdateToken = UUID()
+        await reconcileCatalogIdentities()
         try? await syncSharedCatalogAndTrust()
     }
 

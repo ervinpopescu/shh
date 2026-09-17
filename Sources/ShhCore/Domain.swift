@@ -975,6 +975,20 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
                     technicalDetail: "Keychain item (ref: \(safeRef)) was not found or inaccessible.",
                     recoveryAction: "Re-import or generate a new SSH key for this identity in Key Management."
                 )
+            case .missingIdentity(let id):
+                return ConnectionFailure(
+                    stage: .credential,
+                    reason: "Saved host identity is missing.",
+                    technicalDetail: "Identity descriptor \(id.uuidString) is not present in the catalog.",
+                    recoveryAction: "Edit this host and select an available identity, or restore the missing identity before reconnecting."
+                )
+            case .identityCollision(let id):
+                return ConnectionFailure(
+                    stage: .credential,
+                    reason: "Saved host identity is ambiguous.",
+                    technicalDetail: "Identity descriptor \(id.uuidString) shares an ID or Keychain reference with another descriptor.",
+                    recoveryAction: "Remove duplicate identity records or Keychain references, then select a single identity before reconnecting."
+                )
             case .invalidPrivateKey(let detail):
                 return ConnectionFailure(
                     stage: .credential,

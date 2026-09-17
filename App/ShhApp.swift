@@ -628,6 +628,22 @@ struct HostEditorView: View {
         allHosts.filter { $0.id != existing?.id }
     }
 
+    /// Identities sorted alphabetically by name with UUID tie-breaking.
+    private var pickerIdentities: [IdentityDescriptor] {
+        identities.sorted {
+            let nameOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
+            return nameOrder == .orderedSame ? $0.id.uuidString < $1.id.uuidString : nameOrder == .orderedAscending
+        }
+    }
+
+    /// Disambiguates identities with identical names by appending their
+    /// public key fingerprint suffix.
+    private func identityLabel(_ identity: IdentityDescriptor) -> String {
+        let duplicateName = identities.filter { $0.name.caseInsensitiveCompare(identity.name) == .orderedSame }.count > 1
+        guard duplicateName, let fingerprint = identity.publicFingerprint else { return identity.name }
+        return "\(identity.name) (\(fingerprint.suffix(8)))"
+    }
+
     private func bastionName(for id: UUID) -> String {
         if let host = allHosts.first(where: { $0.id == id }) {
             return "\(host.name) (\(host.address))"
@@ -694,8 +710,13 @@ struct HostEditorView: View {
                     HStack {
                         Picker("Identity", selection: $identityID) {
                             Text("None").tag(UUID?.none)
-                            ForEach(identities) { identity in
-                                Text(identity.name).tag(Optional(identity.id))
+                            if let selectedID = identityID,
+                               !identities.contains(where: { $0.id == selectedID }) {
+                                Text("Missing identity (\(selectedID.uuidString.prefix(8)))")
+                                    .tag(Optional(selectedID))
+                            }
+                            ForEach(pickerIdentities) { identity in
+                                Text(identityLabel(identity)).tag(Optional(identity.id))
                             }
                         }
                         .accessibilityIdentifier("host-editor-identity-picker")
