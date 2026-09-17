@@ -37,6 +37,9 @@ extensions.
   SSH and UDP datagram client with network roaming recovery.
 - **Live SFTP:** SFTP channel client for directory navigation, remote
   file CRUD, atomic upload, and streamed download.
+- **Bonjour Discovery:** Local network SSH service browsing (`_ssh._tcp`)
+  via `NWBrowser` and advertised mDNS hostname and port resolution via
+  `NetService`.
 
 ### 3. ShhTerminal (Rendering & Input)
 - **SwiftTerm Engine:** Native terminal view and rendering.
