@@ -29,7 +29,14 @@ integration without third-party cloud servers or subscription telemetry.
   and debounced resize handling.
 - **Host & Identity Management:** Host configurations, grouping, tags,
   health status, and opaque Keychain references. Private keys are never
-  exposed as raw fields of `Host`.
+  exposed as raw fields of `Host`. Host connections resolve exact
+  descriptors by UUID without loading credentials prior to host-key
+  acceptance, preventing silent fallback to password authentication or
+  arbitrary keys. Missing or colliding identities are detected via
+  metadata-only catalog reconciliation, highlighted in host editor
+  pickers with fingerprint hints, and surfaced as actionable
+  diagnostics. Identity deletion preserves shared Keychain secrets for
+  surviving descriptors.
 - **Tmux Multiplexer:** First-class tmux integration with session
   listing, creation, attach, and exact-command approval sheets. Includes
   collision-resistant pipe-delimited format parsing and backward
