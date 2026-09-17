@@ -188,7 +188,7 @@ struct HostListView: View {
                 showingEditor = true
             }
         }
-        .onChange(of: container.catalogUpdateToken) { _ in
+        .onChange(of: container.catalogUpdateToken) { _, _ in
             Task { await reload() }
         }
     }
@@ -2210,7 +2210,7 @@ struct TerminalAccessoryBar: View {
 
                 // Dismiss Keyboard
                 AccessoryIconButton(systemImage: "keyboard.chevron.compact.down") {
-                    _ = controller.resignFirstResponder()
+                    controller.resignFirstResponder()
                 }
                 .accessibilityLabel("Dismiss keyboard")
                 .accessibilityIdentifier("terminal-accessory-dismiss-keyboard-button")
