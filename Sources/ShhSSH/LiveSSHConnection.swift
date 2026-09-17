@@ -110,6 +110,21 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         }
     }
 
+    /// Sends a keepalive probe over the SSH channel to verify connection responsiveness.
+    public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        let (closed, active): (Bool, Bool) = lock.withLock {
+            (isClosed, parentChannel.isActive && childChannel.isActive)
+        }
+        guard !closed, active else { return false }
+
+        do {
+            try await sendKeepaliveProbe(timeout: timeout)
+            return lock.withLock { !isClosed && parentChannel.isActive && childChannel.isActive }
+        } catch {
+            return false
+        }
+    }
+
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         let id = UUID()
         return AsyncThrowingStream { continuation in
