@@ -70,6 +70,9 @@ final class AppContainer: ObservableObject {
             updateIdleTimerState()
         }
     }
+    @Published public var commandDialPreferences: CommandDialPreferences {
+        didSet { persistCommandDialPreferences() }
+    }
     @Published var activeSession: TerminalSession? {
         didSet {
             updateIdleTimerState()
@@ -215,6 +218,7 @@ final class AppContainer: ObservableObject {
     private static let appearancePreferenceKey = "shh.appearance"
     private static let terminalThemePreferenceKey = UserDefaultsTerminalThemeStore.storageKey
     public static let keepScreenAwakePreferenceKey = "shh.preferences.keepScreenAwake"
+    private static let commandDialPreferenceKey = "shh.preferences.commandDial"
 
     public static let whisperProviderID = VoiceProviderRegistry.whisperProviderID
     public static let appleSpeechProviderID = VoiceProviderRegistry.appleSpeechProviderID
@@ -230,6 +234,25 @@ final class AppContainer: ObservableObject {
     func setAppearance(_ value: AppearanceSetting) {
         appearance = value
         UserDefaults.standard.set(value.rawValue, forKey: Self.appearancePreferenceKey)
+    }
+
+    private func persistCommandDialPreferences() {
+        guard let data = try? JSONEncoder().encode(commandDialPreferences) else { return }
+        UserDefaults.standard.set(data, forKey: Self.commandDialPreferenceKey)
+    }
+
+    func setCommandDialPreferences(_ value: CommandDialPreferences) {
+        commandDialPreferences = value
+    }
+
+    func toggleDialCategory(_ category: DialCategory) {
+        var value = commandDialPreferences
+        if value.pinnedCategories.contains(category) {
+            value.pinnedCategories.removeAll { $0 == category }
+        } else {
+            value.pinnedCategories.append(category)
+        }
+        commandDialPreferences = value
     }
 
     func setTerminalTheme(_ value: TerminalThemePreset) {
@@ -394,9 +417,17 @@ final class AppContainer: ObservableObject {
             rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey) ?? ""
         ) ?? .default
         let storedKeepScreenAwake = UserDefaults.standard.object(forKey: Self.keepScreenAwakePreferenceKey) as? Bool ?? true
+        let storedDialPreferences: CommandDialPreferences = {
+            guard let data = UserDefaults.standard.data(forKey: Self.commandDialPreferenceKey),
+                  let value = try? JSONDecoder().decode(CommandDialPreferences.self, from: data) else {
+                return CommandDialPreferences()
+            }
+            return value
+        }()
         self.appearance = storedAppearance
         self.terminalTheme = storedTheme
         self.keepScreenAwake = storedKeepScreenAwake
+        self.commandDialPreferences = storedDialPreferences
         self.terminalController = ShhTerminalController(
             configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
         )
@@ -1334,6 +1365,17 @@ final class AppContainer: ObservableObject {
         } catch {
             return false
         }
+    }
+
+    @discardableResult
+    func sendPinnedLiteral(_ literal: String, approved: Bool = false) async -> Bool {
+        guard CommandDialModel.isInsertOnlyTerminalText(literal) else { return false }
+        switch CommandPolicy().classify(literal) {
+        case .safe: break
+        case .reviewRequired: guard approved else { return false }
+        case .blocked: return false
+        }
+        return await sendRawInteractive(Data(literal.utf8))
     }
 
     @discardableResult
