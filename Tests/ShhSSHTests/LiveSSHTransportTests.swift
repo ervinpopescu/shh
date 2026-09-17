@@ -27,9 +27,8 @@ final class LiveSSHTransportTests: XCTestCase {
             )
             XCTFail("Connecting to unreachable host 127.0.0.1:1 should throw TransportError")
         } catch let error as TransportError {
-            // Expected: networkUnavailable or timeout
             switch error {
-            case .networkUnavailable, .timeout, .remoteFailure:
+            case .connectionRefused, .networkUnavailable, .timeout, .remoteFailure:
                 break
             default:
                 XCTFail("Unexpected TransportError: \(error)")
@@ -61,7 +60,7 @@ final class LiveSSHTransportTests: XCTestCase {
             XCTFail("Connecting to invalid host should throw TransportError")
         } catch let error as TransportError {
             switch error {
-            case .networkUnavailable, .timeout, .remoteFailure:
+            case .dnsFailure, .networkUnavailable, .timeout, .remoteFailure:
                 break
             default:
                 XCTFail("Unexpected TransportError: \(error)")
@@ -102,7 +101,7 @@ final class LiveSSHTransportTests: XCTestCase {
             XCTFail("Connecting via unreachable bastion should throw TransportError")
         } catch let error as TransportError {
             switch error {
-            case .networkUnavailable, .timeout, .remoteFailure:
+            case .connectionRefused, .networkUnavailable, .timeout, .remoteFailure:
                 break
             default:
                 XCTFail("Unexpected TransportError: \(error)")

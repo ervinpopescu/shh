@@ -1,9 +1,68 @@
+#if canImport(XCTest)
 import XCTest
 @testable import ShhSSH
 import ShhCore
 import Crypto
+import NIOCore
+import NIOPosix
 
 final class LiveSSHTransportErrorMappingTests: XCTestCase {
+    func testTypedNIOSocketErrorsMapToTransportErrors() {
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.ECONNREFUSED.rawValue, reason: "connect failed")),
+            .connectionRefused
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.ETIMEDOUT.rawValue, reason: "connect timed out")),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.ENETUNREACH.rawValue, reason: "network unavailable")),
+            .networkUnavailable
+        )
+    }
+
+    func testConnectionFailureMappingDoesNotExposeRawErrorDetails() {
+        let mapped = LiveSSHTransport.mapError(
+            IOError(errnoCode: POSIXErrorCode.EIO.rawValue, reason: "secret-password should not be surfaced")
+        )
+
+        XCTAssertEqual(mapped, .remoteFailure("SSH connection failed."))
+    }
+
+    func testNIOConnectionErrorSingleStackIPv4DoesNotMaskConnectionRefusedAsDNSFailure() {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+
+        let bootstrap = ClientBootstrap(group: group)
+
+        do {
+            _ = try bootstrap.connect(host: "127.0.0.1", port: 1).wait()
+            XCTFail("Expected connection to fail")
+        } catch {
+            XCTAssertTrue(error is NIOConnectionError)
+            XCTAssertEqual(LiveSSHTransport.mapError(error), .connectionRefused)
+        }
+    }
+
+    func testNIOConnectionErrorPureDNSFailureMapsToDNSFailure() {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        defer { try? group.syncShutdownGracefully() }
+
+        let bootstrap = ClientBootstrap(group: group)
+
+        do {
+            _ = try bootstrap.connect(host: "nonexistent.test.invalid", port: 22).wait()
+            XCTFail("Expected connection to fail")
+        } catch {
+            XCTAssertTrue(error is NIOConnectionError)
+            XCTAssertEqual(
+                LiveSSHTransport.mapError(error),
+                .dnsFailure("DNS resolution failed for hostname")
+            )
+        }
+    }
+
     func testMissingCredentialThrowsMissingCredentialError() async throws {
         let emptyStore = InMemoryCredentialStore()
         let identity = try IdentityDescriptor(
@@ -86,3 +145,4 @@ final class LiveSSHTransportErrorMappingTests: XCTestCase {
         XCTAssertEqual(pass, "secret-pass")
     }
 }
+#endif

@@ -1226,6 +1226,10 @@ public struct LiveSSHTransport: SSHTransport {
             return .cancelled
         }
 
+        if let nioError = error as? NIOConnectionError {
+            return mapNIOConnectionError(nioError)
+        }
+
         if let channelError = error as? ChannelError {
             switch channelError {
             case .connectTimeout:
@@ -1235,20 +1239,11 @@ public struct LiveSSHTransport: SSHTransport {
             }
         }
 
-        if let posixError = error as? POSIXError {
-            switch posixError.code {
-            case .ECONNREFUSED:
-                return .connectionRefused
-            case .EHOSTUNREACH, .ENETUNREACH, .ENETDOWN:
-                return .networkUnavailable
-            case .ETIMEDOUT:
-                return .timeout
-            default:
-                break
-            }
+        if let mapped = mapSocketError(error) {
+            return mapped
         }
 
-        let description = error.localizedDescription.lowercased()
+        let description = "\(error.localizedDescription) \(String(describing: error))".lowercased()
 
         if description.contains("timed out") || description.contains("timeout") {
             return .timeout
@@ -1275,7 +1270,64 @@ public struct LiveSSHTransport: SSHTransport {
             return .authenticationRequired
         }
 
-        let safeMessage = Redactor().redact(error.localizedDescription)
-        return .remoteFailure(safeMessage)
+        return .remoteFailure("SSH connection failed.")
+    }
+
+    /// Maps a `NIOConnectionError` by unpacking child connection failures and distinguishing
+    /// dual-stack DNS resolution errors from TCP connection failures.
+    private static func mapNIOConnectionError(_ error: NIOConnectionError) -> TransportError {
+        if error.connectionErrors.isEmpty && (error.dnsAError != nil || error.dnsAAAAError != nil) {
+            return .dnsFailure("DNS resolution failed for hostname")
+        }
+
+        let childErrors = error.connectionErrors.map { mapError($0.error) }
+        if childErrors.contains(.connectionRefused) {
+            return .connectionRefused
+        }
+        if childErrors.contains(.timeout) {
+            return .timeout
+        }
+        if childErrors.contains(.networkUnavailable) {
+            return .networkUnavailable
+        }
+        if let specific = childErrors.first(where: {
+            if case .remoteFailure = $0 { return false }
+            return true
+        }) {
+            return specific
+        }
+
+        return .remoteFailure("SSH connection failed.")
+    }
+
+    /// Maps low-level POSIX and IOError socket failures to high-level `TransportError` cases.
+    private static func mapSocketError(_ error: Error) -> TransportError? {
+        if let posixError = error as? POSIXError {
+            switch posixError.code {
+            case .ECONNREFUSED:
+                return .connectionRefused
+            case .EHOSTUNREACH, .ENETUNREACH, .ENETDOWN:
+                return .networkUnavailable
+            case .ETIMEDOUT:
+                return .timeout
+            default:
+                break
+            }
+        }
+
+        if let ioError = error as? IOError {
+            switch ioError.errnoCode {
+            case ECONNREFUSED:
+                return .connectionRefused
+            case EHOSTUNREACH, ENETUNREACH, ENETDOWN:
+                return .networkUnavailable
+            case ETIMEDOUT:
+                return .timeout
+            default:
+                break
+            }
+        }
+
+        return nil
     }
 }
