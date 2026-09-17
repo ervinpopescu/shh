@@ -41,13 +41,7 @@ final class KeychainCredentialStoreTests: XCTestCase {
             XCTAssertEqual(loaded, secretData)
             try await store.delete(reference: reference)
         } catch {
-            guard let keychainError = error as? KeychainError else {
-                XCTFail("Expected KeychainError, got: \(error)")
-                return
-            }
-            if case .status(let code) = keychainError {
-                XCTAssertNotEqual(code, 0, "Should never throw KeychainError.status(0)")
-            }
+            XCTFail("Keychain fallback operation failed: \(error)")
         }
         #endif
     }
