@@ -886,6 +886,76 @@ final class AppContainerTests: XCTestCase {
         XCTAssertNil(updatedHost?.identityID)
     }
 
+    func testDeleteIdentityWithSharedKeychainReferencePreservesSecretForSurvivingIdentity() async throws {
+        let container = AppContainer.demo()
+        let ref = "shared-kc-ref"
+        let secret = Data("shared-private-key".utf8)
+        try await container.keychain.save(secret, reference: ref)
+
+        let first = try IdentityDescriptor(name: "Key 1", kind: .privateKey, keychainReference: ref)
+        let second = try IdentityDescriptor(name: "Key 2", kind: .privateKey, keychainReference: ref)
+        try await container.catalog.save(first)
+        try await container.catalog.save(second)
+
+        try await container.deleteIdentity(id: first.id)
+
+        let remaining = try await container.catalog.identities()
+        XCTAssertFalse(remaining.contains(where: { $0.id == first.id }))
+        XCTAssertTrue(remaining.contains(where: { $0.id == second.id }))
+
+        let loaded = try await container.keychain.load(reference: ref)
+        XCTAssertEqual(loaded, secret)
+
+        try await container.deleteIdentity(id: second.id)
+        do {
+            _ = try await container.keychain.load(reference: ref)
+            XCTFail("Keychain secret should have been deleted after last reference is removed")
+        } catch {
+            // Expected
+        }
+    }
+
+    func testDeleteIdentitySucceedsWhenKeychainItemAlreadyMissing() async throws {
+        let container = AppContainer.demo()
+        let missingRef = "missing-kc-ref"
+        let identity = try IdentityDescriptor(name: "Orphan Key", kind: .privateKey, keychainReference: missingRef)
+        try await container.catalog.save(identity)
+
+        let host = try Host(name: "Orphan Host", hostname: "server.local", username: "admin", identityID: identity.id)
+        try await container.saveHost(host)
+
+        try await container.deleteIdentity(id: identity.id)
+
+        let remaining = try await container.catalog.identities()
+        XCTAssertFalse(remaining.contains(where: { $0.id == identity.id }))
+
+        let updatedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
+        XCTAssertNil(updatedHost?.identityID)
+    }
+
+    func testRedactionIncludesSecretEvenForCollidingIdentities() async throws {
+        let container = AppContainer.demo()
+        let ref = "colliding-ref"
+        let secretText = "super-secret-key-material"
+        try await container.keychain.save(Data(secretText.utf8), reference: ref)
+
+        let first = try IdentityDescriptor(name: "Key A", kind: .privateKey, keychainReference: ref)
+        let second = try IdentityDescriptor(name: "Key B", kind: .privateKey, keychainReference: ref)
+        try await container.catalog.save(first)
+        try await container.catalog.save(second)
+
+        let host = try Host(name: "Target", hostname: "server.local", username: "admin", identityID: first.id)
+        try await container.saveHost(host)
+
+        await container.loadRedactionSecret(for: host)
+
+        let sampleOutput = Data("output containing super-secret-key-material here".utf8)
+        let redactedData = container.redacted(sampleOutput)
+        let redactedString = String(decoding: redactedData, as: UTF8.self)
+        XCTAssertFalse(redactedString.contains(secretText))
+        XCTAssertTrue(redactedString.contains("[REDACTED]"))
+    }
+
     func testBonjourDiscoveryForwarding() async {
         let container = AppContainer.demo()
         XCTAssertNotNil(container.bonjourDiscovery)

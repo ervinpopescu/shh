@@ -323,7 +323,7 @@ public final class FileProviderEnumerator: NSObject, NSFileProviderEnumerator {
             switch transportError {
             case .networkUnavailable, .timeout, .dnsFailure, .connectionRefused:
                 return NSFileProviderError(.serverUnreachable)
-            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired, .missingCredential, .invalidPrivateKey:
+            case .authenticationRequired, .hostKeyChanged, .hostKeyApprovalRequired, .missingCredential, .missingIdentity, .identityCollision, .invalidPrivateKey:
                 return NSFileProviderError(.notAuthenticated)
             case .cancelled:
                 return NSError(domain: NSCocoaErrorDomain, code: NSUserCancelledError, userInfo: nil)
