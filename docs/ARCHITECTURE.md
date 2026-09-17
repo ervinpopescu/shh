@@ -42,6 +42,11 @@ extensions.
 - **SwiftTerm Engine:** Native terminal view and rendering.
 - **Controller:** Alternate screen buffer coordination, debounced resize
   handling (150ms window), and bracketed paste encoding.
+- **Input Coordinator:** Sticky modifier state coordination
+  (`TerminalInputCoordinator`) bridging accessory controls with SwiftTerm
+  keyboard input, one-shot modifier consumption, exact Ctrl+Space NUL
+  encoding, and passthrough safety for escape sequences, UTF-8, and
+  bracketed paste.
 
 ### 4. ShhVoice (Local Speech Processing)
 - **WhisperKit Transcriber:** On-device CoreML Whisper model
