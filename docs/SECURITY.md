@@ -90,6 +90,13 @@ data, remote execution outputs, voice transcripts, and backup storage.
   prevent path traversal vulnerabilities (`../`).
 - Materialized files are cached with bounded counts, disk sizes, and
   LRU eviction policies.
+- Active terminal and tunnel sessions utilize finite UIKit background
+  execution tasks (`beginBackgroundTask`) rather than background audio
+  modes or silent audio playback, ensuring App Store guideline
+  compliance. On task expiration, session restoration metadata is
+  securely persisted while avoiding premature socket destruction.
+  Transports are probed on foreground return to verify cryptographic
+  channel integrity.
 
 ### 6. Privacy Manifest & Required-Reason APIs
 - `Resources/PrivacyInfo.xcprivacy` declares only accessed APIs:
