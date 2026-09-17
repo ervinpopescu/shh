@@ -926,6 +926,57 @@ final class VoiceAppTests: XCTestCase {
         XCTAssertGreaterThan(regularController.view.subviews.count, 0)
     }
 
+    func testDemoTranscriberSerializesConcurrentStateAccess() async throws {
+        let transcriber = DemoTranscriber(transcript: "initial", simulateDelay: 0)
+        let updates = Task.detached {
+            for index in 0..<100 {
+                transcriber.setTranscript("transcript-\(index)")
+            }
+        }
+
+        var results: [String] = []
+        await withTaskGroup(of: String.self) { group in
+            for _ in 0..<100 {
+                group.addTask {
+                    do {
+                        return try await transcriber.transcribe(audio: Data())
+                    } catch {
+                        return ""
+                    }
+                }
+            }
+            for await result in group {
+                results.append(result)
+            }
+        }
+        await updates.value
+
+        XCTAssertEqual(results.count, 100)
+        XCTAssertTrue(results.allSatisfy { $0 == "initial" || $0.hasPrefix("transcript-") })
+    }
+
+    func testDemoTranscriberConcurrentErrorInjectionAndRecovery() async throws {
+        struct TestTranscribeError: Error, Equatable {}
+        let transcriber = DemoTranscriber(transcript: "valid-transcription", simulateDelay: 0)
+
+        // Inject simulated error
+        transcriber.setSimulateError(TestTranscribeError())
+
+        do {
+            _ = try await transcriber.transcribe(audio: Data())
+            XCTFail("Transcribe must throw when simulateError is set")
+        } catch is TestTranscribeError {
+            // Expected
+        } catch {
+            XCTFail("Unexpected error type: \(error)")
+        }
+
+        // Clear error and verify recovery
+        transcriber.setSimulateError(nil)
+        let recovered = try await transcriber.transcribe(audio: Data())
+        XCTAssertEqual(recovered, "valid-transcription")
+    }
+
     // MARK: - 13. Demo Mode Behavior
 
     func testDemoContainerFullVoiceWorkflow() async throws {
