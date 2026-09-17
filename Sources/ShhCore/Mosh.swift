@@ -455,6 +455,10 @@ public actor DemoMoshConnection: MoshSessionControlling, SSHConnection {
         eventContinuation?.finish()
         eventContinuation = nil
     }
+
+    public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        return !isClosed && moshState == .connected
+    }
 }
 
 // MARK: - Demo Mosh Transport

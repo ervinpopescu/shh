@@ -112,7 +112,20 @@ public protocol HostTrustEvaluator: Sendable {
     func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision
 }
 public enum TerminalEvent: Sendable, Equatable { case bytes(Data); case closed; case error(TransportError) }
-public protocol SSHConnection: Sendable { func events() async -> AsyncThrowingStream<TerminalEvent, Error>; func send(_ data: Data) async throws; func resize(_ size: TerminalSize) async throws; func close() async }
+public protocol SSHConnection: Sendable {
+    func events() async -> AsyncThrowingStream<TerminalEvent, Error>
+    func send(_ data: Data) async throws
+    func resize(_ size: TerminalSize) async throws
+    func close() async
+    /// Probes the connection to determine whether it is active and responsive.
+    func testResponsiveness(timeout: TimeInterval) async -> Bool
+}
+
+public extension SSHConnection {
+    func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        return true
+    }
+}
 public protocol SSHTransport: Sendable {
     func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection
 }
@@ -124,6 +137,7 @@ public extension SSHTransport {
 }
 
 public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
+    private var isClosed = false
     private var continuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     private var commandHandler: (@Sendable (String) -> SSHCommandResult)?
     private var herdrWorkspaces: [HerdrWorkspace] = DemoSSHConnection.makeDefaultHerdrWorkspaces()
@@ -224,7 +238,15 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
         continuation?.yield(.bytes(Data("\r\n[demo] ".utf8) + data + Data("\r\n$ ".utf8)))
     }
     public func resize(_ size: TerminalSize) async throws {}
-    public func close() async { continuation?.yield(.closed); continuation?.finish() }
+    public func close() async {
+        isClosed = true
+        continuation?.yield(.closed)
+        continuation?.finish()
+    }
+
+    public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        return !isClosed
+    }
 
     public func executeCommand(_ command: String) async throws -> SSHCommandResult {
         try await executeCommand(command, timeout: nil, maxOutputBytes: nil)

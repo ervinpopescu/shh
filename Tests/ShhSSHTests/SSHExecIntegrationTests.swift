@@ -492,4 +492,40 @@ final class SSHExecIntegrationTests: XCTestCase {
 
         await demo.close()
     }
+
+    func testResponsivenessOnLiveConnection() async throws {
+        let server = SSHTestServer()
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 10.0,
+            keepaliveTimeout: 1.0
+        )
+        addTeardownBlock { await connection.close() }
+
+        let responsive = await connection.testResponsiveness(timeout: 2.0)
+        XCTAssertTrue(responsive)
+
+        await connection.close()
+        let afterClose = await connection.testResponsiveness(timeout: 1.0)
+        XCTAssertFalse(afterClose)
+    }
+
+    func testResponsivenessReturnsFalseWhenConnectionSevered() async throws {
+        let server = SSHTestServer()
+        _ = try await server.start()
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 10.0,
+            keepaliveTimeout: 1.0
+        )
+        addTeardownBlock { await connection.close() }
+
+        try await server.stop()
+        let responsive = await connection.testResponsiveness(timeout: 1.0)
+        XCTAssertFalse(responsive)
+    }
 }
