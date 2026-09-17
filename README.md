@@ -16,6 +16,10 @@ backups.
 - **Terminal & Transport:** Live Citadel/NIOSSH transport with PTY,
   TOFU host-key verification, and SwiftTerm rendering with alternate
   screen buffers and debounced resize handling.
+- **Lifecycle & Keepalive:** Finite iOS background grace period
+  keepalives for active SSH, Mosh, and forwarding sessions without
+  background audio modes, with zero-delay foreground resumption via
+  transport probing.
 - **Multiplexing:** First-class Tmux integration supporting session
   listing, creation, attach, and command approval.
 - **On-Device Voice AI:** WhisperKit and Apple Speech local transcribers
