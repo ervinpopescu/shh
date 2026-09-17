@@ -138,6 +138,7 @@ public final class ShhTerminalController: ObservableObject {
     public let configuration: ShhTerminalConfiguration
     public let fontSizeStore: any TerminalFontSizeStore
     public let themeStore: any TerminalThemeStore
+    public let inputCoordinator: TerminalInputCoordinator
 
     @Published public private(set) var size: TerminalSize
     @Published public private(set) var terminalFontSize: Double
@@ -170,6 +171,7 @@ public final class ShhTerminalController: ObservableObject {
 
     private var resizeDebouncer: ResizeDebouncer!
     private var fontGeometryWorkItem: DispatchWorkItem?
+    private var inputCoordinatorSubscription: AnyCancellable?
     private var headlessTerminal: SwiftTerm.Terminal?
     private var headlessDelegate: HeadlessBridgeDelegate?
     private var headlessSearchQuery: String = ""
@@ -190,11 +192,17 @@ public final class ShhTerminalController: ObservableObject {
         self.configuration = configuration
         self.fontSizeStore = fontSizeStore
         self.themeStore = themeStore
+        self.inputCoordinator = TerminalInputCoordinator()
         self.size = configuration.initialSize
         self.terminalFontSize = TerminalFontSize.clamped(
             fontSizeStore.load() ?? configuration.initialFontSize
         )
         self.terminalTheme = themeStore.load() ?? configuration.initialTheme
+
+        self.inputCoordinatorSubscription = self.inputCoordinator.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
 
         self.resizeDebouncer = ResizeDebouncer(
             delay: configuration.resizeDebounceInterval,
@@ -325,6 +333,19 @@ public final class ShhTerminalController: ObservableObject {
         send(raw: data)
     }
 
+    /// Sends a key selected from the accessory bar and applies its sticky
+    /// modifiers. Regular `send(key:)` remains a direct encoded send for callers
+    /// that already own the complete terminal sequence.
+    public func send(accessoryKey key: TerminalKey) {
+        send(raw: inputCoordinator.encodeAccessory(key))
+    }
+
+    /// Sends text selected from the accessory bar or another single-key source.
+    /// Multi-byte text is passed through unchanged for UTF-8 and IME safety.
+    public func send(accessoryText text: String) {
+        send(raw: inputCoordinator.encodeAccessoryText(text))
+    }
+
     public func paste(_ text: String) {
         let isBracketed = bracketedPasteMode
         let data = TerminalKeyEncoder.encodePaste(text, bracketed: isBracketed)
@@ -346,6 +367,7 @@ public final class ShhTerminalController: ObservableObject {
     }
 
     public func reset() {
+        inputCoordinator.clear()
         resizeDebouncer.cancel()
         fontGeometryWorkItem?.cancel()
         fontGeometryWorkItem = nil
@@ -537,7 +559,7 @@ public final class ShhTerminalController: ObservableObject {
     // MARK: - Internal Engine Bridge Handling
 
     internal func handleOutput(_ data: Data) {
-        send(raw: data)
+        send(raw: inputCoordinator.processKeyboardInput(data))
     }
 
     internal func handleTitle(_ newTitle: String) {
