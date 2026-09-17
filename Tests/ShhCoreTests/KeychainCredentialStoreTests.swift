@@ -34,12 +34,20 @@ final class KeychainCredentialStoreTests: XCTestCase {
         let reference = "test-ref-\(UUID().uuidString)"
         let secretData = Data("sample-secret-payload".utf8)
 
-        // Saving should not throw even if the access group is invalid, because it falls back to local Keychain
+        // Saving should not throw even if the access group is invalid, because it falls back to local Keychain.
+        // Under unsigned simulator test environments without Keychain entitlements, Keychain access is disallowed
+        // by the system and throws errSecMissingEntitlement (-34018).
         do {
             try await store.save(secretData, reference: reference)
             let loaded = try await store.load(reference: reference)
             XCTAssertEqual(loaded, secretData)
             try await store.delete(reference: reference)
+        } catch KeychainError.status(let code) {
+            #if targetEnvironment(simulator)
+            XCTAssertEqual(code, errSecMissingEntitlement, "Unsigned simulator tests without Keychain entitlements must fail explicitly with errSecMissingEntitlement (-34018)")
+            #else
+            XCTFail("Keychain fallback operation failed with status code: \(code)")
+            #endif
         } catch {
             XCTFail("Keychain fallback operation failed: \(error)")
         }
