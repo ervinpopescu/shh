@@ -5,9 +5,14 @@ import NIOPosix
 final class TestTCPClientHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = ByteBuffer
     private let onData: @Sendable (Data) -> Void
+    private let onDisconnect: @Sendable (Error?) -> Void
 
-    init(onData: @escaping @Sendable (Data) -> Void) {
+    init(
+        onData: @escaping @Sendable (Data) -> Void,
+        onDisconnect: @escaping @Sendable (Error?) -> Void
+    ) {
         self.onData = onData
+        self.onDisconnect = onDisconnect
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -16,6 +21,16 @@ final class TestTCPClientHandler: ChannelInboundHandler, @unchecked Sendable {
             onData(Data(bytes))
         }
     }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        onDisconnect(nil)
+        context.fireChannelInactive()
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        onDisconnect(error)
+        context.fireErrorCaught(error)
+    }
 }
 
 final class TestTCPClient: @unchecked Sendable {
@@ -23,7 +38,9 @@ final class TestTCPClient: @unchecked Sendable {
     private var channel: Channel?
     private let lock = NSLock()
     private var receivedData: [Data] = []
-    private var dataContinuations: [AsyncStream<Data>.Continuation] = []
+    private var waiters: [(id: UUID, continuation: CheckedContinuation<Data, Error>)] = []
+    private var isClosed = false
+    private var disconnectError: Error?
 
     init() {
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
@@ -34,9 +51,14 @@ final class TestTCPClient: @unchecked Sendable {
         let bootstrap = ClientBootstrap(group: group)
             .channelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
             .channelInitializer { ch in
-                let handler = TestTCPClientHandler { data in
-                    client.handleData(data)
-                }
+                let handler = TestTCPClientHandler(
+                    onData: { data in
+                        client.handleData(data)
+                    },
+                    onDisconnect: { error in
+                        client.handleDisconnect(error: error)
+                    }
+                )
                 return ch.pipeline.addHandler(handler)
             }
 
@@ -44,54 +66,105 @@ final class TestTCPClient: @unchecked Sendable {
     }
 
     private func handleData(_ data: Data) {
-        let continuation: AsyncStream<Data>.Continuation? = lock.withLock {
-            if !dataContinuations.isEmpty {
-                return dataContinuations.removeFirst()
+        let waiter: CheckedContinuation<Data, Error>? = lock.withLock {
+            guard !isClosed else { return nil }
+            if !waiters.isEmpty {
+                return waiters.removeFirst().continuation
             } else {
                 receivedData.append(data)
                 return nil
             }
         }
-        continuation?.yield(data)
-        continuation?.finish()
+        waiter?.resume(returning: data)
     }
 
-    func send(_ data: Data) async throws {
-        guard let channel = self.channel else {
-            throw POSIXError(.ENOTCONN)
+    private func handleDisconnect(error: Error?) {
+        let pendingWaiters: [CheckedContinuation<Data, Error>] = lock.withLock {
+            guard !isClosed else { return [] }
+            isClosed = true
+            disconnectError = error
+            let continuations = waiters.map(\.continuation)
+            waiters.removeAll()
+            return continuations
         }
-        var buffer = channel.allocator.buffer(capacity: data.count)
-        buffer.writeBytes(data)
-        try await channel.writeAndFlush(buffer).get()
+        let failure = error ?? POSIXError(.ECONNRESET)
+        for continuation in pendingWaiters {
+            continuation.resume(throwing: failure)
+        }
     }
 
-    func receiveNext(timeout: TimeInterval = 3.0) async throws -> Data {
-        let existing: Data? = lock.withLock {
-            if !receivedData.isEmpty {
-                return receivedData.removeFirst()
+    private func cancelWaiter(id: UUID) {
+        let continuation: CheckedContinuation<Data, Error>? = lock.withLock {
+            if let index = waiters.firstIndex(where: { $0.id == id }) {
+                return waiters.remove(at: index).continuation
             }
             return nil
         }
-        if let existing {
-            return existing
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    func send(_ data: Data) async throws {
+        let currentChannel: Channel? = lock.withLock {
+            guard !isClosed else { return nil }
+            return self.channel
         }
+        guard let currentChannel else {
+            throw POSIXError(.ENOTCONN)
+        }
+        var buffer = currentChannel.allocator.buffer(capacity: data.count)
+        buffer.writeBytes(data)
+        try await currentChannel.writeAndFlush(buffer).get()
+    }
+
+    func receiveNext(timeout: TimeInterval = 3.0) async throws -> Data {
+        let immediate: Result<Data, Error>? = lock.withLock {
+            if !receivedData.isEmpty {
+                return .success(receivedData.removeFirst())
+            }
+            if let error = disconnectError {
+                return .failure(error)
+            }
+            if isClosed {
+                return .failure(POSIXError(.ECONNRESET))
+            }
+            return nil
+        }
+        if let immediate {
+            return try immediate.get()
+        }
+
+        let waiterID = UUID()
 
         return try await withThrowingTaskGroup(of: Data.self) { group in
             group.addTask {
-                let stream = AsyncStream<Data> { continuation in
-                    self.lock.withLock {
-                        self.dataContinuations.append(continuation)
+                try await withTaskCancellationHandler {
+                    try await withCheckedThrowingContinuation { continuation in
+                        self.lock.withLock {
+                            if !self.receivedData.isEmpty {
+                                continuation.resume(returning: self.receivedData.removeFirst())
+                                return
+                            }
+                            if let error = self.disconnectError {
+                                continuation.resume(throwing: error)
+                                return
+                            }
+                            if self.isClosed {
+                                continuation.resume(throwing: POSIXError(.ECONNRESET))
+                                return
+                            }
+                            self.waiters.append((id: waiterID, continuation: continuation))
+                        }
                     }
+                } onCancel: {
+                    self.cancelWaiter(id: waiterID)
                 }
-                for await chunk in stream {
-                    return chunk
-                }
-                throw POSIXError(.ECONNRESET)
             }
+
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
                 throw POSIXError(.ETIMEDOUT)
             }
+
             do {
                 let result = try await group.next()!
                 group.cancelAll()
@@ -104,6 +177,15 @@ final class TestTCPClient: @unchecked Sendable {
     }
 
     func close() async {
+        let pendingWaiters: [CheckedContinuation<Data, Error>] = lock.withLock {
+            isClosed = true
+            let continuations = waiters.map(\.continuation)
+            waiters.removeAll()
+            return continuations
+        }
+        for continuation in pendingWaiters {
+            continuation.resume(throwing: POSIXError(.ECONNRESET))
+        }
         _ = try? await channel?.close().get()
         channel = nil
         try? await group.shutdownGracefully()
