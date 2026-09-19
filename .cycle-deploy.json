@@ -1,12 +1,14 @@
 {
   "name": "Shh branch review",
   "env": {
-    "REVIEW_SCRIPT": "${SHH_REVIEW_SCRIPT:-/Users/ervin/Desktop/review-branches.sh}"
+    "REVIEW_SCRIPT": "${SHH_REVIEW_SCRIPT:-/Users/ervin/Desktop/review-branches.sh}",
+    "REVIEW_DEVICE_UDID": "${SHH_REVIEW_DEVICE_UDID:-1A17B129-1566-565A-8191-A68F54A724D8}",
+    "DEVELOPMENT_TEAM": "${SHH_DEVELOPMENT_TEAM:-B7D575CY5M}"
   },
   "steps": [
     {
       "name": "Review current branch",
-      "command": "branch=\"$(git branch --show-current)\" || { printf '%s\\n' 'ERROR: unable to determine current worktree branch with git branch --show-current.' >&2; exit 1; }; [ -n \"$branch\" ] || { printf '%s\\n' 'ERROR: current worktree is detached; cannot review without a branch.' >&2; exit 1; }; if [ -n \"${SHH_REVIEW_DEVICE_UDID:-}\" ]; then [ -n \"${SHH_DEVELOPMENT_TEAM:-}\" ] || { printf '%s\\n' 'ERROR: SHH_REVIEW_DEVICE_UDID requires SHH_DEVELOPMENT_TEAM.' >&2; exit 1; }; \"$REVIEW_SCRIPT\" --branch \"$branch\" --device-udid \"$SHH_REVIEW_DEVICE_UDID\" --development-team \"$SHH_DEVELOPMENT_TEAM\"; else \"$REVIEW_SCRIPT\" --branch \"$branch\"; fi"
+      "command": "branch=\"$(git branch --show-current)\" || { printf '%s\\n' 'ERROR: unable to determine current worktree branch with git branch --show-current.' >&2; exit 1; }; [ -n \"$branch\" ] || { printf '%s\\n' 'ERROR: current worktree is detached; cannot review without a branch.' >&2; exit 1; }; results_file=\"${TMPDIR:-/tmp}/shh-cycle-review-$$.jsonl\"; cleanup() { rm -f \"$results_file\"; }; trap cleanup 0 HUP INT TERM; : >\"$results_file\" || { printf '%s\\n' 'ERROR: cannot create temporary review results file.' >&2; exit 1; }; \"$REVIEW_SCRIPT\" --branch \"$branch\" --results-file \"$results_file\" --device-udid \"$REVIEW_DEVICE_UDID\" --development-team \"$DEVELOPMENT_TEAM\"; review_status=$?; python3 - \"$results_file\" \"$review_status\" <<'PY'\nimport json\nimport sys\n\nresults_file = sys.argv[1]\nreview_status = int(sys.argv[2])\nrows = []\nerrors = []\ntry:\n    with open(results_file, encoding=\"utf-8\") as handle:\n        rows = [line.rstrip(\"\\n\") for line in handle if line.strip()]\nexcept OSError as error:\n    errors.append(f\"unable to read results file: {error}\")\n\nif review_status != 0:\n    errors.append(f\"review script exited with status {review_status}\")\nif not rows:\n    errors.append(\"review script recorded no result\")\n\nfor line_number, row in enumerate(rows, 1):\n    try:\n        result = json.loads(row).get(\"result\")\n    except (TypeError, AttributeError, json.JSONDecodeError) as error:\n        errors.append(f\"invalid JSONL row {line_number}: {error}\")\n        continue\n    if result != \"good\":\n        errors.append(f\"review result on row {line_number} is {result!r}, expected 'good'\")\n\nif errors:\n    print(\"ERROR: review outcome rejected: \" + \"; \".join(errors), file=sys.stderr)\n    print(\"Review JSONL rows:\", file=sys.stderr)\n    for row in rows:\n        print(row, file=sys.stderr)\n    sys.exit(1)\nPY"
     }
   ],
   "manual_test": {
