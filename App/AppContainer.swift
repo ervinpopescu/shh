@@ -89,11 +89,9 @@ final class AppContainer: ObservableObject {
     @Published var activeTmuxSessionID: String? = nil {
         didSet {
             terminalController.copyModeFallbackEnabled = activeTmuxSessionID != nil
-            // Note: terminalController.onCopyModeFallbackRequested is intentionally
-            // unwired until a dedicated tmux copy-mode UI affordance is approved.
-            // When unwired, terminalController.isCopyModeFallbackAvailable evaluates
-            // to false, ensuring touch scrolling safely falls back to cursor/page keys
-            // without swallowing touches.
+            // Primary-screen tmux scrolling remains native SwiftTerm scrollback.
+            // Copy-mode fallback is only available when a dedicated handler is
+            // explicitly registered for an alternate-screen gesture.
         }
     }
 

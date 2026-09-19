@@ -158,10 +158,17 @@ public final class ShhTerminalController: ObservableObject {
     /// It only enables a safe UI affordance; it never causes terminal bytes.
     public var copyModeFallbackEnabled = false
 
+    /// Indicates that the active foreground session is a multiplexer session.
+    /// This is separate from fallback availability: primary-screen tmux scrolling
+    /// remains native even when no copy-mode UI handler is registered.
+    public var isMultiplexerActive: Bool {
+        copyModeFallbackEnabled
+    }
+
     /// Indicates whether copy-mode fallback is both enabled by the session layer
     /// and backed by an actively registered UI or session handler.
     public var isCopyModeFallbackAvailable: Bool {
-        copyModeFallbackEnabled && onCopyModeFallbackRequested != nil
+        isMultiplexerActive && onCopyModeFallbackRequested != nil
     }
 
     /// Alias for isCopyModeFallbackAvailable matching TerminalScrollContext terminology.

@@ -45,11 +45,11 @@ extensions.
   fallback signaling.
 - **Touch Scroll Reducer & Gestures:** `TerminalScrollIntentReducer`
   pure state machine translating touch gestures into bounded intents:
-  preserving native `UIScrollView` primary scrollback without PTY bytes,
-  translating mouse-tracking swipes to wheel events, quantizing
-  alternate-screen swipes to navigation keys, and requesting safe UI
-  affordances for multiplexer copy-mode fallback without CLI text
-  injection.
+  preserving native `UIScrollView` primary scrollback without PTY bytes
+  (including primary-screen tmux), translating non-multiplexer
+  mouse-tracking swipes to wheel events, quantizing alternate-screen
+  swipes to navigation keys, and requesting safe UI affordances for
+  multiplexer copy-mode fallback without CLI text injection.
 
 ### 4. ShhVoice (Local Speech Processing)
 - **WhisperKit Transcriber:** On-device CoreML Whisper model

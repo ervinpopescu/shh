@@ -67,6 +67,7 @@ public struct ShhTerminalView: UIViewRepresentable {
             uiView.terminalDelegate = coordinator
             controller.attachEngine(uiView, firstResponder: uiView)
         }
+        uiView.syncMultiplexerMouseReporting()
         uiView.updateSizeIfNeeded()
     }
 
@@ -146,6 +147,8 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     private var scrollReducerState = TerminalScrollIntentReducer.State()
     private var suspendedMouseReporting = false
     private var previousAllowMouseReporting = true
+    private var multiplexerMouseReportingSuppressed = false
+    private var allowMouseReportingBeforeMultiplexerSuppression = true
 
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
@@ -168,8 +171,8 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         addGestureRecognizer(gesture)
 
         // Give this recognizer priority only when it is actually needed. When it
-        // fails (primary screen without mouse reporting), UIScrollView retains
-        // native scrollback and no terminal input is generated.
+        // fails (plain primary scrollback or primary-screen tmux), UIScrollView
+        // retains native scrollback and no terminal input is generated.
         panGestureRecognizer.require(toFail: gesture)
     }
 
@@ -192,8 +195,15 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === scrollGesture else { return true }
+        syncMultiplexerMouseReporting()
         let terminal = getTerminal()
         guard !hasActiveSelection else { return false }
+        // Primary-screen tmux output is already in SwiftTerm's scrollback. Let
+        // its UIScrollView handle the gesture instead of sending a wheel event
+        // that can make tmux enter copy mode unexpectedly.
+        if !terminal.isCurrentBufferAlternate && controller?.isMultiplexerActive == true {
+            return false
+        }
         return terminal.mouseMode != .off || terminal.isCurrentBufferAlternate
     }
 
@@ -224,15 +234,18 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         velocityY: Double = 0,
         location: CGPoint = .zero
     ) {
+        syncMultiplexerMouseReporting()
         let terminal = getTerminal()
         let context = TerminalScrollContext(
             surface: terminal.isCurrentBufferAlternate ? .alternate : .primary,
             mouseReporting: terminal.mouseMode != .off,
+            multiplexerActive: controller?.isMultiplexerActive ?? false,
             rowHeight: max(1, bounds.height / CGFloat(max(1, terminal.rows))),
             rowCount: terminal.rows,
             copyModeFallbackAvailable: controller?.isCopyModeFallbackAvailable ?? false
         )
-        if phase == .began && terminal.mouseMode != .off {
+        if phase == .began && terminal.mouseMode != .off &&
+            !(context.surface == .primary && context.multiplexerActive) {
             previousAllowMouseReporting = allowMouseReporting
             allowMouseReporting = false
             suspendedMouseReporting = true
@@ -278,6 +291,18 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         }
     }
 
+    fileprivate func syncMultiplexerMouseReporting() {
+        let shouldSuppress = controller?.isMultiplexerActive == true && !getTerminal().isCurrentBufferAlternate
+        if shouldSuppress && !multiplexerMouseReportingSuppressed {
+            allowMouseReportingBeforeMultiplexerSuppression = allowMouseReporting
+            allowMouseReporting = false
+            multiplexerMouseReportingSuppressed = true
+        } else if !shouldSuppress && multiplexerMouseReportingSuppressed {
+            allowMouseReporting = allowMouseReportingBeforeMultiplexerSuppression
+            multiplexerMouseReportingSuppressed = false
+        }
+    }
+
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
         switch recognizer.state {
         case .began:
@@ -308,6 +333,7 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     public override func layoutSubviews() {
         super.layoutSubviews()
+        syncMultiplexerMouseReporting()
     }
 
     func updateSizeIfNeeded() {

@@ -955,8 +955,9 @@ final class TmuxAppTests: XCTestCase {
 
         container.activeTmuxSessionID = "$0"
         XCTAssertTrue(container.terminalController.copyModeFallbackEnabled)
-        // In production without an explicit handler, fallback availability remains false
-        // so touch scrolling falls back to cursor/page keys instead of swallowing input.
+        XCTAssertTrue(container.terminalController.isMultiplexerActive)
+        // Primary-screen tmux scrolling remains native even without a copy-mode
+        // handler. Fallback availability is reserved for an explicit handler.
         XCTAssertFalse(container.terminalController.isCopyModeFallbackAvailable)
 
         // When a handler is explicitly registered, availability becomes true
@@ -969,6 +970,7 @@ final class TmuxAppTests: XCTestCase {
 
         container.activeTmuxSessionID = nil
         XCTAssertFalse(container.terminalController.copyModeFallbackEnabled)
+        XCTAssertFalse(container.terminalController.isMultiplexerActive)
         XCTAssertFalse(container.terminalController.isCopyModeFallbackAvailable)
     }
 }

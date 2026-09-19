@@ -30,6 +30,10 @@ public enum TerminalScrollIntent: Equatable, Sendable {
 public struct TerminalScrollContext: Equatable, Sendable {
     public var surface: TerminalScrollSurface
     public var mouseReporting: Bool
+    /// A primary-screen multiplexer owns its own scrollback. Do not report a
+    /// touch as a wheel event to tmux, because tmux may enter copy mode as a
+    /// side effect of that event.
+    public var multiplexerActive: Bool
     public var rowHeight: Double
     public var rowCount: Int
     public var copyModeFallbackAvailable: Bool
@@ -37,12 +41,14 @@ public struct TerminalScrollContext: Equatable, Sendable {
     public init(
         surface: TerminalScrollSurface,
         mouseReporting: Bool,
+        multiplexerActive: Bool = false,
         rowHeight: Double = 24,
         rowCount: Int = 24,
         copyModeFallbackAvailable: Bool = false
     ) {
         self.surface = surface
         self.mouseReporting = mouseReporting
+        self.multiplexerActive = multiplexerActive
         self.rowHeight = max(1, rowHeight)
         self.rowCount = max(1, rowCount)
         self.copyModeFallbackAvailable = copyModeFallbackAvailable
@@ -103,7 +109,7 @@ public struct TerminalScrollIntentReducer: Sendable {
                 state.fallbackEmitted = true
                 return [.copyModeFallback]
             }
-            return context.surface == .primary && !context.mouseReporting ? [.native] : []
+            return context.surface == .primary && (!context.mouseReporting || context.multiplexerActive) ? [.native] : []
         case .cancelled:
             state = State()
             return []
@@ -116,7 +122,9 @@ public struct TerminalScrollIntentReducer: Sendable {
             if context.surface == .alternate && !context.mouseReporting && context.copyModeFallbackAvailable {
                 return []
             }
-            guard context.surface == .alternate || context.mouseReporting else { return [.native] }
+            guard context.surface == .alternate || (context.mouseReporting && !context.multiplexerActive) else {
+                return [.native]
+            }
 
             let velocity = min(max(gesture.velocityY.isFinite ? gesture.velocityY : 0, -maximumVelocity), maximumVelocity)
             let effectiveTranslation = gesture.translationY + velocity * 0.002
@@ -126,7 +134,10 @@ public struct TerminalScrollIntentReducer: Sendable {
 
             let steps = min(abs(rawSteps), maximumIntentsPerUpdate) * (rawSteps.signum())
             state.remainder -= Double(steps) * thresholdRows
-            let direction: TerminalScrollDirection = steps > 0 ? .up : .down
+            // A physical upward swipe has negative translation. Match terminal
+            // scrollback semantics: upward reveals older output and downward
+            // returns toward the live prompt.
+            let direction: TerminalScrollDirection = steps < 0 ? .up : .down
             let count = abs(steps)
 
             if context.mouseReporting {
