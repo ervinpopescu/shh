@@ -633,10 +633,14 @@ final class AppContainer: ObservableObject {
         activeHerdrWorkspaceID = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
-        eventTask?.cancel()
         detachCallbacks()
-        await connection?.close()
+        let previousEventTask = eventTask
+        eventTask?.cancel()
+        eventTask = nil
+        let oldConnection = connection
         connection = nil
+        await oldConnection?.close()
+        _ = await previousEventTask?.result
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         terminalGrid = TerminalGrid()
@@ -818,13 +822,17 @@ final class AppContainer: ObservableObject {
             do {
                 for try await event in events {
                     guard let self,
+                          !Task.isCancelled,
                           self.activeSession?.id == session.id,
-                          !self.isSceneInBackground else { return }
+                          !self.isExplicitDisconnect else { return }
                     switch event {
                     case .bytes(let data):
                         let redactedData = self.redacted(data)
                         self.terminalController.feed(redactedData)
                     case .closed:
+                        guard !Task.isCancelled,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id else { return }
                         self.tmuxRefreshGeneration += 1
                         self.herdrRefreshGeneration += 1
                         self.stopHerdrPolling()
@@ -837,9 +845,15 @@ final class AppContainer: ObservableObject {
                         self.forwardingStreamTask?.cancel()
                         self.forwardingStreamTask = nil
                         await self.portForwardingManager?.stopAll()
+                        guard !Task.isCancelled,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id else { return }
                         self.forwardingSessions = []
                         self.handleConnectionDrop(host: host)
                     case .error(let error):
+                        guard !Task.isCancelled,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id else { return }
                         self.tmuxRefreshGeneration += 1
                         self.herdrRefreshGeneration += 1
                         self.stopHerdrPolling()
@@ -854,14 +868,18 @@ final class AppContainer: ObservableObject {
                         self.forwardingStreamTask?.cancel()
                         self.forwardingStreamTask = nil
                         await self.portForwardingManager?.stopAll()
+                        guard !Task.isCancelled,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id else { return }
                         self.forwardingSessions = []
                         self.handleConnectionDrop(host: host)
                     }
                 }
             } catch {
                 guard let self,
-                      self.activeSession?.id == session.id,
-                      !self.isSceneInBackground else { return }
+                      !Task.isCancelled,
+                      !self.isExplicitDisconnect,
+                      self.activeSession?.id == session.id else { return }
                 self.tmuxRefreshGeneration += 1
                 self.herdrRefreshGeneration += 1
                 self.stopHerdrPolling()
@@ -876,6 +894,9 @@ final class AppContainer: ObservableObject {
                 self.forwardingStreamTask?.cancel()
                 self.forwardingStreamTask = nil
                 await self.portForwardingManager?.stopAll()
+                guard !Task.isCancelled,
+                      !self.isExplicitDisconnect,
+                      self.activeSession?.id == session.id else { return }
                 self.forwardingSessions = []
                 self.handleConnectionDrop(host: host)
             }
@@ -884,9 +905,10 @@ final class AppContainer: ObservableObject {
 
     private func handleConnectionDrop(host: Host) {
         guard !isExplicitDisconnect, !isSceneInBackground,
-              !isNetworkRecoveryInProgress else { return }
-        Task { [weak self] in
-            guard let self else { return }
+              !isNetworkRecoveryInProgress,
+              activeHost?.id == host.id else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.activeHost?.id == host.id else { return }
             await self.reconnectCoordinator.start { [weak self] attempt in
                 guard let self else { return }
                 try await self.performReconnect(to: host, attempt: attempt)
@@ -895,7 +917,8 @@ final class AppContainer: ObservableObject {
     }
 
     func performReconnect(to host: Host, attempt: Int) async throws {
-        guard !isExplicitDisconnect, !isSceneInBackground else {
+        guard !isExplicitDisconnect, !isSceneInBackground,
+              activeHost?.id == host.id else {
             throw TransportError.cancelled
         }
         let connectionGeneration = lifecycleGeneration
@@ -1053,8 +1076,14 @@ final class AppContainer: ObservableObject {
         moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
-        await connection?.close()
+        detachCallbacks()
+        let previousEventTask = eventTask
+        eventTask?.cancel()
+        eventTask = nil
+        let oldConnection = connection
         connection = nil
+        await oldConnection?.close()
+        _ = await previousEventTask?.result
         activeSession?.state = .disconnected
         updateIdleTimerState()
     }
@@ -1230,6 +1259,7 @@ final class AppContainer: ObservableObject {
         }
 
         detachCallbacks()
+        let previousEventTask = eventTask
         eventTask?.cancel()
         eventTask = nil
         let oldConnection = connection
@@ -1243,6 +1273,7 @@ final class AppContainer: ObservableObject {
             await self?.reconnectCoordinator.cancel()
             await oldForwardingManager?.stopAll()
             await oldConnection?.close()
+            _ = await previousEventTask?.result
         }
     }
 
@@ -1339,6 +1370,7 @@ final class AppContainer: ObservableObject {
         await reconnectCoordinator.cancel()
         reconnectState = .idle
         detachCallbacks()
+        let previousEventTask = eventTask
         eventTask?.cancel()
         eventTask = nil
 
@@ -1352,8 +1384,11 @@ final class AppContainer: ObservableObject {
         forwardingSessions = []
         forwardingErrorMessage = nil
 
-        await connection?.close()
+        let oldConnection = connection
         connection = nil
+        await oldConnection?.close()
+        _ = await previousEventTask?.result
+
         activeSession?.state = .disconnected
         redactor = Redactor()
         activeTmuxSessionID = nil
