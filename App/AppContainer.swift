@@ -466,7 +466,16 @@ final class AppContainer: ObservableObject {
         Task { [weak self] in
             await coordinator.setStateChangeHandler { [weak self] newState in
                 Task { @MainActor [weak self] in
-                    self?.reconnectState = newState
+                    guard let self else { return }
+                    self.reconnectState = newState
+                    switch newState {
+                    case .idle, .connected, .cancelled, .exhausted, .failed:
+                        if self.activeSession?.state != .connecting {
+                            self.isNetworkRecoveryInProgress = false
+                        }
+                    case .waiting, .connecting:
+                        break
+                    }
                 }
             }
         }
@@ -664,6 +673,7 @@ final class AppContainer: ObservableObject {
         let previousEventTask = eventTask
         eventTask?.cancel()
         eventTask = nil
+
         let oldConnection = connection
         connection = nil
         await oldConnection?.close()
@@ -934,8 +944,24 @@ final class AppContainer: ObservableObject {
         guard !isExplicitDisconnect, !isSceneInBackground,
               !isNetworkRecoveryInProgress,
               activeHost?.id == host.id else { return }
+        guard reachabilityMonitor.isReachable else {
+            activeSession?.state = .disconnected
+            reconnectState = .failed(reason: "Network unavailable.")
+            return
+        }
+        guard !reconnectState.isReconnecting else { return }
+
+        isNetworkRecoveryInProgress = true
         Task { @MainActor [weak self] in
-            guard let self, self.activeHost?.id == host.id else { return }
+            guard let self else { return }
+            guard !self.isExplicitDisconnect,
+                  !self.isSceneInBackground,
+                  self.activeHost?.id == host.id,
+                  self.reachabilityMonitor.isReachable else {
+                self.isNetworkRecoveryInProgress = false
+                self.reconnectState = .failed(reason: "Network unavailable.")
+                return
+            }
             await self.reconnectCoordinator.start { [weak self] attempt in
                 guard let self else { return }
                 try await self.performReconnect(to: host, attempt: attempt)
@@ -944,7 +970,8 @@ final class AppContainer: ObservableObject {
     }
 
     func performReconnect(to host: Host, attempt: Int) async throws {
-        guard !isExplicitDisconnect, !isSceneInBackground,
+        guard !isExplicitDisconnect,
+              !isSceneInBackground,
               activeHost?.id == host.id else {
             throw TransportError.cancelled
         }
@@ -974,21 +1001,28 @@ final class AppContainer: ObservableObject {
 
         let initialSize = terminalController.size
         let connection: any SSHConnection
-        let selectedIdentity = try await resolveIdentity(for: host)
-        if case .mosh = host.connection {
-            connection = try await moshTransport.connect(
-                host: host,
-                identity: selectedIdentity,
-                trustEvaluator: trustStore,
-                initialSize: initialSize
-            )
-        } else {
-            connection = try await transport.connect(
-                host: host,
-                identity: selectedIdentity,
-                trustEvaluator: trustStore,
-                initialSize: initialSize
-            )
+        do {
+            let selectedIdentity = try await resolveIdentity(for: host)
+            if case .mosh = host.connection {
+                connection = try await moshTransport.connect(
+                    host: host,
+                    identity: selectedIdentity,
+                    trustEvaluator: trustStore,
+                    initialSize: initialSize
+                )
+            } else {
+                connection = try await transport.connect(
+                    host: host,
+                    identity: selectedIdentity,
+                    trustEvaluator: trustStore,
+                    initialSize: initialSize
+                )
+            }
+        } catch {
+            if activeSession?.id == session.id {
+                activeSession?.state = .disconnected
+            }
+            throw error
         }
 
         guard activeSession?.id == session.id,
@@ -1117,7 +1151,12 @@ final class AppContainer: ObservableObject {
 
     func retryReconnect() async {
         guard let host = activeHost else { return }
+        guard reachabilityMonitor.isReachable else {
+            reconnectState = .failed(reason: "Network unavailable.")
+            return
+        }
         isExplicitDisconnect = false
+        isNetworkRecoveryInProgress = true
         await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
@@ -1126,22 +1165,40 @@ final class AppContainer: ObservableObject {
 
     func handleReachabilityChange(_ isReachable: Bool) {
         guard !isExplicitDisconnect else { return }
-        if isReachable {
+        guard isReachable else {
+            isNetworkRecoveryInProgress = false
             if reconnectState.isReconnecting {
+                reconnectState = .failed(reason: "Network unavailable.")
                 Task { [weak self] in
-                    guard let self, let host = self.activeHost else { return }
-                    await self.reconnectCoordinator.retryNow { [weak self] attempt in
-                        guard let self else { return }
-                        try await self.performReconnect(to: host, attempt: attempt)
-                    }
+                    await self?.reconnectCoordinator.cancel()
                 }
-            } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
-                handleConnectionDrop(host: host)
-            } else if let host = activeHost, case .mosh = host.connection {
+            } else if activeSession?.state == .connected {
+                // Reachability can briefly report an unavailable path while an
+                // established transport is still usable. Do not tear down a
+                // healthy session or create a second reconnect cycle here; the
+                // transport event remains authoritative for an actual drop.
+                reconnectState = .failed(reason: "Network unavailable.")
+                return
+            } else if activeSession != nil {
+                activeSession?.state = .disconnected
+                reconnectState = .failed(reason: "Network unavailable.")
+            }
+            return
+        }
+
+        guard let host = activeHost else { return }
+        if activeSession?.state == .connected {
+            if case .mosh = host.connection, !reconnectState.isReconnecting {
                 Task { [weak self] in
                     await self?.performFastSessionRecovery()
                 }
+            } else {
+                reconnectState = .idle
             }
+            return
+        }
+        if activeSession?.state == .failed || activeSession?.state == .disconnected {
+            handleConnectionDrop(host: host)
         }
     }
 
@@ -1176,11 +1233,18 @@ final class AppContainer: ObservableObject {
                   activeSession?.state == .connected,
                   let oldConnection = connection {
             // A path/interface change can leave an established TCP socket
-            // half-alive without producing a channel callback. Force the
-            // normal reconnect path, but keep it bounded by the coordinator.
-            handleConnectionDrop(host: host)
+            // half-alive without producing a channel callback. Replace it
+            // through the normal reconnect path, but first detach the old
+            // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
+            activeSession?.state = .disconnected
+            detachCallbacks()
+            eventTask?.cancel()
+            eventTask = nil
+            connection = nil
             await oldConnection.close()
+            isNetworkRecoveryInProgress = false
+            handleConnectionDrop(host: host)
         }
     }
 
@@ -1198,6 +1262,8 @@ final class AppContainer: ObservableObject {
             }
         }
 
+        guard reachabilityMonitor.isReachable, !reconnectState.isReconnecting else { return }
+        isNetworkRecoveryInProgress = true
         await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
@@ -1230,6 +1296,11 @@ final class AppContainer: ObservableObject {
                     guard let self,
                           self.lifecycleGeneration == generation,
                           !self.isExplicitDisconnect else { return }
+                    // Ensure a reconnect that was invalidated by backgrounding
+                    // cannot cancel the new foreground recovery after it starts.
+                    await self.reconnectCoordinator.cancel()
+                    self.reconnectState = await self.reconnectCoordinator.state
+                    guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
 
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
                         // Test if the existing connection survived suspension and is responsive.
@@ -1257,27 +1328,21 @@ final class AppContainer: ObservableObject {
                                 self.handleConnectionDrop(host: host)
                             }
                         }
-                    } else if self.reconnectState.isReconnecting {
-                        if let host = self.activeHost {
-                            await self.reconnectCoordinator.retryNow { [weak self] attempt in
-                                guard let self else { return }
-                                try await self.performReconnect(to: host, attempt: attempt)
-                            }
-                        }
                     } else if let host = self.activeHost, (self.activeSession?.state == .failed || self.activeSession?.state == .disconnected) {
-                        self.handleConnectionDrop(host: host)
-                    }
-                }
-            } else if reconnectState.isReconnecting {
-                Task { [weak self] in
-                    guard let self, let host = self.activeHost else { return }
-                    await self.reconnectCoordinator.retryNow { [weak self] attempt in
-                        guard let self else { return }
-                        try await self.performReconnect(to: host, attempt: attempt)
+                        // The foreground transition already invalidated any
+                        // prior coordinator generation. Preserve its backoff
+                        // if a newer coordinator is still active.
+                        if !self.reconnectState.isReconnecting {
+                            self.handleConnectionDrop(host: host)
+                        }
                     }
                 }
             } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
-                handleConnectionDrop(host: host)
+                // An already-running coordinator owns its backoff. Do not
+                // restart it for repeated .active notifications.
+                if !reconnectState.isReconnecting {
+                    handleConnectionDrop(host: host)
+                }
             }
         default:
             break
@@ -1290,6 +1355,17 @@ final class AppContainer: ObservableObject {
         isNetworkRecoveryInProgress = false
         lifecycleGeneration += 1
         let backgroundGeneration = lifecycleGeneration
+
+        // A reconnect started before backgrounding cannot safely finish while the
+        // scene is inactive. Invalidate it now and let foreground recovery start
+        // one fresh attempt from the resulting disconnected state.
+        if reconnectState.isReconnecting || activeSession?.state == .connecting {
+            activeSession?.state = .disconnected
+            reconnectState = .cancelled
+            Task { [weak self] in
+                await self?.reconnectCoordinator.cancel()
+            }
+        }
 
         // Persist intent immediately so that if the app is suspended or terminated
         // by the system, the last active target and host are safely preserved.
@@ -1471,6 +1547,8 @@ final class AppContainer: ObservableObject {
         let previousEventTask = eventTask
         eventTask?.cancel()
         eventTask = nil
+        let oldConnection = connection
+        connection = nil
 
         // Reset port forwarding state before closing SSH connection
         forwardingStreamTask?.cancel()
@@ -1482,11 +1560,8 @@ final class AppContainer: ObservableObject {
         forwardingSessions = []
         forwardingErrorMessage = nil
 
-        let oldConnection = connection
-        connection = nil
         await oldConnection?.close()
         _ = await previousEventTask?.result
-
         activeSession?.state = .disconnected
         redactor = Redactor()
         activeTmuxSessionID = nil
