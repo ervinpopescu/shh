@@ -158,6 +158,9 @@ public actor ReconnectCoordinator {
 
                 if let transportError = error as? TransportError {
                     switch transportError {
+                    case .cancelled:
+                        updateState(.cancelled, generation: generation)
+                        return
                     case .hostKeyChanged, .hostKeyApprovalRequired, .authenticationRequired, .unsupported, .invalidConfiguration, .missingCredential, .invalidPrivateKey:
                         updateState(.failed(reason: "Non-retryable error: \(transportError)"), generation: generation)
                         return

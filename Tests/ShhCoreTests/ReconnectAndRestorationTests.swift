@@ -291,6 +291,32 @@ final class ReconnectAndRestorationTests: XCTestCase {
         XCTAssertEqual(stateAfterStaleCompletion, .cancelled, "Stale attempt completion must be ignored by generation guard")
     }
 
+    func testReconnectCoordinatorCancellationErrorHaltsImmediately() async {
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in },
+            jitter: ReconnectCoordinator.zeroJitter
+        )
+        let attemptsRecorded = ManagedAtomicIntArray()
+        let cancelledExpectation = expectation(description: "Coordinator stays cancelled")
+
+        await coordinator.setStateChangeHandler { state in
+            if state == .cancelled {
+                cancelledExpectation.fulfill()
+            }
+        }
+
+        await coordinator.start { attempt in
+            await attemptsRecorded.append(attempt)
+            throw TransportError.cancelled
+        }
+
+        await fulfillment(of: [cancelledExpectation], timeout: 2.0)
+        let attempts = await attemptsRecorded.get()
+        let finalState = await coordinator.state
+        XCTAssertEqual(attempts, [1])
+        XCTAssertEqual(finalState, .cancelled)
+    }
+
     func testReconnectCoordinatorNonRetryableErrorHaltsImmediately() async {
         let coordinator = ReconnectCoordinator(
             clock: { _ in },
