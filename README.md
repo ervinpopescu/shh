@@ -14,8 +14,9 @@ backups.
 ## Capabilities
 
 - **Terminal & Transport:** Live Citadel/NIOSSH transport with PTY,
-  TOFU host-key verification, and SwiftTerm rendering with alternate
-  screen buffers and debounced resize handling.
+  TOFU host-key verification, and SwiftTerm rendering with context-aware
+  touch scrolling, alternate screen buffers, and debounced resize
+  handling.
 - **Multiplexing:** First-class Tmux integration supporting session
   listing, creation, attach, and command approval.
 - **On-Device Voice AI:** WhisperKit and Apple Speech local transcribers

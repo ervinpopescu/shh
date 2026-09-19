@@ -947,6 +947,30 @@ final class TmuxAppTests: XCTestCase {
         let transcript = container.terminalController.currentTranscript(limit: 10)
         XCTAssertTrue(transcript.contains("[Send failed:"), "Send failure must be fed to production terminal surface")
     }
+
+    func testCopyModeFallbackEnabledSynchronizesWithActiveTmuxSession() {
+        let container = AppContainer.demo()
+        XCTAssertFalse(container.terminalController.copyModeFallbackEnabled)
+        XCTAssertFalse(container.terminalController.isCopyModeFallbackAvailable)
+
+        container.activeTmuxSessionID = "$0"
+        XCTAssertTrue(container.terminalController.copyModeFallbackEnabled)
+        // In production without an explicit handler, fallback availability remains false
+        // so touch scrolling falls back to cursor/page keys instead of swallowing input.
+        XCTAssertFalse(container.terminalController.isCopyModeFallbackAvailable)
+
+        // When a handler is explicitly registered, availability becomes true
+        var fallbackInvoked = false
+        container.terminalController.onCopyModeFallbackRequested = { fallbackInvoked = true }
+        XCTAssertTrue(container.terminalController.isCopyModeFallbackAvailable)
+
+        container.terminalController.requestCopyModeFallback()
+        XCTAssertTrue(fallbackInvoked)
+
+        container.activeTmuxSessionID = nil
+        XCTAssertFalse(container.terminalController.copyModeFallbackEnabled)
+        XCTAssertFalse(container.terminalController.isCopyModeFallbackAvailable)
+    }
 }
 
 private actor AsyncGate {

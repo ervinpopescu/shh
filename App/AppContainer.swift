@@ -86,7 +86,16 @@ final class AppContainer: ObservableObject {
     @Published var isProbingTmux: Bool = false
     @Published var isTmuxServerRunning: Bool = false
     @Published var tmuxError: String? = nil
-    @Published var activeTmuxSessionID: String? = nil
+    @Published var activeTmuxSessionID: String? = nil {
+        didSet {
+            terminalController.copyModeFallbackEnabled = activeTmuxSessionID != nil
+            // Note: terminalController.onCopyModeFallbackRequested is intentionally
+            // unwired until a dedicated tmux copy-mode UI affordance is approved.
+            // When unwired, terminalController.isCopyModeFallbackAvailable evaluates
+            // to false, ensuring touch scrolling safely falls back to cursor/page keys
+            // without swallowing touches.
+        }
+    }
 
     // MARK: - Herdr Multiplexer & Agent State
     @Published public var herdrAvailability: HerdrAvailability = .unavailable(reason: "Not connected")
