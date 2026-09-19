@@ -29,6 +29,34 @@ final class CommandDialTests: XCTestCase {
         XCTAssertFalse(state.isOpen)
     }
 
+    func testSwipeCategorySelectionKeepsDialOpenAndSwitchesWithoutReentering() throws {
+        let model = CommandDialModel()
+        var state = CommandDialNavigation(isOpen: true)
+        let commonKeys = try XCTUnwrap(model.roots.first { $0.action == .category(.commonKeys) })
+        let keyboard = try XCTUnwrap(model.roots.first { $0.action == .keyboard })
+
+        state.selectCategory(commonKeys)
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(state.path.isEmpty)
+        XCTAssertEqual(state.selectedNodeID, commonKeys.id)
+
+        state.selectCategory(keyboard)
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(state.path.isEmpty)
+        XCTAssertEqual(state.selectedNodeID, keyboard.id)
+    }
+
+    func testDisabledCategoryCannotBeSelectedBySwipe() throws {
+        let model = CommandDialModel(connected: false)
+        var state = CommandDialNavigation(isOpen: true)
+        let category = try XCTUnwrap(model.roots.first)
+
+        state.selectCategory(category)
+
+        XCTAssertNil(state.selectedNodeID)
+        XCTAssertTrue(state.path.isEmpty)
+    }
+
     func testPinnedLiteralsAreBoundedAndDeduplicated() {
         let model = CommandDialModel(pinnedLiterals: ["  ls ", "ls", "", String(repeating: "x", count: 65)])
         let common = model.roots[0]

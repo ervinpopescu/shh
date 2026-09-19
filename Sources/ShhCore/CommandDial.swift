@@ -223,6 +223,16 @@ public struct CommandDialNavigation: Equatable, Sendable {
     public mutating func dismiss() { isOpen = false; path.removeAll(); selectedNodeID = nil }
     public mutating func clearSelection() { selectedNodeID = nil }
     public mutating func highlight(_ id: String?) { selectedNodeID = id }
+
+    /// Browses a root category without dismissing the dial or requiring a
+    /// category button to be reopened. The category remains selected while
+    /// its children are shown below the category pager.
+    public mutating func selectCategory(_ node: DialNode) {
+        guard node.isEnabled else { return }
+        path.removeAll()
+        selectedNodeID = node.id
+    }
+
     public mutating func back() {
         if !path.isEmpty { path.removeLast() }
         selectedNodeID = nil

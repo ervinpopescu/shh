@@ -116,6 +116,46 @@ final class TmuxAppTests: XCTestCase {
         saveSnapshot(view: view, named: filename)
     }
 
+    func testCommandDialCategoryPagerSupportsSwipeSelectionAndTapFallback() throws {
+        var state = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel()
+        var actions: [DialActionIdentifier] = []
+        let makeSurface = {
+            CommandDialSurface(
+                model: model,
+                navigation: Binding(get: { state }, set: { state = $0 }),
+                placement: .trailing,
+                size: .compact,
+                hostLabel: "Dial Host",
+                paneLabel: "Primary terminal",
+                onAction: { actions.append($0) },
+                onDismiss: {}
+            )
+        }
+
+        let hosting = UIHostingController(rootView: makeSurface())
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        hosting.loadViewIfNeeded()
+        hosting.view.layoutIfNeeded()
+        XCTAssertGreaterThan(hosting.view.bounds.height, 0)
+
+        let commonKeys = try XCTUnwrap(model.roots.first { $0.action == .category(.commonKeys) })
+        state.selectCategory(commonKeys)
+        hosting.rootView = makeSurface()
+        hosting.view.setNeedsLayout()
+        hosting.view.layoutIfNeeded()
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(state.path.isEmpty)
+        XCTAssertEqual(state.selectedNodeID, commonKeys.id)
+
+        // Existing tap behavior still enters the selected category without
+        // dismissing the dial.
+        state.enter(commonKeys)
+        XCTAssertEqual(state.path, [commonKeys.id])
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(actions.isEmpty)
+    }
+
     func testCommandDialSurfaceFitsPhoneAndIPad() {
         var state = CommandDialNavigation(isOpen: true)
         let model = CommandDialModel(pinnedLiterals: ["echo ready"])
