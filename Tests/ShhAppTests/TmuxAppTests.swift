@@ -37,6 +37,363 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.tmuxAvailability, .available(version: "tmux 3.4"))
     }
 
+    func testCommandDialControlRequiresApprovalAndUsesExecChannel() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Dial Host", hostname: "dial.test", username: "user")
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        let sessionID = try TmuxSessionID("$4")
+        let action = MultiplexerControlAction.tmux(.nextWindow(sessionID))
+        let expected = try TmuxControl().command(for: action)
+        mock.onExecuteCommand = { command in
+            SSHCommandResult(exitCode: command == expected ? 0 : 1, stdout: "", stderr: "")
+        }
+
+        let rejected = await container.executeMultiplexerControl(action)
+        XCTAssertFalse(rejected, "Dial controls require review")
+        let approved = await container.executeMultiplexerControl(action, approved: true)
+        XCTAssertTrue(approved)
+        XCTAssertFalse(mock.sentData.contains { $0 == Data(expected.utf8) }, "Dial controls use exec, not PTY")
+    }
+
+    func testPinnedLiteralApprovalInsertsWithoutReturn() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Pinned Host", hostname: "pinned.test", username: "user")
+        await container.connect(to: host)
+
+        let rejected = await container.sendPinnedLiteral("sudo reboot")
+        XCTAssertFalse(rejected)
+        let approved = await container.sendPinnedLiteral("sudo reboot", approved: true)
+        XCTAssertTrue(approved)
+        XCTAssertEqual(mock.sentData.last, Data("sudo reboot".utf8))
+    }
+
+    private func resolveEvidenceDirectory() -> URL? {
+        if let envPath = ProcessInfo.processInfo.environment["EVIDENCE_DIR"], !envPath.isEmpty {
+            let url = URL(fileURLWithPath: envPath, isDirectory: true)
+            if (try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)) != nil ||
+                FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        let fallback = FileManager.default.temporaryDirectory.appendingPathComponent("shh-evidence", isDirectory: true)
+        if (try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)) != nil ||
+            FileManager.default.fileExists(atPath: fallback.path) {
+            return fallback
+        }
+        return FileManager.default.temporaryDirectory
+    }
+
+    private func saveSnapshot(view: UIView, named filename: String) {
+        guard let directory = resolveEvidenceDirectory() else { return }
+        let cleanName = URL(fileURLWithPath: filename).lastPathComponent
+        let targetURL = directory.appendingPathComponent(cleanName)
+        let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
+        let image = renderer.image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        if let png = image.pngData() {
+            try? png.write(to: targetURL)
+        }
+    }
+
+    private func saveSnapshot(view: UIView, to filename: String) {
+        saveSnapshot(view: view, named: filename)
+    }
+
+    func testCommandDialCategoryPagerSupportsSwipeSelectionAndTapFallback() throws {
+        var state = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel()
+        var actions: [DialActionIdentifier] = []
+        let makeSurface = {
+            CommandDialSurface(
+                model: model,
+                navigation: Binding(get: { state }, set: { state = $0 }),
+                placement: .trailing,
+                size: .compact,
+                hostLabel: "Dial Host",
+                paneLabel: "Primary terminal",
+                onAction: { actions.append($0) },
+                onDismiss: {}
+            )
+        }
+
+        let hosting = UIHostingController(rootView: makeSurface())
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        hosting.loadViewIfNeeded()
+        hosting.view.layoutIfNeeded()
+        XCTAssertGreaterThan(hosting.view.bounds.height, 0)
+
+        let commonKeys = try XCTUnwrap(model.roots.first { $0.action == .category(.commonKeys) })
+        state.selectCategory(commonKeys)
+        hosting.rootView = makeSurface()
+        hosting.view.setNeedsLayout()
+        hosting.view.layoutIfNeeded()
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(state.path.isEmpty)
+        XCTAssertEqual(state.selectedNodeID, commonKeys.id)
+
+        // Existing tap behavior still enters the selected category without
+        // dismissing the dial.
+        state.enter(commonKeys)
+        XCTAssertEqual(state.path, [commonKeys.id])
+        XCTAssertTrue(state.isOpen)
+        XCTAssertTrue(actions.isEmpty)
+    }
+
+    func testCommandDialSurfaceRendersNestedSwipeDestinationAndLeafFallback() throws {
+        let leaf = DialNode(id: "mux.review.leaf", title: "Review Leaf", action: .commonKey(.enter))
+        let nested = DialNode(id: "mux.review", title: "Review", action: .category(.commonKeys), children: [leaf])
+        let model = CommandDialModel(multiplexerChildren: [nested])
+        let multiplexer = try XCTUnwrap(model.roots.first { $0.id == "root.multiplexer" })
+        var state = CommandDialNavigation(isOpen: true)
+        state.selectCategory(multiplexer)
+
+        let surface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let hosting = UIHostingController(rootView: surface)
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        hosting.loadViewIfNeeded()
+        hosting.view.layoutIfNeeded()
+
+        XCTAssertEqual(state.openNextSubmenu(using: .north, in: model)?.id, multiplexer.id)
+        XCTAssertEqual(state.openNextSubmenu(using: .northwest, in: model)?.id, nested.id)
+        hosting.rootView = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        hosting.view.setNeedsLayout()
+        hosting.view.layoutIfNeeded()
+        XCTAssertTrue(state.isOpen)
+        XCTAssertEqual(state.path, [multiplexer.id, nested.id])
+        XCTAssertGreaterThan(hosting.view.bounds.height, 0)
+        XCTAssertEqual(nested.children.first?.action, .commonKey(.enter))
+    }
+
+    func testCommandDialSurfaceFitsPhoneAndIPad() {
+        var state = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(pinnedLiterals: ["echo ready"])
+        let surface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .regular,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+
+        let phone = UIHostingController(rootView: surface)
+        phone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let phoneSize = phone.sizeThatFits(in: phone.view.bounds.size)
+        XCTAssertGreaterThan(phoneSize.width, 0)
+        XCTAssertGreaterThan(phoneSize.height, 0)
+        saveSnapshot(view: phone.view, named: "command_dial_surface_phone.png")
+
+        let ipad = UIHostingController(rootView: surface)
+        ipad.view.frame = CGRect(x: 0, y: 0, width: 1024, height: 1366)
+        let ipadSize = ipad.sizeThatFits(in: ipad.view.bounds.size)
+        XCTAssertGreaterThan(ipadSize.width, 0)
+        XCTAssertGreaterThan(ipadSize.height, 0)
+        saveSnapshot(view: ipad.view, named: "command_dial_surface_ipad.png")
+        _ = state
+    }
+
+    func testCommandDialSubmenusAndMultiplexerArtifacts() throws {
+        var commonKeysNav = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(pinnedLiterals: ["ls -la", "cargo test"])
+        guard let commonKeysNode = model.roots.first(where: { $0.id == "root.common-keys" }) else {
+            XCTFail("Missing common-keys root node")
+            return
+        }
+        commonKeysNav.enter(commonKeysNode)
+        XCTAssertEqual(commonKeysNav.path, ["root.common-keys"])
+
+        let commonKeysSurface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { commonKeysNav }, set: { commonKeysNav = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Production Web",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let phone = UIHostingController(rootView: commonKeysSurface)
+        phone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: phone.view, named: "command_dial_common_keys_phone.png")
+
+        // Multiplexer controls submenu
+        var muxNav = CommandDialNavigation(isOpen: true)
+        let session = try TmuxSessionID("$3")
+        let muxChildren = CommandDialMultiplexerMenu.nodes(tmuxSessionID: session, capabilities: .tmux)
+        let muxModel = CommandDialModel(multiplexerChildren: muxChildren)
+        guard let muxNode = muxModel.roots.first(where: { $0.id == "root.multiplexer" }) else {
+            XCTFail("Missing multiplexer root node")
+            return
+        }
+        muxNav.enter(muxNode)
+        XCTAssertEqual(muxNav.path, ["root.multiplexer"])
+
+        let muxSurface = CommandDialSurface(
+            model: muxModel,
+            navigation: Binding(get: { muxNav }, set: { muxNav = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Production Web",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let muxPhone = UIHostingController(rootView: muxSurface)
+        muxPhone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: muxPhone.view, named: "command_dial_multiplexer_menu.png")
+    }
+
+    func testSendImageEndToEndAndArtifacts() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let sftp = DemoSFTPRepository(seedDemoData: true)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            sftpRepository: sftp
+        )
+        let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // 1. Snapshot initial SendImageView using dedicated idle container
+        let idleContainer = AppContainer.demo()
+        let sendImageView = SendImageView().environmentObject(idleContainer)
+        let hosting = UIHostingController(rootView: sendImageView)
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: hosting.view, named: "send_image_view.png")
+
+        // 2. Generate valid test PNG image
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 80, height: 80))
+        let testImage = renderer.image { ctx in
+            UIColor.systemCyan.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 80, height: 80))
+        }
+        guard let pngData = testImage.pngData() else {
+            XCTFail("Failed to render test PNG")
+            return
+        }
+
+        // 3. Initiate send image
+        container.beginSendImage(data: pngData)
+        XCTAssertTrue(container.sendImageState.isActive)
+
+        // 4. Await completion
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            if case .completed = container.sendImageState { break }
+            if case .failed = container.sendImageState { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+
+        guard case .completed(let remotePath) = container.sendImageState else {
+            XCTFail("Expected .completed sendImageState, got: \(container.sendImageState), error: \(container.sendImageErrorMessage ?? "none")")
+            return
+        }
+
+        XCTAssertTrue(remotePath.description.hasPrefix("/home/dev/.shh/images/"))
+        XCTAssertTrue(remotePath.description.hasSuffix(".png"))
+
+        // Verify terminal insertion without Return
+        guard let sentPathData = mock.sentData.last,
+              let sentString = String(data: sentPathData, encoding: .utf8) else {
+            XCTFail("Expected image path sent to terminal connection")
+            return
+        }
+        XCTAssertFalse(sentString.hasSuffix("\n"), "Inserted image path must NOT end with a newline")
+        XCTAssertFalse(sentString.hasSuffix("\r"), "Inserted image path must NOT end with a carriage return")
+        XCTAssertTrue(sentString.contains("/home/dev/.shh/images/"), "Must contain quoted remote path")
+
+        // 5. Snapshot completed SendImageView
+        let completedHosting = UIHostingController(rootView: SendImageView().environmentObject(container))
+        completedHosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: completedHosting.view, named: "send_image_completed.png")
+    }
+
+    func testSendImageAdversarialRejectionAndCancellation() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let sftp = DemoSFTPRepository(seedDemoData: true)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            sftpRepository: sftp
+        )
+        let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
+        await container.connect(to: host)
+
+        let initialSentCount = mock.sentData.count
+
+        // Adversarial 1: Malformed bytes
+        let malformed = Data([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22])
+        container.beginSendImage(data: malformed)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.sendImageState, .failed)
+        XCTAssertNotNil(container.sendImageErrorMessage)
+        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for malformed image")
+
+        // Adversarial 2: Empty data
+        container.beginSendImage(data: Data())
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.sendImageState, .failed)
+        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for empty image")
+
+        // Adversarial 3: Immediate cancellation
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40))
+        let img = renderer.image { _ in UIColor.red.setFill() }
+        if let validData = img.pngData() {
+            container.beginSendImage(data: validData)
+            container.cancelSendImage()
+            XCTAssertEqual(container.sendImageState, .cancelled)
+        }
+    }
+
     func testTmuxProbeFailureNoTmux() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
@@ -237,7 +594,7 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd.contains("list-sessions") {
-                return SSHCommandResult(exitCode: 0, stdout: "$1\tworkspace\t1\t1700000000\t1700000000\t1\n")
+                return SSHCommandResult(exitCode: 0, stdout: "")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }

@@ -26,7 +26,7 @@ private struct DemoNode: Sendable {
     }
 }
 
-public actor DemoSFTPRepository: SFTPRepository, RemoteFileRepository {
+public actor DemoSFTPRepository: SFTPRepository, SFTPRestrictedUploader, RemoteFileRepository {
     private var nodes: [String: DemoNode] = [:]
     public var simulateTransferChunkDelay: TimeInterval = 0
 
@@ -388,6 +388,20 @@ public actor DemoSFTPRepository: SFTPRepository, RemoteFileRepository {
         }
         let data = try Data(contentsOf: localURL)
         try await writeFile(data: data, at: remotePath, progress: progress)
+    }
+
+    public func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        permissions: PosixPermissions,
+        progress: (@Sendable (TransferProgress) -> Void)? = nil
+    ) async throws {
+        try await upload(from: localURL, to: remotePath, progress: progress)
+        guard var node = nodes[remotePath.description] else {
+            throw SFTPRepositoryError.notFound(path: remotePath.description)
+        }
+        node.permissions = permissions
+        nodes[remotePath.description] = node
     }
 
     public func createDirectory(at path: RemotePath) async throws {

@@ -5,7 +5,7 @@ import NIOPosix
 import Citadel
 import ShhCore
 
-public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @unchecked Sendable {
+public final class LiveSFTPRepository: SFTPRepository, SFTPRestrictedUploader, RemoteFileRepository, @unchecked Sendable {
     private let sftpClient: SFTPClient
     private let sshClient: SSHClient?
     private let customGroup: MultiThreadedEventLoopGroup?
@@ -304,6 +304,24 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
         to remotePath: RemotePath,
         progress: (@Sendable (TransferProgress) -> Void)? = nil
     ) async throws {
+        try await upload(from: localURL, to: remotePath, permissions: nil, progress: progress)
+    }
+
+    public func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        permissions: PosixPermissions,
+        progress: (@Sendable (TransferProgress) -> Void)? = nil
+    ) async throws {
+        try await upload(from: localURL, to: remotePath, permissions: permissions.rawValue, progress: progress)
+    }
+
+    private func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        permissions: UInt32?,
+        progress: (@Sendable (TransferProgress) -> Void)? = nil
+    ) async throws {
         try checkActiveAndCancellation()
         guard FileManager.default.fileExists(atPath: localURL.path) else {
             throw SFTPRepositoryError.notFound(path: localURL.path)
@@ -314,9 +332,12 @@ public final class LiveSFTPRepository: SFTPRepository, RemoteFileRepository, @un
             let totalBytes = (fileAttributes[.size] as? NSNumber)?.int64Value ?? 0
             let fileHandle = try FileHandle(forReadingFrom: localURL)
 
+            var attributes = SFTPFileAttributes.none
+            attributes.permissions = permissions ?? PosixPermissions.standardFile.rawValue
             let file = try await sftpClient.openFile(
                 filePath: remotePath.description,
-                flags: [.write, .create, .truncate]
+                flags: [.write, .create, .truncate],
+                attributes: attributes
             )
 
             var bytesTransferred: Int64 = 0

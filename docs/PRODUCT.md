@@ -39,8 +39,29 @@ integration without third-party cloud servers or subscription telemetry.
   surviving descriptors.
 - **Tmux Multiplexer:** First-class tmux integration with session
   listing, creation, attach, and exact-command approval sheets. Includes
-  collision-resistant pipe-delimited format parsing and backward
-  compatibility for legacy and tmux 3.7c underscore-sanitized output.
+  collision-resistant pipe-delimited format parsing, backward
+  compatibility for legacy and tmux 3.7c underscore-sanitized output,
+  and safe out-of-band window and pane controls (switching, directional
+  focus, splits, zoom, copy mode, and pane close) executed over SSH
+  exec channels without typing into the interactive PTY.
+- **One-Handed Command Dial:** Radial overlay menu optimized for
+  single-thumb terminal navigation. Provides rapid access to common
+  keys (Esc, Tab, Shift-Tab, directional arrows, Ctrl-C, Ctrl-D, Enter),
+  custom snippets, voice recording, software keyboard toggling, pinned
+  insert-only literals, and out-of-band multiplexer controls. Supports
+  configurable placement (leading or trailing edge for left- or
+  right-handed grip), compact or regular sizing, and haptic feedback.
+  Integrates strictly with `CommandPolicy`, enforcing modal approval for
+  review-required actions and disabling blocked commands.
+- **SFTP Image-to-Terminal Insertion:** Direct image staging and upload
+  from Photos, Files, or the system clipboard into remote host storage
+  (`~/.shh/images/` or a host-configured directory override) over the
+  active SFTP session. Enforces strict local pre-upload validation
+  (ImageIO type verification for PNG, JPEG, HEIC, GIF, TIFF, and WebP;
+  20 MB size and 40 MP dimension bounds). Safely inserts the
+  POSIX-quoted remote path into the active terminal PTY without
+  appending a newline, allowing the user to inspect or prepend commands
+  before execution.
 - **On-Device Voice AI:** WhisperKit local CoreML models and Apple
   Speech recognition. Local push-to-talk recording, non-secret
   transcripts, editable preview drawers, and strict prohibition against
