@@ -1317,7 +1317,11 @@ final class AppContainer: ObservableObject {
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
                         // Test if the existing connection survived suspension and is responsive.
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
-                        guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
+                        guard self.lifecycleGeneration == generation,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id,
+                              self.activeSession?.state == .connected,
+                              self.connection != nil else { return }
 
                         if isResponsive {
                             // Session is instantly ready with 0 delay and NO reconnect cycle!
