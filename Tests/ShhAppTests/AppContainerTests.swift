@@ -1121,6 +1121,25 @@ final class AppContainerTests: XCTestCase {
         #endif
     }
 
+    func testRapidDisconnectAndReconnectLifecycleSynchronization() async throws {
+        let container = AppContainer.demo()
+        let host = try Host(name: "Demo Host", hostname: "demo.invalid", username: "dev")
+        let challenge = HostKeyChallenge(hostname: "demo.invalid", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        await container.trustStore.save(challenge)
+
+        for _ in 0..<10 {
+            await container.connect(to: host)
+            XCTAssertEqual(container.activeSession?.state, .connected)
+            await container.disconnect()
+            XCTAssertEqual(container.activeSession?.state, .disconnected)
+        }
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        await container.cancelReconnect()
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+    }
+
     // MARK: - Secondary Split Pane Tests
 
     func testSecondaryPaneModeInitialState() {
