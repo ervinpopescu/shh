@@ -713,15 +713,18 @@ final class AppContainerTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mockConnection }
 
-        let container = AppContainer(transport: transport)
+        let reachability = MockReachabilityMonitor(isReachable: false)
+        let container = AppContainer(transport: transport, reachabilityMonitor: reachability)
         let host = try Host(name: "Host", hostname: "host.invalid", username: "user")
 
         // 1. Connect and verify connected
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
 
-        // 2. Emit mid-session error
+        // 2. A transport error followed by close remains failed and keeps the
+        // actionable error visible, even while recovery waits for the network.
         mockConnection.emit(.error(TransportError.networkUnavailable))
+        mockConnection.emit(.closed)
         try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(container.activeSession?.state, .failed)
@@ -729,18 +732,38 @@ final class AppContainerTests: XCTestCase {
         let transcript = container.terminalController.currentTranscript(limit: 10)
         XCTAssertTrue(transcript.contains("[Network unavailable.]"), "Error message must be visible in production terminal surface")
 
-        // 3. Reconnect and emit stream closed
+        // Repeated callbacks must not downgrade the recorded failure.
+        mockConnection.emit(.closed)
+        mockConnection.emit(.error(TransportError.networkUnavailable))
+        await Task.yield()
+        await Task.yield()
+        XCTAssertEqual(container.activeSession?.state, .failed)
+        XCTAssertTrue(container.terminalText.contains("Network unavailable."))
+
+        // 3. Reconnect and emit a clean close. It remains disconnected.
         let mockConnection2 = MockSSHConnection()
         transport.onConnect = { _ in mockConnection2 }
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         mockConnection2.emit(.closed)
+        mockConnection2.emit(.closed)
         try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(container.activeSession?.state, .disconnected)
         let transcript2 = container.terminalController.currentTranscript(limit: 10)
         XCTAssertTrue(transcript2.contains("[Connection closed]"), "Closure notice must be visible in production terminal surface")
+
+        // Explicit disconnect remains authoritative over callbacks already in flight.
+        let mockConnection3 = MockSSHConnection()
+        transport.onConnect = { _ in mockConnection3 }
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        mockConnection3.emit(.error(TransportError.networkUnavailable))
+        await container.disconnect()
+        mockConnection3.emit(.closed)
+        mockConnection3.emit(.error(TransportError.remoteFailure("late callback")))
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
     }
 
     func testSerializedOutboundInteractiveKeystrokeOrdering() async throws {
