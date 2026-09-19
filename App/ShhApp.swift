@@ -127,21 +127,24 @@ struct HostListView: View {
                             selectedDiscoveredService = service
                             showingEditor = true
                         } label: {
-                            HStack {
+                            HStack(spacing: 12) {
                                 Image(systemName: "network")
+                                    .font(.body)
                                     .foregroundStyle(.tint)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(service.name)
-                                        .font(.headline)
+                                        .font(AppTypography.rowTitle)
                                         .foregroundStyle(.primary)
                                     Text("\(service.hostname):\(service.port)")
-                                        .font(.caption)
+                                        .font(AppTypography.rowSubtitle)
                                         .foregroundStyle(.secondary)
                                 }
-                                Spacer()
+                                Spacer(minLength: 8)
                                 Image(systemName: "plus.circle")
+                                    .font(.body)
                                     .foregroundStyle(.tint)
                             }
+                            .frame(minHeight: 44)
                         }
                         .accessibilityIdentifier("discovered-host-\(service.id)")
                     }
@@ -170,8 +173,16 @@ struct HostListView: View {
             }
         }
         .navigationTitle("Hosts")
+        .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $search, prompt: "Search hosts, groups, tags")
-        .toolbar { Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") { Toggle("Healthy only", isOn: $healthyOnly) }; Button("Add", systemImage: "plus") { showingEditor = true } }
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") {
+                    Toggle("Healthy only", isOn: $healthyOnly)
+                }
+                Button("Add", systemImage: "plus") { showingEditor = true }
+            }
+        }
         .sheet(isPresented: $showingEditor, onDismiss: {
             selectedDiscoveredService = nil
             Task { await reload() }
@@ -198,12 +209,30 @@ struct HostListView: View {
 struct HostRow: View {
     let host: Host
     var body: some View {
-        HStack {
-            Image(systemName: "server.rack").foregroundStyle(.tint)
-            VStack(alignment: .leading) { Text(host.name).font(.headline); Text(host.address).font(.caption).foregroundStyle(.secondary); HStack { if host.groupID != nil { Text("Group").tagChip() }; if !host.tagIDs.isEmpty { Text("\(host.tagIDs.count) tag\(host.tagIDs.count == 1 ? "" : "s")").tagChip() } } }
-            Spacer()
-            Text(host.health.label).font(.caption2).foregroundStyle(host.health == .healthy ? Color.green : Color.secondary).accessibilityLabel("Health \(host.health.label)")
+        HStack(spacing: 12) {
+            Image(systemName: "server.rack")
+                .font(.body)
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(host.name)
+                    .font(AppTypography.rowTitle)
+                Text(host.address)
+                    .font(AppTypography.rowSubtitle)
+                    .foregroundStyle(.secondary)
+                HStack {
+                    if host.groupID != nil { Text("Group").tagChip() }
+                    if !host.tagIDs.isEmpty {
+                        Text("\(host.tagIDs.count) tag\(host.tagIDs.count == 1 ? "" : "s")").tagChip()
+                    }
+                }
+            }
+            Spacer(minLength: 8)
+            Text(host.health.label)
+                .font(AppTypography.rowMetadata)
+                .foregroundStyle(host.health == .healthy ? Color.green : Color.secondary)
+                .accessibilityLabel("Health \(host.health.label)")
         }
+        .frame(minHeight: 44)
     }
 }
 
@@ -314,6 +343,7 @@ struct HostDetailView: View {
             }
         }
         .navigationTitle(host.name)
+        .navigationBarTitleDisplayMode(.inline)
         .task {
             bastionHops = await container.resolveBastionNames(for: host)
         }
@@ -665,10 +695,10 @@ struct HostEditorView: View {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(service.name)
-                                            .font(.headline)
+                                            .font(AppTypography.rowTitle)
                                             .foregroundStyle(.primary)
                                         Text("\(service.hostname):\(service.port)")
-                                            .font(.caption)
+                                            .font(AppTypography.rowSubtitle)
                                             .foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -953,6 +983,7 @@ struct HostEditorView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle(existing == nil ? "New host" : "Edit host")
+            .navigationBarTitleDisplayMode(.inline)
             .task {
                 identities = (try? await container.catalog.identities()) ?? []
                 allHosts = (try? await container.catalog.listHosts()) ?? []
@@ -1127,7 +1158,7 @@ struct HostEditorView: View {
 
 struct SessionDashboardView: View {
     @EnvironmentObject private var container: AppContainer
-    var body: some View { Group { if container.activeSession != nil { SessionView() } else { ContentUnavailableView("No active sessions", systemImage: "rectangle.split.2x1", description: Text("Connect a host to create a foreground session.")) } }.navigationTitle("Sessions") }
+    var body: some View { Group { if container.activeSession != nil { SessionView() } else { ContentUnavailableView("No active sessions", systemImage: "rectangle.split.2x1", description: Text("Connect a host to create a foreground session.")) } }.navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline) }
 }
 
 struct PendingCommand: Identifiable {
@@ -1540,7 +1571,7 @@ struct SessionView: View {
                     }
                 }) {
                     Image(systemName: "arrow.down.right.and.arrow.up.left")
-                        .font(.system(size: 14, weight: .semibold))
+                        .font(.body.weight(.semibold))
                         .foregroundStyle(.primary.opacity(0.85))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
@@ -2325,6 +2356,7 @@ struct ApprovalSheet: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .navigationTitle("Confirm command")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
@@ -2525,7 +2557,7 @@ struct MultiplexerPicker: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
                                     Text(session.name)
-                                        .font(.headline)
+                                        .font(AppTypography.rowTitle)
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     Text(session.sessionID)
@@ -2878,7 +2910,7 @@ struct HerdrAgentCardView: View {
     private var headerTitles: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(pane.label.isEmpty ? pane.id : pane.label)
-                .font(.headline)
+                .font(AppTypography.rowTitle)
                 .lineLimit(1)
                 .truncationMode(.tail)
             if !pane.label.isEmpty && pane.label != pane.id {
@@ -2954,7 +2986,7 @@ struct HerdrOutputSheet: View {
                 } else if let error = errorMessage {
                     VStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle")
-                            .font(.largeTitle)
+                            .font(.title2)
                             .foregroundStyle(.red)
                         Text(error)
                             .font(.subheadline)
@@ -2971,7 +3003,7 @@ struct HerdrOutputSheet: View {
                 } else if output.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "text.alignleft")
-                            .font(.largeTitle)
+                            .font(.title2)
                             .foregroundStyle(.secondary)
                         Text("No recent output available.")
                             .font(.subheadline)
@@ -3483,7 +3515,7 @@ struct HerdrAgentCardsView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(workspace.label.isEmpty ? workspace.id : workspace.label)
-                                        .font(.headline)
+                                        .font(AppTypography.rowTitle)
                                     if !workspace.cwd.isEmpty {
                                         Text(workspace.cwd)
                                             .font(.caption.monospaced())
@@ -3564,7 +3596,7 @@ struct HerdrAgentCardsView: View {
 struct SnippetsView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var snippets: [Snippet] = []
-    var body: some View { List(snippets) { snippet in NavigationLink { SnippetEditor(snippet: snippet) } label: { VStack(alignment: .leading) { Text(snippet.name); Text(snippet.body).font(.caption.monospaced()).foregroundStyle(.secondary) } } }.navigationTitle("Snippets").task { snippets = (try? await container.catalog.snippets()) ?? [] } }
+    var body: some View { List(snippets) { snippet in NavigationLink { SnippetEditor(snippet: snippet) } label: { VStack(alignment: .leading) { Text(snippet.name); Text(snippet.body).font(.caption.monospaced()).foregroundStyle(.secondary) } } }.navigationTitle("Snippets").navigationBarTitleDisplayMode(.inline).task { snippets = (try? await container.catalog.snippets()) ?? [] } }
 }
 struct SnippetEditor: View {
     @EnvironmentObject private var container: AppContainer
@@ -3572,9 +3604,9 @@ struct SnippetEditor: View {
     @State private var bodyText: String
     @State private var showApproval = false
     init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
-    var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
+    var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").navigationBarTitleDisplayMode(.inline).sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
 }
-struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring") } }
+struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring").navigationBarTitleDisplayMode(.inline) } }
 struct TerminalThemePickerView: View {
     @EnvironmentObject private var container: AppContainer
 
@@ -3631,6 +3663,7 @@ struct TerminalThemePickerView: View {
             }
         }
         .navigationTitle("Terminal Theme")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 
@@ -3761,6 +3794,7 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

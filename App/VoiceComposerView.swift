@@ -6,7 +6,6 @@ import ShhVoice
 public struct VoiceComposer: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @State private var selectedMode: VoiceInputMode = .shellCommand
     @State private var previewText: String = ""
@@ -124,7 +123,7 @@ public struct VoiceComposer: View {
         VStack(spacing: 16) {
             Spacer()
             Image(systemName: "mic.slash.circle.fill")
-                .font(.system(size: 64))
+                .font(.largeTitle)
                 .foregroundStyle(.secondary)
 
             Text("Voice Input Disabled")
@@ -157,7 +156,7 @@ public struct VoiceComposer: View {
         VStack(spacing: 20) {
             Spacer()
             Image(systemName: "arrow.down.circle.fill")
-                .font(.system(size: 64))
+                .font(.largeTitle)
                 .foregroundStyle(Color.accentColor)
 
             Text("Whisper Model Required")
@@ -311,7 +310,7 @@ public struct VoiceComposer: View {
                             .font(.headline)
                             .foregroundStyle(.red)
                         Text(formatDuration(recordingDuration))
-                            .font(.system(.title, design: .monospaced).bold())
+                            .font(.title2.monospaced().bold())
                             .foregroundStyle(.primary)
                     }
                 } else {
@@ -348,7 +347,7 @@ public struct VoiceComposer: View {
                     .shadow(color: buttonBackgroundColor.opacity(0.4), radius: 12, x: 0, y: 4)
 
                 Image(systemName: isSlideToCancel ? "xmark" : (container.isRecordingVoice ? "waveform" : "mic.fill"))
-                    .font(.system(size: 42))
+                    .font(.title2)
                     .foregroundStyle(.white)
             }
             .gesture(
