@@ -379,17 +379,14 @@ public final class BonjourSSHDiscovery: ObservableObject {
         for target in targets where resolutionTasks[target.key] == nil && resolutions[target.key] == nil {
             let resolver = resolverFactory(target.name, target.type, target.domain)
             resolvers[target.key] = resolver
-            let task = Task { [weak self] in
+            let task = Task { @MainActor [weak self] in
                 let resolution = await resolver.resolve()
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    guard let self else { return }
-                    if self.isSearching, let resolution {
-                        self.apply(resolution, for: target.key, name: target.name, domain: target.domain)
-                    } else {
-                        self.resolutionTasks[target.key] = nil
-                        self.resolvers[target.key] = nil
-                    }
+                guard !Task.isCancelled, let self else { return }
+                if self.isSearching, let resolution {
+                    self.apply(resolution, for: target.key, name: target.name, domain: target.domain)
+                } else {
+                    self.resolutionTasks[target.key] = nil
+                    self.resolvers[target.key] = nil
                 }
             }
             resolutionTasks[target.key] = task

@@ -222,6 +222,7 @@ final class AppContainer: ObservableObject {
     // deciding whether to reconnect, preserving the session with zero delay if it survived.
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
+    private var hasObservedTransportError = false
     private var lifecycleGeneration = 0
     private var foregroundRecoveryTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
@@ -650,6 +651,7 @@ final class AppContainer: ObservableObject {
         isSceneInBackground = false
         isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
+        hasObservedTransportError = false
         let connectionGeneration = lifecycleGeneration
         lastConnectionFailure = nil
         await cancelVoiceRecording()
@@ -687,6 +689,7 @@ final class AppContainer: ObservableObject {
         connection = nil
         await oldConnection?.close()
         _ = await previousEventTask?.result
+        hasObservedTransportError = false
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         terminalGrid = TerminalGrid()
@@ -884,7 +887,15 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
-                        self.activeSession?.state = .disconnected
+                        // Closing is the terminal event for a clean drop. If a
+                        // transport error was already observed for this session,
+                        // retain failed so the actionable error remains visible.
+                        if self.activeSession?.state != .failed,
+                           !self.hasObservedTransportError {
+                            self.activeSession?.state = .disconnected
+                        } else {
+                            self.activeSession?.state = .failed
+                        }
                         self.detachCallbacks()
                         self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
                         self.redactor = Redactor()
@@ -905,7 +916,16 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
-                        self.activeSession?.state = .failed
+                        self.hasObservedTransportError = true
+                        if (error as? TransportError) == .networkUnavailable,
+                           !self.reachabilityMonitor.isReachable {
+                            // An established session with no network is disconnected,
+                            // not failed. Keep the transport error marker so a later
+                            // close still preserves the actionable failure state.
+                            self.activeSession?.state = .disconnected
+                        } else {
+                            self.activeSession?.state = .failed
+                        }
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
                         self.terminalText += "\n" + message
@@ -931,6 +951,7 @@ final class AppContainer: ObservableObject {
                 self.stopHerdrPolling()
                 self.isProbingTmux = false
                 self.isProbingHerdr = false
+                self.hasObservedTransportError = true
                 self.activeSession?.state = .failed
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
@@ -955,7 +976,12 @@ final class AppContainer: ObservableObject {
               activeHost?.id == host.id else { return }
         isForegroundRecoveryInProgress = false
         guard reachabilityMonitor.isReachable else {
-            activeSession?.state = .disconnected
+            // A transport error is already represented as failed and must not be
+            // downgraded to disconnected while recovery waits for the network.
+            // Clean close paths set disconnected before reaching this branch.
+            if activeSession?.state != .failed {
+                activeSession?.state = .disconnected
+            }
             reconnectState = .failed(reason: "Network unavailable.")
             return
         }
@@ -1007,6 +1033,7 @@ final class AppContainer: ObservableObject {
         redactor = Redactor()
         terminalController.reset()
 
+        hasObservedTransportError = false
         let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
         activeSession = session
 
@@ -1195,7 +1222,11 @@ final class AppContainer: ObservableObject {
                 reconnectState = .failed(reason: "Network unavailable.")
                 return
             } else if activeSession != nil {
-                activeSession?.state = .disconnected
+                // Do not erase an actionable transport failure when the path
+                // update arrives after the failure event.
+                if activeSession?.state != .failed {
+                    activeSession?.state = .disconnected
+                }
                 reconnectState = .failed(reason: "Network unavailable.")
             }
             return
@@ -1277,13 +1308,12 @@ final class AppContainer: ObservableObject {
             }
         }
 
-        guard reachabilityMonitor.isReachable, !reconnectState.isReconnecting else { return }
+        guard !reconnectState.isReconnecting else { return }
         isNetworkRecoveryInProgress = true
-        let recoveryTask = await reconnectCoordinator.start { [weak self] attempt in
+        _ = await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
         }
-        await recoveryTask.value
     }
 
     func handleScenePhaseChange(_ phase: ScenePhase) {
@@ -1319,8 +1349,13 @@ final class AppContainer: ObservableObject {
                           !self.isExplicitDisconnect else { return }
                     // Ensure a reconnect that was invalidated by backgrounding
                     // cannot cancel the new foreground recovery after it starts.
-                    await self.reconnectCoordinator.cancel()
-                    self.reconnectState = await self.reconnectCoordinator.state
+                    // Healthy sessions do not need a coordinator generation bump;
+                    // avoiding that actor hop keeps repeated lifecycle probes
+                    // ordered as connected -> connecting -> connected.
+                    if self.reconnectState.isReconnecting {
+                        await self.reconnectCoordinator.cancel()
+                        self.reconnectState = await self.reconnectCoordinator.state
+                    }
                     guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
 
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
