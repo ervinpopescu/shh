@@ -1,0 +1,15 @@
+{
+  "name": "Shh branch review",
+  "env": {
+    "REVIEW_SCRIPT": "${SHH_REVIEW_SCRIPT:-/Users/ervin/Desktop/review-branches.sh}"
+  },
+  "steps": [
+    {
+      "name": "Review current branch",
+      "command": "branch=\"$(git branch --show-current)\" || { printf '%s\\n' 'ERROR: unable to determine current worktree branch with git branch --show-current.' >&2; exit 1; }; [ -n \"$branch\" ] || { printf '%s\\n' 'ERROR: current worktree is detached; cannot review without a branch.' >&2; exit 1; }; if [ -n \"${SHH_REVIEW_DEVICE_UDID:-}\" ]; then [ -n \"${SHH_DEVELOPMENT_TEAM:-}\" ] || { printf '%s\\n' 'ERROR: SHH_REVIEW_DEVICE_UDID requires SHH_DEVELOPMENT_TEAM.' >&2; exit 1; }; \"$REVIEW_SCRIPT\" --branch \"$branch\" --device-udid \"$SHH_REVIEW_DEVICE_UDID\" --development-team \"$SHH_DEVELOPMENT_TEAM\"; else \"$REVIEW_SCRIPT\" --branch \"$branch\"; fi"
+    }
+  ],
+  "manual_test": {
+    "enabled": false
+  }
+}
