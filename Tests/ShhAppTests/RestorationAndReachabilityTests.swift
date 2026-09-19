@@ -371,9 +371,12 @@ final class RestorationAndReachabilityTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .disconnected)
         XCTAssertTrue(container.isExplicitDisconnect)
 
-        // Network changes and scene enters active
+        // Network changes and the scene cycles through inactive/background/active.
+        // Explicit disconnect must suppress every lifecycle trigger.
         reachability.setReachable(false)
         reachability.setReachable(true)
+        container.handleScenePhaseChange(ScenePhase.inactive)
+        container.handleScenePhaseChange(ScenePhase.background)
         container.handleScenePhaseChange(ScenePhase.active)
         try await Task.sleep(nanoseconds: 50_000_000)
 
@@ -437,6 +440,86 @@ final class RestorationAndReachabilityTests: XCTestCase {
     }
 
     // MARK: - Background Grace Period, Expiration & Responsiveness Lifecycle Tests
+
+    func testAppContainerRepeatedInactiveBackgroundForegroundTransitionsPreserveSession() async throws {
+        let connection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return connection
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Repeated Lifecycle Host", hostname: "repeated.invalid", username: "dev")
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        for _ in 0..<3 {
+            container.handleScenePhaseChange(.inactive)
+            container.handleScenePhaseChange(.background)
+            XCTAssertEqual(container.activeSession?.state, .connected)
+            XCTAssertFalse(connection.isClosed)
+
+            container.handleScenePhaseChange(.active)
+            for _ in 0..<8 { await Task.yield() }
+            XCTAssertEqual(container.activeSession?.state, .connected)
+            XCTAssertEqual(connectCount, 1, "A responsive session must not reconnect across repeated transitions")
+        }
+
+        await container.disconnect()
+    }
+
+    func testAppContainerInFlightConnectIsInvalidatedByBackgroundAndRecoveredOnForeground() async throws {
+        let connectStarted = LifecycleGate()
+        let connectGate = LifecycleGate()
+        let initialConnection = MockSSHConnection()
+        let recoveredConnection = MockSSHConnection()
+        let recoveryExpectation = expectation(description: "foreground recovery connects")
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            if connectCount == 1 {
+                await connectStarted.open()
+                await connectGate.wait()
+                return initialConnection
+            }
+            recoveryExpectation.fulfill()
+            return recoveredConnection
+        }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "In Flight Lifecycle Host", hostname: "in-flight.invalid", username: "dev")
+        let initialConnectTask = Task { @MainActor in
+            await container.connect(to: host)
+        }
+
+        await connectStarted.wait()
+        container.handleScenePhaseChange(.inactive)
+        container.handleScenePhaseChange(.background)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        await connectGate.open()
+        await initialConnectTask.value
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(initialConnection.isClosed, "A connection completing after backgrounding must be discarded")
+
+        container.handleScenePhaseChange(.active)
+        await fulfillment(of: [recoveryExpectation], timeout: 2.0)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(connectCount, 2)
+
+        await container.disconnect()
+    }
 
     func testAppContainerBackgroundTaskAcquisitionAndInstantForegroundResume() async throws {
         let mockConnection = MockSSHConnection()

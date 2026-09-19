@@ -219,6 +219,7 @@ final class AppContainer: ObservableObject {
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
     private var lifecycleGeneration = 0
+    private var foregroundRecoveryTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
@@ -464,9 +465,10 @@ final class AppContainer: ObservableObject {
         }
 
         Task { [weak self] in
-            await coordinator.setStateChangeHandler { [weak self] newState in
+            await coordinator.setGenerationStateChangeHandler { [weak self] newState, generation in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self,
+                          await coordinator.currentGeneration == generation else { return }
                     self.reconnectState = newState
                     switch newState {
                     case .idle, .connected, .cancelled, .exhausted, .failed:
@@ -638,6 +640,8 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         isSceneInBackground = false
         isNetworkRecoveryInProgress = false
@@ -1123,6 +1127,8 @@ final class AppContainer: ObservableObject {
     func cancelReconnect() async {
         isExplicitDisconnect = true
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         tmuxRefreshGeneration += 1
         herdrRefreshGeneration += 1
@@ -1277,7 +1283,12 @@ final class AppContainer: ObservableObject {
             }
         }
         switch phase {
-        case .background:
+        case .inactive, .background:
+            // iOS reports .inactive before .background when the scene is
+            // covered or sent to the app switcher. Treat both phases as a
+            // suspension boundary so recovery cannot start while the scene is
+            // no longer interactive. The operation is idempotent when both
+            // callbacks arrive for the same transition.
             enterBackground()
         case .active:
             let wasInBackground = isSceneInBackground
@@ -1292,7 +1303,8 @@ final class AppContainer: ObservableObject {
 
             if wasInBackground {
                 let generation = lifecycleGeneration
-                Task { @MainActor [weak self] in
+                foregroundRecoveryTask?.cancel()
+                let recoveryTask = Task { @MainActor [weak self] in
                     guard let self,
                           self.lifecycleGeneration == generation,
                           !self.isExplicitDisconnect else { return }
@@ -1337,6 +1349,7 @@ final class AppContainer: ObservableObject {
                         }
                     }
                 }
+                foregroundRecoveryTask = recoveryTask
             } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
                 // An already-running coordinator owns its backoff. Do not
                 // restart it for repeated .active notifications.
@@ -1353,6 +1366,8 @@ final class AppContainer: ObservableObject {
         guard !isSceneInBackground else { return }
         isSceneInBackground = true
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         let backgroundGeneration = lifecycleGeneration
 
@@ -1527,6 +1542,8 @@ final class AppContainer: ObservableObject {
         resetVoiceState()
         isExplicitDisconnect = true
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         isSceneInBackground = false
         tmuxRefreshGeneration += 1

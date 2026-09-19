@@ -47,6 +47,7 @@ public actor ReconnectCoordinator {
     private let jitter: ReconnectJitter
     private var activeTask: Task<Void, Never>?
     private var stateChangeHandler: (@Sendable (ReconnectState) -> Void)?
+    private var generationStateChangeHandler: (@Sendable (ReconnectState, Int) -> Void)?
 
     public static let defaultClock: ReconnectClock = { seconds in
         try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
@@ -74,6 +75,13 @@ public actor ReconnectCoordinator {
 
     public func setStateChangeHandler(_ handler: (@Sendable (ReconnectState) -> Void)?) {
         self.stateChangeHandler = handler
+    }
+
+    /// Installs a state observer that also receives the coordinator generation.
+    /// Consumers that launch asynchronous UI work can reject notifications from
+    /// a cancelled recovery run after a newer run has started.
+    public func setGenerationStateChangeHandler(_ handler: (@Sendable (ReconnectState, Int) -> Void)?) {
+        self.generationStateChangeHandler = handler
     }
 
     /// Computes base backoff: 1s for attempt 1, 2s for attempt 2, 4s for attempt 3,
@@ -181,5 +189,6 @@ public actor ReconnectCoordinator {
         guard self.currentGeneration == generation else { return }
         self.state = newState
         self.stateChangeHandler?(newState)
+        self.generationStateChangeHandler?(newState, generation)
     }
 }
