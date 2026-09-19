@@ -47,6 +47,7 @@ public actor ReconnectCoordinator {
     private let jitter: ReconnectJitter
     private var activeTask: Task<Void, Never>?
     private var stateChangeHandler: (@Sendable (ReconnectState) -> Void)?
+    private var generationStateChangeHandler: (@Sendable (ReconnectState, Int) -> Void)?
 
     public static let defaultClock: ReconnectClock = { seconds in
         try await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
@@ -76,6 +77,13 @@ public actor ReconnectCoordinator {
         self.stateChangeHandler = handler
     }
 
+    /// Installs a state observer that also receives the coordinator generation.
+    /// Consumers that launch asynchronous UI work can reject notifications from
+    /// a cancelled recovery run after a newer run has started.
+    public func setGenerationStateChangeHandler(_ handler: (@Sendable (ReconnectState, Int) -> Void)?) {
+        self.generationStateChangeHandler = handler
+    }
+
     /// Computes base backoff: 1s for attempt 1, 2s for attempt 2, 4s for attempt 3,
     /// 8s for attempt 4, 16s for attempt 5, capped at 32s.
     public static func baseDelay(for attempt: Int) -> TimeInterval {
@@ -92,20 +100,35 @@ public actor ReconnectCoordinator {
         return min(max(base, base + offset), maxBackoff)
     }
 
-    public func start(connect: @escaping ReconnectConnectAction) {
+    /// Starts a recovery run and returns its completion task.
+    ///
+    /// Callers that need deterministic ordering can await the returned task. The
+    /// coordinator still owns cancellation and generation checks, so a stale run
+    /// cannot publish state or replace a newer transport.
+    @discardableResult
+    public func start(connect: @escaping ReconnectConnectAction) -> Task<Void, Never> {
         cancel()
 
         currentGeneration += 1
         let generation = currentGeneration
         currentAttempt = 0
 
-        activeTask = Task { [weak self] in
+        let task = Task { [weak self] in
             await self?.run(generation: generation, connect: connect)
+            await self?.finish(generation: generation)
         }
+        activeTask = task
+        return task
     }
 
-    public func retryNow(connect: @escaping ReconnectConnectAction) {
+    @discardableResult
+    public func retryNow(connect: @escaping ReconnectConnectAction) -> Task<Void, Never> {
         start(connect: connect)
+    }
+
+    private func finish(generation: Int) {
+        guard currentGeneration == generation else { return }
+        activeTask = nil
     }
 
     public func cancel() {
@@ -181,5 +204,6 @@ public actor ReconnectCoordinator {
         guard self.currentGeneration == generation else { return }
         self.state = newState
         self.stateChangeHandler?(newState)
+        self.generationStateChangeHandler?(newState, generation)
     }
 }

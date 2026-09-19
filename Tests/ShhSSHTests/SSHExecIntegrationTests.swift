@@ -528,4 +528,44 @@ final class SSHExecIntegrationTests: XCTestCase {
         let responsive = await connection.testResponsiveness(timeout: 1.0)
         XCTAssertFalse(responsive)
     }
+
+    func testResponsivenessTreatsForwardingPolicyRejectionAsLiveSSH() async throws {
+        let server = SSHTestServer()
+        server.rejectTCPForwardingRequests = true
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 10.0,
+            keepaliveTimeout: 1.0
+        )
+        addTeardownBlock { await connection.close() }
+
+        let responsive = await connection.testResponsiveness(timeout: 1.0)
+        XCTAssertTrue(
+            responsive,
+            "A request failure proves the SSH peer is responsive even when forwarding is disabled"
+        )
+    }
+
+    func testResponsivenessTimeoutIsBoundedWhenPeerNeverReplies() async throws {
+        let server = SSHTestServer()
+        server.suppressTCPForwardingResponses = true
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 10.0,
+            keepaliveTimeout: 1.0
+        )
+        addTeardownBlock { await connection.close() }
+
+        let responsive = await connection.testResponsiveness(timeout: 0.1)
+        XCTAssertFalse(
+            responsive,
+            "Foreground recovery must not hang on a black-holed SSH response"
+        )
+    }
 }
