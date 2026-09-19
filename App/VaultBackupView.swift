@@ -120,6 +120,7 @@ struct VaultBackupView: View {
             }
         }
         .navigationTitle("Vault Backup & Sync")
+        .navigationBarTitleDisplayMode(.inline)
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [
@@ -360,6 +361,7 @@ struct VaultBackupView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Decrypt Backup")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") {
@@ -413,6 +415,7 @@ struct VaultBackupView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .navigationTitle("Backup Preview")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") {

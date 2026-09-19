@@ -350,7 +350,7 @@ struct PortForwardingRuleRow: View {
             ViewThatFits(in: .horizontal) {
                 HStack(alignment: .center) {
                     Text(rule.name)
-                        .font(.headline)
+                        .font(AppTypography.rowTitle)
                     Spacer()
                     PortForwardingTypeBadge(type: rule.type)
                     if isConnected {
@@ -359,7 +359,7 @@ struct PortForwardingRuleRow: View {
                 }
                 VStack(alignment: .leading, spacing: 4) {
                     Text(rule.name)
-                        .font(.headline)
+                        .font(AppTypography.rowTitle)
                     HStack {
                         PortForwardingTypeBadge(type: rule.type)
                         if isConnected {

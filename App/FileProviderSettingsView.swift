@@ -53,6 +53,7 @@ struct FileProviderSettingsView: View {
             }
         }
         .navigationTitle("File Provider Domains")
+        .navigationBarTitleDisplayMode(.inline)
         .task {
             container.fileProviderDomainError = nil
             errorMessage = nil
@@ -100,9 +101,9 @@ struct FileProviderSettingsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(host.name)
-                        .font(.headline)
+                        .font(AppTypography.rowTitle)
                     Text("\(host.username)@\(host.hostname):\(host.port)")
-                        .font(.caption)
+                        .font(AppTypography.rowSubtitle)
                         .foregroundStyle(.secondary)
                 }
 
