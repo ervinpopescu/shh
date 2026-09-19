@@ -178,10 +178,11 @@ final class ReconnectAndRestorationTests: XCTestCase {
             }
         }
 
-        await coordinator.start { attempt in
+        let run = await coordinator.start { attempt in
             await attemptsRecorded.append(attempt)
             throw TransportError.networkUnavailable
         }
+        await run.value
 
         await fulfillment(of: [expectation], timeout: 2.0)
 
@@ -206,13 +207,14 @@ final class ReconnectAndRestorationTests: XCTestCase {
             }
         }
 
-        await coordinator.start { attempt in
+        let run = await coordinator.start { attempt in
             await attemptsRecorded.append(attempt)
             if attempt < 3 {
                 throw TransportError.timeout
             }
             // Attempt 3 succeeds!
         }
+        await run.value
 
         await fulfillment(of: [expectation], timeout: 2.0)
 

@@ -1189,6 +1189,9 @@ struct SessionView: View {
     }
 
     private var connectionStatusColor: Color {
+        if container.isForegroundRecoveryInProgress {
+            return .yellow
+        }
         switch container.reconnectState {
         case .waiting, .connecting:
             return .yellow
@@ -1205,6 +1208,9 @@ struct SessionView: View {
     }
 
     private var connectionStatusText: String {
+        if container.isForegroundRecoveryInProgress {
+            return "Checking connection"
+        }
         switch container.reconnectState {
         case .waiting:
             return "Reconnecting"
@@ -1637,7 +1643,23 @@ struct SessionView: View {
 
     @ViewBuilder
     private var reconnectBanner: some View {
-        switch container.reconnectState {
+        if container.isForegroundRecoveryInProgress {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Checking connection after returning to the foreground...")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.yellow.opacity(0.15))
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Checking connection after returning to the foreground")
+            .accessibilityIdentifier("foreground-recovery-banner")
+        } else {
+            switch container.reconnectState {
         case .waiting(let attempt, let delay):
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
@@ -1782,6 +1804,27 @@ struct SessionView: View {
             .padding(.vertical, 6)
             .background(Color.orange.opacity(0.15))
             Divider()
+        case .failed(let reason):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+                Text(reason)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Retry") {
+                    Task { await container.retryReconnect() }
+                }
+                .font(.caption.bold())
+                .accessibilityIdentifier("reconnect-retry-button")
+                .accessibilityLabel("Retry connection")
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 6)
+            .background(Color.red.opacity(0.15))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("reconnect-failure-banner")
+            Divider()
         case .cancelled:
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
@@ -1812,8 +1855,9 @@ struct SessionView: View {
             .padding(.vertical, 6)
             .background(Color.gray.opacity(0.15))
             Divider()
-        default:
-            EmptyView()
+            default:
+                EmptyView()
+            }
         }
     }
 

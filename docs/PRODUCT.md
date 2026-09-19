@@ -32,9 +32,13 @@ integration without third-party cloud servers or subscription telemetry.
 - **Session Lifecycle & Background Keepalive:** Finite iOS background
   grace period execution via standard UIKit background tasks, keeping
   active SSH, Mosh, port forwarding, and terminal sessions alive without
-  silent audio or background audio modes. Probes transport responsiveness
-  via keepalive requests upon foreground return before initiating
-  reconnection, enabling instant resumption when connections survive.
+  silent audio or background audio modes. Backgrounding never proactively
+  closes an active session. Because iOS may suspend the process after the
+  grace period, socket survival is not guaranteed: on foreground return,
+  Shh probes transport responsiveness, keeps the existing session when the
+  probe succeeds, and deterministically reconnects and restores the last
+  multiplexer target when it fails. A forwarding-policy rejection is a live
+  SSH response, not a failed probe.
 - **Host & Identity Management:** Host configurations, grouping, tags,
   health status, and opaque Keychain references. Private keys are never
   exposed as raw fields of `Host`. Host connections resolve exact

@@ -105,6 +105,10 @@ final class AppContainer: ObservableObject {
     @Published public var lastConnectionFailure: ConnectionFailure?
     @Published public var catalogUpdateToken: UUID = UUID()
     @Published var reconnectState: ReconnectState = .idle
+    /// True while foreground return is verifying the previous transport. The
+    /// session is reported as connecting during this interval instead of
+    /// presenting stale connected state while a probe is in flight.
+    @Published var isForegroundRecoveryInProgress = false
     @Published var tmuxAvailability: TmuxAvailability = .unavailable(reason: "Not connected")
     @Published var tmuxSessions: [TmuxSessionInfo] = []
     @Published var isProbingTmux: Bool = false
@@ -219,6 +223,7 @@ final class AppContainer: ObservableObject {
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
     private var lifecycleGeneration = 0
+    private var foregroundRecoveryTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
@@ -464,9 +469,10 @@ final class AppContainer: ObservableObject {
         }
 
         Task { [weak self] in
-            await coordinator.setStateChangeHandler { [weak self] newState in
+            await coordinator.setGenerationStateChangeHandler { [weak self] newState, generation in
                 Task { @MainActor [weak self] in
-                    guard let self else { return }
+                    guard let self,
+                          await coordinator.currentGeneration == generation else { return }
                     self.reconnectState = newState
                     switch newState {
                     case .idle, .connected, .cancelled, .exhausted, .failed:
@@ -638,8 +644,11 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         isSceneInBackground = false
+        isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
         let connectionGeneration = lifecycleGeneration
         lastConnectionFailure = nil
@@ -944,6 +953,7 @@ final class AppContainer: ObservableObject {
         guard !isExplicitDisconnect, !isSceneInBackground,
               !isNetworkRecoveryInProgress,
               activeHost?.id == host.id else { return }
+        isForegroundRecoveryInProgress = false
         guard reachabilityMonitor.isReachable else {
             activeSession?.state = .disconnected
             reconnectState = .failed(reason: "Network unavailable.")
@@ -962,10 +972,11 @@ final class AppContainer: ObservableObject {
                 self.reconnectState = .failed(reason: "Network unavailable.")
                 return
             }
-            await self.reconnectCoordinator.start { [weak self] attempt in
+            let recoveryTask = await self.reconnectCoordinator.start { [weak self] attempt in
                 guard let self else { return }
                 try await self.performReconnect(to: host, attempt: attempt)
             }
+            await recoveryTask.value
         }
     }
 
@@ -1122,7 +1133,10 @@ final class AppContainer: ObservableObject {
 
     func cancelReconnect() async {
         isExplicitDisconnect = true
+        isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         tmuxRefreshGeneration += 1
         herdrRefreshGeneration += 1
@@ -1157,10 +1171,11 @@ final class AppContainer: ObservableObject {
         }
         isExplicitDisconnect = false
         isNetworkRecoveryInProgress = true
-        await reconnectCoordinator.start { [weak self] attempt in
+        let recoveryTask = await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
         }
+        await recoveryTask.value
     }
 
     func handleReachabilityChange(_ isReachable: Bool) {
@@ -1264,10 +1279,11 @@ final class AppContainer: ObservableObject {
 
         guard reachabilityMonitor.isReachable, !reconnectState.isReconnecting else { return }
         isNetworkRecoveryInProgress = true
-        await reconnectCoordinator.start { [weak self] attempt in
+        let recoveryTask = await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
         }
+        await recoveryTask.value
     }
 
     func handleScenePhaseChange(_ phase: ScenePhase) {
@@ -1277,6 +1293,10 @@ final class AppContainer: ObservableObject {
             }
         }
         switch phase {
+        case .inactive:
+            // Inactive is also used for transient interruptions such as
+            // system sheets and calls. It is not a suspension boundary.
+            break
         case .background:
             enterBackground()
         case .active:
@@ -1292,7 +1312,8 @@ final class AppContainer: ObservableObject {
 
             if wasInBackground {
                 let generation = lifecycleGeneration
-                Task { @MainActor [weak self] in
+                foregroundRecoveryTask?.cancel()
+                let recoveryTask = Task { @MainActor [weak self] in
                     guard let self,
                           self.lifecycleGeneration == generation,
                           !self.isExplicitDisconnect else { return }
@@ -1303,12 +1324,23 @@ final class AppContainer: ObservableObject {
                     guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
 
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
-                        // Test if the existing connection survived suspension and is responsive.
+                        // A process may have been suspended after the finite
+                        // background grace period. Report the session as
+                        // connecting while the bounded transport probe runs so
+                        // the UI never claims a dead socket is ready.
+                        self.isForegroundRecoveryInProgress = true
+                        self.activeSession?.state = .connecting
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
-                        guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
+                        guard self.lifecycleGeneration == generation,
+                              !self.isExplicitDisconnect,
+                              self.activeSession?.id == session.id,
+                              self.activeSession?.state == .connecting,
+                              self.connection != nil else { return }
 
                         if isResponsive {
-                            // Session is instantly ready with 0 delay and NO reconnect cycle!
+                            self.isForegroundRecoveryInProgress = false
+                            self.activeSession?.state = .connected
+                            // Session is instantly ready with 0 delay and NO reconnect cycle.
                             self.updateIdleTimerState()
                             return
                         } else {
@@ -1323,12 +1355,14 @@ final class AppContainer: ObservableObject {
                             await self.portForwardingManager?.stopAll()
                             self.forwardingSessions = []
                             await deadConn?.close()
+                            self.isForegroundRecoveryInProgress = false
                             self.activeSession?.state = .disconnected
                             if let host = self.activeHost {
                                 self.handleConnectionDrop(host: host)
                             }
                         }
                     } else if let host = self.activeHost, (self.activeSession?.state == .failed || self.activeSession?.state == .disconnected) {
+                        self.isForegroundRecoveryInProgress = false
                         // The foreground transition already invalidated any
                         // prior coordinator generation. Preserve its backoff
                         // if a newer coordinator is still active.
@@ -1337,6 +1371,7 @@ final class AppContainer: ObservableObject {
                         }
                     }
                 }
+                foregroundRecoveryTask = recoveryTask
             } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
                 // An already-running coordinator owns its backoff. Do not
                 // restart it for repeated .active notifications.
@@ -1352,7 +1387,10 @@ final class AppContainer: ObservableObject {
     private func enterBackground() {
         guard !isSceneInBackground else { return }
         isSceneInBackground = true
+        isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         let backgroundGeneration = lifecycleGeneration
 
@@ -1526,7 +1564,10 @@ final class AppContainer: ObservableObject {
         await cancelVoiceRecording()
         resetVoiceState()
         isExplicitDisconnect = true
+        isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
+        foregroundRecoveryTask?.cancel()
+        foregroundRecoveryTask = nil
         lifecycleGeneration += 1
         isSceneInBackground = false
         tmuxRefreshGeneration += 1

@@ -76,11 +76,10 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     private func sendKeepaliveProbe(timeout: TimeInterval) async throws {
-        let requestFuture = parentChannel.eventLoop.flatSubmit {
+        let eventLoop = parentChannel.eventLoop
+        let requestFuture = eventLoop.flatSubmit {
             self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { handler in
-                let promise = self.parentChannel.eventLoop.makePromise(
-                    of: GlobalRequest.TCPForwardingResponse?.self
-                )
+                let promise = eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
                 // cancel-tcpip-forward never creates a listener. It is a
                 // harmless global request that receives a protocol response.
                 handler.sendTCPForwardingRequest(
@@ -91,17 +90,22 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             }
         }
 
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask {
-                try await requestFuture.get()
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(max(0.1, timeout) * 1_000_000_000))
-                throw TransportError.timeout
-            }
-            _ = try await group.next()
-            group.cancelAll()
+        // Do not race an async task against EventLoopFuture.get(). A future
+        // waiting for a lost SSH response is not cancellation-aware, so a task
+        // group can wait forever for that child after the timeout wins. Resolve
+        // a second NIO promise from the event loop instead, which gives the
+        // foreground recovery path a deterministic bound even on a black-holed
+        // socket.
+        let responsePromise = eventLoop.makePromise(of: Void.self)
+        let timeoutTask = eventLoop.scheduleTask(in: .milliseconds(Int64(max(0.1, timeout) * 1_000))) {
+            responsePromise.fail(TransportError.timeout)
         }
+        requestFuture.whenComplete { result in
+            timeoutTask.cancel()
+            responsePromise.completeWith(result.map { _ in () })
+        }
+
+        try await responsePromise.futureResult.get()
     }
 
     public func setRedactor(_ redactor: Redactor) {
@@ -111,6 +115,10 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     /// Sends a keepalive probe over the SSH channel to verify connection responsiveness.
+    ///
+    /// A peer may reject the forwarding probe because TCP forwarding is disabled. That
+    /// is still a completed SSH exchange, so it must not make an otherwise active
+    /// session look dead during foreground recovery.
     public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
         let (closed, active): (Bool, Bool) = lock.withLock {
             (isClosed, parentChannel.isActive && childChannel.isActive)
@@ -119,10 +127,15 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
 
         do {
             try await sendKeepaliveProbe(timeout: timeout)
-            return lock.withLock { !isClosed && parentChannel.isActive && childChannel.isActive }
+        } catch let error as NIOSSHError
+            where error.type == .globalRequestRefused || error.type == .remotePeerDoesNotSupportMessage {
+            // The SSH peer replied at the protocol level. A forwarding policy
+            // rejection is not evidence that the terminal session is dead.
         } catch {
             return false
         }
+
+        return lock.withLock { !isClosed && parentChannel.isActive && childChannel.isActive }
     }
 
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {

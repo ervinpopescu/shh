@@ -229,8 +229,17 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
         lock.withLock { _requestCount }
     }
 
-    init(group: EventLoopGroup) {
+    let rejectTCPForwardingRequests: Bool
+    let suppressTCPForwardingResponses: Bool
+
+    init(
+        group: EventLoopGroup,
+        rejectTCPForwardingRequests: Bool = false,
+        suppressTCPForwardingResponses: Bool = false
+    ) {
         self.group = group
+        self.rejectTCPForwardingRequests = rejectTCPForwardingRequests
+        self.suppressTCPForwardingResponses = suppressTCPForwardingResponses
     }
 
     func tcpForwardingRequest(
@@ -239,6 +248,10 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
         promise: EventLoopPromise<GlobalRequest.TCPForwardingResponse>
     ) {
         lock.withLock { _requestCount += 1 }
+        if rejectTCPForwardingRequests {
+            promise.fail(ChannelError.operationUnsupported)
+            return
+        }
         switch request {
         case .listen(let host, let port):
             let bootstrap = ServerBootstrap(group: group)
@@ -276,6 +289,7 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
             }
 
         case .cancel(_, let port):
+            guard !suppressTCPForwardingResponses else { return }
             let listener = lock.withLock { self.listeners.removeValue(forKey: port) }
             if let listener {
                 listener.close(promise: nil)
@@ -315,6 +329,8 @@ final class SSHTestServer: @unchecked Sendable {
     var execMode: TestServerExecMode = .normal
     var execDelay: TimeInterval? = nil
     var execHandler: (@Sendable (String) -> SSHCommandTestResponse)? = nil
+    var rejectTCPForwardingRequests = false
+    var suppressTCPForwardingResponses = false
 
     private var herdrWorkspaces: [HerdrWorkspace] = SSHTestServer.defaultHerdrWorkspaces()
     private var herdrPaneOutputs: [String: String] = SSHTestServer.defaultHerdrOutputs()
@@ -409,7 +425,11 @@ final class SSHTestServer: @unchecked Sendable {
 
     func start() async throws -> UInt16 {
         let nioKey = NIOSSHPrivateKey(ed25519Key: hostPrivateKey)
-        let globalDelegate = TestServerGlobalRequestDelegate(group: group)
+        let globalDelegate = TestServerGlobalRequestDelegate(
+            group: group,
+            rejectTCPForwardingRequests: rejectTCPForwardingRequests,
+            suppressTCPForwardingResponses: suppressTCPForwardingResponses
+        )
         self.globalRequestDelegate = globalDelegate
         let serverConfig = SSHServerConfiguration(
             hostKeys: [nioKey],
