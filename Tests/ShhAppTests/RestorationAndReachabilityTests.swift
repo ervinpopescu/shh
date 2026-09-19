@@ -489,14 +489,22 @@ final class RestorationAndReachabilityTests: XCTestCase {
                 await connectGate.wait()
                 return initialConnection
             }
-            recoveryExpectation.fulfill()
             return recoveredConnection
         }
 
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in },
+            jitter: ReconnectCoordinator.zeroJitter,
+            onStateChange: { state in
+                if state == .connected {
+                    recoveryExpectation.fulfill()
+                }
+            }
+        )
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: coordinator
         )
         let host = try Host(name: "In Flight Lifecycle Host", hostname: "in-flight.invalid", username: "dev")
         let initialConnectTask = Task { @MainActor in
