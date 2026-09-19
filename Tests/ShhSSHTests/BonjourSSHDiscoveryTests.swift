@@ -1,6 +1,7 @@
 #if canImport(XCTest)
 import XCTest
 import Foundation
+import Combine
 #if canImport(Network)
 import Network
 #endif
@@ -157,12 +158,20 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
             browserFactory: { browser },
             resolverFactory: { _, _, _ in resolver }
         )
+        let resolutionApplied = expectation(description: "Bonjour resolution is applied")
+        let observation = discovery.$discoveredServices.sink { services in
+            guard let service = services.first,
+                  service.hostname == "schweiz.local",
+                  service.port == 2201 else { return }
+            resolutionApplied.fulfill()
+        }
+        defer { observation.cancel() }
 
         discovery.startDiscovery()
         browser.simulateResults([
             NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil)
         ])
-        try await Task.sleep(nanoseconds: 50_000_000)
+        await fulfillment(of: [resolutionApplied], timeout: 1.0)
 
         XCTAssertEqual(discovery.discoveredServices.count, 1)
         XCTAssertEqual(discovery.discoveredServices[0].hostname, "schweiz.local")
