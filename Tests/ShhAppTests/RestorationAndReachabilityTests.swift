@@ -560,6 +560,89 @@ final class RestorationAndReachabilityTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
+    func testBackgroundDuringReconnectIsInvalidatedAndForegroundStartsOneFreshRecovery() async throws {
+        let reconnectGate = LifecycleGate()
+        let firstConnection = MockSSHConnection()
+        let staleConnection = MockSSHConnection()
+        let recoveredConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            switch connectCount {
+            case 1:
+                return firstConnection
+            case 2:
+                await reconnectGate.wait()
+                return staleConnection
+            default:
+                return recoveredConnection
+            }
+        }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Reconnect Lifecycle Host", hostname: "reconnect-lifecycle.invalid", username: "dev")
+
+        await container.connect(to: host)
+        firstConnection.emit(.closed)
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        container.handleScenePhaseChange(.background)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        container.handleScenePhaseChange(.active)
+        await reconnectGate.open()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(connectCount, 3, "Foreground must replace the cancelled reconnect exactly once")
+        XCTAssertTrue(staleConnection.isClosed, "The stale pre-background connection must be closed")
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertFalse(container.reconnectState.isReconnecting)
+    }
+
+    func testNetworkUnavailableDefersReconnectWithoutStormAndExplicitDisconnectWins() async throws {
+        let firstConnection = MockSSHConnection()
+        let recoveredConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connectCount = 0
+        transport.onConnect = { _ in
+            connectCount += 1
+            return connectCount == 1 ? firstConnection : recoveredConnection
+        }
+        let reachability = MockReachabilityMonitor(isReachable: true)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Offline Recovery Host", hostname: "offline-recovery.invalid", username: "dev")
+
+        await container.connect(to: host)
+        reachability.setReachable(false)
+        firstConnection.emit(.error(.networkUnavailable))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(connectCount, 1, "Offline transport events must not spin reconnect attempts")
+        XCTAssertEqual(container.reconnectState, .failed(reason: "Network unavailable."))
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        reachability.setReachable(true)
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        await container.disconnect()
+        reachability.setReachable(false)
+        reachability.setReachable(true)
+        container.handleScenePhaseChange(.active)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(connectCount, 2, "Explicit disconnect must block later reachability recovery")
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+    }
+
     func testAppContainerBackgroundWithoutActiveSessionDoesNotAcquireBackgroundTask() async throws {
         let bgManager = MockBackgroundTaskManager()
         let container = AppContainer(
