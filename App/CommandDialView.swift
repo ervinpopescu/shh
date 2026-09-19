@@ -224,6 +224,19 @@ struct CommandDialSurface: View {
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).stroke(Color.cyan.opacity(0.35), lineWidth: 1))
         .shadow(color: .black.opacity(0.45), radius: 18, y: 8)
         .accessibilityAddTraits(.isModal)
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 44)
+                .onEnded { value in handleDirectionalSwipe(value.translation) }
+        )
+        .accessibilityHint("Swipe up or diagonally up-left to open the next submenu")
+    }
+
+    private func handleDirectionalSwipe(_ translation: CGSize) {
+        guard let direction = DialSwipeDirection.resolve(translation: translation),
+              direction.opensSubmenu else { return }
+
+        let openedNode = navigation.openNextSubmenu(using: direction, in: model)
+        haptics.emit(openedNode == nil ? .boundary : .selection)
     }
 
     private var categoryBrowser: some View {

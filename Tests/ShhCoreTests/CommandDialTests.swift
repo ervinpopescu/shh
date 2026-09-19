@@ -57,6 +57,43 @@ final class CommandDialTests: XCTestCase {
         XCTAssertTrue(state.path.isEmpty)
     }
 
+    func testDirectionalSwipeResolutionAcceptsNorthAndNorthwestOnlyForForwardNavigation() {
+        XCTAssertEqual(DialSwipeDirection.resolve(translation: CGSize(width: 0, height: -80)), .north)
+        XCTAssertEqual(DialSwipeDirection.resolve(translation: CGSize(width: -64, height: -64)), .northwest)
+        XCTAssertEqual(DialSwipeDirection.resolve(translation: CGSize(width: 80, height: 0)), .east)
+        XCTAssertNil(DialSwipeDirection.resolve(translation: CGSize(width: 12, height: -12)))
+        XCTAssertFalse(DialSwipeDirection.east.opensSubmenu)
+        XCTAssertTrue(DialSwipeDirection.northwest.opensSubmenu)
+    }
+
+    func testDirectionalSwipesDescendNestedCategoriesAndStopBeforeLeafActions() throws {
+        let leaf = DialNode(id: "mux.nested.leaf", title: "Nested Leaf", action: .commonKey(.enter))
+        let nested = DialNode(id: "mux.nested", title: "Nested", action: .category(.commonKeys), children: [leaf])
+        let model = CommandDialModel(multiplexerChildren: [nested])
+        let multiplexer = try XCTUnwrap(model.roots.first { $0.id == "root.multiplexer" })
+        var state = CommandDialNavigation(isOpen: true)
+        state.selectCategory(multiplexer)
+
+        let first = state.openNextSubmenu(using: .north, in: model)
+        XCTAssertEqual(first?.id, multiplexer.id)
+        XCTAssertEqual(state.path, [multiplexer.id])
+        XCTAssertEqual(state.breadcrumb, "Shh / \(multiplexer.id)")
+
+        let second = state.openNextSubmenu(using: .northwest, in: model)
+        XCTAssertEqual(second?.id, nested.id)
+        XCTAssertEqual(state.path, [multiplexer.id, nested.id])
+
+        let invalid = state.openNextSubmenu(using: .east, in: model)
+        XCTAssertNil(invalid)
+        XCTAssertEqual(state.path, [multiplexer.id, nested.id])
+
+        // A leaf remains an action, rather than becoming another navigation
+        // level; tap fallback can still dispatch its safe action.
+        XCTAssertEqual(nested.children.first?.action, .commonKey(.enter))
+        XCTAssertNil(state.openNextSubmenu(using: .north, in: model))
+        XCTAssertEqual(state.path, [multiplexer.id, nested.id])
+    }
+
     func testPinnedLiteralsAreBoundedAndDeduplicated() {
         let model = CommandDialModel(pinnedLiterals: ["  ls ", "ls", "", String(repeating: "x", count: 65)])
         let common = model.roots[0]

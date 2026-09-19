@@ -84,6 +84,47 @@ public enum DialActionAvailability: Equatable, Hashable, Sendable {
     case blocked(reason: String)
 }
 
+/// The compass direction resolved from a dial swipe. North and northwest are
+/// the forward gestures used to open the next submenu; the other directions
+/// remain available for gesture math and intentionally do not navigate.
+public enum DialSwipeDirection: Equatable, Sendable {
+    case north
+    case northeast
+    case east
+    case southeast
+    case south
+    case southwest
+    case west
+    case northwest
+
+    public var opensSubmenu: Bool {
+        self == .north || self == .northwest
+    }
+
+    /// Resolves a sufficiently long translation into one of the eight compass
+    /// sectors. A short or zero-length translation is not a swipe.
+    public static func resolve(translation: CGSize, minimumDistance: CGFloat = 44) -> Self? {
+        guard translation.width * translation.width + translation.height * translation.height >=
+                minimumDistance * minimumDistance else { return nil }
+
+        // atan2's positive y axis points down in UIKit, so invert y to make
+        // north the conventional positive pi/2 direction.
+        let angle = atan2(-translation.height, translation.width)
+        let sector = Int(((angle + .pi / 8).truncatingRemainder(dividingBy: 2 * .pi) + 2 * .pi)
+            .truncatingRemainder(dividingBy: 2 * .pi) / (.pi / 4))
+        switch sector {
+        case 0: return .east
+        case 1: return .northeast
+        case 2: return .north
+        case 3: return .northwest
+        case 4: return .west
+        case 5: return .southwest
+        case 6: return .south
+        default: return .southeast
+        }
+    }
+}
+
 public struct DialNode: Identifiable, Hashable, Sendable {
     public let id: String
     public let title: String
@@ -242,6 +283,36 @@ public struct CommandDialNavigation: Equatable, Sendable {
         guard node.isEnabled else { return }
         path.append(node.id)
         selectedNodeID = nil
+    }
+
+    /// Opens the next enabled child submenu in response to a forward swipe.
+    /// The first swipe enters the selected root category, while subsequent
+    /// swipes descend through nested child categories without executing a leaf.
+    @discardableResult
+    public mutating func openNextSubmenu(using direction: DialSwipeDirection,
+                                         in model: CommandDialModel) -> DialNode? {
+        guard isOpen, direction.opensSubmenu else { return nil }
+
+        if path.isEmpty {
+            let category = model.roots.first { $0.id == selectedNodeID && $0.isEnabled }
+                ?? model.roots.first(where: \.isEnabled)
+            guard let category else { return nil }
+            enter(category)
+            return category
+        }
+
+        guard let current = node(at: path, in: model.roots),
+              let child = current.children.first(where: { $0.isEnabled && !$0.children.isEmpty }) else {
+            return nil
+        }
+        enter(child)
+        return child
+    }
+
+    private func node(at path: [String], in nodes: [DialNode]) -> DialNode? {
+        guard let id = path.first, let current = nodes.first(where: { $0.id == id }) else { return nil }
+        guard path.count > 1 else { return current }
+        return node(at: Array(path.dropFirst()), in: current.children)
     }
 
     public var breadcrumb: String {

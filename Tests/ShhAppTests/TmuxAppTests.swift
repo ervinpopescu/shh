@@ -156,6 +156,51 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertTrue(actions.isEmpty)
     }
 
+    func testCommandDialSurfaceRendersNestedSwipeDestinationAndLeafFallback() throws {
+        let leaf = DialNode(id: "mux.review.leaf", title: "Review Leaf", action: .commonKey(.enter))
+        let nested = DialNode(id: "mux.review", title: "Review", action: .category(.commonKeys), children: [leaf])
+        let model = CommandDialModel(multiplexerChildren: [nested])
+        let multiplexer = try XCTUnwrap(model.roots.first { $0.id == "root.multiplexer" })
+        var state = CommandDialNavigation(isOpen: true)
+        state.selectCategory(multiplexer)
+
+        let surface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let hosting = UIHostingController(rootView: surface)
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        hosting.loadViewIfNeeded()
+        hosting.view.layoutIfNeeded()
+
+        XCTAssertEqual(state.openNextSubmenu(using: .north, in: model)?.id, multiplexer.id)
+        XCTAssertEqual(state.openNextSubmenu(using: .northwest, in: model)?.id, nested.id)
+        hosting.rootView = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        hosting.view.setNeedsLayout()
+        hosting.view.layoutIfNeeded()
+        XCTAssertTrue(state.isOpen)
+        XCTAssertEqual(state.path, [multiplexer.id, nested.id])
+        XCTAssertGreaterThan(hosting.view.bounds.height, 0)
+        XCTAssertEqual(nested.children.first?.action, .commonKey(.enter))
+    }
+
     func testCommandDialSurfaceFitsPhoneAndIPad() {
         var state = CommandDialNavigation(isOpen: true)
         let model = CommandDialModel(pinnedLiterals: ["echo ready"])
