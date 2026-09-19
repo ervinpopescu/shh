@@ -1139,11 +1139,20 @@ private actor Gate {
 final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
+    var isResponsive: Bool = true
+    var onTestResponsiveness: (@Sendable (TimeInterval) async -> Bool)?
     private(set) var sentData: [Data] = []
     private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
     var onSend: (@Sendable (Data) async throws -> Void)?
+
+    func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
+        if let onTestResponsiveness {
+            return await onTestResponsiveness(timeout)
+        }
+        return !lock.withLock { isClosed } && isResponsive
+    }
 
     func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -1214,3 +1223,52 @@ final class ControllableTransport: SSHTransport, @unchecked Sendable {
         return MockSSHConnection()
     }
 }
+
+#if canImport(UIKit)
+final class MockBackgroundTaskManager: BackgroundTaskManaging, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var beginTaskCallCount = 0
+    private(set) var endTaskCallCount = 0
+    private(set) var registeredNames: [String?] = []
+    private(set) var activeIdentifiers: Set<UIBackgroundTaskIdentifier> = []
+    private var expirationHandlers: [UIBackgroundTaskIdentifier: @Sendable () -> Void] = [:]
+    private var nextID = 100
+
+    init() {}
+
+    func beginBackgroundTask(withName name: String? = nil, expirationHandler: (@Sendable () -> Void)? = nil) -> UIBackgroundTaskIdentifier {
+        lock.withLock {
+            beginTaskCallCount += 1
+            registeredNames.append(name)
+            let id = UIBackgroundTaskIdentifier(rawValue: nextID)
+            nextID += 1
+            activeIdentifiers.insert(id)
+            if let expirationHandler {
+                expirationHandlers[id] = expirationHandler
+            }
+            return id
+        }
+    }
+
+    func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier) {
+        lock.withLock {
+            guard identifier != .invalid else { return }
+            endTaskCallCount += 1
+            activeIdentifiers.remove(identifier)
+            expirationHandlers.removeValue(forKey: identifier)
+        }
+    }
+
+    func triggerExpiration(for identifier: UIBackgroundTaskIdentifier) {
+        let handler = lock.withLock { expirationHandlers[identifier] }
+        handler?()
+    }
+
+    func triggerAllExpirations() {
+        let handlers = lock.withLock { Array(expirationHandlers.values) }
+        for handler in handlers {
+            handler()
+        }
+    }
+}
+#endif

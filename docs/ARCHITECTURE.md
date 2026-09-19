@@ -57,6 +57,11 @@ extensions.
   Reconciles catalog identity references on mutation and persistence
   load, resolving exact identities without silent degradation, and
   managing reference-counted Keychain credential deletion.
+  Coordinates finite iOS background execution grace periods via
+  standard UIKit background tasks (`BackgroundTaskManaging`),
+  preserving active SSH, Mosh, and port forwarding sessions without
+  background audio modes, and probes transport responsiveness on
+  foreground return before reconnecting.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
   Group storage (`snapshot.json` and `known_hosts.json`).
