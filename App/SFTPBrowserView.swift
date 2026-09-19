@@ -239,7 +239,7 @@ struct FilesView: View {
                     .imageScale(.medium)
                 if activeCount > 0 {
                     Text("\(activeCount)")
-                        .font(.system(size: 10, weight: .bold))
+                        .font(.caption2.bold())
                         .foregroundColor(.white)
                         .padding(3)
                         .background(Color.blue, in: Circle())
