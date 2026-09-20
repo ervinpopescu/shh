@@ -242,7 +242,7 @@ logs device="iphone" seconds="0" udid="":
     export DEVELOPER_DIR="{{ xcode_developer_dir }}"
     mkdir -p tmp/e2e
     seconds="{{ seconds }}"; seconds="${seconds#seconds=}"
-    output="tmp/e2e/$(date -u +%Y%m%dT%H%M%SZ)-$device-app.log"
+    output="tmp/e2e/$(date -u +%Y%m%dT%H%M%SZ)-$device-app-$$.log"
     if [[ "$seconds" == "0" ]]; then xcrun simctl spawn "$target" log stream --style compact --predicate 'process == "Shh"' 2>&1 | tee "$output"; else (xcrun simctl spawn "$target" log stream --style compact --predicate 'process == "Shh"' >"$output" 2>&1 & pid=$!; sleep "$seconds"; kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true); cat "$output"; fi
     echo "Application log: $output"
 
