@@ -218,6 +218,9 @@ jobs:
       - name: Generate Xcode Project
         run: just generate
 
+      - name: Validate App Group Entitlements
+        run: Tests/verify-app-group.sh Shh.xcodeproj 'generic/platform=iOS'
+
       - name: Build Generic iOS Targets (Unsigned)
         run: |
           set -euo pipefail
