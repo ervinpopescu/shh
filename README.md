@@ -58,6 +58,32 @@ xcodegen generate
 open Shh.xcodeproj
 ```
 
+For the repeatable development lifecycle, install `just` and run `just --list`.
+The default full-Xcode toolchain is `/Applications/Xcode.app/Contents/Developer`;
+override it with `DEVELOPER_DIR=...`. Dedicated simulator presets are selected
+without erasing simulator state:
+
+```sh
+just check
+just build device=iphone
+just test device=ipad
+just deploy iphone
+just deploy-device <simulator-or-device-udid>
+just launch ipad
+just logs iphone seconds=30
+just screenshot ipad
+just stop iphone
+just ci
+```
+
+`IPHONE_UDID`, `IPAD_UDID`, and `DERIVED_DATA_PATH` override the presets and
+build location. Simulator builds use ad-hoc signing by default
+(`SIGNING_IDENTITY=-`, `SIGNING_REQUIRED=NO`); physical-device deployment must
+provide the appropriate signing values, for example
+`SIGNING_IDENTITY="Apple Development: ..." SIGNING_REQUIRED=YES just deploy-device <udid>`.
+`just clean` removes only the selected DerivedData directory. Test results,
+logs, and screenshots are written to timestamped paths under `tmp/e2e/`.
+
 The Foundation-only core is also a Swift package:
 
 ```sh
