@@ -128,21 +128,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install XcodeGen
+      - name: Install just and XcodeGen
         run: |
+          if ! command -v just &> /dev/null; then
+            brew install just
+          fi
           if ! command -v xcodegen &> /dev/null; then
             brew install xcodegen
           fi
 
       - name: Select Xcode 16
         run: |
+          selected_xcode=""
           for xcode in /Applications/Xcode_16*.app; do
             if [ -d "$xcode" ]; then
-              echo "Selecting $xcode"
-              sudo xcode-select -s "$xcode"
+              selected_xcode="$xcode"
               break
             fi
           done
+          if [ -z "$selected_xcode" ]; then
+            echo "Error: no Xcode 16 installation found" >&2
+            exit 1
+          fi
+          developer_dir="$selected_xcode/Contents/Developer"
+          echo "Selecting $developer_dir"
+          sudo xcode-select -s "$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
           XCODE_VER=$(xcodebuild -version | head -n 1 | tr ' ' '-')
           echo "XCODE_VERSION=$XCODE_VER" >> "$GITHUB_ENV"
@@ -156,27 +167,36 @@ jobs:
             build/DerivedData/SourcePackages
             build/DerivedData/Build/Intermediates.noindex
             build/DerivedData/Build/Products
-          key: spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-ios-generic-${{ hashFiles('Package.resolved', 'Package.swift', 'project.yml') }}-${{ github.sha }}
+          key: >-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ios-generic-${{ hashFiles('Package.resolved', 'Package.swift',
+            'project.yml') }}-${{ github.sha }}
           restore-keys: |
-            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-ios-generic-${{ hashFiles('Package.resolved', 'Package.swift', 'project.yml') }}-
-            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-ios-generic-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ios-generic-${{ hashFiles('Package.resolved', 'Package.swift',
+            'project.yml') }}-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ios-generic-
 
       - name: Run Core Swift Tests
         run: |
           set -euo pipefail
-          swift test --enable-code-coverage 2>&1 | tee swift-test.log
+          just unit 2>&1 | tee swift-test.log
           PROFDATA=$(find .build -name "default.profdata" | head -n 1)
           BIN=$(find .build -name "ShhCorePackageTests.xctest" | head -n 1)
           if [ -n "$PROFDATA" ] && [ -n "$BIN" ]; then
             TEST_BIN="$BIN/Contents/MacOS/ShhCorePackageTests"
             if [ -f "$TEST_BIN" ]; then
-              xcrun llvm-cov export -format="lcov" "$TEST_BIN" -instr-profile="$PROFDATA" > swift-coverage.lcov || true
+              xcrun llvm-cov export -format="lcov" "$TEST_BIN" \
+                -instr-profile="$PROFDATA" > swift-coverage.lcov || true
             fi
           fi
 
       - name: Upload Core Swift Coverage to Codecov
         if: always()
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        # v5.5.5
+        uses: >-
+          codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac
         with:
           files: swift-coverage.lcov
           flags: swift
@@ -186,7 +206,9 @@ jobs:
 
       - name: Upload Swift Coverage Artifact
         if: always()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        # v4.6.1
+        uses: >-
+          actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: swift-coverage-artifact
           path: swift-coverage.lcov
@@ -194,8 +216,7 @@ jobs:
           retention-days: 7
 
       - name: Generate Xcode Project
-        run: |
-          xcodegen generate
+        run: just generate
 
       - name: Build Generic iOS Targets (Unsigned)
         run: |
@@ -220,11 +241,14 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee xcodebuild-fp.log
 
-          Tests/verify-app-icon.sh build/DerivedData/Build/Products/Debug-iphoneos/Shh.app
+          Tests/verify-app-icon.sh \
+            build/DerivedData/Build/Products/Debug-iphoneos/Shh.app
 
       - name: Upload Core Build and Test Logs on Failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        # v4.6.1
+        uses: >-
+          actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: ci-failure-artifacts-core-build
           path: |
@@ -256,21 +280,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install XcodeGen
+      - name: Install just and XcodeGen
         run: |
+          if ! command -v just &> /dev/null; then
+            brew install just
+          fi
           if ! command -v xcodegen &> /dev/null; then
             brew install xcodegen
           fi
 
       - name: Select Xcode 16
         run: |
+          selected_xcode=""
           for xcode in /Applications/Xcode_16*.app; do
             if [ -d "$xcode" ]; then
-              echo "Selecting $xcode"
-              sudo xcode-select -s "$xcode"
+              selected_xcode="$xcode"
               break
             fi
           done
+          if [ -z "$selected_xcode" ]; then
+            echo "Error: no Xcode 16 installation found" >&2
+            exit 1
+          fi
+          developer_dir="$selected_xcode/Contents/Developer"
+          echo "Selecting $developer_dir"
+          sudo xcode-select -s "$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
           XCODE_VER=$(xcodebuild -version | head -n 1 | tr ' ' '-')
           echo "XCODE_VERSION=$XCODE_VER" >> "$GITHUB_ENV"
@@ -283,14 +318,22 @@ jobs:
             build/DerivedData/SourcePackages
             build/DerivedData/Build/Intermediates.noindex
             build/DerivedData/Build/Products
-          key: spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ matrix.platform }}-${{ hashFiles('Package.resolved', 'Package.swift', 'project.yml') }}-${{ github.sha }}
+          key: >-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ${{ matrix.platform }}-
+            ${{ hashFiles('Package.resolved', 'Package.swift',
+            'project.yml') }}-
+            ${{ github.sha }}
           restore-keys: |
-            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ matrix.platform }}-${{ hashFiles('Package.resolved', 'Package.swift', 'project.yml') }}-
-            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-${{ matrix.platform }}-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ${{ matrix.platform }}-
+            ${{ hashFiles('Package.resolved', 'Package.swift',
+            'project.yml') }}-
+            spm-deriveddata-${{ runner.os }}-${{ env.XCODE_VERSION }}-
+            ${{ matrix.platform }}-
 
       - name: Generate Xcode Project
-        run: |
-          xcodegen generate
+        run: just generate
 
       - name: Discover and Boot Simulator
         id: simulators
@@ -324,10 +367,12 @@ jobs:
         if: steps.simulators.outputs.device_id != ''
         run: |
           set -euo pipefail
+          device_id="${{ steps.simulators.outputs.device_id }}"
+          destination="platform=iOS Simulator,id=$device_id"
           xcodebuild build-for-testing \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
-            -destination "platform=iOS Simulator,id=${{ steps.simulators.outputs.device_id }}" \
+            -destination "$destination" \
             -derivedDataPath build/DerivedData \
             -enableCodeCoverage YES \
             CODE_SIGNING_ALLOWED=NO \
@@ -339,10 +384,12 @@ jobs:
         if: steps.simulators.outputs.device_id != ''
         run: |
           set -euo pipefail
+          device_id="${{ steps.simulators.outputs.device_id }}"
+          destination="platform=iOS Simulator,id=$device_id"
           xcodebuild test-without-building \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
-            -destination "platform=iOS Simulator,id=${{ steps.simulators.outputs.device_id }}" \
+            -destination "$destination" \
             -derivedDataPath build/DerivedData \
             -resultBundlePath "${{ matrix.result_bundle }}" \
             -enableCodeCoverage YES \
@@ -351,13 +398,18 @@ jobs:
       - name: Export Xcode Coverage Report
         if: always() && steps.simulators.outputs.device_id != ''
         run: |
-          if [ -d "${{ matrix.result_bundle }}" ]; then
-            xcrun xccov view --report --json "${{ matrix.result_bundle }}" > "${{ matrix.log_prefix }}-coverage.json" || true
+          result_bundle="${{ matrix.result_bundle }}"
+          coverage_file="${{ matrix.log_prefix }}-coverage.json"
+          if [ -d "$result_bundle" ]; then
+            xcrun xccov view --report --json "$result_bundle" \
+              > "$coverage_file" || true
           fi
 
       - name: Upload Simulator Coverage to Codecov
         if: always() && steps.simulators.outputs.device_id != ''
-        uses: codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac # v5.5.5
+        # v5.5.5
+        uses: >-
+          codecov/codecov-action@0fb7174895f61a3b6b78fc075e0cd60383518dac
         with:
           files: "${{ matrix.log_prefix }}-coverage.json"
           flags: ${{ matrix.platform }}
@@ -367,7 +419,9 @@ jobs:
 
       - name: Upload Simulator Coverage Artifact
         if: always() && steps.simulators.outputs.device_id != ''
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        # v4.6.1
+        uses: >-
+          actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: ${{ matrix.platform }}-coverage-artifact
           path: |
@@ -378,7 +432,9 @@ jobs:
 
       - name: Upload Test Results and Logs on Failure
         if: failure() || cancelled()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        # v4.6.1
+        uses: >-
+          actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
         with:
           name: ci-failure-artifacts-${{ matrix.platform }}
           path: |
