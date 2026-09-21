@@ -9,6 +9,7 @@ ipad_udid := env_var_or_default("IPAD_UDID", "BE4FD42F-96B9-4AD3-97EA-95FAB80598
 derived_data := env_var_or_default("DERIVED_DATA_PATH", "build/DerivedData")
 signing_identity := env_var_or_default("SIGNING_IDENTITY", "-")
 signing_required := env_var_or_default("SIGNING_REQUIRED", "NO")
+development_team := env_var_or_default("DEVELOPMENT_TEAM", "B7D575CY5M")
 
 project := "Shh.xcodeproj"
 app_scheme := "Shh"
@@ -122,12 +123,21 @@ build device="iphone" udid="":
     else
         target="$udid"
     fi
-    simulator_state=$(xcrun simctl list devices -j | TARGET_UDID="$target" python3 -c 'import json, os, sys; target=os.environ["TARGET_UDID"]; data=json.load(sys.stdin); matches=[device for devices in data.get("devices", {}).values() for device in devices if device.get("udid")==target]; sys.exit(1) if not matches or not matches[0].get("isAvailable", True) else print(matches[0].get("state", "Shutdown"))' || true)
-    if [[ -n "$simulator_state" ]]; then
-        destination="platform=iOS Simulator,id=$target"
-    else
-        destination="platform=iOS,id=$target"
-    fi
+    simulator_state=$(xcrun simctl list devices -j | TARGET_UDID="$target" python3 -c 'import json, os, sys; target=os.environ["TARGET_UDID"]; data=json.load(sys.stdin); matches=[device for devices in data.get("devices", {}).values() for device in devices if device.get("udid")==target]; sys.exit(1) if not matches else print(("available:" if matches[0].get("isAvailable", True) else "unavailable:") + matches[0].get("state", "Shutdown"))' || true)
+    case "$simulator_state" in
+        available:*)
+            destination="platform=iOS Simulator,id=$target"
+            signing=(CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED="{{ signing_required }}" CODE_SIGN_IDENTITY="{{ signing_identity }}")
+            ;;
+        unavailable:*)
+            echo "Error: simulator $target is unavailable; choose an available simulator or use a physical-device UDID" >&2
+            exit 1
+            ;;
+        *)
+            destination="platform=iOS,id=$target"
+            signing=(DEVELOPMENT_TEAM="{{ development_team }}" CODE_SIGN_STYLE=Automatic)
+            ;;
+    esac
     mkdir -p "{{ derived_data }}"
     xcodegen generate --spec project.yml >/dev/null
     xcodebuild build \
@@ -135,9 +145,7 @@ build device="iphone" udid="":
         -scheme "{{ app_scheme }}" \
         -destination "$destination" \
         -derivedDataPath "{{ derived_data }}" \
-        CODE_SIGNING_ALLOWED=YES \
-        CODE_SIGNING_REQUIRED="{{ signing_required }}" \
-        CODE_SIGN_IDENTITY="{{ signing_identity }}"
+        "${signing[@]}"
 
 # Build and run the full app test scheme on one selected simulator.
 test device="iphone" udid="":
@@ -198,16 +206,23 @@ deploy device="iphone" udid="":
     device="{{ device }}"; device="${device#device=}"
     udid="{{ udid }}"; udid="${udid#udid=}"
     target="$udid"; [[ -n "$target" ]] || case "$device" in iphone) target="{{ iphone_udid }}";; ipad) target="{{ ipad_udid }}";; *) echo "Error: device must be iphone or ipad" >&2; exit 2;; esac
-    SIGNING_IDENTITY="{{ signing_identity }}" SIGNING_REQUIRED="{{ signing_required }}" just build "$device" "$target"
-    simulator_state=$(xcrun simctl list devices -j | TARGET_UDID="$target" python3 -c 'import json, os, sys; target=os.environ["TARGET_UDID"]; data=json.load(sys.stdin); print(next((d.get("state", "Shutdown") for ds in data.get("devices", {}).values() for d in ds if d.get("udid")==target), ""))' || true)
-    if [[ -n "$simulator_state" ]]; then
-        xcrun simctl boot "$target" 2>/dev/null || true
-        xcrun simctl bootstatus "$target" -b
-        xcrun simctl install "$target" "{{ derived_data }}/Build/Products/Debug-iphonesimulator/Shh.app"
-    else
-        command -v devicectl >/dev/null 2>&1 || { echo "Error: devicectl is required for physical-device deployment" >&2; exit 1; }
-        xcrun devicectl device install app --device "$target" "{{ derived_data }}/Build/Products/Debug-iphoneos/Shh.app"
-    fi
+    just build "$device" "$target"
+    simulator_state=$(xcrun simctl list devices -j | TARGET_UDID="$target" python3 -c 'import json, os, sys; target=os.environ["TARGET_UDID"]; data=json.load(sys.stdin); matches=[d for ds in data.get("devices", {}).values() for d in ds if d.get("udid")==target]; sys.exit(1) if not matches else print(("available:" if matches[0].get("isAvailable", True) else "unavailable:") + matches[0].get("state", "Shutdown"))' || true)
+    case "$simulator_state" in
+        available:*)
+            xcrun simctl boot "$target" 2>/dev/null || true
+            xcrun simctl bootstatus "$target" -b
+            xcrun simctl install "$target" "{{ derived_data }}/Build/Products/Debug-iphonesimulator/Shh.app"
+            ;;
+        unavailable:*)
+            echo "Error: simulator $target is unavailable; choose an available simulator or use a physical-device UDID" >&2
+            exit 1
+            ;;
+        *)
+            command -v devicectl >/dev/null 2>&1 || { echo "Error: devicectl is required for physical-device deployment" >&2; exit 1; }
+            xcrun devicectl device install app --device "$target" "{{ derived_data }}/Build/Products/Debug-iphoneos/Shh.app"
+            ;;
+    esac
 
 # Convenience form for a specific simulator or physical-device UDID.
 deploy-device udid:
