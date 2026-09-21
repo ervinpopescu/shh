@@ -78,11 +78,13 @@ just ci
 
 `IPHONE_UDID`, `IPAD_UDID`, and `DERIVED_DATA_PATH` override the presets and
 build location. Simulator builds use ad-hoc signing by default
-(`SIGNING_IDENTITY=-`, `SIGNING_REQUIRED=NO`); physical-device deployment must
-provide the appropriate signing values, for example
-`SIGNING_IDENTITY="Apple Development: ..." SIGNING_REQUIRED=YES just deploy-device <udid>`.
-`just clean` removes only the selected DerivedData directory. Test results,
-logs, and screenshots are written to timestamped paths under `tmp/e2e/`.
+(`SIGNING_IDENTITY=-`, `SIGNING_REQUIRED=NO`). Physical-device builds use
+automatic development signing with team `B7D575CY5M` by default; override it
+with `DEVELOPMENT_TEAM=<team-id>` when needed. They never pass the simulator
+ad-hoc identity or disable required signing. An unavailable simulator is
+reported as such instead of being treated as a physical device. `just clean`
+removes only the selected DerivedData directory. Test results, logs, and
+screenshots are written to timestamped paths under `tmp/e2e/`.
 
 The Foundation-only core is also a Swift package:
 
