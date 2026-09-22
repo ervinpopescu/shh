@@ -4,8 +4,8 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 
 xcode_developer_dir := env_var_or_default("DEVELOPER_DIR", "/Applications/Xcode.app/Contents/Developer")
-iphone_udid := env_var_or_default("IPHONE_UDID", "F8EB87EE-3A18-4E0A-8FDF-0469E05E4001")
-ipad_udid := env_var_or_default("IPAD_UDID", "BE4FD42F-96B9-4AD3-97EA-95FAB8059846")
+iphone_udid := env_var_or_default("IPHONE_UDID", `DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" xcrun simctl list devices available -j 2>/dev/null | python3 -c 'import json, sys; data=json.load(sys.stdin); print(next((d.get("udid", "") for ds in data.get("devices", {}).values() for d in ds if d.get("name") == "Shh Review iPhone" and d.get("isAvailable", True)), ""))' 2>/dev/null || true`)
+ipad_udid := env_var_or_default("IPAD_UDID", `DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}" xcrun simctl list devices available -j 2>/dev/null | python3 -c 'import json, sys; data=json.load(sys.stdin); print(next((d.get("udid", "") for ds in data.get("devices", {}).values() for d in ds if d.get("name") == "Shh Review iPad" and d.get("isAvailable", True)), ""))' 2>/dev/null || true`)
 derived_data := env_var_or_default("DERIVED_DATA_PATH", "build/DerivedData")
 signing_identity := env_var_or_default("SIGNING_IDENTITY", "-")
 signing_required := env_var_or_default("SIGNING_REQUIRED", "NO")
@@ -229,14 +229,30 @@ deploy-device udid:
     @just deploy custom "{{ udid }}"
 
 # Launch the already-installed app on exactly one selected device.
-launch device="iphone" udid="":
+launch device="iphone" udid="" *args:
     #!/usr/bin/env bash
     device="{{ device }}"; device="${device#device=}"
     udid="{{ udid }}"; udid="${udid#udid=}"
+    extra_flags=()
+    if [[ "$udid" == args=* ]]; then
+        extra_flags+=("${udid#args=}")
+        udid=""
+    elif [[ "$udid" == --* ]]; then
+        extra_flags+=("$udid")
+        udid=""
+    fi
+    for f in {{ args }}; do
+        f="${f#args=}"
+        extra_flags+=("$f")
+    done
     target="$udid"; [[ -n "$target" ]] || case "$device" in iphone) target="{{ iphone_udid }}";; ipad) target="{{ ipad_udid }}";; *) echo "Error: device must be iphone or ipad" >&2; exit 2;; esac
     export DEVELOPER_DIR="{{ xcode_developer_dir }}"
     simulator_state=$(xcrun simctl list devices -j | TARGET_UDID="$target" python3 -c 'import json, os, sys; target=os.environ["TARGET_UDID"]; data=json.load(sys.stdin); print(next((d.get("state", "Shutdown") for ds in data.get("devices", {}).values() for d in ds if d.get("udid")==target), ""))' || true)
-    if [[ -n "$simulator_state" ]]; then xcrun simctl launch "$target" "{{ bundle_id }}"; else xcrun devicectl device process launch --device "$target" "{{ bundle_id }}"; fi
+    if [[ -n "$simulator_state" ]]; then
+        xcrun simctl launch "$target" "{{ bundle_id }}" ${extra_flags[@]+"${extra_flags[@]}"}
+    else
+        xcrun devicectl device process launch --device "$target" "{{ bundle_id }}" ${extra_flags[@]+"${extra_flags[@]}"}
+    fi
 
 # Terminate only Shh on the selected simulator; physical-device stop is unsupported.
 stop device="iphone" udid="":
