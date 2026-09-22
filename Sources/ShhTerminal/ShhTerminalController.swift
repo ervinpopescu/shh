@@ -27,6 +27,13 @@ public enum TerminalFontSize {
     public static func percentage(for pointSize: Double) -> Int {
         Int((clamped(pointSize) / defaultPointSize * 100).rounded())
     }
+
+    /// Returns the point size rendered by the terminal after applying its explicit zoom preference.
+    /// Terminal text intentionally does not inherit Dynamic Type scaling; accessibility users can
+    /// increase this preference with the terminal's zoom controls without changing the saved value.
+    public static func renderedPointSize(for pointSize: Double) -> CGFloat {
+        CGFloat(clamped(pointSize))
+    }
 }
 
 public protocol TerminalFontSizeStore: AnyObject {
