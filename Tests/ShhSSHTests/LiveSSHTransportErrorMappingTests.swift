@@ -20,6 +20,151 @@ final class LiveSSHTransportErrorMappingTests: XCTestCase {
             LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.ENETUNREACH.rawValue, reason: "network unavailable")),
             .networkUnavailable
         )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.EHOSTUNREACH.rawValue, reason: "host unreachable")),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(IOError(errnoCode: POSIXErrorCode.ENETDOWN.rawValue, reason: "network down")),
+            .networkUnavailable
+        )
+    }
+
+    func testDirectTransportErrorsAndCancellationMapDirectly() {
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(TransportError.authenticationRequired),
+            .authenticationRequired
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(TransportError.connectionRefused),
+            .connectionRefused
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(TransportError.timeout),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(TransportError.networkUnavailable),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(TransportError.dnsFailure("unresolvable")),
+            .dnsFailure("unresolvable")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(CancellationError()),
+            .cancelled
+        )
+    }
+
+    func testChannelErrorMapping() {
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(ChannelError.connectTimeout(.seconds(5))),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(ChannelError.alreadyClosed),
+            .remoteFailure("SSH connection failed.")
+        )
+    }
+
+    func testPOSIXSocketErrorsMapToTransportErrors() {
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.ECONNREFUSED)),
+            .connectionRefused
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.ETIMEDOUT)),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.ENETUNREACH)),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.EHOSTUNREACH)),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.ENETDOWN)),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(POSIXError(.EINVAL)),
+            .remoteFailure("SSH connection failed.")
+        )
+    }
+
+    func testFallbackErrorDescriptionMatching() {
+        struct MockDescribedError: LocalizedError, CustomStringConvertible {
+            let errorDescription: String?
+            var description: String { errorDescription ?? "" }
+        }
+
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "operation timed out")),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "request timeout occurred")),
+            .timeout
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "connection refused by target")),
+            .connectionRefused
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "nodename nor servname provided, or not known")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "unknownhost error")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "hostname could not be resolved")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "name resolution failed")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "eai_again")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "no address associated with nodename")),
+            .dnsFailure("DNS resolution failed for hostname")
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "network is down")),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "network unreachable")),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "host unreachable")),
+            .networkUnavailable
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "permission denied (publickey)")),
+            .authenticationRequired
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "auth failed")),
+            .authenticationRequired
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "authentication rejected")),
+            .authenticationRequired
+        )
+        XCTAssertEqual(
+            LiveSSHTransport.mapError(MockDescribedError(errorDescription: "something completely generic")),
+            .remoteFailure("SSH connection failed.")
+        )
     }
 
     func testConnectionFailureMappingDoesNotExposeRawErrorDetails() {
