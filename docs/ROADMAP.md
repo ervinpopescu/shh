@@ -18,7 +18,8 @@
 4. **Multiplexer Integration:** First-class Tmux control adapter with
    collision-resistant pipe-delimited format parsing, backward-compatible
    parsing for legacy and tmux 3.7c underscore-sanitized output, session
-   listing, creation, attach, and command approval flows.
+   listing, creation, attach, out-of-band pane/window navigation, and
+   command approval flows.
 5. **On-Device Voice AI:** WhisperKit CoreML and Apple Speech
    transcription, push-to-talk recording, preview editing, and zero
    auto-execution policy.
@@ -38,20 +39,24 @@
     zero-knowledge encrypted vault backup (`.shhbackup` AES-GCM +
     PBKDF2), privacy manifest audit, GitHub Actions CI workflow, and
     simulator test suites.
+11. **Command Dial & Terminal Image Insertion:** One-handed radial
+    Command Dial with thumb-reach placement, safe out-of-band Tmux
+    multiplexer controls over SSH exec, and SFTP image-to-terminal
+    insertion with ImageIO validation and Return-omitted path insertion.
 
 ## Future Milestones (Physical Device & Distribution)
 
-11. **Physical Device & Provisioning:** Apple Developer portal App Group
+12. **Physical Device & Provisioning:** Apple Developer portal App Group
     and File Provider entitlement provisioning, device Keychain smoke
     testing, and physical microphone validation.
-12. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
+13. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
     cryptographic packet encryption and speculative local echo (independent
     of the completed SSH transport).
-13. **Independent Audit & Interoperability Expansion:** Third-party
+14. **Independent Audit & Interoperability Expansion:** Third-party
     cryptographic security audit and broad physical-device compatibility
     matrix expansion (current validation covers unit, integration, and
     live-host simulator suites).
-14. **TestFlight Beta & App Store:** Build automation, TestFlight
+15. **TestFlight Beta & App Store:** Build automation, TestFlight
     internal and external beta testing, App Store Connect metadata, and
     EAR Category 5 Part 2 export compliance self-classification filing
     (ECCN 5D992.c).
