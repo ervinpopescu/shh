@@ -465,6 +465,12 @@ final class LiveSFTPRepositoryTests: XCTestCase {
         }
         XCTAssertGreaterThan(uploadProgressCalls.value, 0)
 
+        try await repo.upload(
+            from: tempUploadURL,
+            to: RemotePath("/disk_upload_perms.txt"),
+            permissions: PosixPermissions(rawValue: 0o600)
+        )
+
         // 7. createDirectory
         try await repo.createDirectory(at: RemotePath("/my_folder"))
 
