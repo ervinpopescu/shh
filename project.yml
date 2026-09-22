@@ -14,6 +14,7 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - App
+      - Shared
       - path: Resources/Assets.xcassets
         buildPhase: resources
       - path: Resources/PrivacyInfo.xcprivacy
@@ -115,10 +116,11 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - Tests/ShhAppTests
-      - path: FileProviderExtension
-        excludes:
-          - "Info.plist"
-          - "*.entitlements"
+      - FileProviderExtension/FileProviderEnumerator.swift
+      - FileProviderExtension/FileProviderExtension.swift
+      - FileProviderExtension/FileProviderItem.swift
+      - FileProviderExtension/FileProviderSessionManager.swift
+      - Shared
     dependencies:
       - target: Shh
     settings:
@@ -132,6 +134,7 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - FileProviderExtension
+      - Shared
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
     dependencies:
