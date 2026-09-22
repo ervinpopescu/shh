@@ -46,7 +46,11 @@ struct FilesView: View {
         mainContent
             .navigationTitle(container.currentPath.isRoot ? "Files" : container.currentPath.lastComponent)
             .navigationBarTitleDisplayMode(.inline)
-            .searchable(text: $container.fileSearchQuery, prompt: "Search files")
+            .searchable(
+                text: $container.fileSearchQuery,
+                placement: .navigationBarDrawer(displayMode: .always),
+                prompt: "Search files"
+            )
             .toolbar { toolbarContent }
             .fileModals(
                 showingCreateFolder: $showingCreateFolder,

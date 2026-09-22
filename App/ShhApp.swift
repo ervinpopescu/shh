@@ -20,6 +20,7 @@ struct ShhApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
+                .appDynamicTypeRange()
                 .environmentObject(container)
                 .onChange(of: scenePhase) { _, newPhase in
                     container.handleScenePhaseChange(newPhase)
@@ -91,6 +92,7 @@ struct RootView: View {
             }
         }
         .hostKeyApprovalAlert(container: container)
+        .appDynamicTypeRange()
     }
 }
 
@@ -118,6 +120,7 @@ struct HostListView: View {
                         .accessibilityIdentifier("persistence-readiness-warning")
                 } header: {
                     Text("Persistence readiness")
+                        .appSectionHeader()
                 }
             }
             if !container.discoveredSSHServices.isEmpty {
@@ -133,10 +136,12 @@ struct HostListView: View {
                                     .foregroundStyle(.tint)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(service.name)
-                                        .font(AppTypography.rowTitle)
+                                        .appRowTitle()
                                         .foregroundStyle(.primary)
                                     Text("\(service.hostname):\(service.port)")
-                                        .font(AppTypography.rowSubtitle)
+                                        .appRowSubtitle()
+                                        .lineLimit(1)
+                                        .truncationMode(.tail)
                                         .foregroundStyle(.secondary)
                                 }
                                 Spacer(minLength: 8)
@@ -149,17 +154,19 @@ struct HostListView: View {
                         .accessibilityIdentifier("discovered-host-\(service.id)")
                     }
                 } header: {
-                    HStack {
+                    HStack(alignment: .top) {
                         Text("Discovered on Local Network")
+                            .appSectionHeader()
+                            .fixedSize(horizontal: false, vertical: true)
                         if container.bonjourDiscovery.isSearching {
-                            Spacer()
+                            Spacer(minLength: 8)
                             ProgressView()
                                 .scaleEffect(0.7)
                         }
                     }
                 }
             }
-            Section("Saved hosts") {
+            Section {
                 ForEach(filtered) { host in
                     NavigationLink(destination: HostDetailView(host: host)) { HostRow(host: host) }
                 }
@@ -170,11 +177,19 @@ struct HostListView: View {
                         await reload()
                     }
                 }
+            } header: {
+                Text("Saved hosts")
+                    .appSectionHeader()
             }
         }
         .navigationTitle("Hosts")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $search, prompt: "Search hosts, groups, tags")
+        .searchable(
+            text: $search,
+            placement: .navigationBarDrawer(displayMode: .always),
+            prompt: "Search hosts, groups, tags"
+        )
+        .appDynamicTypeRange()
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
                 Menu("Filter", systemImage: "line.3.horizontal.decrease.circle") {
@@ -215,9 +230,11 @@ struct HostRow: View {
                 .foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 2) {
                 Text(host.name)
-                    .font(AppTypography.rowTitle)
+                    .appRowTitle()
                 Text(host.address)
-                    .font(AppTypography.rowSubtitle)
+                    .appRowSubtitle()
+                    .lineLimit(1)
+                    .truncationMode(.tail)
                     .foregroundStyle(.secondary)
                 HStack {
                     if host.groupID != nil { Text("Group").tagChip() }
@@ -228,9 +245,10 @@ struct HostRow: View {
             }
             Spacer(minLength: 8)
             Text(host.health.label)
-                .font(AppTypography.rowMetadata)
+                .appRowMetadata()
                 .foregroundStyle(host.health == .healthy ? Color.green : Color.secondary)
                 .accessibilityLabel("Health \(host.health.label)")
+                .layoutPriority(1)
         }
         .frame(minHeight: 44)
     }
@@ -695,10 +713,10 @@ struct HostEditorView: View {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text(service.name)
-                                            .font(AppTypography.rowTitle)
+                                            .appRowTitle()
                                             .foregroundStyle(.primary)
                                         Text("\(service.hostname):\(service.port)")
-                                            .font(AppTypography.rowSubtitle)
+                                            .appRowSubtitle()
                                             .foregroundStyle(.secondary)
                                     }
                                     Spacer()
@@ -2601,7 +2619,7 @@ struct MultiplexerPicker: View {
                             VStack(alignment: .leading, spacing: 4) {
                                 HStack(spacing: 6) {
                                     Text(session.name)
-                                        .font(AppTypography.rowTitle)
+                                        .appRowTitle()
                                         .lineLimit(1)
                                         .truncationMode(.tail)
                                     Text(session.sessionID)
@@ -2954,7 +2972,7 @@ struct HerdrAgentCardView: View {
     private var headerTitles: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(pane.label.isEmpty ? pane.id : pane.label)
-                .font(AppTypography.rowTitle)
+                .appRowTitle()
                 .lineLimit(1)
                 .truncationMode(.tail)
             if !pane.label.isEmpty && pane.label != pane.id {
@@ -3559,7 +3577,7 @@ struct HerdrAgentCardsView: View {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(workspace.label.isEmpty ? workspace.id : workspace.label)
-                                        .font(AppTypography.rowTitle)
+                                        .appRowTitle()
                                     if !workspace.cwd.isEmpty {
                                         Text(workspace.cwd)
                                             .font(.caption.monospaced())

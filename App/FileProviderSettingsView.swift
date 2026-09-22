@@ -101,9 +101,9 @@ struct FileProviderSettingsView: View {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(host.name)
-                        .font(AppTypography.rowTitle)
+                        .appRowTitle()
                     Text("\(host.username)@\(host.hostname):\(host.port)")
-                        .font(AppTypography.rowSubtitle)
+                        .appRowSubtitle()
                         .foregroundStyle(.secondary)
                 }
 
