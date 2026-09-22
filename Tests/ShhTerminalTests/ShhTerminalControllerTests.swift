@@ -376,6 +376,20 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertTrue(controller.isFirstResponder)
     }
 
+    func testTerminalFontSizeUsesExplicitZoomAtDefaultAndAccessibilitySizes() {
+        let defaultSize = TerminalFontSize.renderedPointSize(
+            for: TerminalFontSize.defaultPointSize
+        )
+        let accessibilitySize = TerminalFontSize.renderedPointSize(
+            for: TerminalFontSize.defaultPointSize
+        )
+        let zoomedSize = TerminalFontSize.renderedPointSize(for: 18)
+
+        XCTAssertEqual(defaultSize, 14, accuracy: 0.01)
+        XCTAssertEqual(accessibilitySize, defaultSize, accuracy: 0.01)
+        XCTAssertEqual(zoomedSize, 18, accuracy: 0.01)
+    }
+
     func testTerminalFontSizeClampsAndResets() {
         final class MemoryStore: TerminalFontSizeStore {
             var value: Double?
