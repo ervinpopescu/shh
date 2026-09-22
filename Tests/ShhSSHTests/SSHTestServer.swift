@@ -7,6 +7,14 @@ import NIOPosix
 import ShhCore
 @testable import ShhSSH
 
+private final class UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
 extension NIOSSHPublicKey {
     static func ed25519(_ key: Curve25519.Signing.PublicKey) throws -> NIOSSHPublicKey {
         var buffer = ByteBufferAllocator().buffer(capacity: 64)
@@ -254,6 +262,7 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
         }
         switch request {
         case .listen(let host, let port):
+            let handlerBox = UncheckedSendableBox(handler)
             let bootstrap = ServerBootstrap(group: group)
                 .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
                 .childChannelOption(ChannelOptions.allowRemoteHalfClosure, value: true)
@@ -265,7 +274,7 @@ final class TestServerGlobalRequestDelegate: GlobalRequestDelegate, @unchecked S
                         listeningPort: boundPort,
                         originatorAddress: inboundSocketChannel.remoteAddress!
                     )
-                    handler.createChannel(childPromise, channelType: .forwardedTCPIP(forwarded)) { sshChildChannel, _ in
+                    handlerBox.value.createChannel(childPromise, channelType: .forwardedTCPIP(forwarded)) { sshChildChannel, _ in
                         _ = sshChildChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true)
                         let (ours, theirs) = GlueHandler.matchedPair()
                         return sshChildChannel.pipeline.addHandlers([DataToBufferCodec(), theirs]).flatMap {
@@ -442,7 +451,7 @@ final class SSHTestServer: @unchecked Sendable {
             .childChannelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
             .childChannelInitializer { [weak self] channel in
                 self?.lock.withLock { self?.childChannels.append(channel) }
-                let sshHandler = NIOSSHHandler(
+                let sshHandlerBox = UncheckedSendableBox(NIOSSHHandler(
                     role: .server(serverConfig),
                     allocator: channel.allocator,
                     inboundChildChannelInitializer: { [weak self] childChannel, channelType in
@@ -459,8 +468,13 @@ final class SSHTestServer: @unchecked Sendable {
                             return childChannel.close()
                         }
                     }
-                )
-                return channel.pipeline.addHandler(sshHandler)
+                ))
+                do {
+                    try channel.pipeline.syncOperations.addHandler(sshHandlerBox.value)
+                    return channel.eventLoop.makeSucceededFuture(())
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
             }
 
         let channel = try await bootstrap.bind(host: "127.0.0.1", port: 0).get()
