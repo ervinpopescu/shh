@@ -18,8 +18,11 @@ targets:
         buildPhase: resources
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
+      - path: LiveActivity/SSHSessionActivity.swift
     dependencies:
       - target: ShhFileProvider
+      - target: ShhLiveActivity
+      - sdk: ActivityKit.framework
       - package: ShhCore
         product: ShhCore
       - package: ShhCore
@@ -28,7 +31,15 @@ targets:
         product: ShhTerminal
       - package: ShhCore
         product: ShhVoice
-
+    info:
+      path: App/Info.plist
+      properties:
+        NSBonjourServices:
+          - _ssh._tcp
+        NSLocalNetworkUsageDescription: >-
+          Shh discovers SSH servers on your local network.
+        UILaunchScreen: {}
+        NSSupportsLiveActivities: true
     settings:
       base:
         INFOPLIST_FILE: App/Info.plist
@@ -41,6 +52,8 @@ targets:
         MARKETING_VERSION: "1.0"
         CODE_SIGN_ENTITLEMENTS: App/Shh.entitlements
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSMicrophoneUsageDescription: >-
           Shh records only while you hold the local push-to-talk control.
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: >-
@@ -121,6 +134,23 @@ targets:
         SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
         GCC_TREAT_WARNINGS_AS_ERRORS: YES
         GENERATE_INFOPLIST_FILE: YES
+  ShhLiveActivity:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - LiveActivity
+    dependencies:
+      - sdk: ActivityKit.framework
+      - sdk: SwiftUI.framework
+      - sdk: WidgetKit.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.LiveActivity
+        SWIFT_VERSION: "5.9"
+        INFOPLIST_FILE: LiveActivity/Info.plist
+        SKIP_INSTALL: YES
+
   ShhFileProvider:
     type: app-extension
     platform: iOS
