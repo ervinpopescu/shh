@@ -43,20 +43,25 @@
     Command Dial with thumb-reach placement, safe out-of-band Tmux
     multiplexer controls over SSH exec, and SFTP image-to-terminal
     insertion with ImageIO validation and Return-omitted path insertion.
+12. **Live Activities (Lock Screen & Dynamic Island):** Privacy-safe
+    WidgetKit Live Activity tracking truthful SSH session status
+    (connected, reconnecting, failed, disconnected) with reconnection
+    progress, sanitized endpoint metadata, and clear background
+    execution and credential isolation boundaries.
 
 ## Future Milestones (Physical Device & Distribution)
 
-12. **Physical Device & Provisioning:** Apple Developer portal App Group
+13. **Physical Device & Provisioning:** Apple Developer portal App Group
     and File Provider entitlement provisioning, device Keychain smoke
     testing, and physical microphone validation.
-13. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
+14. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
     cryptographic packet encryption and speculative local echo (independent
     of the completed SSH transport).
-14. **Independent Audit & Interoperability Expansion:** Third-party
+15. **Independent Audit & Interoperability Expansion:** Third-party
     cryptographic security audit and broad physical-device compatibility
     matrix expansion (current validation covers unit, integration, and
     live-host simulator suites).
-15. **TestFlight Beta & App Store:** Build automation, TestFlight
+16. **TestFlight Beta & App Store:** Build automation, TestFlight
     internal and external beta testing, App Store Connect metadata, and
     EAR Category 5 Part 2 export compliance self-classification filing
     (ECCN 5D992.c).
