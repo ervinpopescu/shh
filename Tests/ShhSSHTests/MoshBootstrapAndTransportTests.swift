@@ -577,4 +577,150 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
         XCTAssertTrue(info.sessionKey.isZeroized)
         XCTAssertEqual(channelBox.get()?.currentPort, 60030)
     }
+
+    // MARK: - Additional MoshConnection Behavioral Tests
+
+    private final class MockFailingMoshDatagramChannel: MoshDatagramChannel, @unchecked Sendable {
+        let errorToThrow: Error
+
+        init(errorToThrow: Error = TransportError.networkUnavailable) {
+            self.errorToThrow = errorToThrow
+        }
+
+        func start() async throws {}
+        func send(datagram: Data) async throws {}
+        func incomingDatagrams() -> AsyncThrowingStream<Data, Error> {
+            AsyncThrowingStream { cont in
+                cont.finish(throwing: self.errorToThrow)
+            }
+        }
+        func updateEndpoint(host: String, port: UInt16) async throws {}
+        func close() async {}
+    }
+
+    func testMoshConnectionResponsivenessAndClosedErrorHandling() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "192.168.1.50", remotePort: 60001)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "responsivenessTestKey", pid: 5000)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+
+        try await connection.start()
+        let isResponsive = await connection.testResponsiveness()
+        XCTAssertTrue(isResponsive)
+
+        await connection.close()
+        let isResponsiveAfterClose = await connection.testResponsiveness()
+        XCTAssertFalse(isResponsiveAfterClose)
+
+        do {
+            try await connection.send(Data("test".utf8))
+            XCTFail("Expected networkUnavailable error")
+        } catch let error as TransportError {
+            XCTAssertEqual(error, .networkUnavailable)
+        }
+
+        do {
+            try await connection.resize(TerminalSize(columns: 80, rows: 24))
+            XCTFail("Expected networkUnavailable error")
+        } catch let error as TransportError {
+            XCTAssertEqual(error, .networkUnavailable)
+        }
+
+        try await connection.handleNetworkRoaming(NetworkRoamingState(currentInterface: .wifi))
+    }
+
+    func testMoshConnectionPendingEventsDrainedOnEventsCall() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "192.168.1.50", remotePort: 60001)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "pendingEventsTestKey", pid: 5001)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+
+        try await connection.start()
+
+        let datagram = MoshDatagram(kind: .data, sequenceNumber: 1, payload: Data("buffered".utf8))
+        channel.simulateInboundDatagram(datagram.encode())
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+
+        let stream = await connection.events()
+        var iterator = stream.makeAsyncIterator()
+        let firstEvent = try await iterator.next()
+        guard case .bytes(let data) = firstEvent else {
+            XCTFail("Expected bytes event from pendingEvents")
+            return
+        }
+        XCTAssertEqual(data, Data("buffered".utf8))
+
+        await connection.close()
+    }
+
+    func testMoshConnectionAuxiliaryDatagramsAndTeardown() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "192.168.1.50", remotePort: 60001)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "auxDatagramTestKey", pid: 5002)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+
+        try await connection.start()
+
+        channel.simulateInboundDatagram(MoshDatagram(kind: .keepalive, sequenceNumber: 2).encode())
+        channel.simulateInboundDatagram(MoshDatagram(kind: .roamingProbe, sequenceNumber: 3).encode())
+        channel.simulateInboundDatagram(MoshDatagram(kind: .resize, sequenceNumber: 4).encode())
+
+        for _ in 0..<5 {
+            await Task.yield()
+        }
+        let activeState = await connection.moshState
+        XCTAssertEqual(activeState, .connected)
+
+        channel.simulateInboundDatagram(MoshDatagram(kind: .teardown, sequenceNumber: 5).encode())
+
+        var observedDisconnected = false
+        for _ in 0..<20 {
+            let state = await connection.moshState
+            if case .disconnected = state {
+                observedDisconnected = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(observedDisconnected)
+
+        await connection.close()
+    }
+
+    func testMoshConnectionChannelErrorTriggersTeardown() async throws {
+        let channel = MockFailingMoshDatagramChannel(errorToThrow: TransportError.networkUnavailable)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "errorChannelTestKey", pid: 5003)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+
+        try await connection.start()
+
+        var observedDisconnected = false
+        for _ in 0..<20 {
+            let state = await connection.moshState
+            if case .disconnected = state {
+                observedDisconnected = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(observedDisconnected)
+
+        await connection.close()
+    }
 }
