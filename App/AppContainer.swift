@@ -854,8 +854,8 @@ final class AppContainer: ObservableObject {
                 pfManager = UnavailablePortForwardingManager()
             }
             self.portForwardingManager = pfManager
-            self.startForwardingMonitoring(manager: pfManager)
             await self.autoStartForwardingRules(for: host, manager: pfManager)
+            self.startForwardingMonitoring(manager: pfManager)
 
             Task { [weak self] in
                 await self?.refreshTmuxState()
@@ -1184,8 +1184,8 @@ final class AppContainer: ObservableObject {
             pfManager = UnavailablePortForwardingManager()
         }
         self.portForwardingManager = pfManager
-        self.startForwardingMonitoring(manager: pfManager)
         await self.autoStartForwardingRules(for: host, manager: pfManager)
+        self.startForwardingMonitoring(manager: pfManager)
         // Reconnect completion is intentionally published only after the
         // remembered tmux target has been attached successfully.
         isNetworkRecoveryInProgress = false
@@ -3591,13 +3591,14 @@ final class AppContainer: ObservableObject {
         forwardingStreamTask = Task { @MainActor [weak self] in
             let stream = await manager.sessionStatesStream()
             for await states in stream {
-                guard let self else { return }
+                guard let self, !Task.isCancelled else { return }
                 self.forwardingSessions = states
             }
         }
     }
 
     private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async {
+        var started: [ForwardingSessionState] = []
         for rule in host.forwardingRules where rule.enabled {
             if rule.requiresNonLoopbackApproval {
                 let message = "\(rule.name) requires approval to bind to \(rule.localHost)."
@@ -3606,11 +3607,21 @@ final class AppContainer: ObservableObject {
                 continue
             }
             do {
-                _ = try await manager.startForwarding(rule: rule)
+                let session = try await manager.startForwarding(rule: rule)
+                started.append(session)
             } catch {
                 let message = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
                 forwardingErrorMessage = message
                 terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
+            }
+        }
+        if !started.isEmpty {
+            for session in started {
+                if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == session.ruleID }) {
+                    forwardingSessions[idx] = session
+                } else {
+                    forwardingSessions.append(session)
+                }
             }
         }
     }
@@ -3623,6 +3634,11 @@ final class AppContainer: ObservableObject {
         forwardingErrorMessage = nil
         do {
             let session = try await manager.startForwarding(rule: rule)
+            if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == session.ruleID }) {
+                forwardingSessions[idx] = session
+            } else {
+                forwardingSessions.append(session)
+            }
             return session
         } catch {
             forwardingErrorMessage = error.localizedDescription
@@ -3634,6 +3650,10 @@ final class AppContainer: ObservableObject {
         guard let manager = portForwardingManager else { return }
         do {
             try await manager.stopForwarding(ruleID: ruleID)
+            if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == ruleID }) {
+                forwardingSessions[idx].status = .stopped
+                forwardingSessions[idx].activeConnectionsCount = 0
+            }
         } catch {
             forwardingErrorMessage = error.localizedDescription
         }
@@ -3642,6 +3662,10 @@ final class AppContainer: ObservableObject {
     public func stopAllForwarding() async {
         guard let manager = portForwardingManager else { return }
         await manager.stopAll()
+        for idx in forwardingSessions.indices {
+            forwardingSessions[idx].status = .stopped
+            forwardingSessions[idx].activeConnectionsCount = 0
+        }
     }
 
     public func addForwardingRule(_ rule: PortForwardingRule, for host: Host, autoStartIfConnected: Bool = true) async throws {
