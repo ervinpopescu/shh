@@ -112,6 +112,18 @@ struct HostListView: View {
     private var filtered: [Host] { hosts.filter { (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.address.localizedCaseInsensitiveContains(search)) && (!healthyOnly || $0.health == .healthy) } }
     var body: some View {
         List {
+            if let discoveryMessage = container.bonjourDiscovery.state.message {
+                Section("Local Network Discovery") {
+                    Label(discoveryMessage, systemImage: "wifi.exclamationmark")
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .accessibilityIdentifier("bonjour-discovery-status")
+                    Button("Retry Discovery", systemImage: "arrow.clockwise") {
+                        container.bonjourDiscovery.retryDiscovery()
+                    }
+                    .accessibilityIdentifier("bonjour-discovery-retry")
+                }
+            }
             if let persistenceMessage = container.persistenceReadinessMessage {
                 Section {
                     Label(persistenceMessage, systemImage: "externaldrive.badge.exclamationmark")
@@ -702,6 +714,18 @@ struct HostEditorView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let discoveryMessage = container.bonjourDiscovery.state.message {
+                    Section("Local Network Discovery") {
+                        Label(discoveryMessage, systemImage: "wifi.exclamationmark")
+                            .font(.footnote)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("bonjour-discovery-status")
+                        Button("Retry Discovery", systemImage: "arrow.clockwise") {
+                            container.bonjourDiscovery.retryDiscovery()
+                        }
+                        .accessibilityIdentifier("bonjour-discovery-retry")
+                    }
+                }
                 if !container.discoveredSSHServices.isEmpty {
                     Section {
                         ForEach(container.discoveredSSHServices) { service in
