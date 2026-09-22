@@ -1,12 +1,27 @@
 import Foundation
-import Crypto
+@preconcurrency import Crypto
 import NIOCore
 import NIOPosix
 @preconcurrency import NIOSSH
 import ShhCore
 
+// NIOSSHHandler is intentionally non-Sendable: its mutable state belongs to one
+// channel's event loop. These synchronous pipeline operations are only called from
+// NIO event-loop callbacks, so the handler never crosses an isolation boundary.
+private func addHandlersOnEventLoop(
+    _ handlers: ChannelHandler...,
+    to pipeline: ChannelPipeline
+) -> EventLoopFuture<Void> {
+    do {
+        try pipeline.syncOperations.addHandlers(handlers)
+        return pipeline.eventLoop.makeSucceededFuture(())
+    } catch {
+        return pipeline.eventLoop.makeFailedFuture(error)
+    }
+}
+
 final class LiveSSHUserAuthDelegate: NIOSSHClientUserAuthenticationDelegate, @unchecked Sendable {
-    enum Credential: Sendable {
+    enum Credential: @unchecked Sendable {
         case password(String)
         case privateKey(Curve25519.Signing.PrivateKey)
         case none
@@ -668,9 +683,7 @@ public struct LiveSSHTransport: SSHTransport {
                         return inboundRouter.handle(childChannel: childChannel, type: channelType)
                     }
                 )
-                return channel.pipeline.addHandler(sshHandler).flatMap {
-                    channel.pipeline.addHandler(handshakeHandler)
-                }
+                return addHandlersOnEventLoop(sshHandler, handshakeHandler, to: channel.pipeline)
             }
 
             let channel = try await withTaskCancellationHandler {
@@ -865,9 +878,7 @@ public struct LiveSSHTransport: SSHTransport {
                     allocator: channel.allocator,
                     inboundChildChannelInitializer: nil
                 )
-                return channel.pipeline.addHandler(sshHandler).flatMap {
-                    channel.pipeline.addHandler(b1HandshakeHandler)
-                }
+                return addHandlersOnEventLoop(sshHandler, b1HandshakeHandler, to: channel.pipeline)
             }
 
             let b1Channel = try await withTaskCancellationHandler {
@@ -941,9 +952,13 @@ public struct LiveSSHTransport: SSHTransport {
                         originatorAddress: localOrigin
                     )
 
-                    let nextChannel = try await currentChannel.eventLoop.flatSubmit {
-                        currentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { currentSSHHandler in
-                            let childPromise = currentChannel.eventLoop.makePromise(of: Channel.self)
+                    let hopParentChannel = currentChannel
+                    let nextChannel = try await hopParentChannel.eventLoop.flatSubmit {
+                        do {
+                            let currentSSHHandler = try hopParentChannel.pipeline.syncOperations.handler(
+                                type: NIOSSHHandler.self
+                            )
+                            let childPromise = hopParentChannel.eventLoop.makePromise(of: Channel.self)
                             currentSSHHandler.createChannel(childPromise, channelType: .directTCPIP(directSettings)) { childChannel, channelType in
                                 guard case .directTCPIP = channelType else {
                                     return childChannel.eventLoop.makeFailedFuture(TransportError.remoteFailure("Failed to open direct-tcpip channel for hop"))
@@ -954,13 +969,16 @@ public struct LiveSSHTransport: SSHTransport {
                                     allocator: childChannel.allocator,
                                     inboundChildChannelInitializer: nil
                                 )
-                                return childChannel.pipeline.addHandler(codec).flatMap {
-                                    childChannel.pipeline.addHandler(nestedSSHHandler)
-                                }.flatMap {
-                                    childChannel.pipeline.addHandler(hopHandshakeHandler)
-                                }
+                                return addHandlersOnEventLoop(
+                                    codec,
+                                    nestedSSHHandler,
+                                    hopHandshakeHandler,
+                                    to: childChannel.pipeline
+                                )
                             }
                             return childPromise.futureResult
+                        } catch {
+                            return hopParentChannel.eventLoop.makeFailedFuture(error)
                         }
                     }.get()
                     openedChannels.append(nextChannel)
@@ -1031,9 +1049,13 @@ public struct LiveSSHTransport: SSHTransport {
                 originatorAddress: localOrigin
             )
 
-            let targetTransportChannel = try await currentChannel.eventLoop.flatSubmit {
-                currentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { currentSSHHandler in
-                    let childPromise = currentChannel.eventLoop.makePromise(of: Channel.self)
+            let targetParentChannel = currentChannel
+            let targetTransportChannel = try await targetParentChannel.eventLoop.flatSubmit {
+                do {
+                    let currentSSHHandler = try targetParentChannel.pipeline.syncOperations.handler(
+                        type: NIOSSHHandler.self
+                    )
+                    let childPromise = targetParentChannel.eventLoop.makePromise(of: Channel.self)
                     currentSSHHandler.createChannel(childPromise, channelType: .directTCPIP(targetDirectSettings)) { childChannel, channelType in
                         guard case .directTCPIP = channelType else {
                             return childChannel.eventLoop.makeFailedFuture(TransportError.remoteFailure("Failed to open direct-tcpip channel for target"))
@@ -1047,13 +1069,16 @@ public struct LiveSSHTransport: SSHTransport {
                                 return targetInboundRouter.handle(childChannel: child, type: type)
                             }
                         )
-                        return childChannel.pipeline.addHandler(codec).flatMap {
-                            childChannel.pipeline.addHandler(nestedSSHHandler)
-                        }.flatMap {
-                            childChannel.pipeline.addHandler(targetHandshakeHandler)
-                        }
+                        return addHandlersOnEventLoop(
+                            codec,
+                            nestedSSHHandler,
+                            targetHandshakeHandler,
+                            to: childChannel.pipeline
+                        )
                     }
                     return childPromise.futureResult
+                } catch {
+                    return targetParentChannel.eventLoop.makeFailedFuture(error)
                 }
             }.get()
             openedChannels.append(targetTransportChannel)
