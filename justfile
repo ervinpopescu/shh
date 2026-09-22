@@ -58,20 +58,20 @@ generate:
 format:
     #!/usr/bin/env bash
     command -v swift-format >/dev/null 2>&1 || { echo "Error: swift-format is required (install it with brew install swift-format)" >&2; exit 1; }
-    swift-format format --in-place --recursive App FileProviderExtension Sources Tests
+    swift-format format --in-place --recursive App FileProviderExtension LiveActivity Sources Tests
 
 # Check Swift formatting without changing files.
 format-check:
     #!/usr/bin/env bash
     command -v swift-format >/dev/null 2>&1 || { echo "Error: swift-format is required (install it with brew install swift-format)" >&2; exit 1; }
-    swift-format lint --recursive App FileProviderExtension Sources Tests
+    swift-format lint --recursive App FileProviderExtension LiveActivity Sources Tests
 
 # Run Swift formatting and shell-script diagnostics.
 lint:
     #!/usr/bin/env bash
     command -v swift-format >/dev/null 2>&1 || { echo "Error: swift-format is required (install it with brew install swift-format)" >&2; exit 1; }
     command -v shellcheck >/dev/null 2>&1 || { echo "Error: shellcheck is required (install it with brew install shellcheck)" >&2; exit 1; }
-    swift-format lint --recursive App FileProviderExtension Sources Tests
+    swift-format lint --recursive App FileProviderExtension LiveActivity Sources Tests
     shellcheck Tests/*.sh
 
 # Run the host-side Swift package unit and integration tests.
