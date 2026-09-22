@@ -92,6 +92,8 @@ extensions.
 GitHub Actions runs on `macos-14` runners with:
 - Automated package resolution and test verification (`swift test`).
 - Project generation via cached XcodeGen (`xcodegen generate`).
+- Scoped warning settings verification enforcing warnings-as-errors on
+  first-party targets while isolating third-party dependencies.
 - Generic unsigned iOS builds for `Shh` and `ShhFileProvider`.
 - Dynamic simulator discovery selecting available iPhone and iPad
   runtimes without hardcoded identifiers.
