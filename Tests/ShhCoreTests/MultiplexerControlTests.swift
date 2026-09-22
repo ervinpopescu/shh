@@ -117,6 +117,26 @@ final class MultiplexerControlTests: XCTestCase {
         }
     }
 
+    func testDialMenuOmitsHerdrQueryControls() throws {
+        let nodes = CommandDialMultiplexerMenu.nodes(
+            tmuxSessionID: nil,
+            herdrWorkspaceID: nil,
+            capabilities: .herdr
+        )
+        XCTAssertTrue(nodes.isEmpty)
+    }
+
+    func testDialMenuResolvesTmuxPaneControlsWithoutExplicitPaneTarget() throws {
+        let session = try TmuxSessionID("$4")
+        let nodes = CommandDialMultiplexerMenu.nodes(
+            tmuxSessionID: session,
+            capabilities: .tmux
+        )
+        XCTAssertTrue(nodes.contains { $0.id == "mux.tmux.focus.left" })
+        XCTAssertTrue(nodes.contains { $0.id == "mux.tmux.split.vertical" })
+        XCTAssertTrue(nodes.contains { $0.id == "mux.tmux.zoom" })
+    }
+
     func testTargetFormattingAndDescriptions() throws {
         let session = try TmuxSessionID("$4")
         let windowWithoutAt = try TmuxWindowID("7")
