@@ -155,7 +155,11 @@ final class PortForwardingAppTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         // Give the auto-start task a brief moment to finish updating published sessions
-        try await Task.sleep(nanoseconds: 50_000_000)
+        let deadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+        while container.forwardingSessions.first(where: { $0.ruleID == rule1.id })?.status != .active
+            && DispatchTime.now().uptimeNanoseconds < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
 
         // Rule 1 was enabled, so it must be automatically active
         let rule1Session = container.forwardingSessions.first(where: { $0.ruleID == rule1.id })
@@ -293,7 +297,11 @@ final class PortForwardingAppTests: XCTestCase {
         await container.trustStore.save(challenge)
 
         await container.connect(to: host)
-        try await Task.sleep(nanoseconds: 30_000_000)
+        let disconnectHostDeadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+        while container.activeForwardersCount != 1
+            && DispatchTime.now().uptimeNanoseconds < disconnectHostDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         XCTAssertEqual(container.activeForwardersCount, 1)
 
         // Explicit disconnect
@@ -330,12 +338,20 @@ final class PortForwardingAppTests: XCTestCase {
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        try await Task.sleep(nanoseconds: 30_000_000)
+        let dropHostDeadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+        while container.activeForwardersCount != 1
+            && DispatchTime.now().uptimeNanoseconds < dropHostDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
         XCTAssertEqual(container.activeForwardersCount, 1)
 
         // Emit closed event from underlying connection
         mock.emit(.closed)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        let closedDeadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+        while container.activeSession?.state != .disconnected
+            && DispatchTime.now().uptimeNanoseconds < closedDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
 
         // Session must be disconnected and forwarders stopped/cleared
         XCTAssertEqual(container.activeSession?.state, .disconnected)
