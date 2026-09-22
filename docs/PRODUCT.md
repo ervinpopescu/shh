@@ -29,7 +29,12 @@ integration without third-party cloud servers or subscription telemetry.
   address truncation.
 - **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
   buffer support (vim, htop, tmux), ANSI color parser, search drawers,
-  and debounced resize handling.
+  debounced resize handling, and context-aware touch scrolling
+  (preserving native primary scrollback for local mouse-off sessions,
+  routing enabled mouse wheel events through the negotiated terminal
+  protocol including primary-screen tmux, quantizing alternate-screen
+  navigation keys, and invoking safe multiplexer copy-mode fallback
+  without CLI text injection).
 - **Session Lifecycle & Background Keepalive:** Finite iOS background
   grace period execution via standard UIKit background tasks, keeping
   active SSH, Mosh, port forwarding, and terminal sessions alive without
