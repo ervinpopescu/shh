@@ -14,8 +14,9 @@ backups.
 ## Capabilities
 
 - **Terminal & Transport:** Live Citadel/NIOSSH transport with PTY,
-  TOFU host-key verification, and SwiftTerm rendering with alternate
-  screen buffers and debounced resize handling.
+  TOFU host-key verification, and SwiftTerm rendering with context-aware
+  touch scrolling, alternate screen buffers, and debounced resize
+  handling.
 - **Lifecycle & Keepalive:** Finite iOS background grace period
   keepalives for active SSH, Mosh, and forwarding sessions without
   background audio modes, with zero-delay foreground resumption via
