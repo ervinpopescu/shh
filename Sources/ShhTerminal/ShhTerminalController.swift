@@ -159,6 +159,18 @@ public final class ShhTerminalController: ObservableObject {
     public var onBell: (() -> Void)?
     public var onFirstResponderChange: ((Bool) -> Void)?
     public var onRiskyPasteRequested: ((String) -> Void)?
+    /// Requests a UI affordance for entering multiplexer copy mode. This callback
+    /// intentionally emits no PTY bytes, so it cannot type a command into a pane.
+    public var onCopyModeFallbackRequested: (() -> Void)?
+    /// Set by the session layer when the connected foreground is a multiplexer.
+    /// It only enables a safe UI affordance; it never causes terminal bytes.
+    public var copyModeFallbackEnabled = false
+
+    /// Indicates whether copy-mode fallback is both enabled by the session layer
+    /// and backed by an actively registered UI or session handler.
+    public var isCopyModeFallbackAvailable: Bool {
+        copyModeFallbackEnabled && onCopyModeFallbackRequested != nil
+    }
 
     public var isMetalEnabled: Bool { false }
 
@@ -359,6 +371,11 @@ public final class ShhTerminalController: ObservableObject {
         send(raw: data)
     }
 
+    public func requestCopyModeFallback() {
+        guard isCopyModeFallbackAvailable else { return }
+        onCopyModeFallbackRequested?()
+    }
+
     public func handlePasteRequest(_ text: String) {
         if isRiskyUnbracketedPaste(text) {
             onRiskyPasteRequested?(text)
@@ -379,6 +396,7 @@ public final class ShhTerminalController: ObservableObject {
         fontGeometryWorkItem?.cancel()
         fontGeometryWorkItem = nil
         hasPendingFirstResponderRequest = false
+        copyModeFallbackEnabled = false
         title = ""
         clearSearch()
         selectNone()

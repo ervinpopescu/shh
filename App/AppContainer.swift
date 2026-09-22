@@ -114,7 +114,14 @@ final class AppContainer: ObservableObject {
     @Published var isProbingTmux: Bool = false
     @Published var isTmuxServerRunning: Bool = false
     @Published var tmuxError: String? = nil
-    @Published var activeTmuxSessionID: String? = nil
+    @Published var activeTmuxSessionID: String? = nil {
+        didSet {
+            terminalController.copyModeFallbackEnabled = activeTmuxSessionID != nil
+            // Primary-screen tmux wheel events remain application input.
+            // Copy-mode fallback is only available when a dedicated handler is
+            // explicitly registered for an alternate-screen mouse-off gesture.
+        }
+    }
 
     // MARK: - Herdr Multiplexer & Agent State
     @Published public var herdrAvailability: HerdrAvailability = .unavailable(reason: "Not connected")
