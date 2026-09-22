@@ -70,6 +70,13 @@ integration without third-party cloud servers or subscription telemetry.
   reconnection across Wi-Fi and Cellular interface transitions. Note:
   full Mosh SSP remains a separate future protocol task and does not
   affect SSH completeness.
+- **Lock Screen & Dynamic Island Live Activities:** Privacy-safe
+  WidgetKit Live Activity displaying truthful SSH session lifecycle
+  status (`connected`, `reconnecting`, `failed`, `disconnected`) with
+  reconnection attempt counters and elapsed update indicators. Displays
+  sanitized host and session labels, operates strictly as an unprivileged
+  status display, does not extend iOS background socket execution, and
+  never exposes command streams, terminal text, or credentials.
 - **Files App Integration:** File Provider extension exposing remote
   SFTP files directly in Apple's Files app. Domain registration and
   removal from Settings. Mosh-only hosts are explicitly rejected with

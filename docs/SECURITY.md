@@ -98,7 +98,22 @@ data, remote execution outputs, voice transcripts, and backup storage.
   Transports are probed on foreground return to verify cryptographic
   channel integrity.
 
-### 6. Privacy Manifest & Required-Reason APIs
+### 6. Live Activities & Privacy Invariants
+- Live Activity attributes (`ShhSSHSessionActivityAttributes`) and content
+  state (`ContentState`) are strictly limited to non-sensitive connection
+  metadata: session identifier, sanitized display name, sanitized host label,
+  status (`connected`, `reconnecting`, `failed`, `disconnected`), timestamp,
+  and reconnection attempt count.
+- Terminal text, keystrokes, commands, snippets, private keys, passwords,
+  and tokens are strictly excluded and never passed to ActivityKit or
+  rendered on the Lock Screen or Dynamic Island.
+- Display names and host labels are length-bounded and trimmed of
+  leading/trailing whitespace and newlines.
+- Live Activities are visual indicators only. They do not request
+  background processing time, do not keep network sockets open, and do not
+  extend background execution lifetime for SSH or SFTP connections.
+
+### 7. Privacy Manifest & Required-Reason APIs
 - `Resources/PrivacyInfo.xcprivacy` declares only accessed APIs:
   - `NSPrivacyAccessedAPICategoryUserDefaults`: Storing local session
     restoration metadata (`CA92.1`).
@@ -112,7 +127,7 @@ data, remote execution outputs, voice transcripts, and backup storage.
 - `NSPrivacyCollectedDataTypes` is empty: zero analytics, zero crash
   reporting telemetry, zero user tracking.
 
-### 7. Cryptographic Export Compliance (EAR Category 5, Part 2)
+### 8. Cryptographic Export Compliance (EAR Category 5, Part 2)
 - Shh incorporates cryptographic software for remote communication
   (SSH/SFTP tunnels via SwiftNIO SSH and Citadel) and zero-knowledge
   local vault backup encryption (AES-256-GCM / PBKDF2).
