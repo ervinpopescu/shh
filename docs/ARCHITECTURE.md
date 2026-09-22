@@ -38,8 +38,10 @@ extensions.
 - **Live SFTP:** SFTP channel client for directory navigation, remote
   file CRUD, atomic upload, and streamed download.
 - **Bonjour Discovery:** Local network SSH service browsing (`_ssh._tcp`)
-  via `NWBrowser` and advertised mDNS hostname and port resolution via
-  `NetService`.
+  via `NWBrowser` with peer-to-peer support, reference-counted lifecycle
+  ownership, observable `BonjourDiscoveryState` transitions, and
+  advertised mDNS hostname and port resolution via `NetService` scheduled
+  on the main run loop.
 
 ### 3. ShhTerminal (Rendering & Input)
 - **SwiftTerm Engine:** Native terminal view and rendering.
@@ -69,7 +71,9 @@ extensions.
   standard UIKit background tasks (`BackgroundTaskManaging`),
   preserving active SSH, Mosh, and port forwarding sessions without
   background audio modes, and probes transport responsiveness on
-  foreground return before reconnecting.
+  foreground return before reconnecting. Forwards Bonjour discovery
+  state invalidations to drive reactive status and retry banners in
+  host views.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
   Group storage (`snapshot.json` and `known_hosts.json`).
