@@ -77,7 +77,7 @@ struct KeyManagementView: View {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("No SSH keys or credentials saved.")
-                            .font(AppTypography.rowTitle)
+                            .appRowTitle()
                         Text("Generate or import an Ed25519 private key or save a password credential to authenticate with your remote hosts.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -105,7 +105,11 @@ struct KeyManagementView: View {
         }
         .navigationTitle("Keys & Credentials")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $search, prompt: "Search keys and fingerprints")
+        .searchable(
+            text: $search,
+            placement: .navigationBarDrawer(displayMode: .always),
+            prompt: "Search keys and fingerprints"
+        )
         .autocorrectionDisabled()
         .textInputAutocapitalization(.never)
         .toolbar {
@@ -173,7 +177,7 @@ struct IdentityRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(identity.name)
-                        .font(AppTypography.rowTitle)
+                        .appRowTitle()
                     IdentityKindBadge(kind: identity.kind)
                 }
 
