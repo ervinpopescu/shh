@@ -4,6 +4,20 @@ import XCTest
 import ShhCore
 import ShhTerminal
 
+private final class LockedString: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: String
+
+    init(_ value: String) {
+        storage = value
+    }
+
+    var value: String {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+}
+
 @MainActor
 final class TmuxAppTests: XCTestCase {
 
@@ -775,13 +789,13 @@ final class TmuxAppTests: XCTestCase {
         let host = try Host(name: "Create Host", hostname: "create.test", username: "user")
         await container.connect(to: host)
 
-        var sessionsOutput = "$0\tother\t1\t1700000000\t1700000500\t0\n"
+        let sessionsOutput = LockedString("$0\tother\t1\t1700000000\t1700000500\t0\n")
         mock.onExecuteCommand = { cmd in
             if cmd == TmuxCommand.probe {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
-                return SSHCommandResult(exitCode: 0, stdout: sessionsOutput)
+                return SSHCommandResult(exitCode: 0, stdout: sessionsOutput.value)
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -803,7 +817,7 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertTrue(container.isTmuxSessionActive(candidateSession))
 
         // Now remote list updates with the new session
-        sessionsOutput = "$0\tother\t1\t1700000000\t1700000500\t0\n$5\tproject-work\t1\t1700000000\t1700000500\t1\n"
+        sessionsOutput.value = "$0\tother\t1\t1700000000\t1700000500\t0\n$5\tproject-work\t1\t1700000000\t1700000500\t1\n"
         let sessions = await container.listTmuxSessions()
         XCTAssertEqual(sessions.count, 2)
         XCTAssertEqual(container.activeTmuxSessionID, "$5")
