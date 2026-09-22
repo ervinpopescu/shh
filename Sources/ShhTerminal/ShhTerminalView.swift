@@ -141,16 +141,37 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     weak var controller: ShhTerminalController?
     private var lastAppliedBoundsSize: CGSize = .zero
     private var pinchBasePointSize: Double?
+    internal var scrollGesture: UIPanGestureRecognizer!
+    private var scrollReducer = TerminalScrollIntentReducer()
+    private var scrollReducerState = TerminalScrollIntentReducer.State()
+    private var suspendedMouseReporting = false
+    private var previousAllowMouseReporting = true
 
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
         super.init(frame: frame, font: nil, options: options)
         self.inputAccessoryView = nil
         setupTapGesture()
+        setupContextAwareScrollGesture()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    private func setupContextAwareScrollGesture() {
+        let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleScroll(_:)))
+        gesture.maximumNumberOfTouches = 1
+        gesture.cancelsTouchesInView = false
+        gesture.delegate = self
+        scrollGesture = gesture
+        addGestureRecognizer(gesture)
+
+        // Give this recognizer priority only when it is actually needed. When it
+        // fails (plain primary scrollback or primary-screen tmux without mouse
+        // reporting), UIScrollView retains native scrollback and no terminal
+        // input is generated.
+        panGestureRecognizer.require(toFail: gesture)
     }
 
     private func setupTapGesture() {
@@ -170,6 +191,133 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         }
     }
 
+    public override func gestureRecognizerShouldBegin(
+        _ gestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        guard gestureRecognizer === scrollGesture else { return true }
+        let terminal = getTerminal()
+        guard !hasActiveSelection else { return false }
+        // Mouse reporting is application input. This is also required for a
+        // primary-screen tmux session: its wheel binding, not SwiftTerm's local
+        // scroll view, owns the session scrollback. With reporting disabled,
+        // primary-screen scrolling falls through to the native scroll view.
+        return terminal.mouseMode != .off || terminal.isCurrentBufferAlternate
+    }
+
+    @objc private func handleScroll(_ recognizer: UIPanGestureRecognizer) {
+        let phase: TerminalScrollGesture.Phase
+        switch recognizer.state {
+        case .began: phase = .began
+        case .changed: phase = .changed
+        case .ended: phase = .ended
+        case .cancelled, .failed: phase = .cancelled
+        default: return
+        }
+        let translation = recognizer.translation(in: self).y
+        if recognizer.state == .changed {
+            recognizer.setTranslation(.zero, in: self)
+        }
+        processScrollGesture(
+            phase: phase,
+            translationY: translation,
+            velocityY: recognizer.velocity(in: self).y,
+            location: recognizer.location(in: self)
+        )
+    }
+
+    internal func processScrollGesture(
+        phase: TerminalScrollGesture.Phase,
+        translationY: Double,
+        velocityY: Double = 0,
+        location: CGPoint = .zero
+    ) {
+        let terminal = getTerminal()
+        let mouseReporting = terminal.mouseMode != .off
+        // Mouse wheel ticks represent touch movement through a stable viewport
+        // grid, rather than every rendered glyph row. Without this normalization
+        // a large phone/iPad terminal emits multiple wheel packets for one touch
+        // update merely because its font creates more visible rows.
+        let referenceRows = max(1, min(terminal.rows, 24))
+        let rowHeight =
+            mouseReporting
+            ? max(1, bounds.height / CGFloat(referenceRows))
+            : max(1, bounds.height / CGFloat(max(1, terminal.rows)))
+        let context = TerminalScrollContext(
+            surface: terminal.isCurrentBufferAlternate ? .alternate : .primary,
+            mouseReporting: mouseReporting,
+            rowHeight: rowHeight,
+            rowCount: terminal.rows,
+            copyModeFallbackAvailable: controller?.isCopyModeFallbackAvailable ?? false
+        )
+        if phase == .began && terminal.mouseMode != .off {
+            previousAllowMouseReporting = allowMouseReporting
+            allowMouseReporting = false
+            suspendedMouseReporting = true
+        }
+        let event = TerminalScrollGesture(
+            phase: phase,
+            translationY: translationY,
+            velocityY: velocityY
+        )
+        let intents = scrollReducer.reduce(event, context: context, state: &scrollReducerState)
+        for intent in intents {
+            applyScrollIntent(intent, terminal: terminal, at: location)
+        }
+        if phase == .ended || phase == .cancelled {
+            if suspendedMouseReporting {
+                allowMouseReporting = previousAllowMouseReporting
+                suspendedMouseReporting = false
+            }
+        }
+    }
+
+    internal func applyScrollIntent(
+        _ intent: TerminalScrollIntent,
+        terminal: SwiftTerm.Terminal,
+        at point: CGPoint
+    ) {
+        switch intent {
+        case .native:
+            break
+        case .mouseWheel(let direction):
+            let columnWidth = max(1, bounds.width / CGFloat(max(1, terminal.cols)))
+            let rowHeight = max(1, bounds.height / CGFloat(max(1, terminal.rows)))
+            let column = max(0, min(terminal.cols - 1, Int(floor(point.x / columnWidth))))
+            let row = max(0, min(terminal.rows - 1, Int(floor(point.y / rowHeight))))
+            // Use SwiftTerm's encoder rather than constructing CSI bytes here.
+            // It selects SGR, UTF-8, URXVT, or legacy encoding negotiated by the
+            // application, while keeping wheel buttons 4 and 5 (64 and 65).
+            let button = direction == .up ? 4 : 5
+            let buttonFlags = terminal.encodeButton(
+                button: button,
+                release: false,
+                shift: false,
+                meta: false,
+                control: false
+            )
+            terminal.sendEvent(buttonFlags: buttonFlags, x: column, y: row)
+        case .key(let key):
+            let bytes: [UInt8]
+            switch key {
+            case .up:
+                bytes =
+                    terminal.applicationCursor
+                    ? EscapeSequences.moveUpApp
+                    : EscapeSequences.moveUpNormal
+            case .down:
+                bytes =
+                    terminal.applicationCursor
+                    ? EscapeSequences.moveDownApp
+                    : EscapeSequences.moveDownNormal
+            case .pageUp: bytes = EscapeSequences.cmdPageUp
+            case .pageDown: bytes = EscapeSequences.cmdPageDown
+            }
+            insertText(String(decoding: bytes, as: UTF8.self))
+        case .copyModeFallback:
+            controller?.requestCopyModeFallback()
+        }
+    }
+
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
         switch recognizer.state {
         case .began:
@@ -186,11 +334,31 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     public func gestureRecognizer(
         _ gestureRecognizer: UIGestureRecognizer,
+        shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        // SwiftTerm installs its own pan recognizer for mouse drags when any
+        // mouse mode is enabled. Make that recognizer wait for this reducer so
+        // a touch scroll emits wheel events, never a press/drag sequence.
+        gestureRecognizer === scrollGesture
+            && otherGestureRecognizer is UIPanGestureRecognizer
+            && otherGestureRecognizer !== scrollGesture
+    }
+
+    public func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         // Pinch must not steal scrolling, selection, keyboard cursor movement, or
-        // SwiftTerm's own touch handling.
-        true
+        // SwiftTerm's own touch handling. The context-aware pan is exclusive so
+        // SwiftTerm's mouse-drag recognizer cannot add motion reports to a wheel.
+        if gestureRecognizer === scrollGesture || otherGestureRecognizer === scrollGesture {
+            let other =
+                gestureRecognizer === scrollGesture
+                ? otherGestureRecognizer
+                : gestureRecognizer
+            return other is UIPinchGestureRecognizer
+        }
+        return true
     }
 
     public override func layoutSubviews() {
