@@ -20,7 +20,7 @@ final class TestEchoServer: @unchecked Sendable {
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
     }
 
-    func start() async throws -> UInt16 {
+    func start(host: String = "127.0.0.1") async throws -> UInt16 {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
             .childChannelOption(ChannelOptions.socket(SocketOptionLevel(IPPROTO_TCP), TCP_NODELAY), value: 1)
@@ -28,7 +28,7 @@ final class TestEchoServer: @unchecked Sendable {
                 channel.pipeline.addHandler(TestEchoHandler())
             }
 
-        let channel = try await bootstrap.bind(host: "127.0.0.1", port: 0).get()
+        let channel = try await bootstrap.bind(host: host, port: 0).get()
         self.serverChannel = channel
         self.port = UInt16(channel.localAddress!.port!)
         return self.port
