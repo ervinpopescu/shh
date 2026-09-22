@@ -86,6 +86,7 @@ final class AppContainer: ObservableObject {
     #endif
     let reachabilityMonitor: any ReachabilityMonitoring
     let reconnectCoordinator: ReconnectCoordinator
+    private let liveActivityManager: SSHSessionLiveActivityManager
     private let didProvideCustomCatalog: Bool
     private var persistenceWriteBlocked = false
     @Published public var persistenceReadinessMessage: String? = nil
@@ -118,6 +119,7 @@ final class AppContainer: ObservableObject {
     @Published var activeSession: TerminalSession? {
         didSet {
             updateIdleTimerState()
+            syncLiveActivityState()
         }
     }
     @Published var terminalText = ""
@@ -125,7 +127,11 @@ final class AppContainer: ObservableObject {
     @Published var pendingTrustChallenge: HostKeyChallenge?
     @Published public var lastConnectionFailure: ConnectionFailure?
     @Published public var catalogUpdateToken: UUID = UUID()
-    @Published var reconnectState: ReconnectState = .idle
+    @Published var reconnectState: ReconnectState = .idle {
+        didSet {
+            syncLiveActivityState()
+        }
+    }
     /// True while foreground return is verifying the previous transport. The
     /// session is reported as connecting during this interval instead of
     /// presenting stale connected state while a probe is in flight.
@@ -333,6 +339,31 @@ final class AppContainer: ObservableObject {
         #endif
     }
 
+    private func syncLiveActivityState() {
+        guard let session = activeSession else {
+            liveActivityManager.endAll()
+            return
+        }
+        guard activeHost != nil, !isExplicitDisconnect else {
+            liveActivityManager.end(sessionID: session.id)
+            return
+        }
+
+        let mapped = SSHLiveActivityStatusMapper.map(
+            sessionState: session.state,
+            reconnectState: reconnectState
+        )
+        if mapped.status == .connected, session.state == .connected {
+            liveActivityManager.startOrUpdate(session: session, host: activeHost!)
+        } else {
+            liveActivityManager.update(
+                sessionID: session.id,
+                status: mapped.status,
+                reconnectAttempt: mapped.reconnectAttempt
+            )
+        }
+    }
+
     var activeTranscriber: any LocalTranscriber {
         customTranscriber ?? voiceRegistry.activeTranscriber()
     }
@@ -502,6 +533,7 @@ final class AppContainer: ObservableObject {
         self.reachabilityMonitor = monitor
         let coordinator = reconnectCoordinator ?? ReconnectCoordinator()
         self.reconnectCoordinator = coordinator
+        self.liveActivityManager = SSHSessionLiveActivityManager()
         let resolvedBonjour = bonjourDiscovery ?? BonjourSSHDiscovery()
         self.bonjourDiscovery = resolvedBonjour
 
@@ -714,6 +746,7 @@ final class AppContainer: ObservableObject {
 
     func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
         guard activeSession?.state != .connecting else { return }
+        liveActivityManager.endAll()
         foregroundRecoveryTask?.cancel()
         foregroundRecoveryTask = nil
         lifecycleGeneration += 1
@@ -1105,7 +1138,12 @@ final class AppContainer: ObservableObject {
         terminalController.reset()
 
         hasObservedTransportError = false
-        let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
+        let session = TerminalSession(
+            id: activeSession?.id ?? UUID(),
+            hostID: host.id,
+            state: .connecting,
+            capabilities: ["ansi", "resize"]
+        )
         activeSession = session
 
         let initialSize = terminalController.size
@@ -1231,6 +1269,7 @@ final class AppContainer: ObservableObject {
 
     func cancelReconnect() async {
         isExplicitDisconnect = true
+        liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
         isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
         foregroundRecoveryTask?.cancel()
@@ -1704,6 +1743,7 @@ final class AppContainer: ObservableObject {
             ))
         }
         activeHost = nil
+        liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
         await reconnectCoordinator.cancel()
         reconnectState = .idle
         detachCallbacks()
