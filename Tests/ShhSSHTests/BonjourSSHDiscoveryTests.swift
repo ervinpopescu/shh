@@ -13,6 +13,7 @@ final class MockBonjourResolver: BonjourServiceResolving, @unchecked Sendable {
     private let waitsForCancellation: Bool
     private let lock = NSLock()
     private(set) var cancelCallCount = 0
+    private(set) var resolveCallCount = 0
 
     init(result: BonjourServiceResolution?, waitsForCancellation: Bool = false) {
         self.result = result
@@ -20,6 +21,9 @@ final class MockBonjourResolver: BonjourServiceResolving, @unchecked Sendable {
     }
 
     func resolve() async -> BonjourServiceResolution? {
+        lock.withLock {
+            resolveCallCount += 1
+        }
         guard waitsForCancellation else { return result }
         try? await Task.sleep(nanoseconds: 10_000_000_000)
         return nil
@@ -66,6 +70,10 @@ final class MockBonjourBrowser: BonjourServiceBrowsing, @unchecked Sendable {
         let handler = lock.withLock { stateHandler }
         handler?(state)
     }
+}
+
+final class MockBonjourBrowserStore: @unchecked Sendable {
+    var browsers: [MockBonjourBrowser] = []
 }
 #endif
 
@@ -272,28 +280,118 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         XCTAssertTrue(ports.contains(2222))
     }
 
+    #if canImport(Network)
     @MainActor
-    func testStateTransitions() {
-        let discovery = BonjourSSHDiscovery()
+    func testStateTransitionsUseReferenceCounting() {
+        let browser = MockBonjourBrowser()
+        let discovery = BonjourSSHDiscovery(browserFactory: { browser })
         XCTAssertFalse(discovery.isSearching)
+        XCTAssertEqual(discovery.state, .idle)
         XCTAssertTrue(discovery.discoveredServices.isEmpty)
 
-        // Starting discovery
+        discovery.startDiscovery()
         discovery.startDiscovery()
         XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(browser.startCallCount, 1)
 
-        // Calling start again while searching is a safe no-op
-        discovery.startDiscovery()
+        // The first lifecycle owner can stop without cancelling the shared browser.
+        discovery.stopDiscovery()
         XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(browser.cancelCallCount, 0)
 
-        // Stopping discovery
         discovery.stopDiscovery()
         XCTAssertFalse(discovery.isSearching)
+        XCTAssertEqual(discovery.state, .idle)
+        XCTAssertEqual(browser.cancelCallCount, 1)
 
-        // Calling stop again is safe
+        // Extra releases remain harmless.
         discovery.stopDiscovery()
-        XCTAssertFalse(discovery.isSearching)
+        XCTAssertEqual(browser.cancelCallCount, 1)
     }
+
+    @MainActor
+    func testBrowserStateTransitionsAreObservable() async throws {
+        let browser = MockBonjourBrowser()
+        let discovery = BonjourSSHDiscovery(browserFactory: { browser })
+
+        discovery.startDiscovery()
+        XCTAssertEqual(discovery.state, .starting)
+
+        browser.simulateState(.setup)
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertEqual(discovery.state, .starting)
+
+        browser.simulateState(.ready)
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertEqual(discovery.state, .searching)
+        XCTAssertTrue(discovery.isSearching)
+
+        browser.simulateState(.waiting(.posix(.ENETDOWN)))
+        try await Task.sleep(nanoseconds: 10_000_000)
+        if case let .waiting(message) = discovery.state {
+            XCTAssertFalse(message.isEmpty)
+        } else {
+            XCTFail("Expected waiting state")
+        }
+        XCTAssertTrue(discovery.isSearching)
+
+        browser.simulateState(.failed(.posix(.ECONNABORTED)))
+        try await Task.sleep(nanoseconds: 10_000_000)
+        if case let .failed(message) = discovery.state {
+            XCTAssertFalse(message.isEmpty)
+        } else {
+            XCTFail("Expected failed state")
+        }
+        XCTAssertFalse(discovery.isSearching)
+
+        browser.simulateState(.failed(.posix(.EPERM)))
+        try await Task.sleep(nanoseconds: 10_000_000)
+        if case let .failed(message) = discovery.state {
+            XCTAssertTrue(message.contains("Local Network access is denied"))
+        } else {
+            XCTFail("Expected denied access state")
+        }
+    }
+
+    @MainActor
+    func testRetryStartsDiscoveryWithoutExistingOwner() {
+        let browser = MockBonjourBrowser()
+        let discovery = BonjourSSHDiscovery(browserFactory: { browser })
+
+        discovery.retryDiscovery()
+
+        XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(discovery.state, .starting)
+        XCTAssertEqual(browser.startCallCount, 1)
+        discovery.stopDiscovery()
+    }
+
+    @MainActor
+    func testRetryRestartsAfterBrowserFailureWithoutReleasingOwner() async throws {
+        let browserStore = MockBonjourBrowserStore()
+        let discovery = BonjourSSHDiscovery(browserFactory: {
+            let browser = MockBonjourBrowser()
+            browserStore.browsers.append(browser)
+            return browser
+        })
+
+        discovery.startDiscovery()
+        XCTAssertEqual(browserStore.browsers.count, 1)
+        browserStore.browsers[0].simulateState(.failed(.posix(.ECONNABORTED)))
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        discovery.retryDiscovery()
+        XCTAssertEqual(browserStore.browsers.count, 2)
+        XCTAssertEqual(browserStore.browsers[0].cancelCallCount, 1)
+        XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(discovery.state, .starting)
+
+        browserStore.browsers[1].simulateState(.ready)
+        try await Task.sleep(nanoseconds: 10_000_000)
+        XCTAssertEqual(discovery.state, .searching)
+        discovery.stopDiscovery()
+    }
+    #endif
 
     #if canImport(Network)
     @MainActor
@@ -356,6 +454,85 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         discovery.stopDiscovery()
         XCTAssertFalse(discovery.isSearching)
         XCTAssertEqual(createdBrowsers[1].cancelCallCount, 1)
+    }
+    @MainActor
+    func testDiscoveryStateMessagesExposeActionableFailures() {
+        XCTAssertNil(BonjourDiscoveryState.idle.message)
+        XCTAssertNil(BonjourDiscoveryState.starting.message)
+        XCTAssertNil(BonjourDiscoveryState.searching.message)
+        XCTAssertEqual(BonjourDiscoveryState.waiting(message: "waiting").message, "waiting")
+        XCTAssertEqual(BonjourDiscoveryState.failed(message: "failed").message, "failed")
+    }
+
+    @MainActor
+    func testLiveBonjourBrowserCanBeCancelled() {
+        let browser = LiveBonjourServiceBrowser()
+        browser.cancel()
+    }
+
+    @MainActor
+    func testHostPortResultsBecomeDiscoveredServices() async throws {
+        let browser = MockBonjourBrowser()
+        let discovery = BonjourSSHDiscovery(browserFactory: { browser })
+        discovery.startDiscovery()
+
+        browser.simulateResults([
+            NWEndpoint.hostPort(
+                host: NWEndpoint.Host("server.local"),
+                port: NWEndpoint.Port(integerLiteral: 2200)
+            )
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(discovery.discoveredServices.count, 1)
+        XCTAssertEqual(discovery.discoveredServices[0].hostname, "server.local")
+        XCTAssertEqual(discovery.discoveredServices[0].port, 2200)
+        discovery.stopDiscovery()
+    }
+
+    @MainActor
+    func testRemovingEndpointCancelsObsoleteResolution() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(result: nil, waitsForCancellation: true)
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+        discovery.startDiscovery()
+        browser.simulateResults([
+            NWEndpoint.service(name: "nas", type: "_ssh._tcp", domain: "local.", interface: nil)
+        ])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        browser.simulateResults([])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(resolver.cancelCallCount, 1)
+        discovery.stopDiscovery()
+    }
+
+    @MainActor
+    func testFailedResolutionIsRetriedForTheSameService() async throws {
+        let browser = MockBonjourBrowser()
+        let resolver = MockBonjourResolver(result: nil)
+        let discovery = BonjourSSHDiscovery(
+            browserFactory: { browser },
+            resolverFactory: { _, _, _ in resolver }
+        )
+        let endpoint = NWEndpoint.service(
+            name: "nas",
+            type: "_ssh._tcp",
+            domain: "local.",
+            interface: nil
+        )
+        discovery.startDiscovery()
+        browser.simulateResults([endpoint])
+        try await Task.sleep(nanoseconds: 50_000_000)
+        browser.simulateResults([endpoint])
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(resolver.resolveCallCount, 2)
+        discovery.stopDiscovery()
     }
     #endif
 

@@ -179,8 +179,18 @@ private final class NetServiceBonjourResolver: NSObject, BonjourServiceResolving
                     continuation.resume(returning: nil)
                     return
                 }
-                service.schedule(in: .main, forMode: .default)
-                service.resolve(withTimeout: timeout)
+                // NetService performs its callbacks on the run loop where it is
+                // scheduled. Always start resolution on the main run loop; the
+                // browser callback itself arrives on the private Network queue.
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    let shouldResolve = self.lock.withLock {
+                        !self.isCancelled && self.continuation != nil
+                    }
+                    guard shouldResolve else { return }
+                    self.service.schedule(in: .main, forMode: .default)
+                    self.service.resolve(withTimeout: self.timeout)
+                }
             }
         } onCancel: {
             cancel()
@@ -190,10 +200,13 @@ private final class NetServiceBonjourResolver: NSObject, BonjourServiceResolving
     func cancel() {
         let continuation = lock.withLock { () -> CheckedContinuation<BonjourServiceResolution?, Never>? in
             isCancelled = true
-            service.stop()
             defer { self.continuation = nil }
             return self.continuation
         }
+        // NetService may synchronously deliver a delegate callback from stop().
+        // Do not hold the resolver lock while stopping it or that callback can
+        // deadlock while trying to finish the continuation.
+        service.stop()
         continuation?.resume(returning: nil)
     }
 
@@ -235,7 +248,13 @@ public final class LiveBonjourServiceBrowser: BonjourServiceBrowsing, @unchecked
     private var browser: NWBrowser?
 
     public init(type: String = "_ssh._tcp", domain: String? = nil) {
-        self.browser = NWBrowser(for: .bonjour(type: type, domain: domain), using: .tcp)
+        let parameters = NWParameters.tcp
+        // Physical iPhones can expose reachable peers through the device-to-
+        // device path even when the Wi-Fi interface is unavailable. Enabling
+        // this does not replace normal LAN browsing and is supported by
+        // Network.framework for Bonjour browsers.
+        parameters.includePeerToPeer = true
+        self.browser = NWBrowser(for: .bonjour(type: type, domain: domain), using: parameters)
     }
 
     public func start(
@@ -261,11 +280,36 @@ public final class LiveBonjourServiceBrowser: BonjourServiceBrowsing, @unchecked
 }
 #endif
 
+/// The user-visible state of local-network Bonjour discovery.
+public enum BonjourDiscoveryState: Equatable, Sendable {
+    /// Discovery is stopped or has not yet started.
+    case idle
+    /// Discovery is starting and initializing the service browser.
+    case starting
+    /// The service browser is active and listening for local network services.
+    case searching
+    /// Discovery is waiting for network connectivity or authorization with user-facing guidance.
+    case waiting(message: String)
+    /// Discovery encountered an error or was stopped unexpectedly.
+    case failed(message: String)
+
+    /// The user-facing explanation if discovery is waiting or failed.
+    public var message: String? {
+        switch self {
+        case .idle, .starting, .searching:
+            return nil
+        case .waiting(let message), .failed(let message):
+            return message
+        }
+    }
+}
+
 /// Discovers SSH services on the local network using Bonjour (`_ssh._tcp`) and resolves advertised mDNS hostnames.
 @MainActor
 public final class BonjourSSHDiscovery: ObservableObject {
     @Published public private(set) var discoveredServices: [DiscoveredSSHService] = []
     @Published public private(set) var isSearching: Bool = false
+    @Published public private(set) var state: BonjourDiscoveryState = .idle
 
     #if canImport(Network)
     private var browser: (any BonjourServiceBrowsing)?
@@ -275,6 +319,8 @@ public final class BonjourSSHDiscovery: ObservableObject {
     private var resolutionTasks: [String: Task<Void, Never>] = [:]
     private var resolvers: [String: any BonjourServiceResolving] = [:]
     private var resolutions: [String: BonjourServiceResolution] = [:]
+    private var discoveryReferenceCount = 0
+    private var discoveryGeneration = 0
 
     /// Creates a discovery coordinator with optional custom browser and resolver factories for testing.
     public init(
@@ -289,8 +335,39 @@ public final class BonjourSSHDiscovery: ObservableObject {
         self.queue = queue
     }
 
+    /// Retains a discovery client. Discovery stays alive until every client has
+    /// released its reference, which prevents a sheet transition from stopping
+    /// the browser owned by the host list.
     public func startDiscovery() {
-        guard !isSearching else { return }
+        discoveryReferenceCount += 1
+        if browser == nil {
+            startBrowser()
+        }
+    }
+
+    /// Releases one discovery client. Extra releases are harmless, which keeps
+    /// SwiftUI lifecycle callbacks safe when views are recreated.
+    public func stopDiscovery() {
+        guard discoveryReferenceCount > 0 else { return }
+        discoveryReferenceCount -= 1
+        guard discoveryReferenceCount == 0 else { return }
+        stopBrowser()
+    }
+
+    /// Restarts the active browser without changing lifecycle ownership.
+    public func retryDiscovery() {
+        guard discoveryReferenceCount > 0 else {
+            startDiscovery()
+            return
+        }
+        stopBrowser()
+        startBrowser()
+    }
+
+    private func startBrowser() {
+        discoveryGeneration += 1
+        let generation = discoveryGeneration
+        state = .starting
         isSearching = true
 
         let browser = browserFactory()
@@ -298,29 +375,67 @@ public final class BonjourSSHDiscovery: ObservableObject {
 
         browser.start(queue: queue) { [weak self] endpoints in
             Task { @MainActor [weak self] in
-                self?.handleBrowserResults(endpoints)
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.handleBrowserResults(endpoints)
             }
-        } onStateChanged: { [weak self] state in
+        } onStateChanged: { [weak self] browserState in
             Task { @MainActor [weak self] in
-                guard let self else { return }
-                switch state {
-                case .cancelled, .failed:
-                    self.isSearching = false
-                    self.cancelResolutions()
-                default:
-                    break
-                }
+                guard let self, self.discoveryGeneration == generation else { return }
+                self.handleBrowserState(browserState)
             }
         }
     }
 
-    public func stopDiscovery() {
-        guard isSearching || browser != nil || !resolutionTasks.isEmpty else { return }
+    private func stopBrowser() {
+        discoveryGeneration += 1
         isSearching = false
         browser?.cancel()
         browser = nil
         cancelResolutions()
         resolutions.removeAll()
+        state = .idle
+    }
+
+    private func handleBrowserState(_ browserState: NWBrowser.State) {
+        switch browserState {
+        case .setup:
+            state = .starting
+        case .ready:
+            isSearching = true
+            state = .searching
+        case let .waiting(error):
+            // Waiting is recoverable. Keep the browser alive so Network.framework
+            // can recover when Wi-Fi or local-network authorization returns.
+            isSearching = true
+            state = .waiting(message: message(for: error, waiting: true))
+        case let .failed(error):
+            isSearching = false
+            state = .failed(message: message(for: error, waiting: false))
+            cancelResolutions()
+        case .cancelled:
+            // Explicit cancellation already transitions to idle and increments
+            // the generation. This branch handles an unexpected cancellation.
+            isSearching = false
+            state = .failed(message: "Local Network discovery stopped unexpectedly. Tap Retry to search again.")
+            cancelResolutions()
+        @unknown default:
+            isSearching = false
+            state = .failed(message: "Local Network discovery entered an unknown state. Tap Retry to search again.")
+            cancelResolutions()
+        }
+    }
+
+    private func message(for error: NWError, waiting: Bool) -> String {
+        let description = error.localizedDescription
+        let lowercased = description.lowercased()
+        if lowercased.contains("denied") || lowercased.contains("not permitted") ||
+            lowercased.contains("permission") || lowercased.contains("operation not permitted") {
+            return "Local Network access is denied. Enable Shh in Settings > Privacy & Security > Local Network, then tap Retry."
+        }
+        if waiting {
+            return "The local network is unavailable. Connect to Wi-Fi or enable Local Network access; Shh will keep waiting, or tap Retry."
+        }
+        return "Bonjour discovery failed: \(description). Check the network and tap Retry."
     }
 
     public func updateDiscoveredServices(_ services: [DiscoveredSSHService]) {
@@ -337,10 +452,11 @@ public final class BonjourSSHDiscovery: ObservableObject {
         for endpoint in endpoints {
             switch endpoint {
             case let .service(name, type, domain, _):
-                let targetDomain = domain.isEmpty ? "local." : (domain.hasSuffix(".") ? domain : domain + ".")
-                let key = "\(name)|\(type)|\(targetDomain)"
+                let targetType = Self.normalizedServiceType(type)
+                let targetDomain = Self.normalizedDomain(domain)
+                let key = Self.targetKey(name: name, type: targetType, domain: targetDomain)
                 if seenTargetKeys.insert(key).inserted {
-                    targets.append((key: key, name: name, type: type, domain: targetDomain))
+                    targets.append((key: key, name: name, type: targetType, domain: targetDomain))
                 }
 
                 if let resolution = resolutions[key] {
@@ -404,6 +520,21 @@ public final class BonjourSSHDiscovery: ObservableObject {
         resolutionTasks.removeAll()
     }
 
+    private static func normalizedServiceType(_ type: String) -> String {
+        let trimmed = type.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.hasSuffix(".") ? String(trimmed.dropLast()) : trimmed
+    }
+
+    private static func normalizedDomain(_ domain: String) -> String {
+        let trimmed = domain.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return "local." }
+        return trimmed.hasSuffix(".") ? trimmed : trimmed + "."
+    }
+
+    private static func targetKey(name: String, type: String, domain: String) -> String {
+        "\(name.lowercased())|\(type.lowercased())|\(domain.lowercased())"
+    }
+
     private func apply(
         _ resolution: BonjourServiceResolution,
         for targetKey: String,
@@ -436,9 +567,30 @@ public final class BonjourSSHDiscovery: ObservableObject {
 
     #else
 
+    private var discoveryReferenceCount = 0
+
     public init() {}
-    public func startDiscovery() { isSearching = true }
-    public func stopDiscovery() { isSearching = false }
+    public func startDiscovery() {
+        discoveryReferenceCount += 1
+        isSearching = true
+        state = .searching
+    }
+    public func stopDiscovery() {
+        guard discoveryReferenceCount > 0 else { return }
+        discoveryReferenceCount -= 1
+        if discoveryReferenceCount == 0 {
+            isSearching = false
+            state = .idle
+        }
+    }
+    public func retryDiscovery() {
+        guard discoveryReferenceCount > 0 else {
+            startDiscovery()
+            return
+        }
+        isSearching = true
+        state = .searching
+    }
     public func updateDiscoveredServices(_ services: [DiscoveredSSHService]) {
         self.discoveredServices = DiscoveredSSHService.deduplicate(services)
     }
