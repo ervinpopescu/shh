@@ -24,5 +24,7 @@
 	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Shh discovers SSH servers on your local network.</string>
+	<key>UILaunchScreen</key>
+	<dict/>
 </dict>
 </plist>
