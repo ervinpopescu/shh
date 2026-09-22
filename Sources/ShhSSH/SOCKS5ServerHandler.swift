@@ -255,35 +255,36 @@ final class SOCKS5ServerHandler: ChannelInboundHandler, @unchecked Sendable {
                     let sshBridge = SOCKS5BridgeSSHHandler(clientChannel: clientChannel, counter: counter)
                     _ = try await sshChannel.pipeline.addHandler(sshBridge).get()
 
-                    _ = try await clientChannel.eventLoop.submit {
-                        guard let self else {
-                            _ = sshChannel.close()
-                            return
-                        }
-                        self.sshChannel = sshChannel
-                        self.state = .bridged
+                    guard let handler = self else {
+                        _ = try? await sshChannel.close()
+                        return
+                    }
+                    _ = try await clientChannel.eventLoop.submit { [handler] in
+                        handler.sshChannel = sshChannel
+                        handler.state = .bridged
 
                         var reply = clientChannel.allocator.buffer(capacity: 10)
                         reply.writeBytes([0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
                         clientChannel.writeAndFlush(reply, promise: nil)
 
-                        if let pending = self.cumulationBuffer, pending.readableBytes > 0 {
+                        if let pending = handler.cumulationBuffer, pending.readableBytes > 0 {
                             sshChannel.writeAndFlush(pending, promise: nil)
-                            self.cumulationBuffer = nil
+                            handler.cumulationBuffer = nil
                         }
                     }.get()
 
                     onChannelOpened?(sshChannel)
                 } catch {
                     _ = try? await openedSSHChannel?.close()
-                    _ = try? await clientChannel.eventLoop.submit {
-                        guard let self else { return }
-                        var reply = clientChannel.allocator.buffer(capacity: 10)
-                        reply.writeBytes([0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
-                        clientChannel.writeAndFlush(reply, promise: nil)
-                        _ = clientChannel.close()
-                        self.state = .failed
-                    }.get()
+                    if let handler = self {
+                        _ = try? await clientChannel.eventLoop.submit { [handler] in
+                            var reply = clientChannel.allocator.buffer(capacity: 10)
+                            reply.writeBytes([0x05, 0x05, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+                            clientChannel.writeAndFlush(reply, promise: nil)
+                            _ = clientChannel.close()
+                            handler.state = .failed
+                        }.get()
+                    }
                 }
             }
 
