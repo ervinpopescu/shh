@@ -64,6 +64,148 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertFalse(mock.sentData.contains { $0 == Data(expected.utf8) }, "Dial controls use exec, not PTY")
     }
 
+    private func resolveEvidenceDirectory() -> URL? {
+        if let envPath = ProcessInfo.processInfo.environment["EVIDENCE_DIR"], !envPath.isEmpty {
+            let url = URL(fileURLWithPath: envPath, isDirectory: true)
+            if (try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)) != nil ||
+                FileManager.default.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        let fallback = FileManager.default.temporaryDirectory.appendingPathComponent("shh-evidence", isDirectory: true)
+        if (try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)) != nil ||
+            FileManager.default.fileExists(atPath: fallback.path) {
+            return fallback
+        }
+        return FileManager.default.temporaryDirectory
+    }
+
+    private func saveSnapshot(view: UIView, named filename: String) {
+        guard let directory = resolveEvidenceDirectory() else { return }
+        let cleanName = URL(fileURLWithPath: filename).lastPathComponent
+        let targetURL = directory.appendingPathComponent(cleanName)
+        let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
+        let image = renderer.image { _ in
+            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
+        }
+        if let png = image.pngData() {
+            try? png.write(to: targetURL)
+        }
+    }
+
+    private func saveSnapshot(view: UIView, to filename: String) {
+        saveSnapshot(view: view, named: filename)
+    }
+
+    func testSendImageEndToEndAndArtifacts() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let sftp = DemoSFTPRepository(seedDemoData: true)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            sftpRepository: sftp
+        )
+        let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // 1. Snapshot initial SendImageView using dedicated idle container
+        let idleContainer = AppContainer.demo()
+        let sendImageView = SendImageView().environmentObject(idleContainer)
+        let hosting = UIHostingController(rootView: sendImageView)
+        hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: hosting.view, named: "send_image_view.png")
+
+        // 2. Generate valid test PNG image
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 80, height: 80))
+        let testImage = renderer.image { ctx in
+            UIColor.systemCyan.setFill()
+            ctx.fill(CGRect(x: 0, y: 0, width: 80, height: 80))
+        }
+        guard let pngData = testImage.pngData() else {
+            XCTFail("Failed to render test PNG")
+            return
+        }
+
+        // 3. Initiate send image
+        container.beginSendImage(data: pngData)
+        XCTAssertTrue(container.sendImageState.isActive)
+
+        // 4. Await completion
+        let deadline = Date().addingTimeInterval(5.0)
+        while Date() < deadline {
+            if case .completed = container.sendImageState { break }
+            if case .failed = container.sendImageState { break }
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+
+        guard case .completed(let remotePath) = container.sendImageState else {
+            XCTFail("Expected .completed sendImageState, got: \(container.sendImageState), error: \(container.sendImageErrorMessage ?? "none")")
+            return
+        }
+
+        XCTAssertTrue(remotePath.description.hasPrefix("/home/dev/.shh/images/"))
+        XCTAssertTrue(remotePath.description.hasSuffix(".png"))
+
+        // Verify terminal insertion without Return
+        guard let sentPathData = mock.sentData.last,
+              let sentString = String(data: sentPathData, encoding: .utf8) else {
+            XCTFail("Expected image path sent to terminal connection")
+            return
+        }
+        XCTAssertFalse(sentString.hasSuffix("\n"), "Inserted image path must NOT end with a newline")
+        XCTAssertFalse(sentString.hasSuffix("\r"), "Inserted image path must NOT end with a carriage return")
+        XCTAssertTrue(sentString.contains("/home/dev/.shh/images/"), "Must contain quoted remote path")
+
+        // 5. Snapshot completed SendImageView
+        let completedHosting = UIHostingController(rootView: SendImageView().environmentObject(container))
+        completedHosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        saveSnapshot(view: completedHosting.view, named: "send_image_completed.png")
+    }
+
+    func testSendImageAdversarialRejectionAndCancellation() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let sftp = DemoSFTPRepository(seedDemoData: true)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            sftpRepository: sftp
+        )
+        let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
+        await container.connect(to: host)
+
+        let initialSentCount = mock.sentData.count
+
+        // Adversarial 1: Malformed bytes
+        let malformed = Data([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22])
+        container.beginSendImage(data: malformed)
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.sendImageState, .failed)
+        XCTAssertNotNil(container.sendImageErrorMessage)
+        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for malformed image")
+
+        // Adversarial 2: Empty data
+        container.beginSendImage(data: Data())
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(container.sendImageState, .failed)
+        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for empty image")
+
+        // Adversarial 3: Immediate cancellation
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40))
+        let img = renderer.image { _ in UIColor.red.setFill() }
+        if let validData = img.pngData() {
+            container.beginSendImage(data: validData)
+            container.cancelSendImage()
+            XCTAssertEqual(container.sendImageState, .cancelled)
+        }
+    }
+
     func testTmuxProbeFailureNoTmux() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()

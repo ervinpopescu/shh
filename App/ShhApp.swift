@@ -540,6 +540,7 @@ struct HostEditorView: View {
     @State private var connectionType: HostConnectionType
     @State private var bastionHops: [BastionHopItem]
     @State private var forwardingRules: [PortForwardingRule]
+    @State private var sendImageDestination: String
     @State private var showingAddRule = false
     @State private var ruleToEdit: PortForwardingRule? = nil
     @State private var allHosts: [Host] = []
@@ -662,6 +663,7 @@ struct HostEditorView: View {
         _connectionType = State(initialValue: initialType)
         _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
         _forwardingRules = State(initialValue: existing?.forwardingRules ?? [])
+        _sendImageDestination = State(initialValue: existing?.sendImageDestination ?? "")
 
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
         _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
@@ -977,6 +979,15 @@ struct HostEditorView: View {
                     Toggle("Auto-attach last used tmux session", isOn: $autoAttachTmux)
                         .accessibilityIdentifier("host-editor-auto-attach-toggle")
                 }
+                Section("Image transfer") {
+                    TextField("Private remote directory (optional)", text: $sendImageDestination)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityIdentifier("host-editor-send-image-destination")
+                    Text("Leave blank for /home/<username>/.shh/images. The directory is created over SFTP when needed.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Section("Voice input policy") {
                     Toggle("Enable voice input", isOn: $enableVoice)
                         .accessibilityIdentifier("host-editor-voice-toggle")
@@ -1153,7 +1164,8 @@ struct HostEditorView: View {
             autoAttachTmux: autoAttachTmux,
             voicePolicy: voicePolicy,
             isProduction: isProductionHost,
-            forwardingRules: forwardingRules
+            forwardingRules: forwardingRules,
+            sendImageDestination: sendImageDestination.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : sendImageDestination.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 
@@ -1199,6 +1211,7 @@ struct SessionView: View {
     @State private var pendingRiskyPaste: String?
     @State private var showPortForwarding = false
     @State private var showTelemetry = false
+    @State private var showSendImage = false
     @State private var isZenMode: Bool = false
     private let policy = CommandPolicy()
 
@@ -1563,6 +1576,9 @@ struct SessionView: View {
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showTelemetry) { ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium]) }
+        .sheet(isPresented: $showSendImage) {
+            SendImageView().environmentObject(container).presentationDetents([.medium, .large])
+        }
         .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
         .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
         .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
