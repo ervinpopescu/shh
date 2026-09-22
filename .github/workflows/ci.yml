@@ -221,6 +221,9 @@ jobs:
       - name: Validate App Group Entitlements
         run: Tests/verify-app-group.sh Shh.xcodeproj 'generic/platform=iOS'
 
+      - name: Verify Scoped Warning Settings
+        run: Tests/verify-warning-settings.sh
+
       - name: Build Generic iOS Targets (Unsigned)
         run: |
           set -euo pipefail
