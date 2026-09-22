@@ -26,6 +26,13 @@ extensions.
   contracts, change anchors, and LRU cache eviction rules.
 - **Mosh & Herdr Contracts:** Datagram parsing, command templates, and
   output parsers.
+- **Command Dial & Multiplexer Controls:** Node hierarchies, navigation
+  state, preferences, insert-only literal validation, typed tmux/herdr
+  control commands (`TmuxControl`, `HerdrControl`), and client identity
+  resolution.
+- **Send Image Validation:** `SendImageValidator` ImageIO payload and
+  dimension bounds checking, safe destination resolution, and POSIX
+  shell path escaping.
 
 ### 2. ShhSSH (Network & Transports)
 - **Citadel / SwiftNIO SSH:** Live SSH connection management, PTY
@@ -61,7 +68,8 @@ extensions.
 
 ### 5. App (SwiftUI & Application Coordination)
 - **`AppContainer`:** `@MainActor` state coordinator binding UI scenes
-  with transport, catalog, audio, forwarding, and trust stores.
+  with transport, catalog, audio, forwarding, trust stores, Command Dial
+  preferences, and out-of-band multiplexer/image transfers.
   Reconciles catalog identity references on mutation and persistence
   load, resolving exact identities without silent degradation, and
   managing reference-counted Keychain credential deletion.
@@ -70,6 +78,12 @@ extensions.
   preserving active SSH, Mosh, and port forwarding sessions without
   background audio modes, and probes transport responsiveness on
   foreground return before reconnecting.
+- **Command Dial UI:** `CommandDialSurface` and `CommandDialTrigger`
+  providing thumb-reachable overlay navigation, hit-testing isolation,
+  and gesture handling over the terminal view.
+- **Send Image Workflow:** `SendImageView` coordinating image source
+  selection, background upload progress, cancellation, and PTY prompt
+  path insertion.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
   Group storage (`snapshot.json` and `known_hosts.json`).

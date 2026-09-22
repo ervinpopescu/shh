@@ -5,11 +5,11 @@ iOS/iPadOS 17+.
 
 ## Overview
 
-Shh provides an adaptive terminal client, multiplexer integration,
-on-device voice transcription, multi-hop port forwarding, Herdr agent
-management, Mosh roaming recovery, native iOS Files app integration
-via a File Provider extension, and zero-knowledge encrypted vault
-backups.
+Shh provides an adaptive terminal client, one-handed Command Dial,
+multiplexer integration, on-device voice transcription, multi-hop port
+forwarding, Herdr agent management, Mosh roaming recovery, native iOS
+Files app integration via a File Provider extension, and zero-knowledge
+encrypted vault backups.
 
 ## Capabilities
 
@@ -20,8 +20,13 @@ backups.
   keepalives for active SSH, Mosh, and forwarding sessions without
   background audio modes, with zero-delay foreground resumption via
   transport probing.
+- **Command Dial & Input:** One-handed radial dial for thumb access to
+  common keys, pinned insertion text, snippets, voice input, and
+  multiplexer actions, with configurable leading/trailing placement and
+  strict `CommandPolicy` gating.
 - **Multiplexing:** First-class Tmux integration supporting session
-  listing, creation, attach, and command approval.
+  listing, creation, attach, safe out-of-band pane and window controls
+  over SSH exec channels, and command approval.
 - **On-Device Voice AI:** WhisperKit and Apple Speech local transcribers
   with push-to-talk recording, editable preview drawers, and strict
   manual send safety policies.
@@ -39,6 +44,9 @@ backups.
   in the iOS Files app via an `NSFileProviderReplicatedExtension`.
   Atomic synchronization of catalog snapshot and trusted host keys.
   Mosh-only hosts are rejected as unsupported.
+- **SFTP Image Insertion:** Uploads local, Photos, or clipboard images
+  over SFTP to remote host storage with local format validation and
+  inserts quoted paths into the terminal prompt without sending Return.
 - **Encrypted Vault Backup:** Zero-knowledge `.shhbackup` export and
   import encrypted with AES-256-GCM and PBKDF2-HMAC-SHA256 (600,000
   rounds). Includes preview of record counts before restore, explicit

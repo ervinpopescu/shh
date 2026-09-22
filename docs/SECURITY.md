@@ -61,6 +61,23 @@ data, remote execution outputs, voice transcripts, and backup storage.
 - High-risk or unrecognized syntax requires explicit modal approval
   before transmission.
 - Safety approvals cannot override unconditional blocks.
+- Pinned literals in the Command Dial are restricted to insert-only
+  terminal text (at most 64 bytes, containing no newlines or control
+  characters). All literals and dial actions are evaluated by
+  `CommandPolicy`, requiring explicit modal confirmation for
+  review-required items and blocking destructive syntax.
+- Multiplexer controls execute strictly out-of-band over non-interactive
+  SSH exec channels, preventing PTY sequence injection. Multiplexer
+  target identifiers (`$id`, `@id`, `%id`) and client TTYs are strictly
+  validated before shell command construction.
+- SFTP image insertion performs local ImageIO content and dimension
+  validation (20 MB / 40 MP limits, restricted image types) before
+  staging, transfers exclusively over the active host's authenticated
+  SFTP channel to user-owned storage with restrictive file permissions
+  (0600), rejects ASCII control characters (including carriage return and
+  newline) and null bytes in destinations and paths, and inserts the
+  POSIX-quoted remote path into the terminal PTY without a trailing
+  newline, preventing automatic or unintentional command execution.
 
 ### 4. Zero-Knowledge Encrypted Vault Backups
 - Encrypted backup envelopes (`.shhbackup`) use AES-256-GCM authenticated
