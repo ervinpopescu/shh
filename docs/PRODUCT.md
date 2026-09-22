@@ -51,9 +51,13 @@ integration without third-party cloud servers or subscription telemetry.
   diagnostics. Identity deletion preserves shared Keychain secrets for
   surviving descriptors.
 - **Local Network Bonjour Discovery:** Discovers LAN SSH servers (`_ssh._tcp`)
-  via Network.framework `NWBrowser` and resolves advertised mDNS hostnames
-  and ports using `NetService`, stripping trailing dots and preserving
-  resolved services across interface updates for one-tap host configuration.
+  via Network.framework `NWBrowser` with peer-to-peer discovery enabled,
+  backed by `NSBonjourServices` and `NSLocalNetworkUsageDescription`
+  declarations. Coordinates lifecycle-safe browsing across navigation
+  transitions, resolves advertised mDNS hostnames and ports using
+  `NetService`, normalizes `.local` domains and service types, and
+  surfaces observable waiting and failed states with actionable retry
+  guidance in host list and host editor views.
 - **Tmux Multiplexer:** First-class tmux integration with session
   listing, creation, attach, and exact-command approval sheets. Includes
   collision-resistant pipe-delimited format parsing and backward

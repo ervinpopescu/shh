@@ -26,7 +26,8 @@ backups.
   with push-to-talk recording, editable preview drawers, and strict
   manual send safety policies.
 - **Local Network Discovery:** Bonjour discovery (`_ssh._tcp`) detecting
-  local SSH servers with advertised mDNS hostname and port resolution.
+  local SSH servers with advertised mDNS hostname and port resolution,
+  peer-to-peer browsing, and in-app status and retry recovery.
 - **Tunneling & Bastions:** Multi-hop ProxyJump pipeline and port
   forwarding (local, remote, and dynamic SOCKS5).
 - **Herdr Supervision:** Workspace and pane management with structured
