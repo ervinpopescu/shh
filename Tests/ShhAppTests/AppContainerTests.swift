@@ -1050,13 +1050,24 @@ final class AppContainerTests: XCTestCase {
         XCTAssertNotNil(container.bonjourDiscovery)
         XCTAssertTrue(container.discoveredSSHServices.isEmpty)
 
+        var notificationCount = 0
+        let cancellable = container.objectWillChange.sink {
+            notificationCount += 1
+        }
+
         let service = DiscoveredSSHService(name: "test-rpi", hostname: "test-rpi.local", port: 22)
         container.bonjourDiscovery.updateDiscoveredServices([service])
 
+        XCTAssertGreaterThan(notificationCount, 0)
         XCTAssertEqual(container.discoveredSSHServices.count, 1)
         XCTAssertEqual(container.discoveredSSHServices.first?.name, "test-rpi")
         XCTAssertEqual(container.discoveredSSHServices.first?.hostname, "test-rpi.local")
         XCTAssertEqual(container.discoveredSSHServices.first?.port, 22)
+
+        let countBeforeRetry = notificationCount
+        container.bonjourDiscovery.retryDiscovery()
+        XCTAssertGreaterThan(notificationCount, countBeforeRetry)
+        _ = cancellable
     }
 
     func testKeepScreenAwakePersistenceAndDefaults() {

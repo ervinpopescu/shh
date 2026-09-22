@@ -196,6 +196,7 @@ final class AppContainer: ObservableObject {
     // MARK: - Local Network Bonjour Discovery
     public let bonjourDiscovery: BonjourSSHDiscovery
     @Published public var discoveredSSHServices: [DiscoveredSSHService] = []
+    private var cancellables = Set<AnyCancellable>()
 
     @Published public var activeEditingFile: RemoteFile? = nil
     @Published public var editingFileContent: String = ""
@@ -498,6 +499,12 @@ final class AppContainer: ObservableObject {
             }
         }
         monitor.start()
+
+        resolvedBonjour.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
 
         resolvedBonjour.$discoveredServices
             .assign(to: &$discoveredSSHServices)
