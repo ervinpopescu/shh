@@ -451,6 +451,26 @@ final class MoshBootstrapAndTransportTests: XCTestCase {
         await connection.close()
     }
 
+    func testMoshStateUpdatesRemoveObserverWhenConsumerTerminates() async throws {
+        let channel = MockMoshDatagramChannel(remoteHost: "192.168.1.50", remotePort: 60001)
+        let info = MoshSessionInfo(udpPort: 60001, sessionKey: "stateObserverKey123", pid: 4000)
+        let connection = MoshConnection(
+            sessionInfo: info,
+            remoteHostname: "192.168.1.50",
+            channel: channel
+        )
+
+        try await connection.start()
+        let updates = await connection.moshStateUpdates()
+        let consumer = Task {
+            for await _ in updates { }
+        }
+        consumer.cancel()
+        await consumer.value
+
+        await connection.close()
+    }
+
     // MARK: - LiveMoshTransport Tests
 
     private final class MockSSHConnectionWithExecutor: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
