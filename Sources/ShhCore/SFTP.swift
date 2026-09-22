@@ -417,6 +417,17 @@ public struct FileTransferConflict: Identifiable, @unchecked Sendable {
 
 // MARK: - SFTP Repository Protocol
 
+/// Optional capability for repositories that can apply restrictive mode bits
+/// while creating an upload. Existing repositories remain source-compatible.
+public protocol SFTPRestrictedUploader: Sendable {
+    func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        permissions: PosixPermissions,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws
+}
+
 public protocol SFTPRepository: Sendable {
     func listDirectory(at path: RemotePath) async throws -> [RemoteFile]
     func readFile(at path: RemotePath) async throws -> Data
