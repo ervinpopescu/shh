@@ -35,6 +35,7 @@ targets:
           - _ssh._tcp
         NSLocalNetworkUsageDescription: >-
           Shh discovers SSH servers on your local network.
+        UILaunchScreen: {}
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh
