@@ -463,4 +463,111 @@ final class LiveActivityTests: XCTestCase {
       .failed
     )
   }
+
+  func testSafeDisplayAndHostSanitizationLengthLimits() {
+    let longName = String(repeating: "ServerAlpha-", count: 10)
+    let sanitizedName = SSHSessionLiveActivityManager.safeDisplayName(longName)
+    XCTAssertEqual(sanitizedName.count, 80)
+    XCTAssertEqual(sanitizedName, String(longName.prefix(80)))
+
+    let longHost = String(repeating: "node-subdomain.", count: 20)
+    let sanitizedHost = SSHSessionLiveActivityManager.safeHostLabel(longHost)
+    XCTAssertEqual(sanitizedHost.count, 253)
+    XCTAssertEqual(sanitizedHost, String(longHost.prefix(253)))
+
+    XCTAssertEqual(SSHSessionLiveActivityManager.safeDisplayName("   \n\t  "), "SSH session")
+    XCTAssertEqual(SSHSessionLiveActivityManager.safeHostLabel("   \n\t  "), "Remote host")
+  }
+
+  @MainActor
+  func testStartOrUpdateRejectsNonConnectedSessions() async throws {
+    let manager = SSHSessionLiveActivityManager()
+    let host = try Host(name: "bastion", hostname: "bastion.internal", port: 22, username: "ops")
+
+    let disconnectedSession = TerminalSession(
+      id: UUID(), hostID: UUID(), state: .disconnected, capabilities: ["ansi"])
+    manager.startOrUpdate(session: disconnectedSession, host: host)
+
+    let connectingSession = TerminalSession(
+      id: UUID(), hostID: UUID(), state: .connecting, capabilities: ["ansi"])
+    manager.startOrUpdate(session: connectingSession, host: host)
+
+    let failedSession = TerminalSession(
+      id: UUID(), hostID: UUID(), state: .failed, capabilities: ["ansi"])
+    manager.startOrUpdate(session: failedSession, host: host)
+
+    for _ in 0..<5 {
+      await Task.yield()
+    }
+    manager.endAll()
+  }
+
+  @MainActor
+  func testLiveActivityCardRendersAllLifecycleStates() {
+    let states: [ShhSSHSessionActivityAttributes.ContentState] = [
+      ShhSSHSessionActivityAttributes.ContentState(
+        status: .connected,
+        updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+      ),
+      ShhSSHSessionActivityAttributes.ContentState(
+        status: .disconnected,
+        updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+      ),
+      ShhSSHSessionActivityAttributes.ContentState(
+        status: .failed,
+        updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+      ),
+      ShhSSHSessionActivityAttributes.ContentState(
+        status: .reconnecting,
+        updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
+        reconnectAttempt: nil
+      ),
+    ]
+
+    for state in states {
+      var renderer = ImageRenderer(
+        content: ShhLiveActivityCardView(
+          displayName: "workstation",
+          hostLabel: "workstation.internal:22",
+          state: state
+        )
+        .frame(width: 360, height: 180)
+      )
+      renderer.scale = 1
+      let image = renderer.uiImage
+      XCTAssertEqual(image?.size, CGSize(width: 360, height: 180))
+      XCTAssertNotNil(image?.pngData())
+    }
+  }
+
+  @MainActor
+  func testLiveActivityManagerEndAllWhileActivityActive() async throws {
+    let manager = SSHSessionLiveActivityManager()
+    let session = TerminalSession(
+      id: UUID(), hostID: UUID(), state: .connected, capabilities: ["ansi"])
+    let host = try Host(name: "prod-db", hostname: "db.internal", port: 22, username: "admin")
+
+    manager.startOrUpdate(session: session, host: host)
+    for _ in 0..<10 {
+      await Task.yield()
+    }
+
+    manager.startOrUpdate(session: session, host: host)
+    for _ in 0..<10 {
+      await Task.yield()
+    }
+
+    manager.update(sessionID: session.id, status: .reconnecting, reconnectAttempt: 1)
+    for _ in 0..<10 {
+      await Task.yield()
+    }
+
+    let randomID = UUID()
+    manager.end(sessionID: randomID)
+
+    manager.endAll()
+    for _ in 0..<10 {
+      await Task.yield()
+    }
+  }
 }
