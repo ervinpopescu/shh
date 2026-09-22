@@ -327,7 +327,10 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     }
 
     func setFontSize(_ pointSize: Double) {
-        font = UIFont.monospacedSystemFont(ofSize: CGFloat(pointSize), weight: .regular)
+        font = UIFont.monospacedSystemFont(
+            ofSize: TerminalFontSize.renderedPointSize(for: pointSize),
+            weight: .regular
+        )
         setNeedsLayout()
     }
 
