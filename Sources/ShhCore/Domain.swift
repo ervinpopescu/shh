@@ -447,6 +447,9 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     public var voicePolicy: HostVoicePolicy
     public var isProduction: Bool
     public var forwardingRules: [PortForwardingRule]
+    /// Absolute SFTP directory override for Command Dial image uploads.
+    /// Nil uses a private directory under the remote home.
+    public var sendImageDestination: String?
 
     public var isVoiceEnabled: Bool {
         voicePolicy.isEnabled
@@ -479,7 +482,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         autoAttachTmux: Bool = false,
         voicePolicy: HostVoicePolicy = .disabled,
         isProduction: Bool? = nil,
-        forwardingRules: [PortForwardingRule] = []
+        forwardingRules: [PortForwardingRule] = [],
+        sendImageDestination: String? = nil
     ) throws {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "host name") }
         guard !hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw ShhValidationError.empty(field: "hostname") }
@@ -490,6 +494,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         self.health = health; self.lastUsedAt = lastUsedAt
         self.voicePolicy = voicePolicy
         self.forwardingRules = forwardingRules
+        self.sendImageDestination = sendImageDestination
         let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
         self.isProduction = isProduction ?? inferredProd
         if defaultTmuxSession != nil || autoAttachTmux {
@@ -507,7 +512,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case id, name, hostname, port, username, groupID, tagIDs, identityID, connection, health, lastUsedAt
         case tmuxPreferences, defaultTmuxSession, autoAttachTmux, autoAttach
-        case voicePolicy, isProduction, forwardingRules
+        case voicePolicy, isProduction, forwardingRules, sendImageDestination
     }
 
     public init(from decoder: Decoder) throws {
@@ -538,6 +543,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         let inferredProd = name.localizedCaseInsensitiveContains("prod") || hostname.localizedCaseInsensitiveContains("prod")
         self.isProduction = (try? container.decodeIfPresent(Bool.self, forKey: .isProduction)) ?? inferredProd
         self.forwardingRules = (try? container.decodeIfPresent([PortForwardingRule].self, forKey: .forwardingRules)) ?? []
+        self.sendImageDestination = try container.decodeIfPresent(
+            String.self, forKey: .sendImageDestination)
 
         if let prefs = try container.decodeIfPresent(HostTmuxPreferences.self, forKey: .tmuxPreferences) {
             self.tmuxPreferences = prefs
@@ -568,6 +575,7 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         try container.encode(voicePolicy, forKey: .voicePolicy)
         try container.encode(isProduction, forKey: .isProduction)
         try container.encode(forwardingRules, forKey: .forwardingRules)
+        try container.encodeIfPresent(sendImageDestination, forKey: .sendImageDestination)
     }
 }
 
