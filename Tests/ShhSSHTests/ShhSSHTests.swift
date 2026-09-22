@@ -305,6 +305,30 @@ final class ShhSSHTests: XCTestCase {
             // Expected
         }
 
+        do {
+            try await connection.resize(TerminalSize(columns: 80, rows: 24))
+            XCTFail("Resize after close should throw")
+        } catch {
+            // Expected
+        }
+
+        if let liveConn = connection as? LiveSSHConnection {
+            XCTAssertNotNil(liveConn.eventLoop)
+            do {
+                _ = try await liveConn.executeCommand("echo test")
+                XCTFail("Execute after close should throw")
+            } catch {
+                // Expected
+            }
+        }
+
+        let postCloseEvents = await connection.events()
+        var postCloseIterator = postCloseEvents.makeAsyncIterator()
+        let postCloseEvent = try await postCloseIterator.next()
+        XCTAssertEqual(postCloseEvent, .closed)
+        let postCloseNext = try await postCloseIterator.next()
+        XCTAssertNil(postCloseNext)
+
         // Multiple close calls are idempotent and must not crash
         await connection.close()
         await connection.close()
