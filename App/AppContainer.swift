@@ -2146,6 +2146,37 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
+    func executeMultiplexerControl(_ action: MultiplexerControlAction, approved: Bool = false) async -> Bool {
+        guard activeSession?.state == .connected, let conn = connection,
+              let executor = conn as? SSHCommandExecuting else { return false }
+        let sessionID = activeSession?.id
+        let connObj = conn as AnyObject
+        let command: String
+        do {
+            switch action {
+            case .tmux: command = try TmuxControl().command(for: action)
+            case .herdr: command = try HerdrControl().command(for: action)
+            }
+        } catch { return false }
+        switch CommandPolicy().classify(command) {
+        case .safe: break
+        case .reviewRequired: guard approved else { return false }
+        case .blocked: return false
+        }
+        do {
+            let result = try await executor.executeCommand(command, timeout: 10.0)
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else { return false }
+            guard result.isSuccess else { return false }
+            if case .herdr = action { await refreshHerdrState() }
+            if case .tmux = action { tmuxRefreshGeneration += 1 }
+            return true
+        } catch { return false }
+    }
+
+    @discardableResult
     func attachTmuxSession(id: String) async -> Bool {
         guard activeSession?.state == .connected, let conn = connection else {
             tmuxError = "Not connected."
@@ -2161,13 +2192,27 @@ final class AppContainer: ObservableObject {
             return false
         }
 
-        let cmd = TmuxCommand.attachSession(id: validatedID)
+        let cmd: String
+        do {
+            cmd = try TmuxControl().command(for: .tmux(.attachSession(validatedID)))
+        } catch {
+            tmuxError = error.localizedDescription
+            return false
+        }
         guard CommandPolicy().canSend(cmd, approved: true) else {
             tmuxError = "Safety policy rejected command."
             return false
         }
 
-        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        // Attaching is the one intentional PTY exception: tmux must take over
+        // the user's interactive terminal. Post-attach controls use exec below.
+        let sent: Bool
+        do {
+            try await conn.send(Data((cmd + "\n").utf8))
+            sent = true
+        } catch {
+            sent = false
+        }
         guard activeSession?.id == sessionID,
               activeSession?.state == .connected,
               !isExplicitDisconnect,
@@ -2211,13 +2256,27 @@ final class AppContainer: ObservableObject {
             return false
         }
 
-        let cmd = TmuxCommand.newSession(name: validatedName)
+        let cmd: String
+        do {
+            cmd = try TmuxControl().command(for: .tmux(.createSession(validatedName)))
+        } catch {
+            tmuxError = error.localizedDescription
+            return false
+        }
         guard CommandPolicy().canSend(cmd, approved: true) else {
             tmuxError = "Safety policy rejected command."
             return false
         }
 
-        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        // Creating and attaching is the same intentional PTY exception as
+        // attachTmuxSession. Subsequent controls never use this path.
+        let sent: Bool
+        do {
+            try await conn.send(Data((cmd + "\n").utf8))
+            sent = true
+        } catch {
+            sent = false
+        }
         guard activeSession?.id == sessionID,
               activeSession?.state == .connected,
               !isExplicitDisconnect,
@@ -2226,10 +2285,12 @@ final class AppContainer: ObservableObject {
         }
         if sent {
             tmuxRefreshGeneration += 1
-            activeTmuxSessionID = validatedName.value
+            _ = await listTmuxSessions()
+            activeTmuxSessionID = tmuxSessions.first(where: { $0.name == validatedName.value })?.sessionID ?? validatedName.value
             tmuxError = nil
             if let host = activeHost, let session = activeSession,
-               let target = LastUsedMultiplexerTarget.tmuxTarget(validatedName.value) {
+               let targetID = activeTmuxSessionID,
+               let target = LastUsedMultiplexerTarget.tmuxTarget(targetID) {
                 try? await restorationStore.save(restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,

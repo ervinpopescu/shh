@@ -37,6 +37,33 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.tmuxAvailability, .available(version: "tmux 3.4"))
     }
 
+    func testCommandDialControlRequiresApprovalAndUsesExecChannel() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Dial Host", hostname: "dial.test", username: "user")
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        let sessionID = try TmuxSessionID("$4")
+        let action = MultiplexerControlAction.tmux(.nextWindow(sessionID))
+        let expected = try TmuxControl().command(for: action)
+        mock.onExecuteCommand = { command in
+            SSHCommandResult(exitCode: command == expected ? 0 : 1, stdout: "", stderr: "")
+        }
+
+        let rejected = await container.executeMultiplexerControl(action)
+        XCTAssertFalse(rejected, "Dial controls require review")
+        let approved = await container.executeMultiplexerControl(action, approved: true)
+        XCTAssertTrue(approved)
+        XCTAssertFalse(mock.sentData.contains { $0 == Data(expected.utf8) }, "Dial controls use exec, not PTY")
+    }
+
     func testTmuxProbeFailureNoTmux() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
@@ -237,7 +264,7 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd.contains("list-sessions") {
-                return SSHCommandResult(exitCode: 0, stdout: "$1\tworkspace\t1\t1700000000\t1700000000\t1\n")
+                return SSHCommandResult(exitCode: 0, stdout: "")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
