@@ -24,8 +24,9 @@ integration without third-party cloud servers or subscription telemetry.
   upload/download, in-app file editing, structured failure state cards
   with actionable recovery, and automatic approval retries.
 - **Adaptive Navigation Shell:** Three-column `NavigationSplitView` on
-  iPad and tabbed layout on iPhone, with dark mode and Dynamic Type
-  support.
+  iPad and tabbed layout on iPhone, with dark mode, Dynamic Type
+  support, and size-class-adaptive row typography with single-line host
+  address truncation.
 - **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
   buffer support (vim, htop, tmux), ANSI color parser, search drawers,
   and debounced resize handling.
