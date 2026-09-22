@@ -191,9 +191,9 @@ public actor WhisperModelManager {
         modelsDirectory: URL = WhisperModelManager.defaultModelsDirectory(),
         deviceChecker: any DeviceResourceChecking = SystemDeviceResourceChecker(),
         validator: any WhisperModelValidating = StandardWhisperModelValidator(),
-        downloader: any WhisperModelDownloading = LiveWhisperModelDownloader(),
-        fileManager: FileManager = .default
+        downloader: any WhisperModelDownloading = LiveWhisperModelDownloader()
     ) {
+        let fileManager = FileManager.default
         self.modelsDirectory = modelsDirectory
         self.deviceChecker = deviceChecker
         self.validator = validator

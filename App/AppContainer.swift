@@ -25,6 +25,24 @@ public final class UIKitBackgroundTaskManager: BackgroundTaskManaging, @unchecke
         UIApplication.shared.endBackgroundTask(identifier)
     }
 }
+
+private final class BackgroundTaskBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var identifier: UIBackgroundTaskIdentifier = .invalid
+
+    var value: UIBackgroundTaskIdentifier {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return identifier
+        }
+        set {
+            lock.lock()
+            identifier = newValue
+            lock.unlock()
+        }
+    }
+}
 #endif
 import ShhCore
 import ShhSSH
@@ -492,7 +510,7 @@ final class AppContainer: ObservableObject {
                 self?.handleReachabilityChange(reachable)
             }
         }
-        monitor.onInterfaceChange = { [weak self] newInterface, roamingState in
+        monitor.onInterfaceChange = { @Sendable [weak self] newInterface, roamingState in
             Task { @MainActor [weak self] in
                 await self?.handleNetworkInterfaceChange(newInterface, roamingState: roamingState)
             }
@@ -917,7 +935,7 @@ final class AppContainer: ObservableObject {
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
                         self.hasObservedTransportError = true
-                        if (error as? TransportError) == .networkUnavailable,
+                        if error == .networkUnavailable,
                            !self.reachabilityMonitor.isReachable {
                             // An established session with no network is disconnected,
                             // not failed. Keep the transport error marker so a later
@@ -1468,13 +1486,15 @@ final class AppContainer: ObservableObject {
         #if canImport(UIKit)
         if activeSession?.state == .connected {
             endCurrentBackgroundTask()
-            var taskID: UIBackgroundTaskIdentifier = .invalid
-            taskID = backgroundTaskManager.beginBackgroundTask(withName: "com.ervinpopescu.shh.keepalive") { [weak self] in
-                self?.backgroundTaskManager.endBackgroundTask(taskID)
+            let taskBox = BackgroundTaskBox()
+            let taskID = backgroundTaskManager.beginBackgroundTask(withName: "com.ervinpopescu.shh.keepalive") { [weak self, taskBox] in
+                let id = taskBox.value
+                self?.backgroundTaskManager.endBackgroundTask(id)
                 Task { @MainActor [weak self] in
-                    self?.handleBackgroundTaskExpiration(taskID: taskID)
+                    self?.handleBackgroundTaskExpiration(taskID: id)
                 }
             }
+            taskBox.value = taskID
             currentBackgroundTaskID = taskID
         }
         #endif
