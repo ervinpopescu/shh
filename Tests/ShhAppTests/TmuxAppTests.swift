@@ -44,7 +44,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
         let host = try Host(name: "Dial Host", hostname: "dial.test", username: "user")
         await container.connect(to: host)
@@ -61,40 +62,182 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertFalse(rejected, "Dial controls require review")
         let approved = await container.executeMultiplexerControl(action, approved: true)
         XCTAssertTrue(approved)
-        XCTAssertFalse(mock.sentData.contains { $0 == Data(expected.utf8) }, "Dial controls use exec, not PTY")
+        XCTAssertFalse(
+            mock.sentData.contains { $0 == Data(expected.utf8) }, "Dial controls use exec, not PTY")
     }
 
-    private func resolveEvidenceDirectory() -> URL? {
-        if let envPath = ProcessInfo.processInfo.environment["EVIDENCE_DIR"], !envPath.isEmpty {
-            let url = URL(fileURLWithPath: envPath, isDirectory: true)
-            if (try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)) != nil ||
-                FileManager.default.fileExists(atPath: url.path) {
-                return url
-            }
-        }
-        let fallback = FileManager.default.temporaryDirectory.appendingPathComponent("shh-evidence", isDirectory: true)
-        if (try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)) != nil ||
-            FileManager.default.fileExists(atPath: fallback.path) {
-            return fallback
-        }
-        return FileManager.default.temporaryDirectory
+    func testPinnedLiteralApprovalInsertsWithoutReturn() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Pinned Host", hostname: "pinned.test", username: "user")
+        await container.connect(to: host)
+
+        let rejected = await container.sendPinnedLiteral("sudo reboot")
+        XCTAssertFalse(rejected)
+        let approved = await container.sendPinnedLiteral("sudo reboot", approved: true)
+        XCTAssertTrue(approved)
+        XCTAssertEqual(mock.sentData.last, Data("sudo reboot".utf8))
     }
 
-    private func saveSnapshot(view: UIView, named filename: String) {
-        guard let directory = resolveEvidenceDirectory() else { return }
-        let cleanName = URL(fileURLWithPath: filename).lastPathComponent
-        let targetURL = directory.appendingPathComponent(cleanName)
-        let renderer = UIGraphicsImageRenderer(bounds: view.bounds)
-        let image = renderer.image { _ in
-            view.drawHierarchy(in: view.bounds, afterScreenUpdates: true)
-        }
-        if let png = image.pngData() {
-            try? png.write(to: targetURL)
-        }
+    func testCommandDialSurfaceFitsPhoneAndIPad() {
+        var state = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(pinnedLiterals: ["echo ready"])
+        let surface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .trailing,
+            size: .regular,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+
+        let phone = UIHostingController(rootView: surface)
+        phone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let phoneSize = phone.sizeThatFits(in: phone.view.bounds.size)
+        XCTAssertGreaterThan(phoneSize.width, 0)
+        XCTAssertGreaterThan(phoneSize.height, 0)
+
+        let ipad = UIHostingController(rootView: surface)
+        ipad.view.frame = CGRect(x: 0, y: 0, width: 1024, height: 1366)
+        let ipadSize = ipad.sizeThatFits(in: ipad.view.bounds.size)
+        XCTAssertGreaterThan(ipadSize.width, 0)
+        XCTAssertGreaterThan(ipadSize.height, 0)
+
+        let accessibilityPhone = UIHostingController(
+            rootView: surface.environment(\.dynamicTypeSize, .accessibility3)
+        )
+        accessibilityPhone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        accessibilityPhone.loadViewIfNeeded()
+        accessibilityPhone.view.layoutIfNeeded()
+        XCTAssertGreaterThan(accessibilityPhone.view.bounds.height, 0)
+
+        let leadingSurface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { state }, set: { state = $0 }),
+            placement: .leading,
+            size: .regular,
+            hostLabel: "Dial Host",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let leadingPhone = UIHostingController(rootView: leadingSurface)
+        leadingPhone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        let leadingPhoneSize = leadingPhone.sizeThatFits(in: leadingPhone.view.bounds.size)
+        XCTAssertGreaterThan(leadingPhoneSize.width, 0)
+        XCTAssertGreaterThan(leadingPhoneSize.height, 0)
+        _ = state
     }
 
-    private func saveSnapshot(view: UIView, to filename: String) {
-        saveSnapshot(view: view, named: filename)
+    func testCommandDialLeadingPlacementRadiusMatchesTrailing() {
+        let insets = EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0)
+        let phoneSize = CGSize(width: 393, height: 852)
+
+        let leadingPhone = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .leading,
+            nodeCount: 4,
+            containerSize: phoneSize,
+            safeAreaInsets: insets
+        )
+        let trailingPhone = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .trailing,
+            nodeCount: 4,
+            containerSize: phoneSize,
+            safeAreaInsets: insets
+        )
+
+        XCTAssertEqual(leadingPhone.orbitRadius, trailingPhone.orbitRadius)
+        XCTAssertGreaterThan(leadingPhone.orbitRadius, 132)
+
+        let ipadSize = CGSize(width: 1024, height: 1366)
+        let ipadInsets = EdgeInsets(top: 24, leading: 0, bottom: 20, trailing: 0)
+
+        let leadingIPad = CommandDialSurface.computeRadialLayout(
+            size: .regular,
+            placement: .leading,
+            nodeCount: 4,
+            containerSize: ipadSize,
+            safeAreaInsets: ipadInsets
+        )
+        let trailingIPad = CommandDialSurface.computeRadialLayout(
+            size: .regular,
+            placement: .trailing,
+            nodeCount: 4,
+            containerSize: ipadSize,
+            safeAreaInsets: ipadInsets
+        )
+
+        XCTAssertEqual(leadingIPad.orbitRadius, trailingIPad.orbitRadius)
+        XCTAssertEqual(leadingIPad.orbitRadius, 330)
+    }
+
+    func testCommandDialSubmenusAndMultiplexerArtifacts() throws {
+        var commonKeysNav = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(pinnedLiterals: ["ls -la", "cargo test"])
+        guard let inputNode = model.roots.first(where: { $0.id == "root.input" }) else {
+            XCTFail("Missing input root node")
+            return
+        }
+        commonKeysNav.enter(inputNode)
+        XCTAssertEqual(commonKeysNav.path, ["root.input"])
+
+        let commonKeysSurface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { commonKeysNav }, set: { commonKeysNav = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Production Web",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let phone = UIHostingController(rootView: commonKeysSurface)
+        phone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        phone.loadViewIfNeeded()
+        XCTAssertGreaterThan(phone.view.bounds.height, 0)
+
+        // Multiplexer controls submenu
+        var muxNav = CommandDialNavigation(isOpen: true)
+        let session = try TmuxSessionID("$3")
+        let muxChildren = CommandDialMultiplexerMenu.nodes(
+            tmuxSessionID: session, capabilities: .tmux)
+        let muxModel = CommandDialModel(multiplexerChildren: muxChildren)
+        guard let muxNode = muxModel.roots.first(where: { $0.id == "root.session" }) else {
+            XCTFail("Missing session root node")
+            return
+        }
+        muxNav.enter(muxNode)
+        XCTAssertEqual(muxNav.path, ["root.session"])
+
+        let muxSurface = CommandDialSurface(
+            model: muxModel,
+            navigation: Binding(get: { muxNav }, set: { muxNav = $0 }),
+            placement: .trailing,
+            size: .compact,
+            hostLabel: "Production Web",
+            paneLabel: "Primary terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        let muxPhone = UIHostingController(rootView: muxSurface)
+        muxPhone.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
+        muxPhone.loadViewIfNeeded()
+        XCTAssertGreaterThan(muxPhone.view.bounds.height, 0)
     }
 
     func testSendImageEndToEndAndArtifacts() async throws {
@@ -105,19 +248,20 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
             sftpRepository: sftp
         )
         let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
 
-        // 1. Snapshot initial SendImageView using dedicated idle container
         let idleContainer = AppContainer.demo()
         let sendImageView = SendImageView().environmentObject(idleContainer)
         let hosting = UIHostingController(rootView: sendImageView)
         hosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        saveSnapshot(view: hosting.view, named: "send_image_view.png")
+        hosting.loadViewIfNeeded()
+        XCTAssertGreaterThan(hosting.view.bounds.height, 0)
 
         // 2. Generate valid test PNG image
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 80, height: 80))
@@ -143,7 +287,9 @@ final class TmuxAppTests: XCTestCase {
         }
 
         guard case .completed(let remotePath) = container.sendImageState else {
-            XCTFail("Expected .completed sendImageState, got: \(container.sendImageState), error: \(container.sendImageErrorMessage ?? "none")")
+            XCTFail(
+                "Expected .completed sendImageState, got: \(container.sendImageState), error: \(container.sendImageErrorMessage ?? "none")"
+            )
             return
         }
 
@@ -152,18 +298,23 @@ final class TmuxAppTests: XCTestCase {
 
         // Verify terminal insertion without Return
         guard let sentPathData = mock.sentData.last,
-              let sentString = String(data: sentPathData, encoding: .utf8) else {
+            let sentString = String(data: sentPathData, encoding: .utf8)
+        else {
             XCTFail("Expected image path sent to terminal connection")
             return
         }
-        XCTAssertFalse(sentString.hasSuffix("\n"), "Inserted image path must NOT end with a newline")
-        XCTAssertFalse(sentString.hasSuffix("\r"), "Inserted image path must NOT end with a carriage return")
-        XCTAssertTrue(sentString.contains("/home/dev/.shh/images/"), "Must contain quoted remote path")
+        XCTAssertFalse(
+            sentString.hasSuffix("\n"), "Inserted image path must NOT end with a newline")
+        XCTAssertFalse(
+            sentString.hasSuffix("\r"), "Inserted image path must NOT end with a carriage return")
+        XCTAssertTrue(
+            sentString.contains("/home/dev/.shh/images/"), "Must contain quoted remote path")
 
-        // 5. Snapshot completed SendImageView
-        let completedHosting = UIHostingController(rootView: SendImageView().environmentObject(container))
+        let completedHosting = UIHostingController(
+            rootView: SendImageView().environmentObject(container))
         completedHosting.view.frame = CGRect(x: 0, y: 0, width: 393, height: 852)
-        saveSnapshot(view: completedHosting.view, named: "send_image_completed.png")
+        completedHosting.loadViewIfNeeded()
+        XCTAssertGreaterThan(completedHosting.view.bounds.height, 0)
     }
 
     func testSendImageAdversarialRejectionAndCancellation() async throws {
@@ -174,7 +325,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
             sftpRepository: sftp
         )
         let host = try Host(name: "Image Host", hostname: "image.test", username: "dev")
@@ -188,13 +340,15 @@ final class TmuxAppTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(container.sendImageState, .failed)
         XCTAssertNotNil(container.sendImageErrorMessage)
-        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for malformed image")
+        XCTAssertEqual(
+            mock.sentData.count, initialSentCount, "No terminal data sent for malformed image")
 
         // Adversarial 2: Empty data
         container.beginSendImage(data: Data())
         try? await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(container.sendImageState, .failed)
-        XCTAssertEqual(mock.sentData.count, initialSentCount, "No terminal data sent for empty image")
+        XCTAssertEqual(
+            mock.sentData.count, initialSentCount, "No terminal data sent for empty image")
 
         // Adversarial 3: Immediate cancellation
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: 40, height: 40))

@@ -94,6 +94,9 @@ final class AppContainer: ObservableObject {
             updateIdleTimerState()
         }
     }
+    @Published public var commandDialPreferences: CommandDialPreferences {
+        didSet { persistCommandDialPreferences() }
+    }
     @Published var activeSession: TerminalSession? {
         didSet {
             updateIdleTimerState()
@@ -247,6 +250,7 @@ final class AppContainer: ObservableObject {
     private static let appearancePreferenceKey = "shh.appearance"
     private static let terminalThemePreferenceKey = UserDefaultsTerminalThemeStore.storageKey
     public static let keepScreenAwakePreferenceKey = "shh.preferences.keepScreenAwake"
+    private static let commandDialPreferenceKey = "shh.preferences.commandDial"
 
     public static let whisperProviderID = VoiceProviderRegistry.whisperProviderID
     public static let appleSpeechProviderID = VoiceProviderRegistry.appleSpeechProviderID
@@ -262,6 +266,25 @@ final class AppContainer: ObservableObject {
     func setAppearance(_ value: AppearanceSetting) {
         appearance = value
         UserDefaults.standard.set(value.rawValue, forKey: Self.appearancePreferenceKey)
+    }
+
+    private func persistCommandDialPreferences() {
+        guard let data = try? JSONEncoder().encode(commandDialPreferences) else { return }
+        UserDefaults.standard.set(data, forKey: Self.commandDialPreferenceKey)
+    }
+
+    func setCommandDialPreferences(_ value: CommandDialPreferences) {
+        commandDialPreferences = value
+    }
+
+    func toggleDialCategory(_ category: DialCategory) {
+        var value = commandDialPreferences
+        if value.pinnedCategories.contains(category) {
+            value.pinnedCategories.removeAll { $0 == category }
+        } else {
+            value.pinnedCategories.append(category)
+        }
+        commandDialPreferences = value
     }
 
     func setTerminalTheme(_ value: TerminalThemePreset) {
@@ -430,9 +453,18 @@ final class AppContainer: ObservableObject {
             rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey) ?? ""
         ) ?? .default
         let storedKeepScreenAwake = UserDefaults.standard.object(forKey: Self.keepScreenAwakePreferenceKey) as? Bool ?? true
+        let storedDialPreferences: CommandDialPreferences = {
+            guard let data = UserDefaults.standard.data(forKey: Self.commandDialPreferenceKey),
+                let value = try? JSONDecoder().decode(CommandDialPreferences.self, from: data)
+            else {
+                return CommandDialPreferences()
+            }
+            return value
+        }()
         self.appearance = storedAppearance
         self.terminalTheme = storedTheme
         self.keepScreenAwake = storedKeepScreenAwake
+        self.commandDialPreferences = storedDialPreferences
         self.terminalController = ShhTerminalController(
             configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
         )
@@ -1581,6 +1613,17 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
+    func sendPinnedLiteral(_ literal: String, approved: Bool = false) async -> Bool {
+        guard CommandDialModel.isInsertOnlyTerminalText(literal) else { return false }
+        switch CommandPolicy().classify(literal) {
+        case .safe: break
+        case .reviewRequired: guard approved else { return false }
+        case .blocked: return false
+        }
+        return await sendRawInteractive(Data(literal.utf8))
+    }
+
+    @discardableResult
     func sendValidatedCommand(_ command: String, approved: Bool = false) async -> Bool {
         guard CommandPolicy().canSend(command, approved: approved),
               activeSession?.state == .connected,
@@ -2156,9 +2199,12 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func executeMultiplexerControl(_ action: MultiplexerControlAction, approved: Bool = false) async -> Bool {
+    func executeMultiplexerControl(_ action: MultiplexerControlAction, approved: Bool = false) async
+        -> Bool
+    {
         guard activeSession?.state == .connected, let conn = connection,
-              let executor = conn as? SSHCommandExecuting else { return false }
+            let executor = conn as? SSHCommandExecuting
+        else { return false }
         let sessionID = activeSession?.id
         let connObj = conn as AnyObject
         let command: String
@@ -2176,9 +2222,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(command, timeout: 10.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else { return false }
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else { return false }
             guard result.isSuccess else { return false }
             if case .herdr = action { await refreshHerdrState() }
             if case .tmux = action { tmuxRefreshGeneration += 1 }
@@ -2288,24 +2335,29 @@ final class AppContainer: ObservableObject {
             sent = false
         }
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
             return false
         }
         if sent {
             tmuxRefreshGeneration += 1
             _ = await listTmuxSessions()
-            activeTmuxSessionID = tmuxSessions.first(where: { $0.name == validatedName.value })?.sessionID ?? validatedName.value
+            activeTmuxSessionID =
+                tmuxSessions.first(where: { $0.name == validatedName.value })?.sessionID
+                ?? validatedName.value
             tmuxError = nil
             if let host = activeHost, let session = activeSession,
-               let targetID = activeTmuxSessionID,
-               let target = LastUsedMultiplexerTarget.tmuxTarget(targetID) {
-                try? await restorationStore.save(restorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    target: target
-                ))
+                let targetID = activeTmuxSessionID,
+                let target = LastUsedMultiplexerTarget.tmuxTarget(targetID)
+            {
+                try? await restorationStore.save(
+                    restorationMetadata(
+                        hostID: host.id,
+                        sessionID: session.id,
+                        target: target
+                    ))
             }
             return true
         } else {
@@ -3069,7 +3121,8 @@ final class AppContainer: ObservableObject {
     }
 
     private func performSendImage(data: Data, operationID: UUID) async {
-        let stagingDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("ShhImageUploads", isDirectory: true)
+        let stagingDirectory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhImageUploads", isDirectory: true)
         var stagingURL: URL?
         defer {
             if let stagingURL { try? FileManager.default.removeItem(at: stagingURL) }
@@ -3084,8 +3137,9 @@ final class AppContainer: ObservableObject {
         // replacement upload. Never let that stale task mutate the replacement.
         guard activeSendImageOperationID == operationID else { return }
         guard let host = activeHost,
-              activeSession?.state == .connected,
-              let repo = sftpRepository else {
+            activeSession?.state == .connected,
+            let repo = sftpRepository
+        else {
             sendImageErrorMessage = SendImageError.unavailable.localizedDescription
             sendImageState = .failed
             return
@@ -3099,21 +3153,28 @@ final class AppContainer: ObservableObject {
         do {
             let image = try SendImageValidator.validate(data)
             try Task.checkCancellation()
-            guard isCurrentSendImage(operationID: operationID, hostID: hostID, sessionID: sessionID,
-                                      generation: generation, connectionIdentity: connectionIdentity, repository: repo) else {
+            guard
+                isCurrentSendImage(
+                    operationID: operationID, hostID: hostID, sessionID: sessionID,
+                    generation: generation, connectionIdentity: connectionIdentity, repository: repo
+                )
+            else {
                 throw SendImageError.hostChanged
             }
 
-            try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+            try FileManager.default.createDirectory(
+                at: stagingDirectory, withIntermediateDirectories: true)
             let filename = SendImageNaming.fileName(extension: image.fileExtension)
             let localURL = stagingDirectory.appendingPathComponent(filename, isDirectory: false)
             try image.data.write(to: localURL, options: [.atomic, .completeFileProtection])
             stagingURL = localURL
 
-            let destination = try SendImageDestination.configuredDirectory(host.sendImageDestination)
+            let destination =
+                try SendImageDestination.configuredDirectory(host.sendImageDestination)
                 ?? SendImageDestination.defaultDirectory(username: host.username)
             try await createSendImageDirectory(destination, using: repo)
-            let remotePath = try await uniqueSendImagePath(in: destination, extension: image.fileExtension, using: repo)
+            let remotePath = try await uniqueSendImagePath(
+                in: destination, extension: image.fileExtension, using: repo)
             imageRemotePath = remotePath
             try Task.checkCancellation()
 
@@ -3141,11 +3202,13 @@ final class AppContainer: ObservableObject {
                     Task { @MainActor [weak self] in
                         guard let self else { return }
                         guard self.activeSendImageOperationID == operationID,
-                              self.activeSendImageTransferID == transferID,
-                              self.sendImageState.isActive,
-                              self.isCurrentSendImage(operationID: operationID, hostID: hostID,
-                                                     sessionID: sessionID, generation: generation,
-                                                     connectionIdentity: connectionIdentity, repository: repo) else {
+                            self.activeSendImageTransferID == transferID,
+                            self.sendImageState.isActive,
+                            self.isCurrentSendImage(
+                                operationID: operationID, hostID: hostID,
+                                sessionID: sessionID, generation: generation,
+                                connectionIdentity: connectionIdentity, repository: repo)
+                        else {
                             return
                         }
                         self.sendImageState = .transferring(progress)
@@ -3158,35 +3221,51 @@ final class AppContainer: ObservableObject {
                     }
                 }
                 if let restrictedRepo = repo as? any SFTPRestrictedUploader {
-                    try await restrictedRepo.upload(from: localURL, to: remotePath, permissions: .secureFile, progress: uploadProgress)
+                    try await restrictedRepo.upload(
+                        from: localURL, to: remotePath, permissions: .secureFile,
+                        progress: uploadProgress)
                 } else {
                     try await repo.upload(from: localURL, to: remotePath, progress: uploadProgress)
                 }
-                guard isCurrentSendImage(operationID: operationID, hostID: hostID, sessionID: sessionID,
-                                          generation: generation, connectionIdentity: connectionIdentity, repository: repo) else {
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo)
+                else {
                     throw SendImageError.hostChanged
                 }
                 try Task.checkCancellation()
                 await transferCoordinator.markCompleted(id: transferID)
-                guard activeSendImageOperationID == operationID else { throw SendImageError.cancelled }
+                guard activeSendImageOperationID == operationID else {
+                    throw SendImageError.cancelled
+                }
                 activeSendImageTransferID = nil
                 transferQueueState = await transferCoordinator.snapshot()
                 let quotedPath = try SendImageNaming.shellQuote(remotePath.description)
-                guard await sendImageInsertion(quotedPath, operationID: operationID, hostID: hostID,
-                                               sessionID: sessionID, generation: generation,
-                                               connectionIdentity: connectionIdentity, connection: connection) else {
+                guard
+                    await sendImageInsertion(
+                        quotedPath, operationID: operationID, hostID: hostID,
+                        sessionID: sessionID, generation: generation,
+                        connectionIdentity: connectionIdentity, connection: connection)
+                else {
                     throw SendImageError.unavailable
                 }
-                guard activeSendImageOperationID == operationID else { throw SendImageError.cancelled }
+                guard activeSendImageOperationID == operationID else {
+                    throw SendImageError.cancelled
+                }
                 sendImageState = .completed(remotePath)
             } catch {
                 if let imageRemotePath { try? await repo.removeFile(at: imageRemotePath) }
                 guard activeSendImageOperationID == operationID else { return }
-                if Task.isCancelled || error is CancellationError || error as? SendImageError == .cancelled {
+                if Task.isCancelled || error is CancellationError
+                    || error as? SendImageError == .cancelled
+                {
                     await transferCoordinator.cancel(id: transferID)
                     if activeSendImageOperationID == operationID { sendImageState = .cancelled }
                 } else {
-                    await transferCoordinator.markFailed(id: transferID, error: "Image upload failed")
+                    await transferCoordinator.markFailed(
+                        id: transferID, error: "Image upload failed")
                     guard activeSendImageOperationID == operationID else { return }
                     if let imageError = error as? SendImageError, imageError == .hostChanged {
                         sendImageState = .cancelled
@@ -3203,7 +3282,9 @@ final class AppContainer: ObservableObject {
             }
         } catch {
             guard activeSendImageOperationID == operationID else { return }
-            if Task.isCancelled || error is CancellationError || error as? SendImageError == .cancelled {
+            if Task.isCancelled || error is CancellationError
+                || error as? SendImageError == .cancelled
+            {
                 sendImageState = .cancelled
             } else {
                 sendImageErrorMessage = userSafeSendImageError(error)
@@ -3217,25 +3298,32 @@ final class AppContainer: ObservableObject {
         return "Image upload failed. Check the connection and destination."
     }
 
-    private func isCurrentSendImage(operationID: UUID, hostID: UUID, sessionID: UUID?, generation: Int,
-                                    connectionIdentity: ObjectIdentifier?, repository: any SFTPRepository) -> Bool {
-        activeSendImageOperationID == operationID && activeHost?.id == hostID &&
-            activeSession?.id == sessionID && lifecycleGeneration == generation &&
-            activeSession?.state == .connected &&
-            connection.map { ObjectIdentifier($0 as AnyObject) } == connectionIdentity &&
-            sftpRepository.map { ObjectIdentifier($0 as AnyObject) == ObjectIdentifier(repository as AnyObject) } == true
+    private func isCurrentSendImage(
+        operationID: UUID, hostID: UUID, sessionID: UUID?, generation: Int,
+        connectionIdentity: ObjectIdentifier?, repository: any SFTPRepository
+    ) -> Bool {
+        activeSendImageOperationID == operationID && activeHost?.id == hostID
+            && activeSession?.id == sessionID && lifecycleGeneration == generation
+            && activeSession?.state == .connected
+            && connection.map { ObjectIdentifier($0 as AnyObject) } == connectionIdentity
+            && sftpRepository.map {
+                ObjectIdentifier($0 as AnyObject) == ObjectIdentifier(repository as AnyObject)
+            } == true
     }
 
-    private func sendImageInsertion(_ quotedPath: String, operationID: UUID, hostID: UUID, sessionID: UUID?,
-                                    generation: Int, connectionIdentity: ObjectIdentifier?,
-                                    connection: (any SSHConnection)?) async -> Bool {
+    private func sendImageInsertion(
+        _ quotedPath: String, operationID: UUID, hostID: UUID, sessionID: UUID?,
+        generation: Int, connectionIdentity: ObjectIdentifier?,
+        connection: (any SSHConnection)?
+    ) async -> Bool {
         guard activeSendImageOperationID == operationID,
-              activeHost?.id == hostID,
-              activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              lifecycleGeneration == generation,
-              self.connection.map({ ObjectIdentifier($0 as AnyObject) }) == connectionIdentity,
-              let connection else { return false }
+            activeHost?.id == hostID,
+            activeSession?.id == sessionID,
+            activeSession?.state == .connected,
+            lifecycleGeneration == generation,
+            self.connection.map({ ObjectIdentifier($0 as AnyObject) }) == connectionIdentity,
+            let connection
+        else { return false }
         do {
             try await connection.send(Data(quotedPath.utf8))
             return true
@@ -3244,7 +3332,9 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    private func createSendImageDirectory(_ path: RemotePath, using repo: any SFTPRepository) async throws {
+    private func createSendImageDirectory(_ path: RemotePath, using repo: any SFTPRepository)
+        async throws
+    {
         var current = RemotePath.root
         for component in path.components {
             current = current.appending(component)
@@ -3258,7 +3348,9 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    private func uniqueSendImagePath(in directory: RemotePath, extension fileExtension: String, using repo: any SFTPRepository) async throws -> RemotePath {
+    private func uniqueSendImagePath(
+        in directory: RemotePath, extension fileExtension: String, using repo: any SFTPRepository
+    ) async throws -> RemotePath {
         for _ in 0..<8 {
             let path = directory.appending(SendImageNaming.fileName(extension: fileExtension))
             do {
