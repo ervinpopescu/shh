@@ -29,6 +29,17 @@ jobs:
         # v4.2.2
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
+      - name: Select Xcode 16
+        run: |
+          for xcode in /Applications/Xcode_16*.app; do
+            if [ -d "$xcode" ]; then
+              echo "Selecting $xcode"
+              sudo xcode-select -s "$xcode"
+              break
+            fi
+          done
+          xcodebuild -version
+
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then
@@ -43,12 +54,38 @@ jobs:
         uses: github/codeql-action/init@1190a975f95ce23525efb6a3fc21ea29567c1b52
         with:
           languages: swift
+          build-mode: manual
           config-file: ./.github/codeql/codeql-config.yml
 
-      - name: Autobuild
-        # v3
-        uses: >-
-          github/codeql-action/autobuild@1190a975f95ce23525efb6a3fc21ea29567c1b52
+      - name: Build Swift targets
+        run: |
+          set -euo pipefail
+          xcodebuild build \
+            -project Shh.xcodeproj \
+            -scheme Shh \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
+
+          xcodebuild build \
+            -project Shh.xcodeproj \
+            -scheme ShhFileProvider \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
+
+          xcodebuild build-for-testing \
+            -project Shh.xcodeproj \
+            -scheme ShhAppTests \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
 
       - name: Perform CodeQL analysis
         # v3
