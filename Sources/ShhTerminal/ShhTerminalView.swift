@@ -89,19 +89,11 @@ public struct ShhTerminalView: UIViewRepresentable {
         }
 
         public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
-            if Thread.isMainThread {
-                MainActor.assumeIsolated {
-                    controller?.handleResize(columns: newCols, rows: newRows)
-                }
-            } else {
-                DispatchQueue.main.async { [weak self, weak source] in
-                    guard let self, let controller = self.controller else { return }
-                    let measuredTerminal = source?.getTerminal()
-                    controller.handleResize(
-                        columns: measuredTerminal?.cols ?? newCols,
-                        rows: measuredTerminal?.rows ?? newRows
-                    )
-                }
+            // SwiftTerm may invoke this callback on the main thread without
+            // running on MainActor. Always hop through the actor instead of
+            // assuming that thread affinity establishes actor isolation.
+            Task { @MainActor [weak self] in
+                self?.controller?.handleResize(columns: newCols, rows: newRows)
             }
         }
 
@@ -115,14 +107,8 @@ public struct ShhTerminalView: UIViewRepresentable {
 
         public func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let payload = Data(data)
-            if Thread.isMainThread {
-                MainActor.assumeIsolated {
-                    controller?.handleOutput(payload)
-                }
-            } else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.controller?.handleOutput(payload)
-                }
+            Task { @MainActor [weak self] in
+                self?.controller?.handleOutput(payload)
             }
         }
 
