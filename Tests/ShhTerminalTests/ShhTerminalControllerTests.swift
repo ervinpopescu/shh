@@ -720,10 +720,11 @@ final class ShhTerminalControllerTests: XCTestCase {
             resizeExp.fulfill()
         }
         coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        await Task.yield()
         XCTAssertEqual(
             controller.size,
             TerminalSize(columns: 132, rows: 43),
-            "Viewport callback must update the controller synchronously"
+            "Viewport callback must update the controller on MainActor"
         )
         DispatchQueue.main.async {
             controller.flushResize()
@@ -731,6 +732,28 @@ final class ShhTerminalControllerTests: XCTestCase {
 
         await fulfillment(of: [resizeExp], timeout: 1.0)
         XCTAssertEqual(reportedResize, TerminalSize(columns: 132, rows: 43))
+    }
+
+    func testResizeCallbackFromMainThreadUsesMainActorHop() async {
+        let configuration = ShhTerminalConfiguration(resizeDebounceInterval: 0)
+        let controller = ShhTerminalController(configuration: configuration)
+        let representable = ShhTerminalView(controller: controller)
+        let coordinator = representable.makeCoordinator()
+        let hostView = representable.makeUIView(coordinator: coordinator)
+        let resizeExpectation = expectation(description: "Main-thread callback delivered")
+        controller.onResize = { size in
+            XCTAssertEqual(size, TerminalSize(columns: 132, rows: 43))
+            resizeExpectation.fulfill()
+        }
+
+        // DispatchQueue.main does not establish MainActor isolation for the
+        // callback. The coordinator must hop through MainActor explicitly.
+        DispatchQueue.main.async {
+            coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        }
+
+        await fulfillment(of: [resizeExpectation], timeout: 1.0)
+        XCTAssertEqual(controller.size, TerminalSize(columns: 132, rows: 43))
     }
 
     func testShhTerminalViewHostingControllerResetAndReattach() {
