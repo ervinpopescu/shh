@@ -234,6 +234,7 @@ final class AppContainer: ObservableObject {
     private var pendingTrustHost: Host?
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
+    private var eventMonitoringGeneration = 0
     private var outboundTask: Task<Void, Never>?
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
@@ -719,6 +720,7 @@ final class AppContainer: ObservableObject {
         reconnectState = .idle
         detachCallbacks()
         let previousEventTask = eventTask
+        eventMonitoringGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
 
@@ -909,12 +911,15 @@ final class AppContainer: ObservableObject {
         session: TerminalSession,
         host: Host
     ) {
+        eventMonitoringGeneration &+= 1
+        let monitoringGeneration = eventMonitoringGeneration
         eventTask?.cancel()
         eventTask = Task { @MainActor [weak self] in
             do {
                 for try await event in events {
                     guard let self,
                           !Task.isCancelled,
+                          self.eventMonitoringGeneration == monitoringGeneration,
                           self.activeSession?.id == session.id,
                           !self.isExplicitDisconnect else { return }
                     switch event {
@@ -923,6 +928,7 @@ final class AppContainer: ObservableObject {
                         self.terminalController.feed(redactedData)
                     case .closed:
                         guard !Task.isCancelled,
+                              self.eventMonitoringGeneration == monitoringGeneration,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id else { return }
                         self.tmuxRefreshGeneration += 1
@@ -946,12 +952,14 @@ final class AppContainer: ObservableObject {
                         self.forwardingStreamTask = nil
                         await self.portForwardingManager?.stopAll()
                         guard !Task.isCancelled,
+                              self.eventMonitoringGeneration == monitoringGeneration,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id else { return }
                         self.forwardingSessions = []
                         self.handleConnectionDrop(host: host)
                     case .error(let error):
                         guard !Task.isCancelled,
+                              self.eventMonitoringGeneration == monitoringGeneration,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id else { return }
                         self.tmuxRefreshGeneration += 1
@@ -978,6 +986,7 @@ final class AppContainer: ObservableObject {
                         self.forwardingStreamTask = nil
                         await self.portForwardingManager?.stopAll()
                         guard !Task.isCancelled,
+                              self.eventMonitoringGeneration == monitoringGeneration,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id else { return }
                         self.forwardingSessions = []
@@ -987,6 +996,7 @@ final class AppContainer: ObservableObject {
             } catch {
                 guard let self,
                       !Task.isCancelled,
+                      self.eventMonitoringGeneration == monitoringGeneration,
                       !self.isExplicitDisconnect,
                       self.activeSession?.id == session.id else { return }
                 self.tmuxRefreshGeneration += 1
@@ -1056,6 +1066,9 @@ final class AppContainer: ObservableObject {
             throw TransportError.cancelled
         }
         let connectionGeneration = lifecycleGeneration
+        // Invalidate the previous stream before replacing the transport. A late
+        // event from that stream must not change the new session's Live Activity.
+        eventMonitoringGeneration &+= 1
         // Keep the last selected target independent from transient tmux refreshes
         // while the replacement transport is being established.
         let recoveryTmuxTarget = activeTmuxSessionID
@@ -1230,6 +1243,7 @@ final class AppContainer: ObservableObject {
         networkRoamingState = nil
         detachCallbacks()
         let previousEventTask = eventTask
+        eventMonitoringGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
         let oldConnection = connection
@@ -1432,6 +1446,7 @@ final class AppContainer: ObservableObject {
                         } else {
                             // Connection was severed by OS during deep sleep / suspension.
                             self.detachCallbacks()
+                            self.eventMonitoringGeneration &+= 1
                             self.eventTask?.cancel()
                             self.eventTask = nil
                             let deadConn = self.connection
@@ -1698,6 +1713,7 @@ final class AppContainer: ObservableObject {
         reconnectState = .idle
         detachCallbacks()
         let previousEventTask = eventTask
+        eventMonitoringGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
         let oldConnection = connection

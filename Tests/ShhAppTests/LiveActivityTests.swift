@@ -625,4 +625,53 @@ final class LiveActivityTests: XCTestCase {
       await Task.yield()
     }
   }
+
+  @MainActor
+  func testUnhealthyTransportErrorUpdatesLiveActivityBeforeSocketClose() async throws {
+    let connection = MockSSHConnection()
+    let transport = ControllableTransport()
+    transport.onConnect = { _ in connection }
+    let reachability = MockReachabilityMonitor(isReachable: true)
+    let container = AppContainer(
+      transport: transport,
+      reachabilityMonitor: reachability,
+      reconnectCoordinator: ReconnectCoordinator(
+        clock: { _ in try await Task.sleep(nanoseconds: 5_000_000_000) },
+        jitter: ReconnectCoordinator.zeroJitter
+      )
+    )
+    let host = try Host(name: "Unhealthy Host", hostname: "unhealthy.invalid", username: "dev")
+
+    await container.connect(to: host)
+    let sessionID = try XCTUnwrap(container.activeSession?.id)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+
+    // A keepalive/read/write failure is observable before a peer close event.
+    // The activity must stop claiming the transport is healthy immediately.
+    reachability.setReachable(false)
+    connection.emit(.error(.timeout))
+    try await waitForLiveActivityState(sessionID: sessionID, status: .failed)
+    XCTAssertEqual(container.activeSession?.state, .failed)
+
+    await container.disconnect()
+  }
+
+  @MainActor
+  private func waitForLiveActivityState(
+    sessionID: UUID,
+    status: ShhSSHSessionActivityAttributes.ContentState.Status
+  ) async throws {
+    for _ in 0..<40 {
+      if Activity<ShhSSHSessionActivityAttributes>.activities.first(where: {
+        $0.attributes.sessionID == sessionID
+      })?.content.state.status == status {
+        return
+      }
+      try await Task.sleep(nanoseconds: 25_000_000)
+    }
+    let actual = Activity<ShhSSHSessionActivityAttributes>.activities.first(where: {
+      $0.attributes.sessionID == sessionID
+    })?.content.state.status
+    XCTFail("Expected Live Activity status \(status), got \(String(describing: actual))")
+  }
 }
