@@ -74,6 +74,53 @@ final class CommandDialTests: XCTestCase {
         XCTAssertNil(layout.index(at: CGPoint(x: 180, y: 500)))
     }
 
+    func testRadialSwipeCrossingsNavigateOnlyAtLevelBoundaries() throws {
+        for placement in CommandDialPlacement.allCases {
+            let layout = DialRadialLayout.corner(
+                center: CGPoint(x: 200, y: 500), radius: 150, itemRadius: 38,
+                count: 3, placement: placement)
+            let group = try XCTUnwrap(layout.point(at: 1))
+            let dx = group.x - layout.center.x
+            let dy = group.y - layout.center.y
+            let outside = CGPoint(
+                x: layout.center.x + dx * 1.4,
+                y: layout.center.y + dy * 1.4)
+            let inside = CGPoint(
+                x: layout.center.x + dx * 0.2,
+                y: layout.center.y + dy * 0.2)
+            XCTAssertEqual(
+                layout.levelTransition(
+                    from: group, to: outside, selectedGroup: true, hasParent: false), .enter)
+            XCTAssertNil(
+                layout.levelTransition(
+                    from: group, to: outside, selectedGroup: false, hasParent: false))
+            XCTAssertEqual(
+                layout.levelTransition(
+                    from: group, to: inside, selectedGroup: false, hasParent: true), .back)
+            XCTAssertNil(
+                layout.levelTransition(
+                    from: group, to: inside, selectedGroup: false, hasParent: false))
+            XCTAssertNil(
+                layout.levelTransition(
+                    from: group, to: layout.center, selectedGroup: true, hasParent: false))
+        }
+    }
+
+    func testSwipeNavigationKeepsParentsAndBackAtEachDepth() throws {
+        let model = CommandDialModel()
+        var navigation = CommandDialNavigation(isOpen: true)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        navigation.enter(input)
+        navigation.enter(navigate)
+        XCTAssertEqual(navigation.path, ["root.input", "input.navigate"])
+        navigation.back()
+        XCTAssertEqual(navigation.path, ["root.input"])
+        navigation.back()
+        XCTAssertTrue(navigation.path.isEmpty)
+        XCTAssertTrue(navigation.isOpen)
+    }
+
     func testCornerGeometryMirrorsPlacementAndInsetsSparsePages() throws {
         let leading = DialRadialLayout.corner(
             center: CGPoint(x: 70, y: 700), radius: 240, itemRadius: 38,
