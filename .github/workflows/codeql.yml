@@ -18,7 +18,7 @@ jobs:
   analyze:
     name: Analyze Swift
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       actions: read
       contents: read
@@ -31,13 +31,21 @@ jobs:
 
       - name: Select Xcode 16
         run: |
+          selected_xcode=""
           for xcode in /Applications/Xcode_16*.app; do
             if [ -d "$xcode" ]; then
-              echo "Selecting $xcode"
-              sudo xcode-select -s "$xcode"
+              selected_xcode="$xcode"
               break
             fi
           done
+          if [ -z "$selected_xcode" ]; then
+            echo "Error: no Xcode 16 installation found" >&2
+            exit 1
+          fi
+          developer_dir="$selected_xcode/Contents/Developer"
+          echo "Selecting $developer_dir"
+          sudo xcode-select -s "$developer_dir"
+          echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
 
       - name: Install XcodeGen
