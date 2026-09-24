@@ -725,7 +725,9 @@ final class AppContainerTests: XCTestCase {
         // actionable error visible, even while recovery waits for the network.
         mockConnection.emit(.error(TransportError.networkUnavailable))
         mockConnection.emit(.closed)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil {
+            container.activeSession?.state == .failed
+        }
 
         XCTAssertEqual(container.activeSession?.state, .failed)
         XCTAssertTrue(container.terminalText.contains("Network unavailable."))
@@ -748,7 +750,10 @@ final class AppContainerTests: XCTestCase {
 
         mockConnection2.emit(.closed)
         mockConnection2.emit(.closed)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil {
+            container.activeSession?.state == .disconnected &&
+                container.terminalController.currentTranscript(limit: 10).contains("[Connection closed]")
+        }
 
         XCTAssertEqual(container.activeSession?.state, .disconnected)
         let transcript2 = container.terminalController.currentTranscript(limit: 10)
@@ -1221,6 +1226,17 @@ final class AppContainerTests: XCTestCase {
 
         container.setTerminalTheme(.catppuccinMocha)
         XCTAssertEqual(container.secondaryTerminalController.terminalTheme, .catppuccinMocha)
+    }
+
+    private func waitUntil(
+        timeout: TimeInterval = 5,
+        condition: () -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition() {
+            guard Date() < deadline else { return }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 }
 
