@@ -675,7 +675,11 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    func connect(to host: Host, restoringTmuxSessionID: String? = nil) async {
+    func connect(
+        to host: Host,
+        restoringTmuxSessionID: String? = nil,
+        sessionID: UUID? = nil
+    ) async {
         guard activeSession?.state != .connecting else { return }
         liveActivityManager.endAll()
         foregroundRecoveryTask?.cancel()
@@ -755,7 +759,12 @@ final class AppContainer: ObservableObject {
         forwardingSessions = []
         forwardingErrorMessage = nil
 
-        let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
+        let session = TerminalSession(
+            id: sessionID ?? UUID(),
+            hostID: host.id,
+            state: .connecting,
+            capabilities: ["ansi", "resize"]
+        )
         activeSession = session
         let initialSize = terminalController.size
         do {
@@ -808,6 +817,7 @@ final class AppContainer: ObservableObject {
             self.connection = connection
             (connection as? LiveSSHConnection)?.setRedactor(redactor)
             activeSession?.state = .connected
+            syncLiveActivityState()
 
             let targetSession = await automaticTmuxTarget(
                 for: host,
@@ -1131,6 +1141,7 @@ final class AppContainer: ObservableObject {
         self.connection = connection
         (connection as? LiveSSHConnection)?.setRedactor(redactor)
         activeSession?.state = .connected
+        syncLiveActivityState()
         await oldConnection?.close()
 
         terminalController.onResize = { [weak self, sessionID = session.id] newSize in
@@ -1414,6 +1425,7 @@ final class AppContainer: ObservableObject {
                         if isResponsive {
                             self.isForegroundRecoveryInProgress = false
                             self.activeSession?.state = .connected
+                            self.syncLiveActivityState()
                             // Session is instantly ready with 0 delay and NO reconnect cycle.
                             self.updateIdleTimerState()
                             return
@@ -1572,7 +1584,32 @@ final class AppContainer: ObservableObject {
         } else {
             target = nil
         }
-        await connect(to: host, restoringTmuxSessionID: target)
+        await connect(to: host, restoringTmuxSessionID: target, sessionID: metadata.sessionID)
+    }
+
+    /// Opens a Live Activity deep link only when its opaque session ID matches
+    /// the active session or locally persisted restoration metadata.
+    @discardableResult
+    func openLiveActivitySession(sessionID: UUID) async -> Bool {
+        if let activeSession,
+           activeSession.id == sessionID,
+           activeSession.state != .disconnected {
+            return true
+        }
+        guard let metadata = try? await restorationStore.load(),
+              metadata.sessionID == sessionID,
+              let hosts = try? await catalog.listHosts(),
+              let host = hosts.first(where: { $0.id == metadata.hostID }) else {
+            return false
+        }
+        let target: String?
+        if case .tmux(let tmuxSessionID) = lastUsedTarget(from: metadata) {
+            target = tmuxSessionID
+        } else {
+            target = nil
+        }
+        await connect(to: host, restoringTmuxSessionID: target, sessionID: sessionID)
+        return activeSession?.id == sessionID
     }
 
     func approvePendingHostKey(permanently: Bool) async {

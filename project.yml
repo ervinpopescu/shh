@@ -40,6 +40,10 @@ targets:
           Shh discovers SSH servers on your local network.
         UILaunchScreen: {}
         NSSupportsLiveActivities: true
+        CFBundleURLTypes:
+          - CFBundleURLName: com.ervinpopescu.shh.live-activity
+            CFBundleURLSchemes:
+              - shh
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh

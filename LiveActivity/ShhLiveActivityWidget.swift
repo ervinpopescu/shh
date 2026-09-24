@@ -6,6 +6,9 @@ struct ShhLiveActivityWidget: Widget {
   var body: some WidgetConfiguration {
     ActivityConfiguration(for: ShhSSHSessionActivityAttributes.self) { context in
       ShhLiveActivityLockScreenView(context: context)
+        .widgetURL(
+          URL(string: "shh://session/\(context.attributes.sessionID.uuidString)")!
+        )
         .activityBackgroundTint(Color.black.opacity(0.92))
         .activitySystemActionForegroundColor(.white)
     } dynamicIsland: { context in
@@ -64,6 +67,9 @@ struct ShhLiveActivityWidget: Widget {
           .foregroundStyle(statusColor(context.state.status))
           .accessibilityLabel("SSH session: \(context.state.status.displayName)")
       }
+      .widgetURL(
+        URL(string: "shh://session/\(context.attributes.sessionID.uuidString)")!
+      )
     }
   }
 }

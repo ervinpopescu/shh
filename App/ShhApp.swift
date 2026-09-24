@@ -93,6 +93,13 @@ struct RootView: View {
         }
         .hostKeyApprovalAlert(container: container)
         .appDynamicTypeRange()
+        .onOpenURL { url in
+            guard let sessionID = LiveActivityDeepLink.sessionID(from: url) else { return }
+            Task { @MainActor in
+                guard await container.openLiveActivitySession(sessionID: sessionID) else { return }
+                section = .sessions
+            }
+        }
     }
 }
 
