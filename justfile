@@ -135,7 +135,7 @@ build device="iphone" udid="":
             ;;
         *)
             destination="platform=iOS,id=$target"
-            signing=(DEVELOPMENT_TEAM="{{ development_team }}" CODE_SIGN_STYLE=Automatic)
+            signing=(-allowProvisioningUpdates DEVELOPMENT_TEAM="{{ development_team }}" CODE_SIGN_STYLE=Automatic)
             ;;
     esac
     mkdir -p "{{ derived_data }}"
