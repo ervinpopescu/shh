@@ -1,0 +1,11 @@
+---
+name: Shh CodeQL configuration
+
+queries:
+  - uses: security-extended
+
+# Ignore only generated build products, which are not maintained source files.
+paths-ignore:
+  - .build/**
+  - build/**
+  - DerivedData/**

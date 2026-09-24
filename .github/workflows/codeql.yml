@@ -1,0 +1,58 @@
+---
+name: CodeQL
+
+"on":
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    - cron: "30 2 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze Swift
+    runs-on: macos-14
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        # v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install XcodeGen
+        run: |
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Initialize CodeQL
+        # v3
+        uses: github/codeql-action/init@1190a975f95ce23525efb6a3fc21ea29567c1b52
+        with:
+          languages: swift
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Autobuild
+        # v3
+        uses: >-
+          github/codeql-action/autobuild@1190a975f95ce23525efb6a3fc21ea29567c1b52
+
+      - name: Perform CodeQL analysis
+        # v3
+        uses: >-
+          github/codeql-action/analyze@1190a975f95ce23525efb6a3fc21ea29567c1b52
+        with:
+          category: /language:swift
