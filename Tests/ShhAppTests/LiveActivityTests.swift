@@ -271,9 +271,47 @@ final class LiveActivityTests: XCTestCase {
 
     await container.connect(to: host)
     XCTAssertEqual(container.activeSession?.state, .connected)
+    let sessionID = try XCTUnwrap(container.activeSession?.id)
+    try await Task.sleep(nanoseconds: 250_000_000)
+    XCTAssertTrue(
+      Activity<ShhSSHSessionActivityAttributes>.activities.contains { $0.attributes.sessionID == sessionID },
+      "AppContainer connection wiring must request a Live Activity after the session becomes connected"
+    )
 
     await container.disconnect()
     XCTAssertEqual(container.activeSession?.state, .disconnected)
+  }
+
+  @MainActor
+  func testLiveActivityDeepLinkRoundTripsWithoutSensitiveData() throws {
+    let sessionID = UUID()
+    let url = LiveActivityDeepLink.url(sessionID: sessionID)
+    XCTAssertEqual(LiveActivityDeepLink.sessionID(from: url), sessionID)
+    XCTAssertFalse(url.absoluteString.contains("demo.invalid"))
+    XCTAssertNil(LiveActivityDeepLink.sessionID(from: URL(string: "shh://session/\(sessionID)?host=secret")!))
+    XCTAssertNil(LiveActivityDeepLink.sessionID(from: URL(string: "https://session/\(sessionID)")!))
+  }
+
+  @MainActor
+  func testLiveActivityDeepLinkOpensOnlyMatchingLocalRestorationSession() async throws {
+    let host = try Host(name: "Deep Link Host", hostname: "demo.invalid", username: "dev")
+    let sessionID = UUID()
+    let restorationStore = InMemorySessionRestorationStore(
+      initial: SessionRestorationMetadata(hostID: host.id, sessionID: sessionID)
+    )
+    let catalog = InMemoryCatalog(snapshot: CatalogSnapshot(hosts: [host], identities: []))
+    let container = AppContainer.demo(catalog: catalog, restorationStore: restorationStore)
+    let challenge = HostKeyChallenge(
+      hostname: "demo.invalid", port: 22, algorithm: "ssh-ed25519",
+      fingerprint: "SHA256:demo-fingerprint")
+    await container.trustStore.save(challenge)
+
+    let opened = await container.openLiveActivitySession(sessionID: sessionID)
+    XCTAssertTrue(opened)
+    XCTAssertEqual(container.activeSession?.id, sessionID)
+    let rejected = await container.openLiveActivitySession(sessionID: UUID())
+    XCTAssertFalse(rejected)
+    await container.disconnect()
   }
 
   @MainActor
