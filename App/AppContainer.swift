@@ -793,7 +793,6 @@ final class AppContainer: ObservableObject {
         eventTask?.cancel()
         eventTask = nil
 
-        let initialSize = terminalController.size
         let oldConnection = connection
         connection = nil
         await oldConnection?.close()
@@ -801,6 +800,7 @@ final class AppContainer: ObservableObject {
         hasObservedTransportError = false
         pendingTrustChallenge = nil
         pendingTrustHost = nil
+        terminalController.synchronizeViewportMeasurement()
         terminalGrid = TerminalGrid()
         ansiParser = ANSIParser()
         terminalText = ""
@@ -836,7 +836,7 @@ final class AppContainer: ObservableObject {
             id: sessionID ?? UUID(),
             hostID: host.id,
             state: .connecting,
-            terminalSize: initialSize,
+            terminalSize: terminalController.size,
             capabilities: ["ansi", "resize"]
         )
         activeSession = session
@@ -846,6 +846,11 @@ final class AppContainer: ObservableObject {
             // similarly-labelled identity. Credentials are queried only after
             // host-key acceptance.
             let selectedIdentity = try await resolveIdentity(for: host)
+            // Identity resolution may yield to SwiftUI layout. Capture the
+            // latest measured geometry immediately before PTY initialization.
+            terminalController.synchronizeViewportMeasurement()
+            let initialSize = terminalController.size
+            activeSession?.terminalSize = initialSize
             let connection: any SSHConnection
             if case .mosh = host.connection {
                 connection = try await moshTransport.connect(
@@ -918,8 +923,9 @@ final class AppContainer: ObservableObject {
                 self.enqueueRawInteractive(data, sessionID: sessionID)
             }
 
-            // The viewport may have changed while SSH was establishing the PTY.
-            // Reconcile it before any tmux attach command can use the old grid.
+            // Refresh SwiftUI geometry again after target lookup, immediately
+            // before the PTY resize that precedes tmux attachment.
+            terminalController.synchronizeViewportMeasurement()
             if terminalController.hasMeasuredViewport {
                 activeSession?.terminalSize = terminalController.size
                 try? await connection.resize(terminalController.size)
@@ -1163,6 +1169,7 @@ final class AppContainer: ObservableObject {
         isProbingHerdr = false
 
         // Cleanly reset terminal emulator buffer and parser to avoid stream corruption
+        terminalController.synchronizeViewportMeasurement()
         terminalGrid = TerminalGrid()
         ansiParser = ANSIParser()
         terminalText = ""
@@ -1170,12 +1177,11 @@ final class AppContainer: ObservableObject {
         terminalController.reset()
 
         hasObservedTransportError = false
-        let initialSize = terminalController.size
         let session = TerminalSession(
             id: activeSession?.id ?? UUID(),
             hostID: host.id,
             state: .connecting,
-            terminalSize: initialSize,
+            terminalSize: terminalController.size,
             capabilities: ["ansi", "resize"]
         )
         activeSession = session
@@ -1183,6 +1189,11 @@ final class AppContainer: ObservableObject {
         let connection: any SSHConnection
         do {
             let selectedIdentity = try await resolveIdentity(for: host)
+            // Identity resolution may yield to SwiftUI layout. Capture the
+            // latest measured geometry immediately before PTY initialization.
+            terminalController.synchronizeViewportMeasurement()
+            let initialSize = terminalController.size
+            activeSession?.terminalSize = initialSize
             if case .mosh = host.connection {
                 connection = try await moshTransport.connect(
                     host: host,
@@ -1256,8 +1267,9 @@ final class AppContainer: ObservableObject {
             self.enqueueRawInteractive(data, sessionID: sessionID)
         }
 
-        // Reconcile a viewport change delivered while reconnecting before tmux
-        // restoration attaches the session.
+        // Refresh SwiftUI geometry again after reconnection setup, immediately
+        // before the PTY resize that precedes tmux restoration.
+        terminalController.synchronizeViewportMeasurement()
         if terminalController.hasMeasuredViewport {
             activeSession?.terminalSize = terminalController.size
             try? await connection.resize(terminalController.size)
