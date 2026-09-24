@@ -89,8 +89,19 @@ public struct ShhTerminalView: UIViewRepresentable {
         }
 
         public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
-            Task { @MainActor [weak self] in
-                self?.controller?.handleResize(columns: newCols, rows: newRows)
+            if Thread.isMainThread {
+                MainActor.assumeIsolated {
+                    controller?.handleResize(columns: newCols, rows: newRows)
+                }
+            } else {
+                DispatchQueue.main.async { [weak self, weak source] in
+                    guard let self, let controller = self.controller else { return }
+                    let measuredTerminal = source?.getTerminal()
+                    controller.handleResize(
+                        columns: measuredTerminal?.cols ?? newCols,
+                        rows: measuredTerminal?.rows ?? newRows
+                    )
+                }
             }
         }
 
@@ -200,6 +211,12 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     func updateSizeIfNeeded() {
         setNeedsLayout()
         layoutIfNeeded()
+    }
+
+    var synchronouslyMeasuredSize: TerminalSize? {
+        updateSizeIfNeeded()
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        return currentSize
     }
 
     // MARK: - First Responder Recovery

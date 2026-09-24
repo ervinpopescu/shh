@@ -531,6 +531,17 @@ public final class ShhTerminalController: ObservableObject {
         resizeDebouncer.receive(size: newSize)
     }
 
+    /// Forces the mounted SwiftTerm view to lay out and publishes its current
+    /// geometry before callers snapshot the size for a new PTY.
+    public func synchronizeViewportMeasurement() {
+        #if canImport(UIKit) && canImport(SwiftUI)
+        guard let hostView = persistentHostView,
+              let measuredSize = hostView.synchronouslyMeasuredSize else { return }
+        guard measuredSize != size || !hasMeasuredViewport else { return }
+        handleResize(columns: measuredSize.columns, rows: measuredSize.rows)
+        #endif
+    }
+
     public func flushResize() {
         resizeDebouncer.flush()
     }
