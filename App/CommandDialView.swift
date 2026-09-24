@@ -75,12 +75,11 @@ struct CommandDialSurface: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @State private var highlightedNodeID: String?
     @State private var lastHighlightedNodeID: String?
-    @State private var gestureCrossedCenter = false
-    @State private var gestureLeftOrbit = false
-    @State private var gestureEnteredOrbit = false
+    @State private var gesturePreviousLocation: CGPoint?
+    @State private var gestureChangedLevel = false
 
-    private let accent = Color(red: 0.30, green: 0.96, blue: 0.68)
-    private let coolAccent = Color(red: 0.40, green: 0.62, blue: 1.0)
+    private let accent = Color(red: 0.43, green: 0.95, blue: 0.69)
+    private let coolAccent = Color(red: 0.44, green: 0.62, blue: 0.96)
 
     init(
         model: CommandDialModel, navigation: Binding<CommandDialNavigation>,
@@ -132,7 +131,7 @@ struct CommandDialSurface: View {
     }
 
     private var breadcrumb: String {
-        var titles = [hostLabel, paneLabel]
+        var titles = ["Commands"]
         var nodes = model.roots
         for id in navigation.path {
             guard let node = nodes.first(where: { $0.id == id }) else { break }
@@ -146,7 +145,9 @@ struct CommandDialSurface: View {
         GeometryReader { proxy in
             let layout = radialLayout(in: proxy)
             ZStack {
-                Color.black.opacity(contrast == .increased ? 0.72 : 0.52)
+                Color(red: 0.035, green: 0.05, blue: 0.06)
+                    .opacity(contrast == .increased ? 0.96 : 0.88)
+                    .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { onDismiss() }
                     .accessibilityHidden(true)
@@ -173,7 +174,6 @@ struct CommandDialSurface: View {
                         .zIndex(3)
 
                     wheel(layout: layout)
-                        .id(navigation.path.joined(separator: "/"))
                         .transition(
                             reduceMotion
                                 ? .opacity
@@ -244,7 +244,7 @@ struct CommandDialSurface: View {
 
     private func commandHeader(proxy: GeometryProxy) -> some View {
         let selected = highlightedNode
-        return VStack(alignment: .leading, spacing: 9) {
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "command")
                     .font(.caption.bold())
@@ -259,48 +259,59 @@ struct CommandDialSurface: View {
                     .frame(width: 7, height: 7)
                 Text(connectionStatus)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.75))
             }
             .dynamicTypeSize(...DynamicTypeSize.xxLarge)
 
-            Text(selected?.title ?? currentTitle)
-                .font(.title2.weight(.bold))
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .minimumScaleFactor(0.82)
-                .contentTransition(.numericText())
-
-            Text(selected?.subtitle ?? breadcrumb)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .lineLimit(dynamicTypeSize.isAccessibilitySize ? 4 : 2)
+            Text("\(hostLabel)  /  \(paneLabel)")
+                .font(.system(.caption, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.68))
+                .lineLimit(1)
                 .minimumScaleFactor(0.8)
 
-            if !dynamicTypeSize.isAccessibilitySize {
-                HStack(spacing: 7) {
-                    Image(
-                        systemName: navigation.path.isEmpty ? "hand.draw" : "arrow.uturn.backward")
-                    Text(
-                        navigation.path.isEmpty
-                            ? "Drag from the command button or tap an action"
-                            : "Choose an action, or use the center button to go back")
-                }
-                .font(.caption.weight(.medium))
-                .foregroundStyle(.secondary)
+            Text(breadcrumb.uppercased())
+                .font(.system(.caption2, design: .monospaced, weight: .semibold))
+                .tracking(0.6)
+                .foregroundStyle(coolAccent)
+                .lineLimit(2)
+
+            HStack(alignment: .firstTextBaseline) {
+                Text(currentTitle)
+                    .font(.title2.weight(.bold))
+                    .foregroundStyle(.white)
+                Spacer(minLength: 8)
+                Text("\(currentNodes.count) ACTIONS")
+                    .font(.system(.caption2, design: .monospaced, weight: .semibold))
+                    .foregroundStyle(accent)
             }
+
+            Text(
+                selected.map { node in
+                    node.children.isEmpty
+                        ? (node.subtitle ?? "Lift to activate \(node.title)")
+                        : "\(node.title)  ·  \(node.children.map(\.title).joined(separator: " / "))"
+                }
+                    ?? (navigation.path.isEmpty
+                        ? "Swipe out through a group to explore. Lift on an action to choose."
+                        : "Swipe out to open a group · swipe in to go back")
+            )
+            .font(.subheadline)
+            .foregroundStyle(.white.opacity(0.78))
+            .lineLimit(2)
+            .minimumScaleFactor(0.85)
         }
-        .padding(16)
+        .padding(18)
         .frame(maxWidth: min(proxy.size.width - 32, 540), alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        .background(
+            Color(red: 0.065, green: 0.08, blue: 0.09), in: RoundedRectangle(cornerRadius: 22)
+        )
         .overlay(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .stroke(
-                    contrast == .increased ? Color.white.opacity(0.5) : Color.white.opacity(0.13),
-                    lineWidth: 1)
+            RoundedRectangle(cornerRadius: 22)
+                .stroke(coolAccent.opacity(contrast == .increased ? 0.9 : 0.42), lineWidth: 1)
         )
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(breadcrumb), \(connectionStatus), \(selected?.title ?? currentTitle)"
+            "\(hostLabel), \(paneLabel), \(breadcrumb), \(connectionStatus), \(currentNodes.count) actions, \(selected?.title ?? currentTitle)"
         )
         .accessibilityIdentifier("command-dial-breadcrumb")
     }
@@ -388,7 +399,11 @@ struct CommandDialSurface: View {
         .buttonStyle(.plain)
         .disabled(!node.isEnabled)
         .accessibilityLabel(node.accessibilityLabel)
-        .accessibilityHint(node.children.isEmpty ? "Activates this action" : "Opens \(node.title)")
+        .accessibilityHint(
+            node.children.isEmpty
+                ? "Activates this action"
+                : "Opens \(node.title) and its \(node.children.count) actions"
+        )
         .accessibilityIdentifier(
             "command-dial-node-\(node.id.replacingOccurrences(of: ".", with: "-"))")
     }
@@ -410,7 +425,8 @@ struct CommandDialSurface: View {
         .simultaneousGesture(radialGesture(layout: layout))
         .accessibilityAddTraits(.isModal)
         .accessibilityHint(
-            "Drag toward an action and release to choose it. Categories open another level.")
+            "Swipe outward through a group to open it, inward toward the center to go back. Lift on an action to choose it."
+        )
     }
 
     @ViewBuilder
@@ -458,7 +474,7 @@ struct CommandDialSurface: View {
         } label: {
             ZStack {
                 Circle()
-                    .fill(Color.black.opacity(contrast == .increased ? 1 : 0.88))
+                    .fill(Color(red: 0.09, green: 0.11, blue: 0.12))
                     .overlay(Circle().stroke(accent.opacity(0.82), lineWidth: 1.5))
                     .shadow(color: accent.opacity(0.20), radius: 18)
                 Image(systemName: navigation.path.isEmpty ? "xmark" : "chevron.backward")
@@ -522,6 +538,11 @@ struct CommandDialSurface: View {
                         .font(.caption2)
                         .foregroundStyle(.orange)
                         .padding(7)
+                } else if !node.children.isEmpty {
+                    Image(systemName: "arrow.up.right")
+                        .font(.caption2.bold())
+                        .foregroundStyle(accent)
+                        .padding(7)
                 }
             }
             .shadow(
@@ -536,7 +557,11 @@ struct CommandDialSurface: View {
         .disabled(!node.isEnabled)
         .opacity(node.isEnabled ? 1 : 0.52)
         .accessibilityLabel(node.accessibilityLabel)
-        .accessibilityHint(node.children.isEmpty ? "Activates this action" : "Opens \(node.title)")
+        .accessibilityHint(
+            node.children.isEmpty
+                ? "Activates this action"
+                : "Opens \(node.title) and its \(node.children.count) actions"
+        )
         .accessibilityIdentifier(
             "command-dial-node-\(node.id.replacingOccurrences(of: ".", with: "-"))")
     }
@@ -544,26 +569,41 @@ struct CommandDialSurface: View {
     private func radialGesture(layout: DialRadialLayout) -> some Gesture {
         DragGesture(minimumDistance: 8)
             .onChanged { value in
-                let startDistance = hypot(
-                    value.startLocation.x - layout.center.x, value.startLocation.y - layout.center.y
-                )
-                let currentDistance = hypot(
-                    value.location.x - layout.center.x, value.location.y - layout.center.y)
-                let startIsValid = startDistance <= layout.orbitRadius + layout.itemRadius * 1.8
-                if startDistance > layout.itemRadius, currentDistance <= layout.itemRadius {
-                    gestureCrossedCenter = true
+                let previous = gesturePreviousLocation ?? value.startLocation
+                gesturePreviousLocation = value.location
+                let activeLayout = DialRadialLayout.corner(
+                    center: layout.center, radius: layout.orbitRadius,
+                    itemRadius: layout.itemRadius, count: currentNodes.count,
+                    placement: placement)
+                let selectedGroup = currentNodes.first { $0.id == highlightedNodeID }
+                switch activeLayout.levelTransition(
+                    from: previous, to: value.location,
+                    selectedGroup: selectedGroup?.isEnabled == true
+                        && selectedGroup?.children.isEmpty == false,
+                    hasParent: !navigation.path.isEmpty
+                ) {
+                case .enter:
+                    if let selectedGroup {
+                        navigation.enter(selectedGroup)
+                        gestureChangedLevel = true
+                        highlightedNodeID = nil
+                        lastHighlightedNodeID = nil
+                        haptics.emit(.commit)
+                    }
+                    return
+                case .back:
+                    navigation.back()
+                    gestureChangedLevel = true
+                    highlightedNodeID = nil
+                    lastHighlightedNodeID = nil
+                    haptics.emit(.selection)
+                    return
+                case nil:
+                    break
                 }
-                let polarIndex = layout.index(at: value.location)
-                if polarIndex != nil { gestureEnteredOrbit = true }
-                if gestureEnteredOrbit && polarIndex == nil
-                    && currentDistance > layout.orbitRadius + layout.itemRadius * 1.4
-                {
-                    gestureLeftOrbit = true
-                }
-                guard startIsValid, !gestureCrossedCenter, !gestureLeftOrbit,
-                    let index = polarIndex, currentNodes.indices.contains(index)
+                guard let index = activeLayout.index(at: value.location),
+                    currentNodes.indices.contains(index)
                 else {
-                    if highlightedNodeID != nil { haptics.emit(.boundary) }
                     highlightedNodeID = nil
                     return
                 }
@@ -575,6 +615,9 @@ struct CommandDialSurface: View {
                     return
                 }
                 highlightedNodeID = node.id
+                // A new selection after drilling in can be fired on lift;
+                // crossing the ring alone never dispatches an action.
+                gestureChangedLevel = false
                 if lastHighlightedNodeID != node.id {
                     haptics.emit(.selection)
                     lastHighlightedNodeID = node.id
@@ -582,8 +625,32 @@ struct CommandDialSurface: View {
             }
             .onEnded { value in
                 defer { resetGesture() }
-                guard !gestureCrossedCenter, !gestureLeftOrbit,
-                    let index = layout.index(at: value.location),
+                let activeLayout = DialRadialLayout.corner(
+                    center: layout.center, radius: layout.orbitRadius,
+                    itemRadius: layout.itemRadius, count: currentNodes.count,
+                    placement: placement)
+                if let previous = gesturePreviousLocation {
+                    let selectedGroup = currentNodes.first { $0.id == highlightedNodeID }
+                    switch activeLayout.levelTransition(
+                        from: previous, to: value.location,
+                        selectedGroup: selectedGroup?.isEnabled == true
+                            && selectedGroup?.children.isEmpty == false,
+                        hasParent: !navigation.path.isEmpty
+                    ) {
+                    case .enter:
+                        if let selectedGroup { navigation.enter(selectedGroup) }
+                        haptics.emit(.commit)
+                        return
+                    case .back:
+                        navigation.back()
+                        haptics.emit(.selection)
+                        return
+                    case nil:
+                        break
+                    }
+                }
+                guard !gestureChangedLevel,
+                    let index = activeLayout.index(at: value.location),
                     currentNodes.indices.contains(index),
                     highlightedNodeID == currentNodes[index].id
                 else { return }
@@ -594,9 +661,8 @@ struct CommandDialSurface: View {
     private func resetGesture() {
         highlightedNodeID = nil
         lastHighlightedNodeID = nil
-        gestureCrossedCenter = false
-        gestureLeftOrbit = false
-        gestureEnteredOrbit = false
+        gesturePreviousLocation = nil
+        gestureChangedLevel = false
     }
 
     private func activate(_ node: DialNode) {

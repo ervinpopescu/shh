@@ -1,6 +1,10 @@
 import CoreGraphics
 import Foundation
 
+public enum DialLevelTransition: Equatable, Sendable {
+    case enter, back
+}
+
 /// Geometry shared by the command dial's visual layout and polar hit testing.
 /// Angles use UIKit coordinates: zero points east and positive values rotate
 /// clockwise. The layout is an arc so a corner-mounted puck keeps every item
@@ -94,6 +98,28 @@ public struct DialRadialLayout: Equatable, Sendable {
             center: center, orbitRadius: radius, itemRadius: itemRadius,
             startAngle: start + span * insetFraction,
             endAngle: end - span * insetFraction, count: count)
+    }
+
+    /// A drag crossing the outer edge drills into a highlighted group; a drag
+    /// from the orbit toward the puck returns one level. Neither crossing fires
+    /// a leaf action. The view keeps taps and release-to-activate separate.
+    public func levelTransition(
+        from previous: CGPoint, to location: CGPoint,
+        selectedGroup: Bool, hasParent: Bool
+    ) -> DialLevelTransition? {
+        let oldDistance = hypot(previous.x - center.x, previous.y - center.y)
+        let newDistance = hypot(location.x - center.x, location.y - center.y)
+        if hasParent && oldDistance > itemRadius * 1.15
+            && newDistance <= itemRadius * 1.15
+        {
+            return .back
+        }
+        if selectedGroup && oldDistance <= orbitRadius + itemRadius * 1.15
+            && newDistance > orbitRadius + itemRadius * 1.15
+        {
+            return .enter
+        }
+        return nil
     }
 
     private func point(atAngle angle: CGFloat) -> CGPoint {
