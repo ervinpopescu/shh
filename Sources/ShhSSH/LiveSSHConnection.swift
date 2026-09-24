@@ -13,6 +13,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private let lock = NSLock()
     private var isClosed = false
     private var keepaliveTask: Task<Void, Never>?
+    private var pendingTerminalError: TransportError?
     private var bufferedData: [Data] = []
     private var continuations: [UUID: AsyncThrowingStream<TerminalEvent, Error>.Continuation] = [:]
     private var activeExecChannels: [UUID: Channel] = [:]
@@ -63,14 +64,16 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             guard !Task.isCancelled, !lock.withLock({ isClosed }) else { return }
             do {
                 try await sendKeepaliveProbe(timeout: timeout)
-            } catch let error as TransportError where error == .timeout {
-                // A bounded probe timeout is a real transport failure. Closing
-                // the channel lets AppContainer's normal reconnect path run.
-                handleChannelError(error)
-                return
-            } catch {
+            } catch let error as NIOSSHError
+                where error.type == .globalRequestRefused || error.type == .remotePeerDoesNotSupportMessage {
                 // Refused or unsupported probes still prove that SSH replied.
                 // Do not disconnect a usable session for server policy.
+            } catch {
+                // A timeout, write failure, or inactive transport is a real
+                // liveness failure even when the TCP socket has not reported a
+                // close yet. Publish it through the normal session event path.
+                handleChannelError(error)
+                return
             }
         }
     }
@@ -141,19 +144,26 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         let id = UUID()
         return AsyncThrowingStream { continuation in
-            let (alreadyClosed, pendingData): (Bool, [Data]) = self.lock.withLock {
+            let (alreadyClosed, pendingData, pendingError): (Bool, [Data], TransportError?) = self.lock.withLock {
                 if self.isClosed {
-                    return (true, [])
+                    let error = self.pendingTerminalError
+                    self.pendingTerminalError = nil
+                    return (true, [], error)
                 }
                 self.continuations[id] = continuation
                 let data = self.bufferedData
                 self.bufferedData.removeAll()
-                return (false, data)
+                return (false, data, nil)
             }
 
             if alreadyClosed {
-                continuation.yield(.closed)
-                continuation.finish()
+                if let pendingError {
+                    continuation.yield(.error(pendingError))
+                    continuation.finish(throwing: pendingError)
+                } else {
+                    continuation.yield(.closed)
+                    continuation.finish()
+                }
                 return
             }
 
@@ -548,6 +558,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     func handleChannelError(_ error: Error) {
         keepaliveTask?.cancel()
         keepaliveTask = nil
+        let transportError = (error as? TransportError) ?? TransportError.remoteFailure(error.localizedDescription)
         let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
             [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
             [Channel],
@@ -558,6 +569,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             isClosed = true
             let list = Array(continuations.values)
             continuations.removeAll()
+            pendingTerminalError = list.isEmpty ? transportError : nil
             bufferedData.removeAll()
             let execs = Array(activeExecChannels.values)
             activeExecChannels.removeAll()
@@ -574,7 +586,6 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             forwardedChannel.close(promise: nil)
         }
 
-        let transportError = (error as? TransportError) ?? TransportError.remoteFailure(error.localizedDescription)
         for continuation in activeContinuations {
             continuation.yield(.error(transportError))
             continuation.finish(throwing: transportError)
