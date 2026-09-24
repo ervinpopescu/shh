@@ -539,6 +539,66 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(mockConnection.sentData.last, bracketedPasteBytes)
     }
 
+    func testViewportResizeBeforeConnectionCompletesReachesPTY() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "Phone", hostname: "phone.invalid", username: "user")
+
+        // The terminal can already be mounted while SSH is connecting. Its measured
+        // viewport may be narrower than the initial 80-column PTY request.
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        await container.connect(to: host)
+
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(mockConnection.resizeCalls.last, TerminalSize(columns: 42, rows: 18))
+    }
+
+    func testInitialViewportGridIsUsedForPTYRequest() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "InitialGridHost", hostname: "initial-grid.invalid", username: "user")
+
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        await container.connect(to: host)
+
+        XCTAssertEqual(transport.initialSizes.last, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.terminalController.size, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 42, rows: 18))
+    }
+
+    func testViewportResizeWhileConnectingIsReconciledBeforeSessionAttach() async throws {
+        let mockConnection = MockSSHConnection()
+        let gate = ConnectionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in
+            await gate.waitUntilReleased()
+            return mockConnection
+        }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "ConnectingGridHost", hostname: "connecting-grid.invalid", username: "user")
+        let connecting = Task { @MainActor in
+            await container.connect(to: host)
+        }
+
+        await gate.waitForStart()
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        XCTAssertEqual(container.terminalController.size, TerminalSize(columns: 42, rows: 18))
+
+        await gate.release()
+        await connecting.value
+
+        XCTAssertEqual(transport.initialSizes.last, TerminalSize(columns: 80, rows: 24))
+        XCTAssertEqual(mockConnection.resizeCalls.last, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 42, rows: 18))
+    }
+
     func testResizeDeliveryThroughAdapterDebounce() async throws {
         let mockConnection = MockSSHConnection()
         let transport = ControllableTransport()
@@ -1323,12 +1383,35 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
 
 final class ControllableTransport: SSHTransport, @unchecked Sendable {
     var onConnect: (@Sendable (Host) async throws -> any SSHConnection)?
+    private(set) var initialSizes: [TerminalSize] = []
 
     func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection {
+        initialSizes.append(initialSize)
         if let onConnect {
             return try await onConnect(host)
         }
         return MockSSHConnection()
+    }
+}
+
+actor ConnectionGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var started = false
+
+    func waitUntilReleased() async {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitForStart() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

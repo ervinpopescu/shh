@@ -35,8 +35,8 @@ public struct ShhTerminalView: UIViewRepresentable {
         }
 
         var options = TerminalOptions.default
-        options.cols = controller.configuration.initialSize.columns
-        options.rows = controller.configuration.initialSize.rows
+        options.cols = controller.size.columns
+        options.rows = controller.size.rows
         options.scrollback = controller.configuration.scrollbackLimit
 
         let view = ShhInternalTerminalHostView(

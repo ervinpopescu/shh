@@ -148,6 +148,7 @@ public final class ShhTerminalController: ObservableObject {
     public let inputCoordinator: TerminalInputCoordinator
 
     @Published public private(set) var size: TerminalSize
+    public private(set) var hasMeasuredViewport = false
     @Published public private(set) var terminalFontSize: Double
     @Published public private(set) var terminalTheme: TerminalThemePreset
     @Published public private(set) var title: String = ""
@@ -522,6 +523,11 @@ public final class ShhTerminalController: ObservableObject {
 
     public func handleResize(columns: Int, rows: Int) {
         let newSize = TerminalSize(columns: columns, rows: rows)
+        // SwiftTerm reports the measured viewport before the debounced PTY
+        // delivery. Keep the controller's current grid in sync so connection
+        // setup and keyboard-driven reflow cannot lose that measurement.
+        size = newSize
+        hasMeasuredViewport = true
         resizeDebouncer.receive(size: newSize)
     }
 
@@ -588,6 +594,7 @@ public final class ShhTerminalController: ObservableObject {
         bridge.changeScrollback(configuration.scrollbackLimit)
         bridge.setTheme(terminalTheme)
         bridge.setFontSize(terminalFontSize)
+        bridge.resize(size: size)
 
         if hasPendingFirstResponderRequest {
             if firstResponder?.requestFirstResponder() == true {

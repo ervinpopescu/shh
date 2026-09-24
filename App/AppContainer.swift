@@ -685,6 +685,7 @@ final class AppContainer: ObservableObject {
         eventTask?.cancel()
         eventTask = nil
 
+        let initialSize = terminalController.size
         let oldConnection = connection
         connection = nil
         await oldConnection?.close()
@@ -722,9 +723,13 @@ final class AppContainer: ObservableObject {
         forwardingSessions = []
         forwardingErrorMessage = nil
 
-        let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
+        let session = TerminalSession(
+            hostID: host.id,
+            state: .connecting,
+            terminalSize: initialSize,
+            capabilities: ["ansi", "resize"]
+        )
         activeSession = session
-        let initialSize = terminalController.size
         do {
             // Resolve descriptor by UUID before invoking transport. Never let a
             // missing descriptor degrade into password auth or an arbitrary
@@ -789,6 +794,7 @@ final class AppContainer: ObservableObject {
                           self.activeSession?.id == sessionID,
                           self.activeSession?.state == .connected,
                           let activeConnection = self.connection else { return }
+                    self.activeSession?.terminalSize = newSize
                     try? await activeConnection.resize(newSize)
                 }
             }
@@ -799,6 +805,13 @@ final class AppContainer: ObservableObject {
                       self.activeSession?.id == sessionID,
                       self.activeSession?.state == .connected else { return }
                 self.enqueueRawInteractive(data, sessionID: sessionID)
+            }
+
+            // The viewport may have changed while SSH was establishing the PTY.
+            // Reconcile it before any tmux attach command can use the old grid.
+            if terminalController.hasMeasuredViewport {
+                activeSession?.terminalSize = terminalController.size
+                try? await connection.resize(terminalController.size)
             }
 
             // Auto-attach tmux session if requested by host preferences or restored
@@ -1034,10 +1047,14 @@ final class AppContainer: ObservableObject {
         terminalController.reset()
 
         hasObservedTransportError = false
-        let session = TerminalSession(hostID: host.id, state: .connecting, capabilities: ["ansi", "resize"])
-        activeSession = session
-
         let initialSize = terminalController.size
+        let session = TerminalSession(
+            hostID: host.id,
+            state: .connecting,
+            terminalSize: initialSize,
+            capabilities: ["ansi", "resize"]
+        )
+        activeSession = session
         let connection: any SSHConnection
         do {
             let selectedIdentity = try await resolveIdentity(for: host)
@@ -1101,6 +1118,7 @@ final class AppContainer: ObservableObject {
                       self.activeSession?.id == sessionID,
                       self.activeSession?.state == .connected,
                       let activeConnection = self.connection else { return }
+                self.activeSession?.terminalSize = newSize
                 try? await activeConnection.resize(newSize)
             }
         }
@@ -1110,6 +1128,13 @@ final class AppContainer: ObservableObject {
                   self.activeSession?.id == sessionID,
                   self.activeSession?.state == .connected else { return }
             self.enqueueRawInteractive(data, sessionID: sessionID)
+        }
+
+        // Reconcile a viewport change delivered while reconnecting before tmux
+        // restoration attaches the session.
+        if terminalController.hasMeasuredViewport {
+            activeSession?.terminalSize = terminalController.size
+            try? await connection.resize(terminalController.size)
         }
 
         let targetSession = await automaticTmuxTarget(

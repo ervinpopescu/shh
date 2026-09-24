@@ -77,6 +77,34 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.size, TerminalSize(columns: 110, rows: 35))
     }
 
+    func testMeasuredViewportReflowsAttachedEngineAfterReset() {
+        let controller = ShhTerminalController()
+        controller.handleResize(columns: 42, rows: 18)
+        controller.reset()
+
+        final class MockEngine: TerminalEngineBridge {
+            var bracketedPasteMode = false
+            var isAlternateScreenActive = false
+            var currentSize = TerminalSize(columns: 80, rows: 24)
+            func feed(data: Data) {}
+            func feed(text: String) {}
+            func resize(size: TerminalSize) { currentSize = size }
+            func changeScrollback(_ limit: Int) {}
+            func findNext(_ term: String) -> Bool { true }
+            func findPrevious(_ term: String) -> Bool { true }
+            func searchMatchSummary(_ term: String) -> (index: Int, total: Int) { (0, 0) }
+            func clearSearch() {}
+            func selectAll() {}
+            func selectNone() {}
+            func getSelection() -> String? { nil }
+            func currentTranscript(limit: Int) -> String { "" }
+        }
+
+        let engine = MockEngine()
+        controller.attachEngine(engine, firstResponder: nil)
+        XCTAssertEqual(engine.currentSize, TerminalSize(columns: 42, rows: 18))
+    }
+
     func testFlushResizeImmediatelyInvokesCallback() {
         let config = ShhTerminalConfiguration(
             resizeDebounceInterval: 1.0,
