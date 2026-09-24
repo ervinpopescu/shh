@@ -720,6 +720,11 @@ final class ShhTerminalControllerTests: XCTestCase {
             resizeExp.fulfill()
         }
         coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        XCTAssertEqual(
+            controller.size,
+            TerminalSize(columns: 132, rows: 43),
+            "Viewport callback must update the controller synchronously"
+        )
         DispatchQueue.main.async {
             controller.flushResize()
         }
