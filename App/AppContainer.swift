@@ -923,17 +923,14 @@ final class AppContainer: ObservableObject {
                 self.enqueueRawInteractive(data, sessionID: sessionID)
             }
 
-            // Refresh SwiftUI geometry again after target lookup, immediately
-            // before the PTY resize that precedes tmux attachment.
-            terminalController.synchronizeViewportMeasurement()
-            if terminalController.hasMeasuredViewport {
-                activeSession?.terminalSize = terminalController.size
-                try? await connection.resize(terminalController.size)
-            }
-
-            // Auto-attach tmux session if requested by host preferences or restored
+            // Auto-attach tmux session if requested by host preferences or restored.
+            // The attachment boundary performs the final viewport reconciliation
+            // after any awaited target validation. Without a target, still resize
+            // the connected PTY to the latest measured viewport.
             if let target = targetSession {
                 await self.handleTmuxTarget(target, on: connection, host: host, session: session)
+            } else {
+                _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
             }
 
             let events = await connection.events()
@@ -1267,14 +1264,6 @@ final class AppContainer: ObservableObject {
             self.enqueueRawInteractive(data, sessionID: sessionID)
         }
 
-        // Refresh SwiftUI geometry again after reconnection setup, immediately
-        // before the PTY resize that precedes tmux restoration.
-        terminalController.synchronizeViewportMeasurement()
-        if terminalController.hasMeasuredViewport {
-            activeSession?.terminalSize = terminalController.size
-            try? await connection.resize(terminalController.size)
-        }
-
         let targetSession = await automaticTmuxTarget(
             for: host,
             explicitTarget: recoveryTmuxTarget,
@@ -1282,6 +1271,8 @@ final class AppContainer: ObservableObject {
         )
         if let target = targetSession {
             _ = await self.handleTmuxTarget(target, on: connection, host: host, session: session)
+        } else {
+            _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
         }
 
         let shouldRestoreHerdr = (try? await restorationStore.load())
@@ -2355,6 +2346,32 @@ final class AppContainer: ObservableObject {
         }
     }
 
+    private func synchronizeViewportAndResize(
+        _ conn: any SSHConnection,
+        sessionID: UUID
+    ) async -> Bool {
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              let currentConnection = connection,
+              (currentConnection as AnyObject) === (conn as AnyObject) else {
+            return false
+        }
+
+        terminalController.synchronizeViewportMeasurement()
+        if terminalController.hasMeasuredViewport {
+            let size = terminalController.size
+            activeSession?.terminalSize = size
+            try? await conn.resize(size)
+        }
+
+        guard let currentConnection = connection else { return false }
+        return activeSession?.id == sessionID
+            && activeSession?.state == .connected
+            && !isExplicitDisconnect
+            && (currentConnection as AnyObject) === (conn as AnyObject)
+    }
+
     @discardableResult
     func executeMultiplexerControl(_ action: MultiplexerControlAction, approved: Bool = false) async
         -> Bool
@@ -2396,7 +2413,7 @@ final class AppContainer: ObservableObject {
             tmuxError = "Not connected."
             return false
         }
-        let sessionID = activeSession?.id
+        guard let sessionID = activeSession?.id else { return false }
         let connObj = conn as AnyObject
         let validatedID: TmuxSessionID
         do {
@@ -2418,6 +2435,9 @@ final class AppContainer: ObservableObject {
             return false
         }
 
+        guard await synchronizeViewportAndResize(conn, sessionID: sessionID) else {
+            return false
+        }
         // Attaching is the one intentional PTY exception: tmux must take over
         // the user's interactive terminal. Post-attach controls use exec below.
         let sent: Bool
@@ -2460,7 +2480,7 @@ final class AppContainer: ObservableObject {
             tmuxError = "Not connected."
             return false
         }
-        let sessionID = activeSession?.id
+        guard let sessionID = activeSession?.id else { return false }
         let connObj = conn as AnyObject
         let validatedName: TmuxSessionName
         do {
@@ -2482,6 +2502,9 @@ final class AppContainer: ObservableObject {
             return false
         }
 
+        guard await synchronizeViewportAndResize(conn, sessionID: sessionID) else {
+            return false
+        }
         // Creating and attaching is the same intentional PTY exception as
         // attachTmuxSession. Subsequent controls never use this path.
         let sent: Bool
