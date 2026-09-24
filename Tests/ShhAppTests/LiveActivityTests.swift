@@ -390,6 +390,23 @@ final class LiveActivityTests: XCTestCase {
     print("DEBUG_LIVE_ACTIVITY: areActivitiesEnabled on simulator: \(areEnabled)")
   }
 
+  func testEmbeddedLiveActivityExtensionIsConfiguredForActivityKit() throws {
+    let appBundle = Bundle(for: Self.self).bundleURL
+      .deletingLastPathComponent()
+      .deletingLastPathComponent()
+    let appInfo = try XCTUnwrap(NSDictionary(contentsOf: appBundle.appendingPathComponent("Info.plist")))
+    XCTAssertEqual(appInfo["NSSupportsLiveActivities"] as? Bool, true)
+
+    let extensionURL = appBundle.appendingPathComponent("PlugIns/ShhLiveActivity.appex")
+    let extensionBundle = try XCTUnwrap(Bundle(url: extensionURL))
+    XCTAssertEqual(extensionBundle.object(forInfoDictionaryKey: "CFBundlePackageType") as? String, "XPC!")
+    XCTAssertEqual(
+      extensionBundle.object(forInfoDictionaryKey: "NSExtension") as? [String: String],
+      ["NSExtensionPointIdentifier": "com.apple.widgetkit-extension"]
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: extensionBundle.executableURL?.path ?? ""))
+  }
+
   @MainActor
   func testRealActivityRequestUpdateAndEnd() async throws {
     XCTAssertTrue(ActivityAuthorizationInfo().areActivitiesEnabled)
