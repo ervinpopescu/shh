@@ -99,3 +99,5 @@ GitHub Actions runs on `macos-14` runners with:
   upload on failure.
 - Least-privilege permissions (`contents: read`) and concurrency
   cancellation.
+- Automated CodeQL Swift static analysis using the extended security
+  query suite on pushes, pull requests, and scheduled runs.
