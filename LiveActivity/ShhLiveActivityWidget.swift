@@ -2,6 +2,7 @@ import ActivityKit
 import SwiftUI
 import WidgetKit
 
+@main
 struct ShhLiveActivityWidget: Widget {
   var body: some WidgetConfiguration {
     ActivityConfiguration(for: ShhSSHSessionActivityAttributes.self) { context in
