@@ -106,6 +106,62 @@ final class CommandDialTests: XCTestCase {
         }
     }
 
+    func testContinuousDragSelectsParentThenChildAndDispatchesOnlyOnRelease() throws {
+        let model = CommandDialModel(connected: true)
+        let inner = DialRadialLayout.corner(
+            center: CGPoint(x: 320, y: 720), radius: 145, itemRadius: 38,
+            count: model.roots.count, placement: .trailing)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let outer = DialRadialLayout.corner(
+            center: inner.center, radius: 245, itemRadius: 38,
+            count: input.children.count, placement: .trailing)
+        var drag = CommandDialDrag()
+        let parentPoint = try XCTUnwrap(inner.point(at: 0))
+        drag.update(at: parentPoint, inner: inner, outer: outer, nodes: model.roots)
+        XCTAssertEqual(drag.parentID, input.id)
+        XCTAssertNil(drag.childID)
+        XCTAssertEqual(drag.releasedNode(at: parentPoint, inner: inner, outer: outer, nodes: model.roots)?.id, input.id)
+
+        let childPoint = try XCTUnwrap(outer.point(at: 1))
+        drag.update(at: childPoint, inner: inner, outer: outer, nodes: model.roots)
+        XCTAssertEqual(drag.childID, "input.keyboard")
+        let child = try XCTUnwrap(drag.releasedNode(
+            at: childPoint, inner: inner, outer: outer, nodes: model.roots))
+        var navigation = CommandDialNavigation(isOpen: true)
+        XCTAssertTrue(navigation.path.isEmpty)
+        XCTAssertEqual(navigation.activate(child), .dispatch(.keyboard))
+        XCTAssertTrue(navigation.path.isEmpty)
+    }
+
+    func testContinuousDragLeafOvershootAndInwardCancel() throws {
+        let model = CommandDialModel()
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let inner = DialRadialLayout.corner(
+            center: CGPoint(x: 320, y: 720), radius: 145, itemRadius: 38,
+            count: input.children.count, placement: .trailing)
+        let outer = DialRadialLayout.corner(
+            center: inner.center, radius: 245, itemRadius: 38,
+            count: 0, placement: .trailing)
+        let leafPoint = try XCTUnwrap(inner.point(at: 1))
+        var drag = CommandDialDrag()
+        drag.update(at: leafPoint, inner: inner, outer: outer, nodes: input.children)
+        XCTAssertEqual(drag.parentID, "input.keyboard")
+        XCTAssertNil(drag.childID)
+        let beyond = CGPoint(x: inner.center.x - 245, y: inner.center.y)
+        drag.update(at: beyond, inner: inner, outer: outer, nodes: input.children)
+        XCTAssertNil(drag.releasedNode(at: beyond, inner: inner, outer: outer, nodes: input.children))
+        drag.update(at: inner.center, inner: inner, outer: outer, nodes: input.children)
+        XCTAssertTrue(drag.returnedToCenter)
+        XCTAssertNil(drag.releasedNode(at: inner.center, inner: inner, outer: outer, nodes: input.children))
+        var navigation = CommandDialNavigation(isOpen: true)
+        navigation.enter(input)
+        navigation.back()
+        XCTAssertTrue(navigation.path.isEmpty)
+        XCTAssertEqual(
+            CommandDialDrag().releasedNode(at: leafPoint, inner: inner, outer: outer, nodes: input.children)?.id,
+            nil)
+    }
+
     func testSwipeNavigationKeepsParentsAndBackAtEachDepth() throws {
         let model = CommandDialModel()
         var navigation = CommandDialNavigation(isOpen: true)

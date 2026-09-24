@@ -1219,6 +1219,7 @@ struct SessionView: View {
     @State private var isZenMode: Bool = false
     @State private var isCommandDialOpen = false
     @State private var commandDialNavigation = CommandDialNavigation()
+    @State private var commandDialTriggerDrag: DialPointerEvent?
     @State private var pendingPinnedLiteral: String?
     @State private var pendingDialControl: MultiplexerControlAction?
     @State private var dialSnippets: [Snippet] = []
@@ -1326,6 +1327,7 @@ struct SessionView: View {
                     CommandDialSurface(
                         model: commandDialModel,
                         navigation: $commandDialNavigation,
+                        triggerDrag: commandDialTriggerDrag,
                         placement: container.commandDialPreferences.placement,
                         size: container.commandDialPreferences.size,
                         hostLabel: container.activeHost?.name ?? "No host",
@@ -1355,7 +1357,8 @@ struct SessionView: View {
                         size: container.commandDialPreferences.size,
                         placement: container.commandDialPreferences.placement,
                         onOpen: openCommandDial,
-                        onClose: dismissCommandDial
+                        onClose: dismissCommandDial,
+                        onDrag: { commandDialTriggerDrag = $0 }
                     )
                     .padding(.leading, 6)
                 }
@@ -1366,7 +1369,8 @@ struct SessionView: View {
                         size: container.commandDialPreferences.size,
                         placement: container.commandDialPreferences.placement,
                         onOpen: openCommandDial,
-                        onClose: dismissCommandDial
+                        onClose: dismissCommandDial,
+                        onDrag: { commandDialTriggerDrag = $0 }
                     )
                     .padding(.trailing, 6)
                 }
@@ -2249,6 +2253,7 @@ struct SessionView: View {
     private func dismissCommandDial() {
         isCommandDialOpen = false
         commandDialNavigation.dismiss()
+        commandDialTriggerDrag = nil
     }
 
     private func handleDialAction(_ action: DialActionIdentifier) {

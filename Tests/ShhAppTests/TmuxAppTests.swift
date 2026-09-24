@@ -142,6 +142,46 @@ final class TmuxAppTests: XCTestCase {
         _ = state
     }
 
+    func testCommandDialKeyboardVisibleUsesScrollableActions() {
+        XCTAssertTrue(CommandDialSurface.usesListLayout(height: 500))
+        XCTAssertFalse(CommandDialSurface.usesListLayout(height: 852))
+        var navigation = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(connected: true)
+        let surface = CommandDialSurface(
+            model: model,
+            navigation: Binding(get: { navigation }, set: { navigation = $0 }),
+            placement: .trailing, size: .compact,
+            hostLabel: "Keyboard Review", paneLabel: "Terminal", connectionStatus: "Connected",
+            onAction: { _ in }, onDismiss: {}
+        )
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let hosting = UIHostingController(rootView: surface)
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+        let field = UITextField(frame: CGRect(x: 20, y: 65, width: 210, height: 44))
+        field.accessibilityIdentifier = "keyboard-review-field"
+        window.addSubview(field)
+        XCTAssertTrue(field.becomeFirstResponder())
+        RunLoop.current.run(until: Date().addingTimeInterval(2))
+        hosting.view.layoutIfNeeded()
+        XCTAssertTrue(field.isFirstResponder)
+        // The reduced-height hosting viewport models the keyboard-occluded region.
+        // Attach the rendered action list independent of the test runner foreground app.
+        hosting.view.frame = CGRect(
+            x: 0, y: 0, width: window.bounds.width, height: min(500, window.bounds.height * 0.62))
+        hosting.view.layoutIfNeeded()
+        let renderer = UIGraphicsImageRenderer(bounds: hosting.view.bounds)
+        let image = renderer.image { _ in
+            hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
+        }
+        let attachment = XCTAttachment(image: image)
+        attachment.name = "command-dial-keyboard-viewport"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        _ = navigation
+    }
+
     func testCommandDialLeadingPlacementRadiusMatchesTrailing() {
         let insets = EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0)
         let phoneSize = CGSize(width: 393, height: 852)
