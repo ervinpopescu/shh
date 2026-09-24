@@ -1,8 +1,9 @@
-import SwiftUI
-import XCTest
-@testable import Shh
 import ShhCore
 import ShhTerminal
+import SwiftUI
+import XCTest
+
+@testable import Shh
 
 private final class LockedString: @unchecked Sendable {
     private let lock = NSLock()
@@ -31,7 +32,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Tmux Host", hostname: "tmux.test", username: "user")
@@ -196,6 +198,53 @@ final class TmuxAppTests: XCTestCase {
 
         XCTAssertEqual(leadingIPad.orbitRadius, trailingIPad.orbitRadius)
         XCTAssertEqual(leadingIPad.orbitRadius, 330)
+    }
+
+    func testCommandDialHierarchyVisualEvidence() throws {
+        var navigation = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(connected: true)
+        func surface() -> CommandDialSurface {
+            CommandDialSurface(
+                model: model,
+                navigation: Binding(get: { navigation }, set: { navigation = $0 }),
+                placement: .trailing,
+                size: .compact,
+                hostLabel: "Review Host",
+                paneLabel: "Terminal",
+                connectionStatus: "Connected",
+                onAction: { _ in }, onDismiss: {}
+            )
+        }
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        let hosting = UIHostingController(rootView: surface())
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        func capture(_ name: String) {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+            hosting.view.layoutIfNeeded()
+            let renderer = UIGraphicsImageRenderer(bounds: hosting.view.bounds)
+            let image = renderer.image { _ in
+                hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        capture("dial-root")
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        navigation.enter(input)
+        hosting.rootView = surface()
+        capture("dial-input")
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        navigation.enter(navigate)
+        hosting.rootView = surface()
+        capture("dial-navigate")
+        navigation.back()
+        XCTAssertEqual(navigation.path, ["root.input"])
     }
 
     func testCommandDialSubmenusAndMultiplexerArtifacts() throws {
@@ -382,7 +431,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "No Tmux Host", hostname: "notmux.test", username: "user")
@@ -390,7 +440,8 @@ final class TmuxAppTests: XCTestCase {
 
         mock.onExecuteCommand = { cmd in
             if cmd == TmuxCommand.probe {
-                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "bash: tmux: command not found\n")
+                return SSHCommandResult(
+                    exitCode: 127, stdout: "", stderr: "bash: tmux: command not found\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -412,7 +463,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "List Host", hostname: "list.test", username: "user")
@@ -423,7 +475,8 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
-                let out = "$0\twork\t3\t1700000000\t1700000500\t1\n$1\tbackground\t1\t1700000100\t1700000200\t0\n"
+                let out =
+                    "$0\twork\t3\t1700000000\t1700000500\t1\n$1\tbackground\t1\t1700000100\t1700000200\t0\n"
                 return SSHCommandResult(exitCode: 0, stdout: out)
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
@@ -455,7 +508,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "No Server Host", hostname: "noserver.test", username: "user")
@@ -463,7 +517,8 @@ final class TmuxAppTests: XCTestCase {
 
         mock.onExecuteCommand = { cmd in
             if cmd == TmuxCommand.listSessions {
-                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-501/default\n")
+                return SSHCommandResult(
+                    exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-501/default\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -482,7 +537,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Empty Sessions Host", hostname: "empty.test", username: "user")
@@ -513,7 +569,8 @@ final class TmuxAppTests: XCTestCase {
             transport: transport,
             restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Attach Host", hostname: "attach.test", username: "user")
@@ -526,7 +583,9 @@ final class TmuxAppTests: XCTestCase {
 
         // Check command reached active connection PTY
         let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
-        let hasAttachCmd = sentStrings.contains { $0.contains("env -u TMUX tmux attach-session -d -t '$2'") }
+        let hasAttachCmd = sentStrings.contains {
+            $0.contains("env -u TMUX tmux attach-session -d -t '$2'")
+        }
         XCTAssertTrue(hasAttachCmd, "PTY must receive exact attach command for $2")
 
         // Check restoration metadata persisted
@@ -544,7 +603,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Reject Host", hostname: "reject.test", username: "user")
@@ -557,7 +617,9 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertFalse(attachResult)
         XCTAssertNil(container.activeTmuxSessionID)
         XCTAssertNotNil(container.tmuxError)
-        XCTAssertTrue(container.tmuxError?.contains("Existing tmux sessions must attach by session ID") ?? false)
+        XCTAssertTrue(
+            container.tmuxError?.contains("Existing tmux sessions must attach by session ID")
+                ?? false)
 
         // Zero additional commands sent to PTY
         XCTAssertEqual(mock.sentData.count, initialSentCount)
@@ -584,7 +646,8 @@ final class TmuxAppTests: XCTestCase {
             transport: transport,
             restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Create Host", hostname: "create.test", username: "user")
@@ -596,8 +659,11 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertNil(container.tmuxError)
 
         let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
-        let hasNewSessionCmd = sentStrings.contains { $0.contains("tmux new-session -A -D -s 'workspace'") }
-        XCTAssertTrue(hasNewSessionCmd, "PTY must receive exact new-session command for 'workspace'")
+        let hasNewSessionCmd = sentStrings.contains {
+            $0.contains("tmux new-session -A -D -s 'workspace'")
+        }
+        XCTAssertTrue(
+            hasNewSessionCmd, "PTY must receive exact new-session command for 'workspace'")
 
         let loaded = try await store.load()
         XCTAssertNotNil(loaded)
@@ -612,7 +678,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Invalid Host", hostname: "invalid.test", username: "user")
@@ -624,7 +691,7 @@ final class TmuxAppTests: XCTestCase {
             "foo:bar",
             "foo.bar",
             "foo\u{07}bar",
-            String(repeating: "a", count: 129)
+            String(repeating: "a", count: 129),
         ]
 
         let initialSentCount = mock.sentData.count
@@ -635,7 +702,9 @@ final class TmuxAppTests: XCTestCase {
             XCTAssertNotNil(container.tmuxError)
         }
 
-        XCTAssertEqual(mock.sentData.count, initialSentCount, "No commands sent to PTY for invalid session names")
+        XCTAssertEqual(
+            mock.sentData.count, initialSentCount,
+            "No commands sent to PTY for invalid session names")
     }
 
     // MARK: - 5. Zero Terminal Pollution During Discovery
@@ -648,7 +717,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Clean Host", hostname: "clean.test", username: "user")
@@ -661,7 +731,9 @@ final class TmuxAppTests: XCTestCase {
         _ = await container.listTmuxSessions()
 
         // Verify sentData to PTY remained completely untouched during probe & list
-        XCTAssertEqual(mock.sentData.count, sentCountBeforeDiscovery, "Discovery operations must never write to the active PTY")
+        XCTAssertEqual(
+            mock.sentData.count, sentCountBeforeDiscovery,
+            "Discovery operations must never write to the active PTY")
         XCTAssertEqual(container.terminalText, "", "Terminal text must remain empty and unpolluted")
     }
 
@@ -690,14 +762,16 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Safe Host", hostname: "safe.test", username: "user")
         await container.connect(to: host)
 
         let sentBefore = mock.sentData.count
-        let blockedResult = await container.sendValidatedCommand("tmux kill-server\n", approved: true)
+        let blockedResult = await container.sendValidatedCommand(
+            "tmux kill-server\n", approved: true)
         XCTAssertFalse(blockedResult, "kill-server must be blocked by sendValidatedCommand")
         XCTAssertEqual(mock.sentData.count, sentBefore, "PTY must never receive kill-server")
     }
@@ -710,21 +784,24 @@ final class TmuxAppTests: XCTestCase {
         transport.onConnect = { _ in mock }
 
         let hostID = UUID()
-        let store = InMemorySessionRestorationStore(initial: SessionRestorationMetadata(
-            hostID: hostID,
-            tmuxSessionID: "$99"
-        ))
+        let store = InMemorySessionRestorationStore(
+            initial: SessionRestorationMetadata(
+                hostID: hostID,
+                tmuxSessionID: "$99"
+            ))
         let container = AppContainer(
             transport: transport,
             restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         // Mock has-session to return failure (missing session)
         mock.onExecuteCommand = { cmd in
             if cmd.contains("has-session") && cmd.contains("$99") {
-                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "can't find session: $99\n")
+                return SSHCommandResult(
+                    exitCode: 1, stdout: "", stderr: "can't find session: $99\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -741,11 +818,14 @@ final class TmuxAppTests: XCTestCase {
 
         // Check explicit error message populated
         XCTAssertNotNil(container.tmuxError)
-        XCTAssertTrue(container.tmuxError?.contains("Remembered tmux session $99 no longer exists") ?? false)
+        XCTAssertTrue(
+            container.tmuxError?.contains("Remembered tmux session $99 no longer exists") ?? false)
 
         // Verify attach was NOT sent to PTY
         let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
-        let hasAttach = sentStrings.contains { $0.contains("attach-session") && $0.contains("'$99'") }
+        let hasAttach = sentStrings.contains {
+            $0.contains("attach-session") && $0.contains("'$99'")
+        }
         XCTAssertFalse(hasAttach, "Missing session must not send failing attach command to PTY")
 
         // The stale target remains available for explicit recovery and is not
@@ -764,9 +844,11 @@ final class TmuxAppTests: XCTestCase {
             transport: transport,
             restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
-        let host = try Host(name: "Preserve Target Host", hostname: "preserve.test", username: "user")
+        let host = try Host(
+            name: "Preserve Target Host", hostname: "preserve.test", username: "user")
         await container.connect(to: host)
         let firstAttach = await container.attachTmuxSession(id: "$2")
         XCTAssertTrue(firstAttach)
@@ -787,9 +869,11 @@ final class TmuxAppTests: XCTestCase {
             transport: transport,
             restorationStore: store,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
-        let host = try Host(name: "Disconnect Target Host", hostname: "disconnect-target.test", username: "user")
+        let host = try Host(
+            name: "Disconnect Target Host", hostname: "disconnect-target.test", username: "user")
         await container.connect(to: host)
         let attachSuccess = await container.attachTmuxSession(id: "$4")
         XCTAssertTrue(attachSuccess)
@@ -805,7 +889,8 @@ final class TmuxAppTests: XCTestCase {
     func testReconnectCancellationStopsCoordinator() async throws {
         let transport = ControllableTransport()
         let mockMonitor = MockReachabilityMonitor(isReachable: false)
-        let coordinator = ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        let coordinator = ReconnectCoordinator(
+            clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
 
         let container = AppContainer(
             transport: transport,
@@ -839,7 +924,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Race Host", hostname: "race.test", username: "user")
@@ -867,7 +953,9 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer.demo()
         XCTAssertTrue(container.isDemo)
 
-        let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        let demoChallenge = HostKeyChallenge(
+            hostname: "demo.local", port: 22, algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:demo-fingerprint")
         await container.trustStore.save(demoChallenge)
 
         let host = try Host(name: "Demo Host", hostname: "demo.local", username: "dev")
@@ -900,13 +988,16 @@ final class TmuxAppTests: XCTestCase {
 
     func testMultiplexerPickerViewAccessibilityAndVoiceOver() async throws {
         let container = AppContainer.demo()
-        let demoChallenge = HostKeyChallenge(hostname: "demo.local", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-fingerprint")
+        let demoChallenge = HostKeyChallenge(
+            hostname: "demo.local", port: 22, algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:demo-fingerprint")
         await container.trustStore.save(demoChallenge)
 
         let host = try Host(name: "UI Host", hostname: "demo.local", username: "dev")
         await container.connect(to: host)
 
-        let longSessionName = "a-very-long-tmux-session-name-that-tests-truncation-behavior-across-compact-and-regular-size-classes"
+        let longSessionName =
+            "a-very-long-tmux-session-name-that-tests-truncation-behavior-across-compact-and-regular-size-classes"
         container.tmuxAvailability = .available(version: "tmux 3.4")
         container.isTmuxServerRunning = true
         container.activeTmuxSessionID = "$0"
@@ -915,7 +1006,7 @@ final class TmuxAppTests: XCTestCase {
                 sessionID: "$0",
                 name: longSessionName,
                 windowsCount: 2,
-                createdAt: Date(timeIntervalSince1970: 1700000000),
+                createdAt: Date(timeIntervalSince1970: 1_700_000_000),
                 lastActivityAt: Date(),
                 attachedClients: 1
             ),
@@ -923,10 +1014,10 @@ final class TmuxAppTests: XCTestCase {
                 sessionID: "$1",
                 name: "dev",
                 windowsCount: 1,
-                createdAt: Date(timeIntervalSince1970: 1700000100),
+                createdAt: Date(timeIntervalSince1970: 1_700_000_100),
                 lastActivityAt: Date(),
                 attachedClients: 0
-            )
+            ),
         ]
 
         let picker = MultiplexerPicker().environmentObject(container)
@@ -1016,7 +1107,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Stale Host", hostname: "stale.test", username: "user")
@@ -1030,7 +1122,8 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
-                return SSHCommandResult(exitCode: 0, stdout: "$0\tmain\t1\t1700000000\t1700000500\t1\n")
+                return SSHCommandResult(
+                    exitCode: 0, stdout: "$0\tmain\t1\t1700000000\t1700000500\t1\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -1069,7 +1162,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let gate = AsyncGate()
@@ -1081,7 +1175,9 @@ final class TmuxAppTests: XCTestCase {
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
 
-        let host = try Host(name: "Slow Host", hostname: "slow.test", username: "user", defaultTmuxSession: "$99", autoAttachTmux: true)
+        let host = try Host(
+            name: "Slow Host", hostname: "slow.test", username: "user", defaultTmuxSession: "$99",
+            autoAttachTmux: true)
 
         let connectTask = Task {
             await container.connect(to: host)
@@ -1106,7 +1202,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Create Host", hostname: "create.test", username: "user")
@@ -1140,7 +1237,8 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertTrue(container.isTmuxSessionActive(candidateSession))
 
         // Now remote list updates with the new session
-        sessionsOutput.value = "$0\tother\t1\t1700000000\t1700000500\t0\n$5\tproject-work\t1\t1700000000\t1700000500\t1\n"
+        sessionsOutput.value =
+            "$0\tother\t1\t1700000000\t1700000500\t0\n$5\tproject-work\t1\t1700000000\t1700000500\t1\n"
         let sessions = await container.listTmuxSessions()
         XCTAssertEqual(sessions.count, 2)
         XCTAssertEqual(container.activeTmuxSessionID, "$5")
@@ -1164,14 +1262,17 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertNil(container.activeHost?.defaultTmuxSession)
 
         // Legacy target arguments are ignored while auto-attach remains configurable.
-        try await container.updateActiveHostPreferences(autoAttachTmux: true, defaultTmuxSession: "legacy-session")
+        try await container.updateActiveHostPreferences(
+            autoAttachTmux: true, defaultTmuxSession: "legacy-session")
         XCTAssertEqual(container.activeHost?.autoAttachTmux, true)
         XCTAssertNil(container.activeHost?.defaultTmuxSession)
-        let reloadedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id })
+        let reloadedHost = try await container.catalog.listHosts().first(where: { $0.id == host.id }
+        )
         XCTAssertNil(reloadedHost?.defaultTmuxSession)
         XCTAssertEqual(reloadedHost?.autoAttachTmux, true)
 
-        try await container.updateActiveHostPreferences(autoAttachTmux: false, defaultTmuxSession: "$3")
+        try await container.updateActiveHostPreferences(
+            autoAttachTmux: false, defaultTmuxSession: "$3")
         XCTAssertEqual(container.activeHost?.autoAttachTmux, false)
         XCTAssertNil(container.activeHost?.defaultTmuxSession)
     }
@@ -1184,7 +1285,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Parse Host", hostname: "parse.test", username: "user")
@@ -1216,7 +1318,8 @@ final class TmuxAppTests: XCTestCase {
         let container = AppContainer(
             transport: transport,
             reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
         let host = try Host(name: "Lifecycle Host", hostname: "life.test", username: "user")
@@ -1231,7 +1334,8 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
-                return SSHCommandResult(exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000500\t1\n")
+                return SSHCommandResult(
+                    exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000500\t1\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -1250,7 +1354,9 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
-                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n")
+                return SSHCommandResult(
+                    exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-1000/default\n"
+                )
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -1282,7 +1388,9 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertFalse(success)
         XCTAssertTrue(container.terminalText.contains("Send failed"))
         let transcript = container.terminalController.currentTranscript(limit: 10)
-        XCTAssertTrue(transcript.contains("[Send failed:"), "Send failure must be fed to production terminal surface")
+        XCTAssertTrue(
+            transcript.contains("[Send failed:"),
+            "Send failure must be fed to production terminal surface")
     }
 
     func testCopyModeFallbackEnabledSynchronizesWithActiveTmuxSession() {
