@@ -1,105 +1,187 @@
-# Shh Product Specification
+# Shh product and implementation status
 
-Shh is a native iOS/iPadOS 17+ SSH client designed for engineers who
-require security, terminal fidelity, automation, and platform
-integration without third-party cloud servers or subscription telemetry.
+Shh is a native SwiftUI iPhone/iPad SSH client targeting iOS/iPadOS 17+. It
+provides terminal access, remote file operations, automation and multiplexer
+controls, local voice input, network tunneling, discovery, and encrypted local
+backup without a Shh cloud service, analytics, or tracking.
 
-## Implemented & Validated Features (Simulator & Live Host)
+This document separates implementation present in the repository from
+validation that requires a configured remote host, simulator state, physical
+hardware, or a future protocol task. Test names below are evidence of the
+corresponding seams, not a claim that every external deployment has been
+validated.
 
-- **Production LiveSSHTransport (Direct SwiftNIO SSH):** Primary SSH
-  transport implemented directly with SwiftNIO SSH rather than Citadel.
-  Enforces strict Trust-On-First-Use (TOFU) host-key validation before
-  any credential transmission, password and Ed25519 key authentication
-  (supporting generated and imported OpenSSH, PKCS#8, and raw formats),
-  interactive PTY and shell channels, debounced terminal resizing,
-  isolated non-interactive exec channels, multi-hop ProxyJump bastions,
-  local, remote, and dynamic SOCKS5 forwarding, typed transport error
-  mapping (unpacking SwiftNIO dual-stack DNS and socket connection
-  failures while preserving privacy), automatic backoff reconnection, and
-  validated live-host simulator interoperability.
-- **Remote Files & SFTP Subsystem (Citadel Isolation):** Citadel is
-  strictly isolated to SFTP subsystem management (`LiveSFTPRepository`)
-  and does not govern the primary SSH handshake. Supports native
-  password and Ed25519 authentication, directory navigation, streamed
-  upload/download, in-app file editing, structured failure state cards
-  with actionable recovery, and automatic approval retries.
-- **Adaptive Navigation Shell:** Three-column `NavigationSplitView` on
-  iPad and tabbed layout on iPhone, with dark mode, Dynamic Type
-  support, and size-class-adaptive row typography with single-line host
-  address truncation.
-- **Terminal Session & PTY:** SwiftTerm rendering with alternate screen
-  buffer support (vim, htop, tmux), ANSI color parser, search drawers,
-  and debounced resize handling.
-- **Session Lifecycle & Background Keepalive:** Finite iOS background
-  grace period execution via standard UIKit background tasks, keeping
-  active SSH, Mosh, port forwarding, and terminal sessions alive without
-  silent audio or background audio modes. Backgrounding never proactively
-  closes an active session. Because iOS may suspend the process after the
-  grace period, socket survival is not guaranteed: on foreground return,
-  Shh probes transport responsiveness, keeps the existing session when the
-  probe succeeds, and deterministically reconnects and restores the last
-  multiplexer target when it fails. A forwarding-policy rejection is a live
-  SSH response, not a failed probe.
-- **Host & Identity Management:** Host configurations, grouping, tags,
-  health status, and opaque Keychain references. Private keys are never
-  exposed as raw fields of `Host`. Host connections resolve exact
-  descriptors by UUID without loading credentials prior to host-key
-  acceptance, preventing silent fallback to password authentication or
-  arbitrary keys. Missing or colliding identities are detected via
-  metadata-only catalog reconciliation, highlighted in host editor
-  pickers with fingerprint hints, and surfaced as actionable
-  diagnostics. Identity deletion preserves shared Keychain secrets for
-  surviving descriptors.
-- **Local Network Bonjour Discovery:** Discovers LAN SSH servers (`_ssh._tcp`)
-  via Network.framework `NWBrowser` and resolves advertised mDNS hostnames
-  and ports using `NetService`, stripping trailing dots and preserving
-  resolved services across interface updates for one-tap host configuration.
-- **Tmux Multiplexer:** First-class tmux integration with session
-  listing, creation, attach, and exact-command approval sheets. Includes
-  collision-resistant pipe-delimited format parsing and backward
-  compatibility for legacy and tmux 3.7c underscore-sanitized output.
-- **On-Device Voice AI:** WhisperKit local CoreML models and Apple
-  Speech recognition. Local push-to-talk recording, non-secret
-  transcripts, editable preview drawers, and strict prohibition against
-  automatic execution.
-- **ProxyJump & Forwarding:** Multi-hop bastions, local port forwarding,
-  remote port forwarding, and dynamic SOCKS5 proxying.
-- **Herdr Agent Orchestration:** Workspace creation, pane splitting,
-  command dispatch, agent state monitoring, and output inspection.
-- **Mosh Roaming Recovery:** UDP transport foundation with automatic
-  reconnection across Wi-Fi and Cellular interface transitions. Note:
-  full Mosh SSP remains a separate future protocol task and does not
-  affect SSH completeness.
-- **Files App Integration:** File Provider extension exposing remote
-  SFTP files directly in Apple's Files app. Domain registration and
-  removal from Settings. Mosh-only hosts are explicitly rejected with
-  clear guidance.
-- **Encrypted Vault Backup & Sync:** Zero-knowledge `.shhbackup` export
-  and import with passphrase confirmation, schema and count preview,
-  explicit merge versus replace restore choices, wrong-passphrase and
-  tamper detection, security-scoped file staging, and deterministic
-  passphrase clearing. No Keychain secret bytes are included in backups.
-- **Privacy Manifest:** Audited `PrivacyInfo.xcprivacy` declaring
-  `UserDefaults`, file timestamps, and disk space checks. Zero tracking
-  and zero user data collection.
+## Implemented feature surface
 
-## Pending Hardware & Release Requirements
+### SSH, authentication, and connection profiles
 
-The following capabilities require physical device access, paid Apple
-Developer account provisioning, or future protocol engineering:
+- **Direct SSH:** `LiveSSHTransport` uses SwiftNIO SSH for host-key
+  verification, password and Ed25519 authentication, PTY and interactive shell
+  channels, isolated command channels, keepalives, typed error mapping, and
+  reconnect support.
+- **TOFU and identities:** host records keep opaque identity references;
+  unknown keys require a trust decision and changed keys are rejected. Exact
+  identity resolution and metadata-only catalog reconciliation prevent silent
+  credential fallback.
+- **ProxyJump:** recursive bastion channels support host-ID and endpoint-based
+  hop configuration.
+- **Cloudflare Access profile:** resolves a tunnel domain and prepares the
+  configured Access client ID and optional Keychain-backed client secret as
+  transport-target metadata. Serialization and target-resolution behavior are
+  covered; the repository does not implement or validate an external
+  cloudflared login flow.
+- **Tailscale profile:** resolves the configured Tailscale hostname and port.
+  `checkHostKey` selects trusted-only versus the normal prompt policy.
+  Serialization and target-resolution behavior are covered; no CI job requires
+  a Tailscale network.
 
-- **Physical Device Provisioning:** Apple Developer portal App Group
-  and File Provider entitlement provisioning (`group.com.ervinpopescu.shh`
-  and `com.apple.developer.fileprovider`) for out-of-process File Provider
-  extension execution and physical device Keychain smoke testing.
-- **Hardware Microphone & Audio:** Physical device microphone latency
-  and background audio interruption validation.
-- **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
-  cryptographic packet encryption and speculative local echo (independent
-  of the fully implemented SSH transport).
-- **Independent Security Audit & Broad Interoperability:** Third-party
-  cryptographic audit and broad physical-device hardware matrix testing
-  (current testing covers unit, integration, and live-host simulator
-  suites).
-- **TestFlight Distribution:** TestFlight beta build pipeline and App
-  Store Connect release records.
+Evidence includes `LiveSSHTransportTests.swift`,
+`SSHExecIntegrationTests.swift`, `MultiHopProxyJumpTests.swift`,
+`CloudflareTailscaleTransportTests.swift`, and
+`CloudflareTailscaleConnectionTests.swift`. The optional
+`HetznerConnectionIntegrationTests.swift` exercises a saved live host only when
+its simulator App Group snapshot and credentials are available.
+
+### Terminal and multiplexer workflows
+
+- **Terminal:** SwiftTerm rendering, alternate screen buffers, ANSI themes,
+  search, terminal zoom, debounced resize, bracketed paste, accessory
+  modifiers, and exact terminal key encoding.
+- **Tmux:** availability probing, session listing and parsing, creation,
+  attach, auto-attach, remembered targets, and explicit command approval.
+  Parsing supports the current pipe-delimited output and documented legacy
+  forms.
+- **Herdr:** workspace creation, pane splitting, command dispatch, polling,
+  state parsing, output inspection, and remembered workspace targets.
+- **Deferred multiplexers:** Zellij, Byobu, and Screen are represented as
+  unavailable UI choices and do not have live adapters in this repository.
+
+Evidence is in `Tests/ShhTerminalTests/`, `Tests/ShhAppTests/TmuxAppTests.swift`,
+`Tests/ShhCoreTests/TmuxTests.swift`, `Tests/ShhCoreTests/HerdrTests.swift`,
+and `Tests/ShhSSHTests/HerdrIntegrationTests.swift`.
+
+### SFTP and Files app integration
+
+- **In-app SFTP:** `LiveSFTPRepository` uses Citadel for the SFTP subsystem,
+  isolated from the primary terminal handshake. It supports navigation,
+  metadata, streamed upload/download, editing, directory and file operations,
+  transfer progress, and conflict handling.
+- **File Provider:** `ShhFileProvider` exposes configured SSH/SFTP hosts to the
+  iOS Files app through an `NSFileProviderReplicatedExtension`. Catalog and
+  trusted-host records are synchronized through the shared App Group, sessions
+  are operation-scoped, and materialized files use bounded cache policy.
+  Mosh-only hosts are rejected because Mosh does not provide SFTP.
+
+Evidence is in `Tests/ShhSSHTests/LiveSFTPRepositoryTests.swift`,
+`Tests/ShhCoreTests/SFTPModelTests.swift`,
+`Tests/ShhCoreTests/FileProviderContractsTests.swift`,
+`Tests/ShhCoreTests/FileProviderInfoPlistTests.swift`, and
+`Tests/ShhAppTests/FileProviderAppTests.swift`. The Files app extension still
+requires Apple provisioning and physical-device validation for release use.
+
+### Forwarding, discovery, and lifecycle
+
+- **Forwarding:** local, remote, and dynamic SOCKS5 forwarding with rule
+  validation, traffic counters, status state, non-loopback approval, and
+  ProxyJump support.
+- **Bonjour:** `_ssh._tcp` browsing with advertised hostname and port
+  resolution, trailing-dot normalization, retained discoveries, and actionable
+  network failure states.
+- **Session lifecycle:** finite UIKit background-task grace periods preserve
+  active SSH, Mosh, and forwarding work when iOS permits it. Foreground return
+  probes the existing transport and reconnects/restores the last tmux or Herdr
+  target if the socket did not survive. Indefinite background TCP execution is
+  not promised.
+
+Evidence is in `Tests/ShhSSHTests/PortForwardingTests.swift`,
+`Tests/ShhCoreTests/PortForwardingModelTests.swift`,
+`Tests/ShhSSHTests/BonjourSSHDiscoveryTests.swift`,
+`Tests/ShhAppTests/RestorationAndReachabilityTests.swift`, and
+`Tests/ShhAppTests/ConnectionFailureAppTests.swift`.
+
+### Mosh roaming
+
+`LiveMoshTransport` bootstraps `mosh-server` over SSH, obtains a session key and
+UDP port, uses a datagram channel, and reports connected, roaming, and
+reconnect-related state. `MoshConnection` implements the repository's current
+datagram model, teardown, key zeroization, and roaming probe behavior.
+
+Full Mosh State Synchronization Protocol encryption, packet authentication,
+server-compatible SSP negotiation, and speculative echo are not implemented.
+The current implementation must not be described as a complete Mosh client.
+Evidence is limited to repository model, bootstrap, transport, and app tests in
+`Tests/ShhCoreTests/MoshDomainTests.swift`,
+`Tests/ShhSSHTests/MoshBootstrapAndTransportTests.swift`, and
+`Tests/ShhAppTests/MoshAppTests.swift`.
+
+### Local voice input
+
+- **Providers:** WhisperKit CoreML models and Apple Speech are explicit local
+  providers. Cloud speech recognition is not used by the implementation.
+- **Recording:** push-to-talk audio capture handles permissions, interruptions,
+  route changes, temporary protected files, and cleanup.
+- **Safety:** transcripts appear in an editable preview and require explicit
+  approval before they can be sent as remote input. They are never auto-run.
+- **Model management:** model tiers are selected using device resource checks;
+  model files live under Application Support and can be downloaded or removed.
+
+Evidence is in `Tests/ShhVoiceTests/` and `Tests/ShhAppTests/VoiceTests.swift`.
+Microphone latency and interruptions on physical devices remain unvalidated.
+
+### Encrypted vault backup and privacy
+
+`.shhbackup` export/import uses AES-256-GCM with PBKDF2-HMAC-SHA256 at 600,000
+iterations, authenticated envelope metadata, secret-material scanning, schema
+validation, wrong-passphrase and tamper detection, security-scoped staging,
+and explicit replace or merge restore. Keychain secret bytes and private keys
+are excluded from the backup payload. Passphrase and intermediate buffers have
+explicit cleanup paths.
+
+`Resources/PrivacyInfo.xcprivacy` declares the required-reason APIs used by the
+app for local preferences, file timestamps, and disk-space checks. It declares
+no tracking and no collected data types. Evidence is in
+`Tests/ShhCoreTests/EncryptedVaultBackupTests.swift` and
+`Tests/ShhCoreTests/FileProviderInfoPlistTests.swift`.
+
+### Development and demo mode
+
+The app has an injected demo mode selected by `--demo` or
+`SHH_DEMO_MODE=1`. Demo transports, SFTP, voice, and Mosh adapters allow UI
+and simulator flows without real credentials. Demo mode is not a production
+transport and must not be used as evidence of live-host interoperability.
+
+## Validation boundary
+
+The standard automated coverage is:
+
+- `swift test` or `just unit` for package models, policies, live transport
+  components, in-process SSH integration, terminal behavior, and voice logic.
+- `just test iphone` and `just test ipad` for the generated app test scheme on
+  available simulators.
+- `just ci` for package tests, generated unsigned app and extension builds,
+  icon and entitlement checks, and both simulator test passes.
+- GitHub CodeQL for the manually built Swift targets.
+
+The optional live-host simulator tests require an existing App Group snapshot,
+Keychain credentials, trusted host state, and a remote environment. They are
+skipped when those prerequisites are absent. The Docker OpenSSH fixture in
+`fixtures/docker-sshd/` is available for manual checks but is not a required
+package-test dependency.
+
+## Remaining product and release work
+
+These items are intentionally not marked complete by repository tests:
+
+1. **Physical-device validation and provisioning:** App Group and File Provider
+   provisioning, device Keychain behavior, microphone/audio behavior, and
+   Files app execution require an Apple Developer setup and hardware.
+2. **Complete Mosh SSP:** cryptographic SSP packet processing, negotiation,
+   server interoperability, and speculative local echo require additional
+   protocol implementation.
+3. **Independent security review:** no third-party cryptographic audit is
+   represented by this repository.
+4. **Broad interoperability matrix:** external Cloudflare, Tailscale, SSH
+   server, network-roaming, and physical-device combinations need dedicated
+   validation beyond the current test doubles and optional host tests.
+5. **Distribution:** no TestFlight, App Store Connect, signing, export
+   compliance submission, or App Store release pipeline is present.
