@@ -1360,6 +1360,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
+    var onResize: (@Sendable (TerminalSize) async throws -> Void)?
     var onSend: (@Sendable (Data) async throws -> Void)?
 
     func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
@@ -1390,6 +1391,9 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     func resize(_ size: TerminalSize) async throws {
         lock.withLock {
             resizeCalls.append(size)
+        }
+        if let onResize {
+            try await onResize(size)
         }
     }
 

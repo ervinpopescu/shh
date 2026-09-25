@@ -229,6 +229,7 @@ final class AppContainer: ObservableObject {
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
     private var outboundTask: Task<Void, Never>?
+    private var terminalResizeTask: Task<Bool, Never>?
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
@@ -799,8 +800,11 @@ final class AppContainer: ObservableObject {
                           self.activeSession?.id == sessionID,
                           self.activeSession?.state == .connected,
                           let activeConnection = self.connection else { return }
-                    self.activeSession?.terminalSize = newSize
-                    try? await activeConnection.resize(newSize)
+                    _ = await self.resizePTY(
+                        newSize,
+                        on: activeConnection,
+                        sessionID: sessionID
+                    )
                 }
             }
 
@@ -1126,8 +1130,11 @@ final class AppContainer: ObservableObject {
                       self.activeSession?.id == sessionID,
                       self.activeSession?.state == .connected,
                       let activeConnection = self.connection else { return }
-                self.activeSession?.terminalSize = newSize
-                try? await activeConnection.resize(newSize)
+                _ = await self.resizePTY(
+                    newSize,
+                    on: activeConnection,
+                    sessionID: sessionID
+                )
             }
         }
 
@@ -2173,6 +2180,47 @@ final class AppContainer: ObservableObject {
         }
     }
 
+    private func resizePTY(
+        _ size: TerminalSize,
+        on conn: any SSHConnection,
+        sessionID: UUID
+    ) async -> Bool {
+        let previousResize = terminalResizeTask
+        let resizeTask = Task { @MainActor [weak self] in
+            _ = await previousResize?.value
+            guard let self,
+                  self.activeSession?.id == sessionID,
+                  self.activeSession?.state == .connected,
+                  !self.isExplicitDisconnect,
+                  let currentConnection = self.connection,
+                  (currentConnection as AnyObject) === (conn as AnyObject) else {
+                return false
+            }
+            do {
+                try await conn.resize(size)
+            } catch {
+                guard self.activeSession?.id == sessionID,
+                      self.activeSession?.state == .connected,
+                      !self.isExplicitDisconnect,
+                      (self.connection as AnyObject) === (conn as AnyObject) else {
+                    return false
+                }
+                self.tmuxError = "Failed to resize terminal: \(error.localizedDescription)"
+                return false
+            }
+            guard self.activeSession?.id == sessionID,
+                  self.activeSession?.state == .connected,
+                  !self.isExplicitDisconnect,
+                  (self.connection as AnyObject) === (conn as AnyObject) else {
+                return false
+            }
+            self.activeSession?.terminalSize = size
+            return true
+        }
+        terminalResizeTask = resizeTask
+        return await resizeTask.value
+    }
+
     private func synchronizeViewportAndResize(
         _ conn: any SSHConnection,
         sessionID: UUID
@@ -2185,18 +2233,39 @@ final class AppContainer: ObservableObject {
             return false
         }
 
-        terminalController.synchronizeViewportMeasurement()
-        if terminalController.hasMeasuredViewport {
-            let size = terminalController.size
-            activeSession?.terminalSize = size
-            try? await conn.resize(size)
+        // A viewport can change while resize() is suspended, including while a
+        // debounced callback is queued. Reconcile until the measured viewport
+        // equals the size the remote PTY most recently accepted.
+        for _ in 0..<8 {
+            terminalController.synchronizeViewportMeasurement()
+            guard terminalController.hasMeasuredViewport else {
+                return true
+            }
+            let requestedSize = terminalController.size
+            guard await resizePTY(requestedSize, on: conn, sessionID: sessionID) else {
+                return false
+            }
+            terminalController.synchronizeViewportMeasurement()
+            guard terminalController.hasMeasuredViewport else { return true }
+            if terminalController.size == requestedSize {
+                return true
+            }
         }
 
-        guard let currentConnection = connection else { return false }
-        return activeSession?.id == sessionID
-            && activeSession?.state == .connected
-            && !isExplicitDisconnect
-            && (currentConnection as AnyObject) === (conn as AnyObject)
+        tmuxError = "Terminal viewport changed repeatedly while resizing; tmux attachment cancelled."
+        return false
+    }
+
+    private func sendTmuxCommandAfterViewportReconciliation(
+        _ command: String,
+        on conn: any SSHConnection,
+        sessionID: UUID
+    ) async -> Bool {
+        tmuxError = nil
+        guard await synchronizeViewportAndResize(conn, sessionID: sessionID) else {
+            return false
+        }
+        return await sendValidatedCommand(command + "\n", approved: true)
     }
 
     @discardableResult
@@ -2221,10 +2290,11 @@ final class AppContainer: ObservableObject {
             return false
         }
 
-        guard await synchronizeViewportAndResize(conn, sessionID: sessionID) else {
-            return false
-        }
-        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        let sent = await sendTmuxCommandAfterViewportReconciliation(
+            cmd,
+            on: conn,
+            sessionID: sessionID
+        )
         guard activeSession?.id == sessionID,
               activeSession?.state == .connected,
               !isExplicitDisconnect,
@@ -2247,7 +2317,9 @@ final class AppContainer: ObservableObject {
             }
             return true
         } else {
-            tmuxError = "Failed to attach to tmux session \(validatedID.value)."
+            if tmuxError == nil {
+                tmuxError = "Failed to attach to tmux session \(validatedID.value)."
+            }
             return false
         }
     }
@@ -2274,10 +2346,11 @@ final class AppContainer: ObservableObject {
             return false
         }
 
-        guard await synchronizeViewportAndResize(conn, sessionID: sessionID) else {
-            return false
-        }
-        let sent = await sendValidatedCommand(cmd + "\n", approved: true)
+        let sent = await sendTmuxCommandAfterViewportReconciliation(
+            cmd,
+            on: conn,
+            sessionID: sessionID
+        )
         guard activeSession?.id == sessionID,
               activeSession?.state == .connected,
               !isExplicitDisconnect,
@@ -2298,7 +2371,9 @@ final class AppContainer: ObservableObject {
             }
             return true
         } else {
-            tmuxError = "Failed to create tmux session \(validatedName.value)."
+            if tmuxError == nil {
+                tmuxError = "Failed to create tmux session \(validatedName.value)."
+            }
             return false
         }
     }

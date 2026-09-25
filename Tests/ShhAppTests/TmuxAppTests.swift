@@ -226,6 +226,109 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(mock.resizeCalls.last, createSize)
     }
 
+    func testViewportChangeDuringAttachResizeIsAppliedBeforeTmuxCommand() async throws {
+        let mock = MockSSHConnection()
+        let resizeGate = AsyncGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Attach Resize Race Host", hostname: "attach-race.test", username: "user")
+        await container.connect(to: host)
+
+        let firstSize = TerminalSize(columns: 48, rows: 19)
+        let latestSize = TerminalSize(columns: 61, rows: 24)
+        mock.onResize = { size in
+            if size == firstSize {
+                await resizeGate.wait()
+            }
+        }
+        container.terminalController.handleResize(columns: firstSize.columns, rows: firstSize.rows)
+        let attaching = Task { @MainActor in
+            await container.attachTmuxSession(id: "$2")
+        }
+        await resizeGate.waitForStart()
+        container.terminalController.handleResize(columns: latestSize.columns, rows: latestSize.rows)
+        await resizeGate.open()
+
+        let attachResult = await attaching.value
+        XCTAssertTrue(attachResult)
+        XCTAssertEqual(mock.resizeCalls.suffix(2), [firstSize, latestSize])
+        XCTAssertEqual(container.activeSession?.terminalSize, latestSize)
+        let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
+        XCTAssertTrue(sentStrings.contains { $0.contains("attach-session -d -t '$2'") })
+    }
+
+    func testViewportChangeDuringCreateResizeIsAppliedBeforeTmuxCommand() async throws {
+        let mock = MockSSHConnection()
+        let resizeGate = AsyncGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Create Resize Race Host", hostname: "create-race.test", username: "user")
+        await container.connect(to: host)
+
+        let firstSize = TerminalSize(columns: 49, rows: 20)
+        let latestSize = TerminalSize(columns: 62, rows: 25)
+        mock.onResize = { size in
+            if size == firstSize {
+                await resizeGate.wait()
+            }
+        }
+        container.terminalController.handleResize(columns: firstSize.columns, rows: firstSize.rows)
+        let creating = Task { @MainActor in
+            await container.createTmuxSession(name: "workspace")
+        }
+        await resizeGate.waitForStart()
+        container.terminalController.handleResize(columns: latestSize.columns, rows: latestSize.rows)
+        await resizeGate.open()
+
+        let createResult = await creating.value
+        XCTAssertTrue(createResult)
+        XCTAssertEqual(mock.resizeCalls.suffix(2), [firstSize, latestSize])
+        XCTAssertEqual(container.activeSession?.terminalSize, latestSize)
+        let sentStrings = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }
+        XCTAssertTrue(sentStrings.contains { $0.contains("tmux new-session -A -D -s 'workspace'") })
+    }
+
+    func testTmuxAttachmentAbortsWhenPTYResizeFails() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in },
+                jitter: ReconnectCoordinator.zeroJitter
+            )
+        )
+        let host = try Host(name: "Resize Failure Host", hostname: "resize-failure.test", username: "user")
+        await container.connect(to: host)
+
+        let requestedSize = TerminalSize(columns: 57, rows: 21)
+        mock.onResize = { _ in
+            throw TransportError.remoteFailure("PTY resize refused")
+        }
+        container.terminalController.handleResize(columns: requestedSize.columns, rows: requestedSize.rows)
+        let sentBefore = mock.sentData.count
+
+        let attached = await container.attachTmuxSession(id: "$2")
+
+        XCTAssertFalse(attached)
+        XCTAssertEqual(mock.sentData.count, sentBefore)
+        XCTAssertNil(container.activeTmuxSessionID)
+        XCTAssertNotEqual(container.activeSession?.terminalSize, requestedSize)
+        XCTAssertTrue(container.tmuxError?.contains("Failed to resize terminal") == true)
+    }
+
     func testViewportChangeDuringTmuxTargetValidationIsAppliedBeforeAttach() async throws {
         let mock = MockSSHConnection()
         let validationGate = AsyncGate()
