@@ -1,126 +1,162 @@
-# Security Model & Threat Assessment
+# Security model and threat boundaries
 
-Shh operates under a strict zero-trust model regarding untrusted network
-data, remote execution outputs, voice transcripts, and backup storage.
+Shh treats network peers, remote command output, voice transcripts, backup files,
+and File Provider inputs as untrusted. This document describes guarantees in
+this repository and identifies boundaries that require external deployment or
+review. It is not an independent security audit.
 
-## Core Security Invariants
+## Credentials and secret isolation
 
-### 1. Credentials & Secrets Isolation
-- Host records persist endpoint metadata only (hostname, port,
-  username).
-- Passwords, passphrases, and private key bytes are never stored in
-  `Host` records or written to disk.
-- Identity records contain only opaque Keychain references.
-- In-memory keys are zeroed on teardown.
-- On physical devices, Keychain queries strictly enforce the shared
-  access group (`group.com.ervinpopescu.shh`) and never broaden query
-  scope; unsigned simulator environments use a scoped fallback without
-  weakening device protections.
-- Host connections resolve identities strictly by exact descriptor
-  UUID, deferring credential store queries until after host-key
-  acceptance. Missing descriptors or ambiguous collisions trigger
-  actionable failures rather than silently degrading into password
-  authentication or arbitrary keys.
-- Deleting an identity descriptor performs reference-counted cleanup:
-  when multiple descriptors share a Keychain reference, the secret is
-  retained for surviving descriptors.
-- Terminal log and scrollback redaction unconditionally protects all
-  readable credential secrets regardless of catalog collision status.
+- Host records persist endpoint metadata and opaque identity descriptor IDs.
+  Passwords, passphrases, private-key bytes, and Cloudflare client secret
+  bytes are not fields of `Host`; Cloudflare stores only an opaque Keychain
+  reference in its connection options.
+- `KeychainCredentialStore` owns credential bytes. Physical-device queries use
+  the shared access group `group.com.ervinpopescu.shh`; unsigned simulator
+  environments have a scoped fallback for local tests and previews.
+- Host connections resolve an exact identity descriptor by UUID. Credential
+  resolution occurs from the authentication delegate after the host-key
+  challenge is accepted, rather than loading arbitrary or fallback identities.
+- Deleting an identity descriptor retains a shared Keychain secret while other
+  descriptors still reference it. Terminal output and scrollback redaction
+  protects readable credential values regardless of catalog state.
+- Cloudflare Access client IDs are metadata; an optional client secret is
+  referenced by Keychain ID and resolved only while constructing the transport
+  target. Do not log or serialize the resolved header value.
+- Mosh session keys are redacted in descriptions and zeroized on connection
+  teardown. Vault passphrase, derived-key, and plaintext serialization buffers
+  have explicit cleanup paths, subject to normal platform memory semantics.
 
-### 2. Trust-On-First-Use (TOFU) Verification & Transport Isolation
-- Primary SSH transport (`LiveSSHTransport`) is implemented directly with
-  SwiftNIO SSH.
-- Host-key verification occurs prior to credential transmission across
-  all direct, ProxyJump, and exec channels.
-- Fingerprints are canonicalized using SHA-256 over canonical hostname,
-  port, and algorithm.
-- Changed host keys are unconditionally rejected and require explicit
-  user review.
-- Temporary trust approvals apply only to the active connection and are
-  never exported to persistent storage. Permanent trust records are
-  synchronized atomically to shared App Group storage.
-- Citadel is isolated strictly to the SFTP subsystem repository
-  (`LiveSFTPRepository`) and does not govern the primary SSH terminal
-  handshake or channel pipeline.
-- Full Mosh State Synchronization Protocol (SSP) remains incomplete as
-  a separate future protocol effort and does not affect the complete,
-  production-grade status of the SSH transport.
-- Evaluation boundary honesty: unit, integration, and live-host simulator
-  testing validates implemented protocol behavior, error recovery, and
-  interoperability, but does not substitute for an independent third-party
-  cryptographic security audit or a broad physical-device compatibility
-  matrix.
+Relevant implementation and tests include `Sources/ShhCore/Services.swift`,
+`Sources/ShhCore/Mosh.swift`, `Sources/ShhCore/EncryptedSync.swift`,
+`Tests/ShhCoreTests/KeychainCredentialStoreTests.swift`, and
+`Tests/ShhCoreTests/EncryptedVaultBackupTests.swift`.
 
-### 3. Command Execution & Safety Policy
-- Commands, snippets, Herdr templates, and voice transcripts are treated
-  as untrusted input.
-- `CommandPolicy` inspects commands with a quote-aware tokenizer and a
-  strict allowlist.
-- Destructive operations (root removal, device disk formatting, system
-  tampering) are blocked unconditionally.
-- High-risk or unrecognized syntax requires explicit modal approval
-  before transmission.
-- Safety approvals cannot override unconditional blocks.
+## Host-key trust and transport isolation
 
-### 4. Zero-Knowledge Encrypted Vault Backups
-- Encrypted backup envelopes (`.shhbackup`) use AES-256-GCM authenticated
-  encryption.
-- Symmetric encryption keys are derived using PBKDF2-HMAC-SHA256 with
-  600,000 iterations and a 256-bit cryptographically secure salt.
-- Authenticated Associated Data (AAD) binds the format identifier,
-  schema version, and creation timestamp to the ciphertext envelope.
-- Tampered payloads or incorrect passphrases trigger immediate
-  authentication failure before payload decoding.
-- Backups are scanned for prohibited secret material (such as private
-  key headers and passwords) before encryption and after decryption.
-- Import uses security-scoped file access and stages files securely in
-  the application sandbox, deleting staged copies immediately after use.
-- Passphrase UI state variables are promptly reset upon task completion
-  or modal dismissal. Raw `Data` overloads in `EncryptedVaultService`
-  allow caller-controlled memory wiping via `Data.resetBytes(in:)`,
-  plaintext payload serialization buffers are zeroed immediately
-  following encryption and decryption, and PBKDF2 derived key material
-  is wiped deterministically after use.
+- `LiveSSHTransport` is the primary direct SwiftNIO SSH implementation.
+- Host-key verification uses canonical hostname, port, algorithm, and SHA-256
+  fingerprint data. Unknown keys require an explicit trust decision. Changed
+  host keys are rejected rather than silently replaced.
+- The trust check runs before credential resolution for direct, ProxyJump, and
+  exec flows. Temporary trust approvals apply only to the active connection;
+  persistent trust records are written through the trust/catalog path.
+- ProxyJump validates each hop and the target through the same trust boundary.
+- `LiveSFTPRepository` uses Citadel only for the SFTP subsystem. Citadel does
+  not own the primary terminal SSH handshake or PTY channel pipeline.
+- Tailscale profiles resolve a configured hostname and use the normal prompt
+  policy by default; `checkHostKey` selects trusted-only mode. A network
+  overlay does not itself establish host identity.
+- Cloudflare Access target resolution adds Access headers from configured
+  metadata and Keychain state. The repository tests target construction, not
+  an external Cloudflare Access deployment.
+- Mosh currently bootstraps over SSH and carries the repository's UDP
+  datagrams. Full Mosh SSP cryptographic packet processing and speculative echo
+  are not implemented, so SSH transport completeness must not be conflated
+  with complete Mosh protocol security.
 
-### 5. File Provider & Background Security
-- The `ShhFileProvider` extension runs in a dedicated sandboxed process.
-- Sessions are strictly operation-scoped: connections are established on
-  demand and cleanly torn down after each file operation.
-- Remote paths are normalized and bounded using `appendingSafely` to
-  prevent path traversal vulnerabilities (`../`).
-- Materialized files are cached with bounded counts, disk sizes, and
-  LRU eviction policies.
-- Active terminal and tunnel sessions utilize finite UIKit background
-  execution tasks (`beginBackgroundTask`) rather than background audio
-  modes or silent audio playback, ensuring App Store guideline
-  compliance. On task expiration, session restoration metadata is
-  securely persisted while avoiding premature socket destruction.
-  Transports are probed on foreground return to verify cryptographic
-  channel integrity.
+## Remote command and terminal safety
 
-### 6. Privacy Manifest & Required-Reason APIs
-- `Resources/PrivacyInfo.xcprivacy` declares only accessed APIs:
-  - `NSPrivacyAccessedAPICategoryUserDefaults`: Storing local session
-    restoration metadata (`CA92.1`).
-  - `NSPrivacyAccessedAPICategoryFileTimestamp`: Managing local file
-    timestamps, cache eviction, and displaying file modification dates
-    to the user (`C617.1`, `0A2A.1`, `3B52.1`).
-  - `NSPrivacyAccessedAPICategoryDiskSpace`: Ensuring sufficient disk
-    space before writing files or downloading Whisper AI models
-    (`85F4.1`, `E174.1`).
-- `NSPrivacyTracking` is set to `false`.
-- `NSPrivacyCollectedDataTypes` is empty: zero analytics, zero crash
-  reporting telemetry, zero user tracking.
+- Commands, snippets, Herdr templates, and voice transcripts are untrusted
+  input. `CommandPolicy` uses quote-aware tokenization and classifies syntax.
+- Destructive operations are blocked unconditionally. Review-required or
+  unsupported syntax requires explicit approval in the UI; approval cannot
+  override a hard block.
+- Voice transcription always appears in an editable preview and never executes
+  automatically. Terminal accessory controls preserve exact escape sequences,
+  UTF-8 input, bracketed paste, and Ctrl+Space NUL behavior.
+- Remote output is displayed as data. Error mapping avoids exposing unrelated
+  credential or filesystem details through user-facing transport failures.
 
-### 7. Cryptographic Export Compliance (EAR Category 5, Part 2)
-- Shh incorporates cryptographic software for remote communication
-  (SSH/SFTP tunnels via SwiftNIO SSH and Citadel) and zero-knowledge
-  local vault backup encryption (AES-256-GCM / PBKDF2).
-- Non-exempt encryption declaration `ITSAppUsesNonExemptEncryption` is
-  set to `YES` in `project.yml` (and rendered into `Info.plist`).
-- In accordance with U.S. Export Administration Regulations (EAR, 15
-  C.F.R. Part 740, Category 5, Part 2) and Apple App Store distribution
-  guidelines, Shh falls under mass-market encryption (ECCN 5D992.c)
-  with self-classification / BIS reporting. Distribution complies with
-  Apple App Store Connect export compliance screening.
+## Encrypted vault backups
 
+The `.shhbackup` envelope currently provides:
+
+- AES-256-GCM authenticated encryption with a random nonce.
+- PBKDF2-HMAC-SHA256 key derivation with a default of 600,000 iterations and a
+  256-bit random salt. Imports enforce the configured minimum and maximum
+  iteration bounds.
+- Authenticated associated data binding the format identifier, schema version,
+  and creation metadata to the ciphertext.
+- Authentication failure before payload decoding for wrong passphrases or
+  tampered ciphertext.
+- Secret-material scanning before export and after decryption. Keychain secret
+  bytes and private-key material are excluded from the payload.
+- Security-scoped import staging, explicit replace versus merge restore, and
+  prompt cleanup paths.
+
+See `Sources/ShhCore/EncryptedSync.swift` and
+`Tests/ShhCoreTests/EncryptedVaultBackupTests.swift`. The cryptographic code
+has not received a third-party audit.
+
+## File Provider, filesystem, and lifecycle boundaries
+
+- The File Provider extension runs as a separate sandboxed process.
+- App and extension state is shared through the App Group
+  `group.com.ervinpopescu.shh`. Catalog and known-host snapshots are written
+  atomically by `FileProviderManagerHelper` and consumed by operation-scoped
+  extension sessions.
+- Remote paths are normalized through `RemotePath.appendingSafely`, which
+  rejects traversal outside the selected base path. Materialized files use
+  bounded cache metadata and LRU eviction.
+- Active terminal, Mosh, and forwarding sessions use finite UIKit background
+  execution tasks. Shh does not use silent audio or an audio background mode to
+  obtain indefinite network execution. iOS may still suspend the app; on
+  foreground return, Shh probes the transport and reconnects/restores state
+  when necessary.
+- Mosh-only hosts are rejected by File Provider because they do not expose the
+  required SFTP subsystem.
+
+The relevant code is under `App/FileProviderManagerHelper.swift`,
+`FileProviderExtension/`, `Sources/ShhCore/FileProviderContracts.swift`,
+`Sources/ShhCore/Services.swift`, and `App/AppContainer.swift`.
+
+## Privacy and platform declarations
+
+`Resources/PrivacyInfo.xcprivacy` declares required-reason API access for:
+
+- UserDefaults for local session and preference state.
+- File timestamps for local cache and displayed modification metadata.
+- Disk space checks for file operations and local Whisper model management.
+
+The manifest sets tracking to false and has no collected data types. The app
+also declares local-network access for `_ssh._tcp`, microphone and speech
+usage descriptions for explicit voice features, and non-exempt encryption in
+`project.yml`.
+
+`App/Shh.entitlements` and
+`FileProviderExtension/ShhFileProvider.entitlements` declare the shared App
+Group and Keychain access group. Run the repository validation scripts after
+changing these declarations:
+
+```sh
+Tests/verify-app-group.sh Shh.xcodeproj 'generic/platform=iOS'
+Tests/verify-local-network-info-plist.sh
+Tests/verify-app-icon.sh
+```
+
+The first command requires Xcode's developer directory, for example:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  Tests/verify-app-group.sh Shh.xcodeproj 'generic/platform=iOS'
+```
+
+## Validation limits and release responsibilities
+
+Automated package tests, app tests, generated unsigned builds, simulator tests,
+and optional live-host tests provide evidence for implementation behavior. They
+do not prove:
+
+- physical-device Keychain, App Group, File Provider, microphone, or audio
+  behavior;
+- broad SSH server, Cloudflare, Tailscale, network-roaming, or iOS hardware
+  interoperability;
+- resistance to threats outside the tested model;
+- an independent cryptographic or privacy audit; or
+- App Store/TestFlight readiness.
+
+There is no distribution pipeline in this repository. Apple provisioning,
+App Store Connect submission, export-compliance declarations, and release
+sign-off remain responsibilities for a future release process. Do not infer a
+legal export classification or store approval from `ITSAppUsesNonExemptEncryption`.
