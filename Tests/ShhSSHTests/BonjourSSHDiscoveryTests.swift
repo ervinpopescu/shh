@@ -68,20 +68,6 @@ final class MockBonjourBrowser: BonjourServiceBrowsing, @unchecked Sendable {
     }
 }
 
-final class LockedBonjourEndpoint: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value: NWEndpoint?
-
-    func store(_ endpoint: NWEndpoint) {
-        lock.withLock {
-            value = endpoint
-        }
-    }
-
-    func load() -> NWEndpoint? {
-        lock.withLock { value }
-    }
-}
 #endif
 
 final class BonjourSSHDiscoveryTests: XCTestCase {
@@ -172,43 +158,54 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
             domain: "local."
         )
         let listenerReady = expectation(description: "Bonjour listener is ready")
+        let connectionAccepted = expectation(
+            description: "Bonjour listener accepts a loopback connection"
+        )
         listener.stateUpdateHandler = { state in
             if case .ready = state {
                 listenerReady.fulfill()
             }
         }
         listener.newConnectionHandler = { connection in
+            connectionAccepted.fulfill()
             connection.cancel()
         }
-        listener.start(queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-listener"))
+        listener.start(
+            queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-listener")
+        )
         defer { listener.cancel() }
         await fulfillment(of: [listenerReady], timeout: 5.0)
 
+        let loopbackConnection = NWConnection(
+            host: "127.0.0.1",
+            port: try XCTUnwrap(listener.port),
+            using: .tcp
+        )
+        loopbackConnection.start(
+            queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-loopback")
+        )
+        defer { loopbackConnection.cancel() }
+        await fulfillment(of: [connectionAccepted], timeout: 5.0)
+
         let browser = LiveBonjourServiceBrowser(type: "_ssh._tcp", domain: "local.")
-        let forwardedEndpoint = LockedBonjourEndpoint()
         let endpointForwarded = expectation(description: "Bonjour endpoint is forwarded")
-        browser.start(queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-browser")) { endpoints in
+        browser.start(
+            queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-browser")
+        ) { endpoints in
             guard let endpoint = endpoints.first(where: { endpoint in
                 guard case let .service(name, type, domain, _) = endpoint else { return false }
                 return name == serviceName && type == "_ssh._tcp" && domain == "local."
             }) else { return }
-            forwardedEndpoint.store(endpoint)
+            let service = DiscoveredSSHService(endpoint: endpoint)
+            XCTAssertEqual(service?.name, serviceName)
+            XCTAssertEqual(service?.hostname, "\(serviceName).local")
+            XCTAssertEqual(service?.port, 22)
+            XCTAssertEqual(service?.domain, "local.")
             endpointForwarded.fulfill()
         } onStateChanged: { _ in }
         defer { browser.cancel() }
 
         await fulfillment(of: [endpointForwarded], timeout: 5.0)
-        guard let endpoint = forwardedEndpoint.load() else {
-            XCTFail("Expected the advertised Bonjour service endpoint")
-            return
-        }
-        guard case let .service(name, type, domain, _) = endpoint else {
-            XCTFail("Expected a service endpoint")
-            return
-        }
-        XCTAssertEqual(name, serviceName)
-        XCTAssertEqual(type, "_ssh._tcp")
-        XCTAssertEqual(domain, "local.")
     }
 
     @MainActor
