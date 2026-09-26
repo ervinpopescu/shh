@@ -523,7 +523,13 @@ final class RestorationAndReachabilityTests: XCTestCase {
             XCTAssertFalse(connection.isClosed)
 
             container.handleScenePhaseChange(.active)
-            for _ in 0..<8 { await Task.yield() }
+            let deadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
+            while DispatchTime.now().uptimeNanoseconds < deadline {
+                try await Task.sleep(nanoseconds: 10_000_000)
+                if container.activeSession?.state == .connected && !container.isForegroundRecoveryInProgress {
+                    break
+                }
+            }
             XCTAssertEqual(container.activeSession?.state, .connected)
             XCTAssertEqual(connectCount, 1, "A responsive session must not reconnect across repeated transitions")
         }
