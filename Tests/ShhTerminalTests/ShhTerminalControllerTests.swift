@@ -756,6 +756,32 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.size, TerminalSize(columns: 132, rows: 43))
     }
 
+    func testSynchronizeViewportMeasurementPublishesMountedGrid() {
+        let controller = ShhTerminalController()
+        let representable = ShhTerminalView(controller: controller)
+        let hostingController = UIHostingController(rootView: representable)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
+
+        guard let hostView = controller.persistentHostView else {
+            XCTFail("persistentHostView should be populated after hostingController layout")
+            return
+        }
+        let measuredSize = hostView.currentSize
+        XCTAssertFalse(controller.hasMeasuredViewport)
+
+        controller.synchronizeViewportMeasurement()
+
+        XCTAssertTrue(controller.hasMeasuredViewport)
+        XCTAssertEqual(controller.size, measuredSize)
+
+        controller.synchronizeViewportMeasurement()
+        XCTAssertEqual(controller.size, measuredSize)
+        window.rootViewController = nil
+    }
+
     func testShhTerminalViewHostingControllerResetAndReattach() {
         let controller = ShhTerminalController()
         let representable = ShhTerminalView(controller: controller)
