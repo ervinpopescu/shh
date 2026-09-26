@@ -35,6 +35,11 @@ targets:
           - _ssh._tcp
         NSLocalNetworkUsageDescription: >-
           Shh discovers SSH servers on your local network.
+        NSMicrophoneUsageDescription: >-
+          Shh records only while you hold the local push-to-talk control.
+        NSSpeechRecognitionUsageDescription: >-
+          Shh uses on-device speech recognition only when selected for
+          local voice transcription.
         UILaunchScreen: {}
     settings:
       base:
@@ -46,11 +51,6 @@ targets:
         CODE_SIGN_ENTITLEMENTS: App/Shh.entitlements
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_NSMicrophoneUsageDescription: >-
-          Shh records only while you hold the local push-to-talk control.
-        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: >-
-          Shh uses on-device speech recognition only when selected for
-          local voice transcription.
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
           UIInterfaceOrientationPortrait
           UIInterfaceOrientationPortraitUpsideDown

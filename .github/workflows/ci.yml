@@ -247,6 +247,9 @@ jobs:
           Tests/verify-app-icon.sh \
             build/DerivedData/Build/Products/Debug-iphoneos/Shh.app
 
+          Tests/verify-audio-permissions.sh \
+            build/DerivedData/Build/Products/Debug-iphoneos/Shh.app
+
       - name: Upload Core Build and Test Logs on Failure
         if: failure() || cancelled()
         # v4.6.1
