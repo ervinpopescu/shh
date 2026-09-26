@@ -4,6 +4,7 @@
 build/
 .build/
 DerivedData/
+App/Info.plist
 Shh.xcodeproj/
 *.xcodeproj/xcuserdata/
 *.xcworkspace/xcuserdata/
