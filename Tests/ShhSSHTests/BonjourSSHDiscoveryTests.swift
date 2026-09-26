@@ -67,6 +67,21 @@ final class MockBonjourBrowser: BonjourServiceBrowsing, @unchecked Sendable {
         handler?(state)
     }
 }
+
+final class LockedBonjourEndpoint: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: NWEndpoint?
+
+    func store(_ endpoint: NWEndpoint) {
+        lock.withLock {
+            value = endpoint
+        }
+    }
+
+    func load() -> NWEndpoint? {
+        lock.withLock { value }
+    }
+}
 #endif
 
 final class BonjourSSHDiscoveryTests: XCTestCase {
@@ -146,6 +161,54 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
             DiscoveredSSHService(name: "schweiz", hostname: "schweiz.local.").hostname,
             "schweiz.local"
         )
+    }
+
+    func testLiveBonjourServiceBrowserForwardsAdvertisedServiceEndpoint() async throws {
+        let serviceName = "shh-\(UUID().uuidString.lowercased())"
+        let listener = try NWListener(using: .tcp)
+        listener.service = NWListener.Service(
+            name: serviceName,
+            type: "_ssh._tcp",
+            domain: "local."
+        )
+        let listenerReady = expectation(description: "Bonjour listener is ready")
+        listener.stateUpdateHandler = { state in
+            if case .ready = state {
+                listenerReady.fulfill()
+            }
+        }
+        listener.newConnectionHandler = { connection in
+            connection.cancel()
+        }
+        listener.start(queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-listener"))
+        defer { listener.cancel() }
+        await fulfillment(of: [listenerReady], timeout: 5.0)
+
+        let browser = LiveBonjourServiceBrowser(type: "_ssh._tcp", domain: "local.")
+        let forwardedEndpoint = LockedBonjourEndpoint()
+        let endpointForwarded = expectation(description: "Bonjour endpoint is forwarded")
+        browser.start(queue: DispatchQueue(label: "com.ervinpopescu.shh.bonjour-test-browser")) { endpoints in
+            guard let endpoint = endpoints.first(where: { endpoint in
+                guard case let .service(name, type, domain, _) = endpoint else { return false }
+                return name == serviceName && type == "_ssh._tcp" && domain == "local."
+            }) else { return }
+            forwardedEndpoint.store(endpoint)
+            endpointForwarded.fulfill()
+        } onStateChanged: { _ in }
+        defer { browser.cancel() }
+
+        await fulfillment(of: [endpointForwarded], timeout: 5.0)
+        guard let endpoint = forwardedEndpoint.load() else {
+            XCTFail("Expected the advertised Bonjour service endpoint")
+            return
+        }
+        guard case let .service(name, type, domain, _) = endpoint else {
+            XCTFail("Expected a service endpoint")
+            return
+        }
+        XCTAssertEqual(name, serviceName)
+        XCTAssertEqual(type, "_ssh._tcp")
+        XCTAssertEqual(domain, "local.")
     }
 
     @MainActor
@@ -274,25 +337,30 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
 
     @MainActor
     func testStateTransitions() {
-        let discovery = BonjourSSHDiscovery()
+        let browser = MockBonjourBrowser()
+        let discovery = BonjourSSHDiscovery(browserFactory: { browser })
         XCTAssertFalse(discovery.isSearching)
         XCTAssertTrue(discovery.discoveredServices.isEmpty)
 
         // Starting discovery
         discovery.startDiscovery()
         XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(browser.startCallCount, 1)
 
         // Calling start again while searching is a safe no-op
         discovery.startDiscovery()
         XCTAssertTrue(discovery.isSearching)
+        XCTAssertEqual(browser.startCallCount, 1)
 
         // Stopping discovery
         discovery.stopDiscovery()
         XCTAssertFalse(discovery.isSearching)
+        XCTAssertEqual(browser.cancelCallCount, 1)
 
         // Calling stop again is safe
         discovery.stopDiscovery()
         XCTAssertFalse(discovery.isSearching)
+        XCTAssertEqual(browser.cancelCallCount, 1)
     }
 
     #if canImport(Network)
