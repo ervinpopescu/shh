@@ -2243,6 +2243,14 @@ final class AppContainer: ObservableObject {
             }
             let requestedSize = terminalController.size
             guard await resizePTY(requestedSize, on: conn, sessionID: sessionID) else {
+                if tmuxError == nil,
+                   activeSession?.id == sessionID,
+                   activeSession?.state == .connected,
+                   !isExplicitDisconnect,
+                   let currentConnection = connection,
+                   (currentConnection as AnyObject) === (conn as AnyObject) {
+                    tmuxError = "Failed to resize terminal."
+                }
                 return false
             }
             terminalController.synchronizeViewportMeasurement()

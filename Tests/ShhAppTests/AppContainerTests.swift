@@ -606,7 +606,10 @@ final class AppContainerTests: XCTestCase {
         var connections = [firstConnection, replacementConnection]
         transport.onConnect = { _ in connections.removeFirst() }
 
-        let container = AppContainer(transport: transport)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
         let host = try Host(name: "ReconnectGridHost", hostname: "reconnect-grid.invalid", username: "user")
         await container.connect(to: host)
 
