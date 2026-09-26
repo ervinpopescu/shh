@@ -71,6 +71,22 @@ final class MockBonjourBrowser: BonjourServiceBrowsing, @unchecked Sendable {
 
 final class BonjourSSHDiscoveryTests: XCTestCase {
 
+    @MainActor
+    private func waitForResolvedPort(
+        _ discovery: BonjourSSHDiscovery,
+        port: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        for _ in 0..<100 {
+            if discovery.discoveredServices.first?.port == port {
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(discovery.discoveredServices.first?.port, port, file: file, line: line)
+    }
+
     func testDiscoveredSSHServiceModelCreation() throws {
         // Basic init with defaults
         let pi = DiscoveredSSHService(name: "raspberrypi")
@@ -212,7 +228,7 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         browser.simulateResults([
             NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil)
         ])
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitForResolvedPort(discovery, port: 2201)
 
         XCTAssertEqual(discovery.discoveredServices.count, 1)
         XCTAssertEqual(discovery.discoveredServices[0].hostname, "schweiz.local")

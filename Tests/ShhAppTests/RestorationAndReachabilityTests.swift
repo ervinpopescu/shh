@@ -22,6 +22,22 @@ private actor LifecycleGate {
     }
 }
 
+private final class ConnectionAttemptCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    var value: Int {
+        lock.withLock { count }
+    }
+
+    func incrementAndRead() -> Int {
+        lock.withLock {
+            count += 1
+            return count
+        }
+    }
+}
+
 @MainActor
 final class RestorationAndReachabilityTests: XCTestCase {
 
@@ -223,10 +239,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let mockConnection1 = MockSSHConnection()
         let mockConnection2 = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { (_: Host) async throws -> any SSHConnection in
-            connectCount += 1
-            return connectCount == 1 ? mockConnection1 : mockConnection2
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? mockConnection1 : mockConnection2
         }
 
         let reachability = MockReachabilityMonitor(isReachable: true)
@@ -246,7 +262,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         // 1. Initial connect
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(connectCount.value, 1)
 
         // 2. Mid-session network drop
         mockConnection1.emit(TerminalEvent.error(TransportError.networkUnavailable))
@@ -263,17 +279,17 @@ final class RestorationAndReachabilityTests: XCTestCase {
         try await Task.sleep(nanoseconds: 80_000_000)
 
         XCTAssertEqual(container.activeSession?.state, .connected, "Network recovery must trigger reconnect and succeed")
-        XCTAssertEqual(connectCount, 2, "A second connection attempt must have been performed")
+        XCTAssertEqual(connectCount.value, 2, "A second connection attempt must have been performed")
     }
 
     func testAppContainerInterfaceTransitionTriggersReconnect() async throws {
         let firstConnection = MockSSHConnection()
         let secondConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            return connectCount == 1 ? firstConnection : secondConnection
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? firstConnection : secondConnection
         }
 
         let reachability = MockReachabilityMonitor(isReachable: true, initialInterface: .wifi)
@@ -290,7 +306,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         reachability.transitionInterface(to: .cellular)
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        XCTAssertEqual(connectCount, 2, "An interface transition must recover the SSH session")
+        XCTAssertEqual(connectCount.value, 2, "An interface transition must recover the SSH session")
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertTrue(firstConnection.isClosed)
         await container.disconnect()
@@ -300,10 +316,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let mockConnection1 = MockSSHConnection()
         let mockConnection2 = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { (_: Host) async throws -> any SSHConnection in
-            connectCount += 1
-            return connectCount == 1 ? mockConnection1 : mockConnection2
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? mockConnection1 : mockConnection2
         }
 
         let reachability = MockReachabilityMonitor(isReachable: true)
@@ -323,7 +339,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         // 1. Connect
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(connectCount.value, 1)
 
         // 2. Connection drops unexpectedly
         mockConnection1.emit(TerminalEvent.closed)
@@ -336,15 +352,15 @@ final class RestorationAndReachabilityTests: XCTestCase {
         try await Task.sleep(nanoseconds: 80_000_000)
 
         XCTAssertEqual(container.activeSession?.state, .connected, "Foregrounding scene phase must trigger reconnect and succeed")
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
     }
 
     func testAppContainerExplicitDisconnectDoesNotAutoReconnect() async throws {
         let mockConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { (_: Host) async throws -> any SSHConnection in
-            connectCount += 1
+            _ = connectCount.incrementAndRead()
             return mockConnection
         }
 
@@ -364,7 +380,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
 
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(connectCount.value, 1)
 
         // User explicitly disconnects
         await container.disconnect()
@@ -381,7 +397,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         try await Task.sleep(nanoseconds: 50_000_000)
 
         // No new connection attempt must have occurred
-        XCTAssertEqual(connectCount, 1, "Explicit disconnect must prevent automatic reconnect triggers")
+        XCTAssertEqual(connectCount.value, 1, "Explicit disconnect must prevent automatic reconnect triggers")
         XCTAssertEqual(container.activeSession?.state, .disconnected)
     }
 
@@ -389,10 +405,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let firstConnection = MockSSHConnection()
         let secondConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            return connectCount == 1 ? firstConnection : secondConnection
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? firstConnection : secondConnection
         }
         let store = InMemorySessionRestorationStore()
         let container = AppContainer(
@@ -431,7 +447,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         container.handleScenePhaseChange(.active)
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertTrue(
             secondConnection.sentData.compactMap { String(data: $0, encoding: .utf8) }
@@ -462,10 +478,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
             }
         )
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            return connectCount == 1 ? firstConnection : recoveredConnection
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? firstConnection : recoveredConnection
         }
         let container = AppContainer(
             transport: transport,
@@ -490,7 +506,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         await releaseProbe.open()
         for _ in 0..<8 { await Task.yield() }
 
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertFalse(container.isForegroundRecoveryInProgress)
         XCTAssertFalse(recoveredConnection.isClosed)
@@ -501,9 +517,9 @@ final class RestorationAndReachabilityTests: XCTestCase {
     func testAppContainerRepeatedInactiveBackgroundForegroundTransitionsPreserveSession() async throws {
         let connection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
+            _ = connectCount.incrementAndRead()
             return connection
         }
         let container = AppContainer(
@@ -525,7 +541,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
             container.handleScenePhaseChange(.active)
             for _ in 0..<8 { await Task.yield() }
             XCTAssertEqual(container.activeSession?.state, .connected)
-            XCTAssertEqual(connectCount, 1, "A responsive session must not reconnect across repeated transitions")
+            XCTAssertEqual(connectCount.value, 1, "A responsive session must not reconnect across repeated transitions")
         }
 
         await container.disconnect()
@@ -538,10 +554,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let recoveredConnection = MockSSHConnection()
         let recoveryExpectation = expectation(description: "foreground recovery connects")
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            if connectCount == 1 {
+            let attempt = connectCount.incrementAndRead()
+            if attempt == 1 {
                 await connectStarted.open()
                 await connectGate.wait()
                 return initialConnection
@@ -581,7 +597,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         container.handleScenePhaseChange(.active)
         await fulfillment(of: [recoveryExpectation], timeout: 2.0)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
 
         await container.disconnect()
     }
@@ -589,9 +605,9 @@ final class RestorationAndReachabilityTests: XCTestCase {
     func testAppContainerBackgroundTaskAcquisitionAndInstantForegroundResume() async throws {
         let mockConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
+            _ = connectCount.incrementAndRead()
             return mockConnection
         }
         let bgManager = MockBackgroundTaskManager()
@@ -608,7 +624,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         // 1. Connect
         await container.connect(to: host)
         XCTAssertEqual(container.activeSession?.state, .connected)
-        XCTAssertEqual(connectCount, 1)
+        XCTAssertEqual(connectCount.value, 1)
 
         // 2. Enter background
         container.handleScenePhaseChange(.background)
@@ -626,16 +642,16 @@ final class RestorationAndReachabilityTests: XCTestCase {
         try await Task.sleep(nanoseconds: 50_000_000)
 
         XCTAssertEqual(bgManager.endTaskCallCount, 1, "Background task must be ended upon returning to active")
-        XCTAssertEqual(connectCount, 1, "No reconnect cycle must occur when returning to foreground with responsive socket")
+        XCTAssertEqual(connectCount.value, 1, "No reconnect cycle must occur when returning to foreground with responsive socket")
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
     func testAppContainerBackgroundTaskExpirationDoesNotProactivelyCloseSocket() async throws {
         let mockConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
+            _ = connectCount.incrementAndRead()
             return mockConnection
         }
         let bgManager = MockBackgroundTaskManager()
@@ -671,7 +687,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         container.handleScenePhaseChange(.active)
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertEqual(connectCount, 1, "If socket survived in OS, session resumes without reconnect")
+        XCTAssertEqual(connectCount.value, 1, "If socket survived in OS, session resumes without reconnect")
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
@@ -679,10 +695,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let firstConnection = MockSSHConnection()
         let secondConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            return connectCount == 1 ? firstConnection : secondConnection
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? firstConnection : secondConnection
         }
         let bgManager = MockBackgroundTaskManager()
         let container = AppContainer(
@@ -704,7 +720,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
 
         // Probing detected dead connection -> triggers reconnect
-        XCTAssertEqual(connectCount, 2, "Severed connection must trigger reconnect on active transition")
+        XCTAssertEqual(connectCount.value, 2, "Severed connection must trigger reconnect on active transition")
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
@@ -714,10 +730,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let staleConnection = MockSSHConnection()
         let recoveredConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            switch connectCount {
+            let attempt = connectCount.incrementAndRead()
+            switch attempt {
             case 1:
                 return firstConnection
             case 2:
@@ -745,7 +761,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         await reconnectGate.open()
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        XCTAssertEqual(connectCount, 3, "Foreground must replace the cancelled reconnect exactly once")
+        XCTAssertEqual(connectCount.value, 3, "Foreground must replace the cancelled reconnect exactly once")
         XCTAssertTrue(staleConnection.isClosed, "The stale pre-background connection must be closed")
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertFalse(container.reconnectState.isReconnecting)
@@ -755,10 +771,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let firstConnection = MockSSHConnection()
         let recoveredConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            return connectCount == 1 ? firstConnection : recoveredConnection
+            let attempt = connectCount.incrementAndRead()
+            return attempt == 1 ? firstConnection : recoveredConnection
         }
         let reachability = MockReachabilityMonitor(isReachable: true)
         let container = AppContainer(
@@ -773,13 +789,13 @@ final class RestorationAndReachabilityTests: XCTestCase {
         firstConnection.emit(.error(.networkUnavailable))
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertEqual(connectCount, 1, "Offline transport events must not spin reconnect attempts")
+        XCTAssertEqual(connectCount.value, 1, "Offline transport events must not spin reconnect attempts")
         XCTAssertEqual(container.reconnectState, .failed(reason: "Network unavailable."))
         XCTAssertEqual(container.activeSession?.state, .disconnected)
 
         reachability.setReachable(true)
         try await Task.sleep(nanoseconds: 100_000_000)
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         await container.disconnect()
@@ -787,7 +803,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         reachability.setReachable(true)
         container.handleScenePhaseChange(.active)
         try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(connectCount, 2, "Explicit disconnect must block later reachability recovery")
+        XCTAssertEqual(connectCount.value, 2, "Explicit disconnect must block later reachability recovery")
         XCTAssertEqual(container.activeSession?.state, .disconnected)
     }
 
@@ -832,10 +848,10 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let firstConnection = MockSSHConnection()
         let lateConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connectCount = 0
+        let connectCount = ConnectionAttemptCounter()
         transport.onConnect = { _ in
-            connectCount += 1
-            if connectCount == 1 { return firstConnection }
+            let attempt = connectCount.incrementAndRead()
+            if attempt == 1 { return firstConnection }
             await gate.wait()
             return lateConnection
         }
@@ -855,7 +871,7 @@ final class RestorationAndReachabilityTests: XCTestCase {
         await gate.open()
         try await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertEqual(connectCount, 2)
+        XCTAssertEqual(connectCount.value, 2)
         XCTAssertTrue(lateConnection.isClosed)
         XCTAssertEqual(container.activeSession?.state, .disconnected)
     }

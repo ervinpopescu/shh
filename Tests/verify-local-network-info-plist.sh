@@ -1,5 +1,5 @@
 #!/bin/bash
-# Verify the generated application's local-network Bonjour declarations.
+# Verify the generated application's local-network Bonjour declarations and orientation metadata.
 set -euo pipefail
 
 repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -28,5 +28,18 @@ if plist.get("NSLocalNetworkUsageDescription") != expected_description:
 if plist.get("NSBonjourServices") != ["_ssh._tcp"]:
     raise SystemExit("NSBonjourServices must be the array [_ssh._tcp]")
 
-print(f"Bonjour local-network permissions are valid in {plist_path}")
+expected_orientations = [
+    "UIInterfaceOrientationPortrait",
+    "UIInterfaceOrientationPortraitUpsideDown",
+    "UIInterfaceOrientationLandscapeLeft",
+    "UIInterfaceOrientationLandscapeRight",
+]
+if plist.get("UILaunchScreen") != {}:
+    raise SystemExit("UILaunchScreen is missing or incorrect")
+if plist.get("UISupportedInterfaceOrientations") != expected_orientations:
+    raise SystemExit("UISupportedInterfaceOrientations is missing or incorrect")
+if plist.get("UISupportedInterfaceOrientations~ipad") != expected_orientations:
+    raise SystemExit("UISupportedInterfaceOrientations~ipad is missing or incorrect")
+
+print(f"App Info.plist declarations are valid in {plist_path}")
 PY

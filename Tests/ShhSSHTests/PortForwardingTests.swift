@@ -143,12 +143,18 @@ final class PortForwardingTests: XCTestCase {
         var connectPacket = Data([0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1])
         let portBytes = withUnsafeBytes(of: echoPort.bigEndian) { Data($0) }
         connectPacket.append(portBytes)
+        let pendingPayload = Data("socks5-pending-data\n".utf8)
+        connectPacket.append(pendingPayload)
         try await client.send(connectPacket)
 
         let connectReply = try await client.receiveNext()
         XCTAssertGreaterThanOrEqual(connectReply.count, 2)
         XCTAssertEqual(connectReply[0], 0x05) // VER
         XCTAssertEqual(connectReply[1], 0x00) // SUCCESS
+
+        // Data that arrived with CONNECT must be forwarded after the success reply.
+        let receivedPendingPayload = try await client.receiveNext()
+        XCTAssertEqual(receivedPendingPayload, pendingPayload)
 
         // Step 3: Application Data duplex forwarding
         let payload = Data("socks5-tunnelled-data-stream\n".utf8)
@@ -166,6 +172,76 @@ final class PortForwardingTests: XCTestCase {
         let activeAfterClose = await forwardingManager.activeSessions()
         XCTAssertEqual(activeAfterClose.first?.activeConnectionsCount, 0)
 
+        try await forwardingManager.stopForwarding(ruleID: rule.id)
+        await connection.close()
+        try await sshServer.stop()
+        try await echoServer.stop()
+    }
+
+    func testDynamicSOCKS5HandshakeAndRoutingIPv6() async throws {
+        let echoServer = TestEchoServer()
+        let echoPort = try await echoServer.start(host: "::1")
+
+        let sshServer = SSHTestServer()
+        let sshPort = try await sshServer.start()
+
+        let credStore = InMemoryCredentialStore()
+        try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
+        let identity = try IdentityDescriptor(name: "Test", kind: .password, keychainReference: "ref-pass")
+
+        let trustStore = InMemoryTrustStore()
+        await trustStore.save(HostKeyChallenge(
+            hostname: "127.0.0.1",
+            port: sshPort,
+            algorithm: "ssh-ed25519",
+            fingerprint: sshServer.fingerprint
+        ))
+
+        let host = try ShhCore.Host(
+            name: "TestHost",
+            hostname: "127.0.0.1",
+            port: sshPort,
+            username: "testuser",
+            identityID: identity.id
+        )
+        let transport = LiveSSHTransport(credentialStore: credStore)
+        let connection = try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
+        guard let liveConn = connection as? LiveSSHConnection else { return }
+
+        let forwardingManager = PortForwardingManager(connection: liveConn)
+        let rule = try PortForwardingRule(type: .dynamic, localHost: "127.0.0.1", localPort: 0)
+        let sessionState = try await forwardingManager.startForwarding(rule: rule)
+        let socksPort = sessionState.boundPort!
+
+        let client = TestTCPClient()
+        try await client.connect(host: "127.0.0.1", port: Int(socksPort))
+
+        // Step 1: Greeting
+        try await client.send(Data([0x05, 0x01, 0x00]))
+        let greetingReply = try await client.receiveNext()
+        XCTAssertEqual(greetingReply, Data([0x05, 0x00]))
+
+        // Step 2: CONNECT with ATYP=0x04 (IPv6 ::1)
+        var connectPacket = Data([0x05, 0x01, 0x00, 0x04])
+        let ipv6Bytes: [UInt8] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]
+        connectPacket.append(contentsOf: ipv6Bytes)
+        let portBytes = withUnsafeBytes(of: echoPort.bigEndian) { Data($0) }
+        connectPacket.append(portBytes)
+        try await client.send(connectPacket)
+
+        let connectReply = try await client.receiveNext()
+        XCTAssertGreaterThanOrEqual(connectReply.count, 2)
+        XCTAssertEqual(connectReply[0], 0x05) // VER
+        XCTAssertEqual(connectReply[1], 0x00) // SUCCESS
+
+        // Step 3: Application Data duplex forwarding over IPv6
+        let payload = Data("socks5-ipv6-tunnelled-data\n".utf8)
+        try await client.send(payload)
+
+        let receivedPayload = try await client.receiveNext()
+        XCTAssertEqual(receivedPayload, payload)
+
+        await client.close()
         try await forwardingManager.stopForwarding(ruleID: rule.id)
         await connection.close()
         try await sshServer.stop()
@@ -303,6 +379,52 @@ final class PortForwardingTests: XCTestCase {
         XCTAssertEqual(reply2[1], 0x05) // Connection refused
 
         await client2.close()
+
+        // Subtest 3: Unsupported authentication method
+        let client3 = TestTCPClient()
+        try await client3.connect(host: "127.0.0.1", port: Int(socksPort))
+        try await client3.send(Data([0x05, 0x01, 0x02]))
+        let reply3 = try await client3.receiveNext()
+        XCTAssertEqual(reply3, Data([0x05, 0xFF]))
+        await client3.close()
+
+        // Subtest 4: Invalid greeting version
+        let client4 = TestTCPClient()
+        try await client4.connect(host: "127.0.0.1", port: Int(socksPort))
+        try await client4.send(Data([0x04, 0x01, 0x00]))
+        do {
+            _ = try await client4.receiveNext()
+            XCTFail("Expected disconnect on invalid SOCKS version")
+        } catch {
+            // Expected connection reset / disconnect
+        }
+        await client4.close()
+
+        // Subtest 5: Invalid request version
+        let client5 = TestTCPClient()
+        try await client5.connect(host: "127.0.0.1", port: Int(socksPort))
+        try await client5.send(Data([0x05, 0x01, 0x00]))
+        _ = try await client5.receiveNext()
+        try await client5.send(Data([0x04, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 80]))
+        do {
+            _ = try await client5.receiveNext()
+            XCTFail("Expected disconnect on invalid request version")
+        } catch {
+            // Expected connection reset / disconnect
+        }
+        await client5.close()
+
+        // Subtest 6: Unsupported address type (ATYP = 0x08)
+        let client6 = TestTCPClient()
+        try await client6.connect(host: "127.0.0.1", port: Int(socksPort))
+        try await client6.send(Data([0x05, 0x01, 0x00]))
+        _ = try await client6.receiveNext()
+        try await client6.send(Data([0x05, 0x01, 0x00, 0x08, 0, 0, 0, 0, 0, 80]))
+        let reply6 = try await client6.receiveNext()
+        XCTAssertEqual(reply6[0], 0x05)
+        XCTAssertEqual(reply6[1], 0x08) // Address type not supported
+        await client6.close()
+
         try await forwardingManager.stopForwarding(ruleID: rule.id)
         await connection.close()
         try await sshServer.stop()

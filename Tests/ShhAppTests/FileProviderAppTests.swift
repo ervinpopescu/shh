@@ -270,7 +270,7 @@ final class FileProviderAppTests: XCTestCase {
             var error: Error?
 
             func didEnumerate(_ updatedItems: [NSFileProviderItemProtocol]) {
-                items.append(contentsOf: updatedItems.compactMap { $0 as? NSFileProviderItem })
+                items.append(contentsOf: updatedItems)
             }
             func finishEnumerating(upTo page: NSFileProviderPage?) {
                 finished = true
