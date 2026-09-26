@@ -754,6 +754,7 @@ final class TmuxAppTests: XCTestCase {
             throw TransportError.remoteFailure("PTY resize refused")
         }
         container.terminalController.handleResize(columns: requestedSize.columns, rows: requestedSize.rows)
+        container.terminalController.flushResize()
         let sentBefore = mock.sentData.count
 
         let attached = await container.attachTmuxSession(id: "$2")
