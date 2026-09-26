@@ -14,6 +14,7 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - App
+      - Shared
       - path: Resources/Assets.xcassets
         buildPhase: resources
       - path: Resources/PrivacyInfo.xcprivacy
@@ -44,6 +45,8 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         MARKETING_VERSION: "1.0"
         CODE_SIGN_ENTITLEMENTS: App/Shh.entitlements
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGNING_REQUIRED: YES
         INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: YES
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSMicrophoneUsageDescription: >-
@@ -115,16 +118,18 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - Tests/ShhAppTests
-      - path: FileProviderExtension
-        excludes:
-          - "Info.plist"
-          - "*.entitlements"
+      - FileProviderExtension/FileProviderEnumerator.swift
+      - FileProviderExtension/FileProviderExtension.swift
+      - FileProviderExtension/FileProviderItem.swift
+      - FileProviderExtension/FileProviderSessionManager.swift
+      - Shared
     dependencies:
       - target: Shh
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.app.tests
         SWIFT_VERSION: "5.9"
+        SUPPORTED_PLATFORMS: iphoneos iphonesimulator
         GENERATE_INFOPLIST_FILE: YES
   ShhFileProvider:
     type: app-extension
@@ -132,6 +137,7 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - FileProviderExtension
+      - Shared
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
     dependencies:
@@ -145,4 +151,6 @@ targets:
         SWIFT_VERSION: "5.9"
         CODE_SIGN_ENTITLEMENTS: >-
           FileProviderExtension/ShhFileProvider.entitlements
+        CODE_SIGNING_ALLOWED: YES
+        CODE_SIGNING_REQUIRED: YES
         INFOPLIST_FILE: FileProviderExtension/Info.plist

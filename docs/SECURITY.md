@@ -90,6 +90,12 @@ data, remote execution outputs, voice transcripts, and backup storage.
   prevent path traversal vulnerabilities (`../`).
 - Materialized files are cached with bounded counts, disk sizes, and
   LRU eviction policies.
+- Shared container resolution (`SharedContainerResolver`) strictly
+  enforces the entitled App Group (`group.com.ervinpopescu.shh`) on
+  physical devices, failing closed (`.unavailable`) if the entitlement
+  is missing rather than silently falling back to unshared local storage;
+  simulator environments use an isolated Application Support fallback
+  without weakening device protections.
 - Active terminal and tunnel sessions utilize finite UIKit background
   execution tasks (`beginBackgroundTask`) rather than background audio
   modes or silent audio playback, ensuring App Store guideline

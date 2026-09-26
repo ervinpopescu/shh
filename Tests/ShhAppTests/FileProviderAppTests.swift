@@ -19,6 +19,79 @@ final class FileProviderAppTests: XCTestCase {
         return (helper, root)
     }
 
+    func testSimulatorFallbackIsObservableAndDataIsolated() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhSimulatorGroup_\(UUID().uuidString)"
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let helper = FileProviderManagerHelper(
+            localContainerURL: root.appendingPathComponent("local"),
+            containerURLResolver: { _ in nil },
+            simulatorFallbackURL: root,
+            allowSimulatorFallback: true
+        )
+
+        XCTAssertEqual(helper.containerURL, root)
+        XCTAssertTrue(helper.isUsingSimulatorFallback)
+        XCTAssertFalse(helper.isSharedContainerAvailable)
+        XCTAssertEqual(helper.appGroupContainerURL, nil)
+        XCTAssertEqual(helper.sharedContainerResolution, .simulatorFallback(root))
+        XCTAssertFalse(helper.hasPersistedSnapshot)
+
+        let host = try Host(
+            name: "Simulator Host", hostname: "simulator.invalid", username: "user"
+        )
+        XCTAssertTrue(
+            try helper.syncSharedState(snapshot: CatalogSnapshot(hosts: [host]))
+        )
+        XCTAssertTrue(helper.hasPersistedSnapshot)
+        XCTAssertTrue(
+            FileManager.default.fileExists(
+                atPath: root.appendingPathComponent("catalogs/snapshot.json").path
+            )
+        )
+    }
+
+    func testUnavailableDevicePathDoesNotSilentlyBecomeShared() {
+        let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhDeviceFallback_\(UUID().uuidString)"
+        )
+        let helper = FileProviderManagerHelper(
+            containerURLResolver: { _ in nil },
+            simulatorFallbackURL: fallbackURL,
+            allowSimulatorFallback: false
+        )
+
+        XCTAssertEqual(helper.sharedContainerResolution, .unavailable)
+        XCTAssertNil(helper.appGroupContainerURL)
+        XCTAssertFalse(helper.isSharedContainerAvailable)
+        XCTAssertFalse(helper.isUsingSimulatorFallback)
+    }
+
+    func testEntitledAppGroupTakesPrecedenceOverSimulatorFallback() throws {
+        let entitledURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhEntitledGroup_\(UUID().uuidString)"
+        )
+        let fallbackURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhFallbackGroup_\(UUID().uuidString)"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: entitledURL)
+            try? FileManager.default.removeItem(at: fallbackURL)
+        }
+        let helper = FileProviderManagerHelper(
+            containerURLResolver: { _ in entitledURL },
+            simulatorFallbackURL: fallbackURL,
+            allowSimulatorFallback: true
+        )
+
+        XCTAssertEqual(helper.containerURL, entitledURL)
+        XCTAssertEqual(helper.appGroupContainerURL, entitledURL)
+        XCTAssertTrue(helper.isSharedContainerAvailable)
+        XCTAssertFalse(helper.isUsingSimulatorFallback)
+        XCTAssertEqual(helper.sharedContainerResolution, .appGroup(entitledURL))
+    }
+
     func testAppGroupUnavailableLoadsLocalFallback() async throws {
         let (helper, root) = try isolatedPersistenceHelper()
         defer { try? FileManager.default.removeItem(at: root) }

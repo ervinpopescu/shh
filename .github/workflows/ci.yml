@@ -48,25 +48,32 @@ jobs:
           HEAD=""
 
           if [ "$EVENT_NAME" = "pull_request" ]; then
-            if [ -n "$BASE_SHA" ] && git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            if [ -n "$BASE_SHA" ] &&
+             git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
               BASE="$BASE_SHA"
             elif [ -n "$BASE_REF" ]; then
               BASE=$(git merge-base "origin/$BASE_REF" HEAD 2>/dev/null || true)
             fi
 
-            if [ -n "$HEAD_SHA" ] && git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
+            if [ -n "$HEAD_SHA" ] &&
+               git cat-file -e "${HEAD_SHA}^{commit}" 2>/dev/null; then
               HEAD="$HEAD_SHA"
             else
               HEAD="HEAD"
             fi
           elif [ "$EVENT_NAME" = "push" ]; then
-            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ] && git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
+            if [ -n "$BEFORE_SHA" ] &&
+               [ "$BEFORE_SHA" != \
+                 "0000000000000000000000000000000000000000" ] &&
+               git cat-file -e "${BEFORE_SHA}^{commit}" 2>/dev/null; then
               BASE="$BEFORE_SHA"
               HEAD="$CURRENT_SHA"
             fi
           fi
 
-          if [ -n "$BASE" ] && [ -n "$HEAD" ] && git cat-file -e "${BASE}^{commit}" 2>/dev/null && git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
+          if [ -n "$BASE" ] && [ -n "$HEAD" ] &&
+             git cat-file -e "${BASE}^{commit}" 2>/dev/null &&
+             git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
             CHANGED_FILES=$(git diff --name-only "$BASE" "$HEAD" || true)
             if [ -n "$CHANGED_FILES" ]; then
               ALL_DOCS=true
@@ -75,7 +82,8 @@ jobs:
                 case "$file" in
                   *.md|*.markdown)
                     case "$file" in
-                      .github/*|fixtures/*|Tests/*|Sources/*|App/*|FileProviderExtension/*|Resources/*)
+                      .github/*|fixtures/*|Tests/*|Sources/*|App/*|\
+                      FileProviderExtension/*|Resources/*)
                         ALL_DOCS=false
                         break
                         ;;
@@ -96,13 +104,16 @@ jobs:
           fi
 
           if [ "$IS_DOCS_ONLY" = "true" ]; then
-            echo "Docs-only markdown changes detected. Running lightweight documentation validation..."
+            echo "Docs-only markdown changes detected. Running lightweight" \
+              "documentation validation..."
+            conflict_pattern='^<{7}[[:space:]]|^={7}$|^>{7}[[:space:]]'
             while IFS= read -r file; do
               [ -z "$file" ] && continue
               if [ -f "$file" ]; then
                 iconv -f UTF-8 -t UTF-8 "$file" > /dev/null
-                if grep -En '^<{7}[[:space:]]|^={7}$|^>{7}[[:space:]]' "$file" /dev/null; then
-                  echo "Error: Unresolved merge conflict marker found in $file" >&2
+                if grep -En "$conflict_pattern" "$file" /dev/null; then
+                  echo "Error: Unresolved merge conflict marker found" \
+                    "in $file" >&2
                   exit 1
                 fi
               fi
@@ -111,7 +122,8 @@ jobs:
             git diff --check "$BASE" "$HEAD" -- '*.md' '*.markdown' || true
             echo "Documentation validation passed successfully."
           else
-            echo "Full CI suite required (source, test, project, workflow, config, or fail-closed diff)."
+            echo "Full CI suite required (source, test, project, workflow," \
+              "config, or fail-closed diff)."
           fi
 
           echo "run_full_suite=$RUN_FULL_SUITE" >> "$GITHUB_OUTPUT"
@@ -218,8 +230,52 @@ jobs:
       - name: Generate Xcode Project
         run: just generate
 
-      - name: Validate App Group Entitlements
-        run: Tests/verify-app-group.sh Shh.xcodeproj 'generic/platform=iOS'
+      - name: Validate Generated App Group Configuration
+        run: |
+          set -euo pipefail
+          expected_group='group.com.ervinpopescu.shh'
+          for entitlements in App/Shh.entitlements \
+            FileProviderExtension/ShhFileProvider.entitlements; do
+            actual=$(
+              /usr/libexec/PlistBuddy \
+                -c 'Print :com.apple.security.application-groups:0' \
+                "$entitlements"
+            )
+            [[ "$actual" == "$expected_group" ]]
+          done
+
+          settings_for() {
+            xcodebuild -showBuildSettings \
+              -project Shh.xcodeproj \
+              -scheme "$1" \
+              -configuration Debug \
+              -destination 'generic/platform=iOS'
+          }
+
+          app_settings=$(settings_for Shh)
+          extension_settings=$(settings_for ShhFileProvider)
+          for settings in "$app_settings" "$extension_settings"; do
+            grep -Eq '^    CODE_SIGNING_ALLOWED = YES$' <<< "$settings"
+            grep -Eq '^    CODE_SIGNING_REQUIRED = YES$' <<< "$settings"
+          done
+          grep -Eq '^    CODE_SIGN_ENTITLEMENTS = App/Shh.entitlements$' \
+            <<< "$app_settings"
+          grep -Eq '^    CODE_SIGN_ENTITLEMENTS = FileProviderExtension/' \
+            <<< "$extension_settings"
+          grep -Eq 'ShhFileProvider.entitlements$' <<< "$extension_settings"
+
+          test_settings=$(xcodebuild -showBuildSettings \
+            -project Shh.xcodeproj \
+            -target ShhAppTests \
+            -configuration Debug)
+          grep -Eq '^    SUPPORTED_PLATFORMS = iphoneos iphonesimulator$' \
+            <<< "$test_settings"
+          if grep -Eq '^    CODE_SIGN_ENTITLEMENTS = .+' \
+            <<< "$test_settings"; then
+            echo 'ShhAppTests must not carry an App Group entitlement' >&2
+            exit 1
+          fi
+          echo "App Group configuration validated: $expected_group"
 
       - name: Build Generic iOS Targets (Unsigned)
         run: |
@@ -366,6 +422,57 @@ jobs:
             exit 1
           fi
 
+      - name: Validate Generated Simulator App Group Configuration
+        if: steps.simulators.outputs.device_id != ''
+        run: |
+          set -euo pipefail
+          device_id="${{ steps.simulators.outputs.device_id }}"
+          destination="platform=iOS Simulator,id=$device_id"
+          expected_group='group.com.ervinpopescu.shh'
+          for entitlements in App/Shh.entitlements \
+            FileProviderExtension/ShhFileProvider.entitlements; do
+            actual=$(
+              /usr/libexec/PlistBuddy \
+                -c 'Print :com.apple.security.application-groups:0' \
+                "$entitlements"
+            )
+            [[ "$actual" == "$expected_group" ]]
+          done
+
+          settings_for() {
+            xcodebuild -showBuildSettings \
+              -project Shh.xcodeproj \
+              -scheme "$1" \
+              -configuration Debug \
+              -destination "$destination"
+          }
+
+          app_settings=$(settings_for Shh)
+          extension_settings=$(settings_for ShhFileProvider)
+          for settings in "$app_settings" "$extension_settings"; do
+            grep -Eq '^    CODE_SIGNING_ALLOWED = YES$' <<< "$settings"
+            grep -Eq '^    CODE_SIGNING_REQUIRED = YES$' <<< "$settings"
+            grep -Eq '^    ENTITLEMENTS_ALLOWED = NO$' <<< "$settings"
+          done
+          grep -Eq '^    CODE_SIGN_ENTITLEMENTS = App/Shh.entitlements$' \
+            <<< "$app_settings"
+          grep -Eq '^    CODE_SIGN_ENTITLEMENTS = FileProviderExtension/' \
+            <<< "$extension_settings"
+          grep -Eq 'ShhFileProvider.entitlements$' <<< "$extension_settings"
+
+          test_settings=$(xcodebuild -showBuildSettings \
+            -project Shh.xcodeproj \
+            -target ShhAppTests \
+            -configuration Debug)
+          grep -Eq '^    SUPPORTED_PLATFORMS = iphoneos iphonesimulator$' \
+            <<< "$test_settings"
+          if grep -Eq '^    CODE_SIGN_ENTITLEMENTS = .+' \
+            <<< "$test_settings"; then
+            echo 'ShhAppTests must not carry an App Group entitlement' >&2
+            exit 1
+          fi
+          echo "Simulator App Group configuration validated: $expected_group"
+
       - name: Build For Testing
         if: steps.simulators.outputs.device_id != ''
         run: |
@@ -378,9 +485,9 @@ jobs:
             -destination "$destination" \
             -derivedDataPath build/DerivedData \
             -enableCodeCoverage YES \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGNING_REQUIRED=YES \
             2>&1 | tee "${{ matrix.log_prefix }}-build.log"
 
       - name: Test Without Building

@@ -3829,7 +3829,7 @@ final class AppContainer: ObservableObject {
             self.fileProviderDomainError = err.localizedDescription
             throw err
         }
-        guard fileProviderHelper.containerURL != nil else {
+        guard fileProviderHelper.appGroupContainerURL != nil else {
             let err = FileProviderManagerError.containerUnavailable(fileProviderHelper.appGroupIdentifier)
             self.fileProviderDomainError = err.localizedDescription
             throw err

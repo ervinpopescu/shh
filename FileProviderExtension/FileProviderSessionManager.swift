@@ -37,11 +37,14 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
     private let keychainAccessGroup: String
 
     public init(
-        appGroupIdentifier: String = "group.com.ervinpopescu.shh",
+        appGroupIdentifier: String = SharedAppGroupConfiguration.identifier,
         keychainAccessGroup: String? = nil
     ) {
         self.appGroupIdentifier = appGroupIdentifier
-        self.keychainAccessGroup = keychainAccessGroup ?? KeychainCredentialStore.defaultSharedAccessGroup ?? "group.com.ervinpopescu.shh"
+        self.keychainAccessGroup =
+            keychainAccessGroup
+            ?? KeychainCredentialStore.defaultSharedAccessGroup
+            ?? SharedAppGroupConfiguration.identifier
     }
 
     public func withRepository<T: Sendable>(
@@ -108,21 +111,14 @@ public final class LiveFileProviderRepositoryProvider: FileProviderRepositoryPro
     }
 
     private var candidateContainerURLs: [URL] {
-        var urls: [URL] = []
-        if let groupURL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
-            urls.append(groupURL)
+        guard
+            let containerURL = SharedContainerResolver(
+                groupIdentifier: appGroupIdentifier
+            ).containerURL
+        else {
+            return []
         }
-        let fallbackStorage = FileProviderStorageManager.shared.containerURL
-        if !urls.contains(fallbackStorage) {
-            urls.append(fallbackStorage)
-        }
-        if let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
-            let localURL = appSupport.appendingPathComponent("Shh", isDirectory: true)
-            if !urls.contains(localURL) {
-                urls.append(localURL)
-            }
-        }
-        return urls
+        return [containerURL]
     }
 
     private func loadSharedTrustRecords() -> [TrustRecord] {
@@ -166,16 +162,26 @@ public final class FileProviderStorageManager: @unchecked Sendable {
     public static let shared = FileProviderStorageManager()
 
     public let appGroupIdentifier: String
+    private let sharedContainerResolver: SharedContainerResolver
     private let fallbackBaseURL: URL
 
-    public init(appGroupIdentifier: String = "group.com.ervinpopescu.shh") {
+    public init(appGroupIdentifier: String = SharedAppGroupConfiguration.identifier) {
         self.appGroupIdentifier = appGroupIdentifier
-        self.fallbackBaseURL = FileManager.default.temporaryDirectory.appendingPathComponent("ShhFileProviderFallback", isDirectory: true)
-        try? FileManager.default.createDirectory(at: fallbackBaseURL, withIntermediateDirectories: true)
+        self.sharedContainerResolver = SharedContainerResolver(groupIdentifier: appGroupIdentifier)
+        self.fallbackBaseURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ShhFileProviderStaging", isDirectory: true)
+        if sharedContainerResolver.containerURL == nil {
+            try? FileManager.default.createDirectory(
+                at: fallbackBaseURL,
+                withIntermediateDirectories: true
+            )
+        }
     }
 
+    /// Staging is local when the App Group API is unavailable. Shared catalog
+    /// reads deliberately do not use this fallback on physical devices.
     public var containerURL: URL {
-        FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) ?? fallbackBaseURL
+        sharedContainerResolver.containerURL ?? fallbackBaseURL
     }
 
     public var stagingURL: URL {

@@ -72,7 +72,8 @@ extensions.
   foreground return before reconnecting.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
-  Group storage (`snapshot.json` and `known_hosts.json`).
+  Group storage (`snapshot.json` and `known_hosts.json`) via
+  `SharedContainerResolver`, maintaining an isolated simulator fallback.
 - **Vault Backup UI:** `VaultBackupView` managing encrypted backup
   export, import, preview, replace/merge restore, and security-scoped
   staging.
@@ -84,7 +85,8 @@ extensions.
   per operation and torn down promptly, preventing background connection
   leaks.
 - **Shared App Group Storage:** Loads catalog and known-host records
-  from `catalogs/snapshot.json` and `catalogs/known_hosts.json`.
+  from `catalogs/snapshot.json` and `catalogs/known_hosts.json` resolved
+  via `SharedContainerResolver`.
 - **Cache Eviction:** Bounded LRU cache for materialized files.
 
 ## CI Workflow Architecture
@@ -92,9 +94,12 @@ extensions.
 GitHub Actions runs on `macos-14` runners with:
 - Automated package resolution and test verification (`swift test`).
 - Project generation via cached XcodeGen (`xcodegen generate`).
+- App Group entitlement and build settings validation for generic iOS
+  and simulator targets.
 - Generic unsigned iOS builds for `Shh` and `ShhFileProvider`.
 - Dynamic simulator discovery selecting available iPhone and iPad
   runtimes without hardcoded identifiers.
+- Ad-hoc signed simulator test builds.
 - Bounded test execution with log capture and xcresult artifact
   upload on failure.
 - Least-privilege permissions (`contents: read`) and concurrency

@@ -49,9 +49,10 @@ public struct CatalogPersistenceReadResult: Sendable {
 
 /// Helper for managing File Provider domains and catalog persistence.
 ///
-/// The App Group is preferred, but Application Support is always maintained as
-/// a local fallback. This is important for simulator and unsigned builds where
-/// the security-scoped group URL can be unavailable.
+/// The App Group is preferred, with an explicitly isolated simulator fallback
+/// when Apple's container API is unavailable. A missing device entitlement is
+/// never represented as an App Group URL; local app-only persistence remains
+/// distinct from shared-container resolution.
 public final class FileProviderManagerHelper: @unchecked Sendable {
     public static let shared = FileProviderManagerHelper()
 
@@ -60,7 +61,7 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
     public let customLocalContainerURL: URL?
     public typealias ContainerURLResolver = @Sendable (String) -> URL?
 
-    private let containerURLResolver: ContainerURLResolver
+    private let sharedContainerResolver: SharedContainerResolver
 
     #if canImport(FileProvider)
     public typealias DomainAdder = @Sendable (NSFileProviderDomain) async throws -> Void
@@ -77,10 +78,12 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
     private let customDomainLister: DomainLister?
 
     public init(
-        appGroupIdentifier: String = "group.com.ervinpopescu.shh",
+        appGroupIdentifier: String = SharedAppGroupConfiguration.identifier,
         containerURL: URL? = nil,
         localContainerURL: URL? = nil,
         containerURLResolver: ContainerURLResolver? = nil,
+        simulatorFallbackURL: URL? = nil,
+        allowSimulatorFallback: Bool? = nil,
         domainAdder: DomainAdder? = nil,
         domainRemover: DomainRemover? = nil,
         domainLister: DomainLister? = nil
@@ -88,21 +91,38 @@ public final class FileProviderManagerHelper: @unchecked Sendable {
         self.appGroupIdentifier = appGroupIdentifier
         self.customContainerURL = containerURL
         self.customLocalContainerURL = localContainerURL
-        self.containerURLResolver = containerURLResolver ?? { identifier in
-            FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: identifier)
-        }
+        self.sharedContainerResolver = SharedContainerResolver(
+            groupIdentifier: appGroupIdentifier,
+            urlResolver: containerURLResolver,
+            simulatorFallbackURL: simulatorFallbackURL,
+            allowSimulatorFallback: allowSimulatorFallback
+        )
         self.customDomainAdder = domainAdder
         self.customDomainRemover = domainRemover
         self.customDomainLister = domainLister
     }
 
-    /// Resolved base container URL for App Group storage.
-    public var containerURL: URL? {
-        customContainerURL ?? containerURLResolver(appGroupIdentifier)
+    /// Resolved base container URL for shared-state operations.
+    public var containerURL: URL? { customContainerURL ?? sharedContainerResolver.containerURL }
+
+    /// The actual entitled App Group URL, excluding simulator fallback storage.
+    public var appGroupContainerURL: URL? {
+        customContainerURL ?? sharedContainerResolver.appGroupURL
     }
 
-    /// Whether the signed process can currently access the shared App Group.
-    public var isSharedContainerAvailable: Bool { containerURL != nil }
+    /// Resolution selected for shared-state operations.
+    public var sharedContainerResolution: SharedContainerLocation {
+        if let customContainerURL { return .appGroup(customContainerURL) }
+        return sharedContainerResolver.location
+    }
+
+    /// Whether the signed process can currently access the real shared App Group.
+    public var isSharedContainerAvailable: Bool { appGroupContainerURL != nil }
+
+    /// True when persistence is using the isolated simulator/test fallback.
+    public var isUsingSimulatorFallback: Bool {
+        customContainerURL == nil && sharedContainerResolver.isUsingSimulatorFallback
+    }
 
     /// Local Application Support storage used whenever the App Group is absent.
     public var localContainerURL: URL {
