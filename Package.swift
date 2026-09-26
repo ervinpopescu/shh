@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ShhCore",
-    platforms: [.iOS(.v17), .macOS(.v13)],
+    platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "ShhCore", targets: ["ShhCore"]),
         .library(name: "ShhSSH", targets: ["ShhSSH"]),
@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "ShhVoice", targets: ["ShhVoice"])
     ],
     dependencies: [
-        .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.7.0"),
+        .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.12.1"),
         .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.18.0"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "1.1.0")
     ],
