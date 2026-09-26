@@ -539,6 +539,116 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(mockConnection.sentData.last, bracketedPasteBytes)
     }
 
+    func testViewportResizeBeforeConnectionCompletesReachesPTY() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "Phone", hostname: "phone.invalid", username: "user")
+
+        // The terminal can already be mounted while SSH is connecting. Its measured
+        // viewport may be narrower than the initial 80-column PTY request.
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        await container.connect(to: host)
+
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(mockConnection.resizeCalls.last, TerminalSize(columns: 42, rows: 18))
+    }
+
+    func testInitialViewportGridIsUsedForPTYRequest() async throws {
+        let mockConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockConnection }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "InitialGridHost", hostname: "initial-grid.invalid", username: "user")
+
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        await container.connect(to: host)
+
+        XCTAssertEqual(transport.initialSizes.last, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.terminalController.size, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 42, rows: 18))
+    }
+
+    func testViewportResizeWhileConnectingIsReconciledBeforeSessionAttach() async throws {
+        let mockConnection = MockSSHConnection()
+        let gate = ConnectionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in
+            await gate.waitUntilReleased()
+            return mockConnection
+        }
+        let container = AppContainer(transport: transport)
+        let host = try Host(name: "ConnectingGridHost", hostname: "connecting-grid.invalid", username: "user")
+        let connecting = Task { @MainActor in
+            await container.connect(to: host)
+        }
+
+        await gate.waitForStart()
+        container.terminalController.handleResize(columns: 42, rows: 18)
+        container.terminalController.flushResize()
+        XCTAssertEqual(container.terminalController.size, TerminalSize(columns: 42, rows: 18))
+
+        await gate.release()
+        await connecting.value
+
+        XCTAssertEqual(transport.initialSizes.last, TerminalSize(columns: 80, rows: 24))
+        XCTAssertEqual(mockConnection.resizeCalls.last, TerminalSize(columns: 42, rows: 18))
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 42, rows: 18))
+    }
+
+    func testViewportResizeRaceDuringReconnectUsesLatestGrid() async throws {
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        var connections = [firstConnection, replacementConnection]
+        transport.onConnect = { _ in connections.removeFirst() }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let host = try Host(name: "ReconnectGridHost", hostname: "reconnect-grid.invalid", username: "user")
+        await container.connect(to: host)
+
+        let measuredSize = TerminalSize(columns: 51, rows: 19)
+        container.terminalController.handleResize(columns: measuredSize.columns, rows: measuredSize.rows)
+        container.terminalController.flushResize()
+        try await container.performReconnect(to: host, attempt: 1)
+
+        XCTAssertEqual(transport.initialSizes.last, measuredSize)
+        XCTAssertEqual(replacementConnection.resizeCalls.last, measuredSize)
+        XCTAssertEqual(container.terminalController.size, measuredSize)
+        XCTAssertEqual(container.activeSession?.terminalSize, measuredSize)
+    }
+
+    func testViewportResizeRaceDuringHostSwitchUsesLatestGrid() async throws {
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "first-grid.invalid" ? firstConnection : replacementConnection
+        }
+
+        let container = AppContainer(transport: transport)
+        let firstHost = try Host(name: "First Grid Host", hostname: "first-grid.invalid", username: "user")
+        let replacementHost = try Host(name: "Replacement Grid Host", hostname: "replacement-grid.invalid", username: "user")
+        await container.connect(to: firstHost)
+
+        let measuredSize = TerminalSize(columns: 57, rows: 21)
+        container.terminalController.handleResize(columns: measuredSize.columns, rows: measuredSize.rows)
+        container.terminalController.flushResize()
+        await container.connect(to: replacementHost)
+
+        XCTAssertEqual(transport.initialSizes.last, measuredSize)
+        XCTAssertEqual(replacementConnection.resizeCalls.last, measuredSize)
+        XCTAssertEqual(container.terminalController.size, measuredSize)
+        XCTAssertEqual(container.activeSession?.terminalSize, measuredSize)
+        XCTAssertEqual(container.activeSession?.hostID, replacementHost.id)
+    }
+
     func testResizeDeliveryThroughAdapterDebounce() async throws {
         let mockConnection = MockSSHConnection()
         let transport = ControllableTransport()
@@ -1253,6 +1363,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     private(set) var resizeCalls: [TerminalSize] = []
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
+    var onResize: (@Sendable (TerminalSize) async throws -> Void)?
     var onSend: (@Sendable (Data) async throws -> Void)?
 
     func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
@@ -1283,6 +1394,9 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     func resize(_ size: TerminalSize) async throws {
         lock.withLock {
             resizeCalls.append(size)
+        }
+        if let onResize {
+            try await onResize(size)
         }
     }
 
@@ -1323,12 +1437,35 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
 
 final class ControllableTransport: SSHTransport, @unchecked Sendable {
     var onConnect: (@Sendable (Host) async throws -> any SSHConnection)?
+    private(set) var initialSizes: [TerminalSize] = []
 
     func connect(host: Host, identity: IdentityDescriptor?, trustEvaluator: any HostTrustEvaluator, initialSize: TerminalSize) async throws -> any SSHConnection {
+        initialSizes.append(initialSize)
         if let onConnect {
             return try await onConnect(host)
         }
         return MockSSHConnection()
+    }
+}
+
+actor ConnectionGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+    private(set) var started = false
+
+    func waitUntilReleased() async {
+        started = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitForStart() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }
 

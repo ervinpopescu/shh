@@ -35,8 +35,8 @@ public struct ShhTerminalView: UIViewRepresentable {
         }
 
         var options = TerminalOptions.default
-        options.cols = controller.configuration.initialSize.columns
-        options.rows = controller.configuration.initialSize.rows
+        options.cols = controller.size.columns
+        options.rows = controller.size.rows
         options.scrollback = controller.configuration.scrollbackLimit
 
         let view = ShhInternalTerminalHostView(
@@ -89,6 +89,9 @@ public struct ShhTerminalView: UIViewRepresentable {
         }
 
         public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+            // SwiftTerm may invoke this callback on the main thread without
+            // running on MainActor. Always hop through the actor instead of
+            // assuming that thread affinity establishes actor isolation.
             Task { @MainActor [weak self] in
                 self?.controller?.handleResize(columns: newCols, rows: newRows)
             }
@@ -104,14 +107,8 @@ public struct ShhTerminalView: UIViewRepresentable {
 
         public func send(source: TerminalView, data: ArraySlice<UInt8>) {
             let payload = Data(data)
-            if Thread.isMainThread {
-                MainActor.assumeIsolated {
-                    controller?.handleOutput(payload)
-                }
-            } else {
-                DispatchQueue.main.async { [weak self] in
-                    self?.controller?.handleOutput(payload)
-                }
+            Task { @MainActor [weak self] in
+                self?.controller?.handleOutput(payload)
             }
         }
 
@@ -200,6 +197,12 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     func updateSizeIfNeeded() {
         setNeedsLayout()
         layoutIfNeeded()
+    }
+
+    var synchronouslyMeasuredSize: TerminalSize? {
+        updateSizeIfNeeded()
+        guard bounds.width > 0, bounds.height > 0 else { return nil }
+        return currentSize
     }
 
     // MARK: - First Responder Recovery

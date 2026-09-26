@@ -77,6 +77,34 @@ final class ShhTerminalControllerTests: XCTestCase {
         XCTAssertEqual(controller.size, TerminalSize(columns: 110, rows: 35))
     }
 
+    func testMeasuredViewportReflowsAttachedEngineAfterReset() {
+        let controller = ShhTerminalController()
+        controller.handleResize(columns: 42, rows: 18)
+        controller.reset()
+
+        final class MockEngine: TerminalEngineBridge {
+            var bracketedPasteMode = false
+            var isAlternateScreenActive = false
+            var currentSize = TerminalSize(columns: 80, rows: 24)
+            func feed(data: Data) {}
+            func feed(text: String) {}
+            func resize(size: TerminalSize) { currentSize = size }
+            func changeScrollback(_ limit: Int) {}
+            func findNext(_ term: String) -> Bool { true }
+            func findPrevious(_ term: String) -> Bool { true }
+            func searchMatchSummary(_ term: String) -> (index: Int, total: Int) { (0, 0) }
+            func clearSearch() {}
+            func selectAll() {}
+            func selectNone() {}
+            func getSelection() -> String? { nil }
+            func currentTranscript(limit: Int) -> String { "" }
+        }
+
+        let engine = MockEngine()
+        controller.attachEngine(engine, firstResponder: nil)
+        XCTAssertEqual(engine.currentSize, TerminalSize(columns: 42, rows: 18))
+    }
+
     func testFlushResizeImmediatelyInvokesCallback() {
         let config = ShhTerminalConfiguration(
             resizeDebounceInterval: 1.0,
@@ -692,12 +720,66 @@ final class ShhTerminalControllerTests: XCTestCase {
             resizeExp.fulfill()
         }
         coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        await Task.yield()
+        XCTAssertEqual(
+            controller.size,
+            TerminalSize(columns: 132, rows: 43),
+            "Viewport callback must update the controller on MainActor"
+        )
         DispatchQueue.main.async {
             controller.flushResize()
         }
 
         await fulfillment(of: [resizeExp], timeout: 1.0)
         XCTAssertEqual(reportedResize, TerminalSize(columns: 132, rows: 43))
+    }
+
+    func testResizeCallbackFromMainThreadUsesMainActorHop() async {
+        let configuration = ShhTerminalConfiguration(resizeDebounceInterval: 0)
+        let controller = ShhTerminalController(configuration: configuration)
+        let representable = ShhTerminalView(controller: controller)
+        let coordinator = representable.makeCoordinator()
+        let hostView = representable.makeUIView(coordinator: coordinator)
+        let resizeExpectation = expectation(description: "Main-thread callback delivered")
+        controller.onResize = { size in
+            XCTAssertEqual(size, TerminalSize(columns: 132, rows: 43))
+            resizeExpectation.fulfill()
+        }
+
+        // DispatchQueue.main does not establish MainActor isolation for the
+        // callback. The coordinator must hop through MainActor explicitly.
+        DispatchQueue.main.async {
+            coordinator.sizeChanged(source: hostView, newCols: 132, newRows: 43)
+        }
+
+        await fulfillment(of: [resizeExpectation], timeout: 1.0)
+        XCTAssertEqual(controller.size, TerminalSize(columns: 132, rows: 43))
+    }
+
+    func testSynchronizeViewportMeasurementPublishesMountedGrid() {
+        let controller = ShhTerminalController()
+        let representable = ShhTerminalView(controller: controller)
+        let hostingController = UIHostingController(rootView: representable)
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 400))
+        window.rootViewController = hostingController
+        window.makeKeyAndVisible()
+        hostingController.view.layoutIfNeeded()
+
+        guard let hostView = controller.persistentHostView else {
+            XCTFail("persistentHostView should be populated after hostingController layout")
+            return
+        }
+        let measuredSize = hostView.currentSize
+        XCTAssertFalse(controller.hasMeasuredViewport)
+
+        controller.synchronizeViewportMeasurement()
+
+        XCTAssertTrue(controller.hasMeasuredViewport)
+        XCTAssertEqual(controller.size, measuredSize)
+
+        controller.synchronizeViewportMeasurement()
+        XCTAssertEqual(controller.size, measuredSize)
+        window.rootViewController = nil
     }
 
     func testShhTerminalViewHostingControllerResetAndReattach() {
