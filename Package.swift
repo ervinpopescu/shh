@@ -12,7 +12,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/orlandos-nl/Citadel.git", exact: "0.7.0"),
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.18.0"),
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", exact: "1.19.0"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", exact: "1.1.0")
     ],
     targets: [

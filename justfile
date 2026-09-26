@@ -145,6 +145,7 @@ build device="iphone" udid="":
         -scheme "{{ app_scheme }}" \
         -destination "$destination" \
         -derivedDataPath "{{ derived_data }}" \
+        -skipPackagePluginValidation \
         "${signing[@]}"
 
 # Build and run the full app test scheme on one selected simulator.
@@ -164,8 +165,8 @@ test device="iphone" udid="":
     result="tmp/e2e/$(date -u +%Y%m%dT%H%M%SZ)-{{ device }}-tests-$$.xcresult"
     destination="platform=iOS Simulator,id=$target"
     xcodegen generate --spec project.yml >/dev/null
-    xcodebuild build-for-testing -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "$destination" -derivedDataPath "{{ derived_data }}" -enableCodeCoverage YES CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED="{{ signing_required }}" CODE_SIGN_IDENTITY="{{ signing_identity }}"
-    xcodebuild test-without-building -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "$destination" -derivedDataPath "{{ derived_data }}" -resultBundlePath "$result" -enableCodeCoverage YES
+    xcodebuild build-for-testing -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "$destination" -derivedDataPath "{{ derived_data }}" -skipPackagePluginValidation -enableCodeCoverage YES CODE_SIGNING_ALLOWED=YES CODE_SIGNING_REQUIRED="{{ signing_required }}" CODE_SIGN_IDENTITY="{{ signing_identity }}"
+    xcodebuild test-without-building -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "$destination" -derivedDataPath "{{ derived_data }}" -skipPackagePluginValidation -resultBundlePath "$result" -enableCodeCoverage YES
     echo "Result bundle: $result"
 
 # Run one app-test class or method, for example test=ShhAppTests/AppContainerTests.
@@ -181,7 +182,7 @@ test-focused test="ShhAppTests/AppContainerTests" device="iphone" udid="":
     mkdir -p "{{ derived_data }}" tmp/e2e
     result="tmp/e2e/$(date -u +%Y%m%dT%H%M%SZ)-focused-$$.xcresult"
     xcodegen generate --spec project.yml >/dev/null
-    xcodebuild test -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "platform=iOS Simulator,id=$target" -derivedDataPath "{{ derived_data }}" -only-testing:"$test" -resultBundlePath "$result" -enableCodeCoverage YES
+    xcodebuild test -project "{{ project }}" -scheme "{{ test_scheme }}" -destination "platform=iOS Simulator,id=$target" -derivedDataPath "{{ derived_data }}" -skipPackagePluginValidation -only-testing:"$test" -resultBundlePath "$result" -enableCodeCoverage YES
     echo "Result bundle: $result"
 
 # CI-equivalent host, generic-device, and iPhone/iPad simulator validation.
@@ -192,8 +193,8 @@ ci:
     just generate
     export DEVELOPER_DIR="{{ xcode_developer_dir }}"
     mkdir -p "{{ derived_data }}"
-    xcodebuild build -project "{{ project }}" -scheme "{{ app_scheme }}" -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
-    xcodebuild build -project "{{ project }}" -scheme ShhFileProvider -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+    xcodebuild build -project "{{ project }}" -scheme "{{ app_scheme }}" -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
+    xcodebuild build -project "{{ project }}" -scheme ShhFileProvider -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" -skipPackagePluginValidation CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
     Tests/verify-app-icon.sh "{{ derived_data }}/Build/Products/Debug-iphoneos/Shh.app"
     just test iphone
     just test ipad
