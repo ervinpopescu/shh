@@ -195,6 +195,7 @@ ci:
     xcodebuild build -project "{{ project }}" -scheme "{{ app_scheme }}" -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
     xcodebuild build -project "{{ project }}" -scheme ShhFileProvider -destination 'generic/platform=iOS' -derivedDataPath "{{ derived_data }}" CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO
     Tests/verify-app-icon.sh "{{ derived_data }}/Build/Products/Debug-iphoneos/Shh.app"
+    Tests/verify-audio-permissions.sh "{{ derived_data }}/Build/Products/Debug-iphoneos/Shh.app"
     just test iphone
     just test ipad
 
