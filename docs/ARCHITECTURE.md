@@ -44,12 +44,21 @@ extensions.
 ### 3. ShhTerminal (Rendering & Input)
 - **SwiftTerm Engine:** Native terminal view and rendering.
 - **Controller:** Alternate screen buffer coordination, debounced resize
-  handling (150ms window), and bracketed paste encoding.
+  handling (150ms window), bracketed paste encoding, and copy-mode
+  fallback signaling.
 - **Input Coordinator:** Sticky modifier state coordination
   (`TerminalInputCoordinator`) bridging accessory controls with SwiftTerm
   keyboard input, one-shot modifier consumption, exact Ctrl+Space NUL
   encoding, and passthrough safety for escape sequences, UTF-8, and
   bracketed paste.
+- **Touch Scroll Reducer & Gestures:** `TerminalScrollIntentReducer`
+  pure state machine translating touch gestures into bounded intents:
+  preserving native `UIScrollView` primary scrollback without PTY bytes
+  for local mouse-off sessions, routing enabled mouse wheel events
+  (including primary-screen tmux) through SwiftTerm's negotiated
+  protocol, quantizing alternate-screen swipes to navigation keys, and
+  requesting safe UI affordances for multiplexer copy-mode fallback
+  without CLI text injection.
 
 ### 4. ShhVoice (Local Speech Processing)
 - **WhisperKit Transcriber:** On-device CoreML Whisper model
