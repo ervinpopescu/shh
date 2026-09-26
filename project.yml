@@ -39,6 +39,11 @@ targets:
           - _ssh._tcp
         NSLocalNetworkUsageDescription: >-
           Shh discovers SSH servers on your local network.
+        NSMicrophoneUsageDescription: >-
+          Shh records only while you hold the local push-to-talk control.
+        NSSpeechRecognitionUsageDescription: >-
+          Shh uses on-device speech recognition only when selected for
+          local voice transcription.
         UILaunchScreen: {}
         NSSupportsLiveActivities: true
         CFBundleURLTypes:
@@ -66,6 +71,16 @@ targets:
         INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: >-
           Shh uses on-device speech recognition only when selected for
           local voice transcription.
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: >-
+          UIInterfaceOrientationPortrait
+          UIInterfaceOrientationPortraitUpsideDown
+          UIInterfaceOrientationLandscapeLeft
+          UIInterfaceOrientationLandscapeRight
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: >-
+          UIInterfaceOrientationPortrait
+          UIInterfaceOrientationLandscapeLeft
+          UIInterfaceOrientationLandscapeRight
+          UIInterfaceOrientationPortraitUpsideDown
   ShhCoreTests:
     type: bundle.unit-test
     platform: iOS
