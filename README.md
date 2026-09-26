@@ -1,7 +1,6 @@
 # Shh
 
-Shh is a native SwiftUI iPhone/iPad SSH client foundation targeting
-iOS/iPadOS 17+.
+Shh is a native SwiftUI iPhone/iPad SSH client targeting iOS/iPadOS 17+.
 
 ## Overview
 
@@ -11,11 +10,24 @@ management, Mosh roaming recovery, native iOS Files app integration
 via a File Provider extension, and zero-knowledge encrypted vault
 backups.
 
+## Documentation
+
+- [`AGENTS.md`](AGENTS.md) - Repository map, architecture seams, setup,
+  commands, security contracts, testing, CI, and troubleshooting for coding
+  agents.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Layer and target boundaries.
+- [`docs/PRODUCT.md`](docs/PRODUCT.md) - Implemented behavior and release
+  limitations.
+- [`docs/SECURITY.md`](docs/SECURITY.md) - Credential, transport, backup,
+  privacy, and entitlement guarantees.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) - Completed and future milestones.
+
 ## Capabilities
 
-- **Terminal & Transport:** Live Citadel/NIOSSH transport with PTY,
+- **Terminal & Transport:** Live SwiftNIO SSH transport with PTY,
   TOFU host-key verification, and SwiftTerm rendering with alternate
-  screen buffers and debounced resize handling.
+  screen buffers and debounced resize handling. Citadel is isolated to
+  the SFTP subsystem.
 - **Lifecycle & Keepalive:** Finite iOS background grace period
   keepalives for active SSH, Mosh, and forwarding sessions without
   background audio modes, with zero-delay foreground resumption via
@@ -29,6 +41,10 @@ backups.
   local SSH servers with advertised mDNS hostname and port resolution.
 - **Tunneling & Bastions:** Multi-hop ProxyJump pipeline and port
   forwarding (local, remote, and dynamic SOCKS5).
+- **Network Profiles:** Cloudflare Access tunnel resolution with optional
+  Keychain-backed client secrets and Tailscale hostname resolution with
+  configurable host-key policy. External service interoperability is not part
+  of CI.
 - **Herdr Supervision:** Workspace and pane management with structured
   agent state monitoring and output inspection.
 - **Mosh Roaming:** UDP datagram transport with automatic network
@@ -51,10 +67,11 @@ backups.
 
 ## Getting Started
 
-On macOS with [XcodeGen](https://github.com/yonaskolb/XcodeGen):
+On macOS, install [XcodeGen](https://github.com/yonaskolb/XcodeGen) and
+`just`, then generate the ignored Xcode project:
 
 ```sh
-xcodegen generate
+just generate
 open Shh.xcodeproj
 ```
 
@@ -95,8 +112,14 @@ swift test
 
 ## Platform Status & Limitations
 
-All features above are implemented and verified via automated tests on
-macOS host runners and iOS/iPadOS 17+ simulators. Physical device
-deployment, Apple Developer App Group/File Provider provisioning
-profiles, TestFlight distribution, and full Mosh SSP encryption remain
-pending future hardware releases.
+The implementation is covered by package tests, app tests, generated unsigned
+builds, and iPhone/iPad simulator tests where applicable. Optional live-host
+integration tests require a configured simulator snapshot and remote host;
+Cloudflare and Tailscale tests cover target resolution rather than external
+service login.
+
+Physical-device App Group/File Provider provisioning, hardware microphone and
+Files app validation, full Mosh SSP encryption, independent security review,
+broad interoperability testing, and TestFlight/App Store distribution remain
+unverified or incomplete. See [`docs/PRODUCT.md`](docs/PRODUCT.md) and
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for the evidence boundary.
