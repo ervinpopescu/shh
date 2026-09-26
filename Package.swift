@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "ShhCore",
-    platforms: [.iOS(.v17), .macOS(.v13)],
+    platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "ShhCore", targets: ["ShhCore"]),
         .library(name: "ShhSSH", targets: ["ShhSSH"]),
