@@ -540,6 +540,7 @@ struct HostEditorView: View {
     @State private var connectionType: HostConnectionType
     @State private var bastionHops: [BastionHopItem]
     @State private var forwardingRules: [PortForwardingRule]
+    @State private var sendImageDestination: String
     @State private var showingAddRule = false
     @State private var ruleToEdit: PortForwardingRule? = nil
     @State private var allHosts: [Host] = []
@@ -662,6 +663,7 @@ struct HostEditorView: View {
         _connectionType = State(initialValue: initialType)
         _bastionHops = State(initialValue: initialBastions.map { BastionHopItem(hostID: $0) })
         _forwardingRules = State(initialValue: existing?.forwardingRules ?? [])
+        _sendImageDestination = State(initialValue: existing?.sendImageDestination ?? "")
 
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
         _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
@@ -977,6 +979,17 @@ struct HostEditorView: View {
                     Toggle("Auto-attach last used tmux session", isOn: $autoAttachTmux)
                         .accessibilityIdentifier("host-editor-auto-attach-toggle")
                 }
+                Section("Image transfer") {
+                    TextField("Private remote directory (optional)", text: $sendImageDestination)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityIdentifier("host-editor-send-image-destination")
+                    Text(
+                        "Leave blank for /home/<username>/.shh/images. The directory is created over SFTP when needed."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
                 Section("Voice input policy") {
                     Toggle("Enable voice input", isOn: $enableVoice)
                         .accessibilityIdentifier("host-editor-voice-toggle")
@@ -1153,7 +1166,10 @@ struct HostEditorView: View {
             autoAttachTmux: autoAttachTmux,
             voicePolicy: voicePolicy,
             isProduction: isProductionHost,
-            forwardingRules: forwardingRules
+            forwardingRules: forwardingRules,
+            sendImageDestination: sendImageDestination.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty ? nil : sendImageDestination.trimmingCharacters(in: .whitespacesAndNewlines)
         )
     }
 
@@ -1199,8 +1215,29 @@ struct SessionView: View {
     @State private var pendingRiskyPaste: String?
     @State private var showPortForwarding = false
     @State private var showTelemetry = false
+    @State private var showSendImage = false
     @State private var isZenMode: Bool = false
+    @State private var isCommandDialOpen = false
+    @State private var commandDialNavigation = CommandDialNavigation()
+    @State private var commandDialTriggerDrag: DialPointerEvent?
+    @State private var pendingPinnedLiteral: String?
+    @State private var pendingDialControl: MultiplexerControlAction?
+    @State private var dialSnippets: [Snippet] = []
     private let policy = CommandPolicy()
+
+    private var isPinnedLiteralPresented: Binding<Bool> {
+        Binding(
+            get: { pendingPinnedLiteral != nil }, set: { if !$0 { pendingPinnedLiteral = nil } })
+    }
+    private var isDialControlPresented: Binding<Bool> {
+        Binding(get: { pendingDialControl != nil }, set: { if !$0 { pendingDialControl = nil } })
+    }
+    private var isBlockedCommandPresented: Binding<Bool> {
+        Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })
+    }
+    private var isRiskyPastePresented: Binding<Bool> {
+        Binding(get: { pendingRiskyPaste != nil }, set: { if !$0 { pendingRiskyPaste = nil } })
+    }
 
     private func terminalColor(_ value: TerminalColor) -> Color {
         Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
@@ -1276,14 +1313,69 @@ struct SessionView: View {
             }
 
             // Terminal Surface (Production SwiftTerm, or iPadOS Side-by-Side Split View)
-            if horizontalSizeClass == .regular && container.secondaryPaneMode != .none {
-                splitPaneArea
-            } else {
-                terminalSurfaceArea
+            ZStack(
+                alignment: container.commandDialPreferences.placement == .leading
+                    ? .bottomLeading : .bottomTrailing
+            ) {
+                if horizontalSizeClass == .regular && container.secondaryPaneMode != .none {
+                    splitPaneArea
+                } else {
+                    terminalSurfaceArea
+                }
+
+                if isCommandDialOpen {
+                    CommandDialSurface(
+                        model: commandDialModel,
+                        navigation: $commandDialNavigation,
+                        triggerDrag: commandDialTriggerDrag,
+                        placement: container.commandDialPreferences.placement,
+                        size: container.commandDialPreferences.size,
+                        hostLabel: container.activeHost?.name ?? "No host",
+                        paneLabel: "Primary terminal",
+                        connectionStatus: commandDialConnectionStatus,
+                        onAction: handleDialAction,
+                        onDismiss: dismissCommandDial,
+                        haptics: container.commandDialPreferences.hapticsEnabled
+                            ? SystemDialHaptics() : NoopDialHaptics()
+                    )
+                }
+            }
+            .overlay(
+                alignment: container.commandDialPreferences.placement == .leading
+                    ? .bottomLeading : .bottomTrailing
+            ) {
+                // The trigger lives in the accessory region below, so the closed
+                // dial never participates in terminal hit testing.
+                EmptyView()
             }
 
             // Extra-key accessory bar (always accessible above drawer)
-            TerminalAccessoryBar(controller: container.terminalController)
+            HStack(spacing: 6) {
+                if container.commandDialPreferences.placement == .leading {
+                    CommandDialTrigger(
+                        isOpen: $isCommandDialOpen,
+                        size: container.commandDialPreferences.size,
+                        placement: container.commandDialPreferences.placement,
+                        onOpen: openCommandDial,
+                        onClose: dismissCommandDial,
+                        onDrag: { commandDialTriggerDrag = $0 }
+                    )
+                    .padding(.leading, 6)
+                }
+                TerminalAccessoryBar(controller: container.terminalController)
+                if container.commandDialPreferences.placement == .trailing {
+                    CommandDialTrigger(
+                        isOpen: $isCommandDialOpen,
+                        size: container.commandDialPreferences.size,
+                        placement: container.commandDialPreferences.placement,
+                        onOpen: openCommandDial,
+                        onClose: dismissCommandDial,
+                        onDrag: { commandDialTriggerDrag = $0 }
+                    )
+                    .padding(.trailing, 6)
+                }
+            }
+            .background(Color(.systemGray6))
             Divider()
 
             // Collapsible Validated-Command Drawer
@@ -1563,16 +1655,47 @@ struct SessionView: View {
         .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
         .sheet(isPresented: $showTelemetry) { ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium]) }
-        .sheet(item: $pendingSnippet) { snippet in ApprovalSheet(command: snippet.body).environmentObject(container) }
-        .sheet(item: $pendingApproval) { request in ApprovalSheet(command: request.command).environmentObject(container) }
-        .alert("Command blocked", isPresented: Binding(get: { !blockedCommand.isEmpty }, set: { if !$0 { blockedCommand = "" } })) {
+        .sheet(isPresented: $showSendImage) {
+            SendImageView().environmentObject(container).presentationDetents([.medium, .large])
+        }
+        .sheet(item: $pendingSnippet) { snippet in
+            ApprovalSheet(command: snippet.body).environmentObject(container)
+        }
+        .sheet(item: $pendingApproval) { request in
+            ApprovalSheet(command: request.command).environmentObject(container)
+        }
+        .confirmationDialog(
+            "Review pinned text", isPresented: isPinnedLiteralPresented,
+            presenting: pendingPinnedLiteral
+        ) { literal in
+            Button("Insert Without Sending Return") {
+                pendingPinnedLiteral = nil
+                insertPinnedLiteral(literal, approved: true)
+            }
+            Button("Cancel", role: .cancel) { pendingPinnedLiteral = nil }
+        } message: { literal in
+            Text("Review this text before inserting it into the terminal: \(literal)")
+        }
+        .confirmationDialog(
+            "Confirm multiplexer control", isPresented: isDialControlPresented,
+            presenting: pendingDialControl
+        ) { control in
+            Button(control.displayName) {
+                pendingDialControl = nil
+                Task { _ = await container.executeMultiplexerControl(control, approved: true) }
+            }
+            Button("Cancel", role: .cancel) { pendingDialControl = nil }
+        } message: { _ in
+            Text("This control can change the remote multiplexer state.")
+        }
+        .alert("Command blocked", isPresented: isBlockedCommandPresented) {
             Button("OK", role: .cancel) { blockedCommand = "" }
         } message: {
             Text("This command is not permitted by the safety policy.")
         }
         .confirmationDialog(
             "Confirm Multi-Line Paste",
-            isPresented: Binding(get: { pendingRiskyPaste != nil }, set: { if !$0 { pendingRiskyPaste = nil } }),
+            isPresented: isRiskyPastePresented,
             titleVisibility: .visible
         ) {
             Button("Paste Anyway", role: .destructive) {
@@ -1614,6 +1737,20 @@ struct SessionView: View {
             container.terminalController.onRiskyPasteRequested = { text in
                 pendingRiskyPaste = text
             }
+        }
+        .task {
+            dialSnippets = (try? await container.catalog.snippets()) ?? []
+        }
+        .onChange(of: isCommandDialOpen) { _, open in
+            if !open { commandDialNavigation.dismiss() }
+        }
+        .onChange(of: container.activeSession?.id) { _, _ in
+            isCommandDialOpen = false
+            commandDialNavigation.dismiss()
+        }
+        .onDisappear {
+            isCommandDialOpen = false
+            commandDialNavigation.dismiss()
         }
     }
 
@@ -2052,6 +2189,134 @@ struct SessionView: View {
             }
         }
         .background(Color(.systemBackground))
+    }
+
+    private var commandDialConnectionStatus: String {
+        if container.sendImageState.isActive { return "Uploading image" }
+        if container.reconnectState.isReconnecting { return "Reconnecting" }
+        switch container.activeSession?.state {
+        case .connecting: return "Connecting"
+        case .connected: return "Connected"
+        case .disconnected, .failed, .none: return "Disconnected"
+        }
+    }
+
+    private var commandDialModel: CommandDialModel {
+        let descriptors = dialSnippets.map { snippet in
+            let availability: DialActionAvailability
+            switch policy.classify(snippet.body) {
+            case .safe: availability = .available
+            case .reviewRequired: availability = .reviewRequired
+            case .blocked: availability = .blocked(reason: "Safety policy")
+            }
+            return DialSnippetDescriptor(
+                id: snippet.id, name: snippet.name,
+                preview: String(snippet.body.prefix(72)), availability: availability)
+        }
+        return CommandDialModel(
+            pinnedLiterals: container.commandDialPreferences.pinnedLiterals,
+            snippets: descriptors,
+            connected: container.activeSession?.state == .connected,
+            pinnedCategories: container.commandDialPreferences.pinnedCategories,
+            multiplexerChildren: commandDialMultiplexerNodes
+        )
+    }
+
+    private var commandDialMultiplexerNodes: [DialNode] {
+        guard container.activeSession?.state == .connected else { return [] }
+        var nodes: [DialNode] = []
+        let tmuxRawID =
+            container.activeTmuxSessionID.flatMap { raw in
+                (try? TmuxSessionID(raw))?.value
+                    ?? container.tmuxSessions.first(where: { $0.name == raw || $0.sessionID == raw }
+                    )?.sessionID
+            } ?? container.tmuxSessions.first?.sessionID
+        if let tmuxRawID, let sessionID = try? TmuxSessionID(tmuxRawID),
+            container.tmuxAvailability.isAvailable
+        {
+            nodes += CommandDialMultiplexerMenu.nodes(tmuxSessionID: sessionID, capabilities: .tmux)
+        }
+        if container.herdrAvailability.isAvailable {
+            nodes += CommandDialMultiplexerMenu.nodes(
+                tmuxSessionID: nil, herdrWorkspaceID: container.activeHerdrWorkspaceID,
+                capabilities: .herdr
+            )
+        }
+        return nodes
+    }
+
+    private func openCommandDial() {
+        commandDialNavigation.open()
+        if container.commandDialPreferences.hapticsEnabled { SystemDialHaptics().emit(.open) }
+    }
+
+    private func dismissCommandDial() {
+        isCommandDialOpen = false
+        commandDialNavigation.dismiss()
+        commandDialTriggerDrag = nil
+    }
+
+    private func handleDialAction(_ action: DialActionIdentifier) {
+        switch action {
+        case .commonKey(let key):
+            sendDialCommonKey(key)
+            commandDialNavigation.clearSelection()
+        case .pinnedLiteral(let literal):
+            switch policy.classify(literal) {
+            case .safe: insertPinnedLiteral(literal)
+            case .reviewRequired: pendingPinnedLiteral = literal
+            case .blocked: blockedCommand = literal
+            }
+            commandDialNavigation.clearSelection()
+        case .snippet(let id):
+            guard let snippet = dialSnippets.first(where: { $0.id == id }) else { return }
+            submit(snippet.body)
+            dismissCommandDial()
+        case .voice:
+            container.resetVoiceState()
+            dismissCommandDial()
+            showVoice = true
+        case .keyboard:
+            dismissCommandDial()
+            container.terminalController.recoverFirstResponder()
+        case .multiplexer:
+            dismissCommandDial()
+            showMultiplexer = true
+        case .multiplexerControl(let control):
+            if control.requiresConfirmation {
+                pendingDialControl = control
+            } else {
+                Task { _ = await container.executeMultiplexerControl(control) }
+            }
+            commandDialNavigation.clearSelection()
+        case .sendImage:
+            dismissCommandDial()
+            showSendImage = true
+        case .category:
+            break
+        }
+    }
+
+    private func insertPinnedLiteral(_ literal: String, approved: Bool = false) {
+        guard CommandDialModel.isInsertOnlyTerminalText(literal),
+            policy.classify(literal) != .blocked
+        else { return }
+        Task { _ = await container.sendPinnedLiteral(literal, approved: approved) }
+    }
+
+    private func sendDialCommonKey(_ key: DialCommonKey) {
+        switch key {
+        case .escape: container.terminalController.send(key: .escape)
+        case .tab: container.terminalController.send(key: .tab())
+        case .shiftTab: container.terminalController.send(key: .tab(shift: true))
+        case .arrowUp: container.terminalController.send(key: .arrow(.up))
+        case .arrowDown: container.terminalController.send(key: .arrow(.down))
+        case .arrowLeft: container.terminalController.send(key: .arrow(.left))
+        case .arrowRight: container.terminalController.send(key: .arrow(.right))
+        case .controlC: container.terminalController.send(key: .ctrlC)
+        case .controlD: container.terminalController.send(key: .ctrlD)
+        case .enter: container.terminalController.send(raw: Data([0x0D]))
+        }
     }
 
     private func handlePasteFromClipboard() {
@@ -3759,6 +4024,25 @@ struct TerminalThemePreview: View {
 
 struct SettingsView: View {
     @EnvironmentObject private var container: AppContainer
+    @State private var newDialLiteral = ""
+
+    private func categoryBinding(_ category: DialCategory) -> Binding<Bool> {
+        Binding(
+            get: { container.commandDialPreferences.pinnedCategories.contains(category) },
+            set: { _ in container.toggleDialCategory(category) }
+        )
+    }
+
+    private func addDialLiteral() {
+        let value = newDialLiteral.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        var preferences = container.commandDialPreferences
+        preferences.pinnedLiterals = CommandDialModel.validPinnedLiterals(
+            preferences.pinnedLiterals + [value])
+        container.setCommandDialPreferences(preferences)
+        newDialLiteral = ""
+    }
+
     var body: some View {
         Form {
             Section("Terminal Preferences") {
@@ -3776,11 +4060,88 @@ struct SettingsView: View {
                 }
                 .accessibilityIdentifier("settings-keep-screen-awake-toggle")
             }
+            Section("Command Dial") {
+                Picker(
+                    "Placement",
+                    selection: Binding(
+                        get: { container.commandDialPreferences.placement },
+                        set: { value in
+                            var preferences = container.commandDialPreferences
+                            preferences.placement = value
+                            container.setCommandDialPreferences(preferences)
+                        }
+                    )
+                ) {
+                    ForEach(CommandDialPlacement.allCases) { placement in
+                        Text(placement.title).tag(placement)
+                    }
+                }
+                .accessibilityIdentifier("settings-command-dial-placement")
+
+                Picker(
+                    "Size",
+                    selection: Binding(
+                        get: { container.commandDialPreferences.size },
+                        set: { value in
+                            var preferences = container.commandDialPreferences
+                            preferences.size = value
+                            container.setCommandDialPreferences(preferences)
+                        }
+                    )
+                ) {
+                    ForEach(CommandDialSize.allCases) { size in Text(size.title).tag(size) }
+                }
+                .accessibilityIdentifier("settings-command-dial-size")
+
+                Toggle(
+                    "Haptic feedback",
+                    isOn: Binding(
+                        get: { container.commandDialPreferences.hapticsEnabled },
+                        set: { value in
+                            var preferences = container.commandDialPreferences
+                            preferences.hapticsEnabled = value
+                            container.setCommandDialPreferences(preferences)
+                        }
+                    )
+                )
+                .accessibilityIdentifier("settings-command-dial-haptics")
+
+                ForEach(DialCategory.allCases) { category in
+                    Toggle(category.title, isOn: categoryBinding(category))
+                }
+
+                HStack {
+                    TextField("Pinned literal", text: $newDialLiteral)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                    Button("Add", action: addDialLiteral)
+                        .disabled(
+                            newDialLiteral.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                if !container.commandDialPreferences.pinnedLiterals.isEmpty {
+                    ForEach(container.commandDialPreferences.pinnedLiterals, id: \.self) {
+                        literal in
+                        HStack {
+                            Text(literal).font(.system(.body, design: .monospaced))
+                            Spacer()
+                            Button("Remove", role: .destructive) {
+                                var preferences = container.commandDialPreferences
+                                preferences.pinnedLiterals.removeAll { $0 == literal }
+                                container.setCommandDialPreferences(preferences)
+                            }
+                            .font(.caption)
+                        }
+                    }
+                }
+            }
             Section("Appearance") {
-                Picker("Appearance", selection: Binding(
-                    get: { container.appearance },
-                    set: { container.setAppearance($0) }
-                )) {
+                Picker(
+                    "Appearance",
+                    selection: Binding(
+                        get: { container.appearance },
+                        set: { container.setAppearance($0) }
+                    )
+                ) {
                     ForEach(AppearanceSetting.allCases) { appearance in
                         Text(appearance.displayName).tag(appearance)
                     }

@@ -367,6 +367,17 @@ final class SFTPModelTests: XCTestCase {
         let remoteData = try await repo.readFile(at: remoteUploadPath)
         XCTAssertEqual(remoteData, uploadPayload)
         XCTAssertGreaterThan(uploadProgressCalls.value, 0)
+
+        // Upload with restricted permissions
+        let restrictedUploadPath = RemotePath("/home/dev/upload_restricted.txt")
+        let restrictedPerms = PosixPermissions(rawValue: 0o600)
+        try await repo.upload(
+            from: localUploadURL,
+            to: restrictedUploadPath,
+            permissions: restrictedPerms
+        )
+        let restrictedAttrs = try await repo.fetchAttributes(at: restrictedUploadPath)
+        XCTAssertEqual(restrictedAttrs.permissions?.rawValue, 0o600)
     }
 
     // MARK: - 8. DemoSFTPRepository Directory CRUD & Error Mapping
