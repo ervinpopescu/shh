@@ -73,6 +73,7 @@ jobs:
             -scheme Shh \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO
@@ -82,6 +83,7 @@ jobs:
             -scheme ShhFileProvider \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO
@@ -91,6 +93,7 @@ jobs:
             -scheme ShhAppTests \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGNING_REQUIRED=NO
