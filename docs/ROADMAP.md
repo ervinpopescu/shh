@@ -38,20 +38,25 @@
     zero-knowledge encrypted vault backup (`.shhbackup` AES-GCM +
     PBKDF2), privacy manifest audit, GitHub Actions CI workflow, and
     simulator test suites.
+11. **Live Activities (Lock Screen & Dynamic Island):** Privacy-safe
+    WidgetKit Live Activity tracking truthful SSH session status
+    (connected, reconnecting, failed, disconnected) with reconnection
+    progress, sanitized endpoint metadata, and clear background
+    execution and credential isolation boundaries.
 
 ## Future Milestones (Physical Device & Distribution)
 
-11. **Physical Device & Provisioning:** Apple Developer portal App Group
+12. **Physical Device & Provisioning:** Apple Developer portal App Group
     and File Provider entitlement provisioning, device Keychain smoke
     testing, and physical microphone validation.
-12. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
+13. **Full Mosh SSP:** Complete State Synchronization Protocol (SSP)
     cryptographic packet encryption and speculative local echo (independent
     of the completed SSH transport).
-13. **Independent Audit & Interoperability Expansion:** Third-party
+14. **Independent Audit & Interoperability Expansion:** Third-party
     cryptographic security audit and broad physical-device compatibility
     matrix expansion (current validation covers unit, integration, and
     live-host simulator suites).
-14. **TestFlight Beta & App Store:** Build automation, TestFlight
+15. **TestFlight Beta & App Store:** Build automation, TestFlight
     internal and external beta testing, App Store Connect metadata, and
     EAR Category 5 Part 2 export compliance self-classification filing
     (ECCN 5D992.c).

@@ -61,15 +61,18 @@ extensions.
 
 ### 5. App (SwiftUI & Application Coordination)
 - **`AppContainer`:** `@MainActor` state coordinator binding UI scenes
-  with transport, catalog, audio, forwarding, and trust stores.
-  Reconciles catalog identity references on mutation and persistence
-  load, resolving exact identities without silent degradation, and
-  managing reference-counted Keychain credential deletion.
+  with transport, catalog, audio, forwarding, trust stores, and Live
+  Activities. Reconciles catalog identity references on mutation and
+  persistence load, resolving exact identities without silent degradation,
+  and managing reference-counted Keychain credential deletion.
   Coordinates finite iOS background execution grace periods via
   standard UIKit background tasks (`BackgroundTaskManaging`),
   preserving active SSH, Mosh, and port forwarding sessions without
   background audio modes, and probes transport responsiveness on
   foreground return before reconnecting.
+- **Live Activity Manager:** `SSHSessionLiveActivityManager` coordinating
+  ActivityKit lifecycle events from session and reconnect transitions,
+  enforcing single-activity invariants, and sanitizing endpoint labels.
 - **File Provider Manager:** `FileProviderManagerHelper` coordinating
   domain registration, unregistration, and atomic updates to shared App
   Group storage (`snapshot.json` and `known_hosts.json`).
@@ -87,12 +90,24 @@ extensions.
   from `catalogs/snapshot.json` and `catalogs/known_hosts.json`.
 - **Cache Eviction:** Bounded LRU cache for materialized files.
 
+### 7. ShhLiveActivity (App Extension)
+- **`ShhLiveActivityWidget`:** WidgetKit Live Activity rendering
+  truthful SSH session status (`connected`, `reconnecting`, `failed`,
+  `disconnected`) and reconnect progress across Lock Screen and Dynamic
+  Island presentations (expanded, compact, minimal).
+- **Privacy & Lifecycle Isolation:** Driven by sanitized
+  `ShhSSHSessionActivityAttributes` and minimal `ContentState`. Operates
+  strictly as an ambient status surface; does not alter or extend
+  background socket lifetime, and never ingests or displays command
+  buffers, credentials, or terminal contents.
+
 ## CI Workflow Architecture
 
 GitHub Actions runs on `macos-14` runners with:
 - Automated package resolution and test verification (`swift test`).
 - Project generation via cached XcodeGen (`xcodegen generate`).
-- Generic unsigned iOS builds for `Shh` and `ShhFileProvider`.
+- Generic unsigned iOS builds for `Shh` (including `ShhLiveActivity`)
+  and `ShhFileProvider`.
 - Dynamic simulator discovery selecting available iPhone and iPad
   runtimes without hardcoded identifiers.
 - Bounded test execution with log capture and xcresult artifact

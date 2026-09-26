@@ -568,4 +568,44 @@ final class SSHExecIntegrationTests: XCTestCase {
             "Foreground recovery must not hang on a black-holed SSH response"
         )
     }
+
+    func testKeepaliveTimeoutPublishesUnhealthyTransportEvent() async throws {
+        let server = SSHTestServer()
+        server.suppressTCPForwardingResponses = true
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            keepaliveInterval: 0.01,
+            keepaliveTimeout: 0.1
+        )
+        addTeardownBlock { await connection.close() }
+        let events = await connection.events()
+        let observedError = AtomicBox<TransportError?>(nil)
+        let eventTask = Task {
+            do {
+                for try await event in events {
+                    if case .error(let error) = event {
+                        observedError.set(error)
+                        return
+                    }
+                }
+            } catch {
+                if let transportError = error as? TransportError {
+                    observedError.set(transportError)
+                }
+            }
+        }
+
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await connection.close()
+        _ = await eventTask.result
+
+        XCTAssertEqual(
+            observedError.get(),
+            .timeout,
+            "A black-holed keepalive must publish an unhealthy transport event"
+        )
+    }
 }

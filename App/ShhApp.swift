@@ -93,6 +93,13 @@ struct RootView: View {
         }
         .hostKeyApprovalAlert(container: container)
         .appDynamicTypeRange()
+        .onOpenURL { url in
+            guard let sessionID = LiveActivityDeepLink.sessionID(from: url) else { return }
+            Task { @MainActor in
+                guard await container.openLiveActivitySession(sessionID: sessionID) else { return }
+                section = .sessions
+            }
+        }
     }
 }
 
@@ -3849,6 +3856,11 @@ struct SettingsView: View {
             Section("Capabilities") {
                 Text("Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, and encrypted vault backup active. On-device WhisperKit and Apple Speech voice active. Full Mosh SSP encryption and physical device TestFlight validation pending.")
                     .font(.caption)
+            }
+            Section("Live Activities") {
+                Text("Live Activities display connection status on the Lock Screen and Dynamic Island. They do not extend background socket execution and never expose commands or credentials.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             Section("Privacy") {
                 Text("Zero transcript analytics. All speech processing is 100% on-device. Audio files are deleted immediately after transcription.")

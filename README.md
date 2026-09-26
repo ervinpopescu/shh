@@ -7,9 +7,9 @@ iOS/iPadOS 17+.
 
 Shh provides an adaptive terminal client, multiplexer integration,
 on-device voice transcription, multi-hop port forwarding, Herdr agent
-management, Mosh roaming recovery, native iOS Files app integration
-via a File Provider extension, and zero-knowledge encrypted vault
-backups.
+management, Mosh roaming recovery, Lock Screen and Dynamic Island Live
+Activities, native iOS Files app integration via a File Provider
+extension, and zero-knowledge encrypted vault backups.
 
 ## Capabilities
 
@@ -35,6 +35,11 @@ backups.
   roaming recovery and session resumption. Full Mosh State
   Synchronization Protocol (SSP) payload encryption and speculative echo
   remain pending.
+- **Live Activities:** Privacy-safe WidgetKit Live Activity displaying
+  truthful SSH session status on the Lock Screen and Dynamic Island
+  (connected, reconnecting, failed, and disconnected) with reconnection
+  progress. Operates as an ambient status surface, does not extend
+  background socket execution, and never exposes commands or credentials.
 - **File Provider Extension:** Exposes remote SFTP directories directly
   in the iOS Files app via an `NSFileProviderReplicatedExtension`.
   Atomic synchronization of catalog snapshot and trusted host keys.
