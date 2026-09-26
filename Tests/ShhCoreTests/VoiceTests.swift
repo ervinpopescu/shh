@@ -46,7 +46,11 @@ final class VoiceTests: XCTestCase {
         var textToReturn: String = "echo hello"
         var errorToThrow: Error?
         var delaySeconds: TimeInterval = 0
+        var holdAfterProgress = false
         var recordedFractions: [Double] = []
+        var progressValue: Double?
+        var progressWaiters: [CheckedContinuation<Double, Never>] = []
+        var releaseContinuation: CheckedContinuation<Void, Never>?
 
         func setTextToReturn(_ text: String) {
             self.textToReturn = text
@@ -60,6 +64,29 @@ final class VoiceTests: XCTestCase {
             self.delaySeconds = delay
         }
 
+        func setHoldAfterProgress(_ hold: Bool) {
+            self.holdAfterProgress = hold
+        }
+
+        func waitForProgress() async -> Double {
+            if let progressValue { return progressValue }
+            return await withCheckedContinuation { continuation in
+                progressWaiters.append(continuation)
+            }
+        }
+
+        func releaseHeldTranscription() {
+            releaseContinuation?.resume()
+            releaseContinuation = nil
+        }
+
+        private func recordProgress(_ value: Double) {
+            progressValue = value
+            let waiters = progressWaiters
+            progressWaiters.removeAll()
+            waiters.forEach { $0.resume(returning: value) }
+        }
+
         func transcribe(
             recording: AudioRecordingHandle,
             progress: (@Sendable (Double) -> Void)?
@@ -69,7 +96,13 @@ final class VoiceTests: XCTestCase {
             }
             if let errorToThrow { throw errorToThrow }
             progress?(0.5)
+            recordProgress(0.5)
             recordedFractions.append(0.5)
+            if holdAfterProgress {
+                await withCheckedContinuation { continuation in
+                    releaseContinuation = continuation
+                }
+            }
             progress?(1.0)
             recordedFractions.append(1.0)
             return textToReturn
@@ -169,6 +202,38 @@ final class VoiceTests: XCTestCase {
 
         providerState = .failed(.modelUnavailable)
         XCTAssertFalse(providerState.isReady)
+    }
+
+    func testVoiceSessionCoordinatorPublishesTranscriptionProgress() async throws {
+        let recorder = MockAudioRecorder()
+        let transcriber = MockTranscriber()
+        await transcriber.setHoldAfterProgress(true)
+        let coordinator = VoiceSessionCoordinator(recorder: recorder, transcriber: transcriber)
+        let host = try Host(
+            name: "ProgressBox", hostname: "progress.invalid", username: "dev", voicePolicy: .enabled
+        )
+
+        try await coordinator.startRecording(host: host, mode: .shellCommand)
+        let transcriptionTask = Task {
+            try await coordinator.stopRecordingAndTranscribe(host: host, mode: .shellCommand)
+        }
+        defer {
+            Task { await transcriber.releaseHeldTranscription() }
+        }
+
+        let emittedProgress = await transcriber.waitForProgress()
+        XCTAssertEqual(emittedProgress, 0.5)
+
+        var progressState = await coordinator.state
+        for _ in 0..<1000 {
+            if case .transcribingWithProgress = progressState { break }
+            await Task.yield()
+            progressState = await coordinator.state
+        }
+        XCTAssertEqual(progressState, .transcribingWithProgress(fractionCompleted: 0.5))
+
+        await transcriber.releaseHeldTranscription()
+        _ = try await transcriptionTask.value
     }
 
     func testVoiceSessionCoordinatorHappyPathLifecycle() async throws {
