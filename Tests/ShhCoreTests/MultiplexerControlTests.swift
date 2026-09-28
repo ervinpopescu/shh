@@ -357,7 +357,6 @@ final class MultiplexerControlTests: XCTestCase {
         let recorder = Recorder()
         let session = try TmuxSessionID("$4")
         let targetTTY = try TmuxClientTTY("/dev/pts/3")
-        let anotherTTY = try TmuxClientTTY("/dev/pts/4")
 
         let matchExecutor = Executor(
             recorder: recorder,
