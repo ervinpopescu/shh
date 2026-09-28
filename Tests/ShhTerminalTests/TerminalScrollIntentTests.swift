@@ -1,6 +1,16 @@
 import XCTest
 @testable import ShhTerminal
 
+private final class TerminalOutputSink {
+    var data = Data()
+    var expectation: XCTestExpectation?
+
+    func receive(_ data: Data) {
+        self.data.append(data)
+        expectation?.fulfill()
+    }
+}
+
 final class TerminalScrollIntentTests: XCTestCase {
     func testPrimaryScrollbackNeverProducesPTYIntent() {
         var reducer = TerminalScrollIntentReducer()
@@ -244,7 +254,7 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
-    func testHostViewMouseModeTranslatesSwipesToWheelEvents() {
+    func testHostViewMouseModeTranslatesSwipesToWheelEvents() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
             frame: CGRect(x: 0, y: 0, width: 393, height: 852),
@@ -268,8 +278,8 @@ extension TerminalScrollIntentTests {
 
         XCTAssertTrue(hostView.gestureRecognizerShouldBegin(hostView.scrollGesture))
 
-        var ptyOutput = Data()
-        controller.onOutput = { ptyOutput.append($0) }
+        let output = TerminalOutputSink()
+        controller.onOutput = { output.receive($0) }
 
         // A physical upward swipe has negative translation and reports wheel-up.
         hostView.processScrollGesture(
@@ -277,11 +287,15 @@ extension TerminalScrollIntentTests {
             translationY: 0,
             location: CGPoint(x: 100, y: 100)
         )
+        let wheelUp = expectation(description: "wheel-up output")
+        output.expectation = wheelUp
         hostView.processScrollGesture(
             phase: .changed,
             translationY: -50,
             location: CGPoint(x: 100, y: 100)
         )
+        await fulfillment(of: [wheelUp], timeout: 1)
+        output.expectation = nil
 
         let terminal = hostView.getTerminal()
         let columnWidth = max(1, hostView.bounds.width / CGFloat(max(1, terminal.cols)))
@@ -289,23 +303,27 @@ extension TerminalScrollIntentTests {
         let column = Int(floor(100 / columnWidth)) + 1
         let row = Int(floor(100 / rowHeight)) + 1
         XCTAssertEqual(
-            Array(ptyOutput),
+            Array(output.data),
             Array("\u{1b}[<64;\(column);\(row)M".utf8),
             "One touch update must emit exactly one SGR wheel-up event"
         )
 
-        ptyOutput.removeAll()
+        output.data.removeAll()
         hostView.processScrollGesture(phase: .ended, translationY: 0)
 
         // A separate physical downward swipe reports one wheel-down event.
         hostView.processScrollGesture(phase: .began, translationY: 0, location: CGPoint(x: 100, y: 100))
+        let wheelDown = expectation(description: "wheel-down output")
+        output.expectation = wheelDown
         hostView.processScrollGesture(
             phase: .changed,
             translationY: 50,
             location: CGPoint(x: 100, y: 100)
         )
+        await fulfillment(of: [wheelDown], timeout: 1)
+        output.expectation = nil
         XCTAssertEqual(
-            Array(ptyOutput),
+            Array(output.data),
             Array("\u{1b}[<65;\(column);\(row)M".utf8),
             "One touch update must emit exactly one SGR wheel-down event"
         )
@@ -314,7 +332,7 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
-    func testHostViewPrimaryTmuxMouseReportingRoutesWheelEvents() {
+    func testHostViewPrimaryTmuxMouseReportingRoutesWheelEvents() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
             frame: CGRect(x: 0, y: 0, width: 393, height: 852),
@@ -343,25 +361,33 @@ extension TerminalScrollIntentTests {
         )
         XCTAssertTrue(hostView.allowMouseReporting, "Mouse reporting stays enabled until the wheel gesture begins")
 
-        var ptyOutput = Data()
+        let output = TerminalOutputSink()
         var fallbackRequested = false
-        controller.onOutput = { ptyOutput.append($0) }
+        controller.onOutput = { output.receive($0) }
         controller.onCopyModeFallbackRequested = { fallbackRequested = true }
 
         hostView.processScrollGesture(phase: .began, translationY: 0, location: CGPoint(x: 0, y: 0))
         XCTAssertFalse(hostView.allowMouseReporting, "SwiftTerm's drag reporter must be suppressed during touch-wheel routing")
+        let wheelUp = expectation(description: "tmux wheel-up output")
+        output.expectation = wheelUp
         hostView.processScrollGesture(phase: .changed, translationY: -50, location: CGPoint(x: 0, y: 0))
-        let upOutput = String(decoding: ptyOutput, as: UTF8.self)
+        await fulfillment(of: [wheelUp], timeout: 1)
+        output.expectation = nil
+        let upOutput = String(decoding: output.data, as: UTF8.self)
         XCTAssertTrue(upOutput.contains("\u{1b}[<64;1;1M"), "Expected tmux wheel-up event: \(upOutput)")
 
-        ptyOutput.removeAll()
+        output.data.removeAll()
+        let wheelDown = expectation(description: "tmux wheel-down output")
+        output.expectation = wheelDown
         hostView.processScrollGesture(phase: .changed, translationY: 50, location: CGPoint(x: 0, y: 0))
-        let downOutput = String(decoding: ptyOutput, as: UTF8.self)
+        await fulfillment(of: [wheelDown], timeout: 1)
+        output.expectation = nil
+        let downOutput = String(decoding: output.data, as: UTF8.self)
         XCTAssertTrue(downOutput.contains("\u{1b}[<65;1;1M"), "Expected tmux wheel-down event: \(downOutput)")
 
         hostView.processScrollGesture(phase: .ended, translationY: 0)
         XCTAssertTrue(hostView.allowMouseReporting)
-        XCTAssertTrue(ptyOutput.count > 0)
+        XCTAssertTrue(output.data.count > 0)
         XCTAssertFalse(fallbackRequested, "Primary tmux scrolling must not enter copy mode")
 
         controller.copyModeFallbackEnabled = false
@@ -371,7 +397,7 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
-    func testHostViewPrimaryTmuxLegacyMouseReportingUsesLegacyWheelEncoding() {
+    func testHostViewPrimaryTmuxLegacyMouseReportingUsesLegacyWheelEncoding() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
             frame: CGRect(x: 0, y: 0, width: 393, height: 852),
@@ -391,22 +417,26 @@ extension TerminalScrollIntentTests {
 
         // Keep tracking enabled but explicitly select the legacy X10 protocol.
         hostView.feed(text: "\u{1b}[?1000h\u{1b}[?1006l")
-        var ptyOutput = Data()
-        controller.onOutput = { ptyOutput.append($0) }
+        let output = TerminalOutputSink()
+        controller.onOutput = { output.receive($0) }
 
         hostView.processScrollGesture(
             phase: .began,
             translationY: 0,
             location: CGPoint(x: 0, y: 0)
         )
+        let wheelUp = expectation(description: "legacy wheel-up output")
+        output.expectation = wheelUp
         hostView.processScrollGesture(
             phase: .changed,
             translationY: -50,
             location: CGPoint(x: 0, y: 0)
         )
+        await fulfillment(of: [wheelUp], timeout: 1)
+        output.expectation = nil
 
         XCTAssertEqual(
-            Array(ptyOutput),
+            Array(output.data),
             [0x1b, 0x5b, 0x4d, 0x60, 0x21, 0x21],
             "Legacy wheel-up must use button 4 and 1-based coordinates"
         )
@@ -414,7 +444,7 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
-    func testHostViewAlternateScreenQuantizesNavigationKeys() {
+    func testHostViewAlternateScreenQuantizesNavigationKeys() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
             frame: CGRect(x: 0, y: 0, width: 393, height: 852),
@@ -438,20 +468,28 @@ extension TerminalScrollIntentTests {
 
         XCTAssertTrue(hostView.gestureRecognizerShouldBegin(hostView.scrollGesture))
 
-        var ptyOutput = Data()
-        controller.onOutput = { ptyOutput.append($0) }
+        let output = TerminalOutputSink()
+        controller.onOutput = { output.receive($0) }
 
         // Physical swipe up in alternate buffer -> arrow up
         hostView.processScrollGesture(phase: .began, translationY: 0)
+        let arrowUp = expectation(description: "alternate-screen arrow-up output")
+        output.expectation = arrowUp
         hostView.processScrollGesture(phase: .changed, translationY: -30)
+        await fulfillment(of: [arrowUp], timeout: 1)
+        output.expectation = nil
 
-        let receivedUp = String(decoding: ptyOutput, as: UTF8.self)
+        let receivedUp = String(decoding: output.data, as: UTF8.self)
         XCTAssertTrue(receivedUp.contains("\u{1b}[A") || receivedUp.contains("\u{1b}OA"), "Expected arrow up sequence: \(receivedUp)")
 
-        ptyOutput.removeAll()
+        output.data.removeAll()
         // High velocity physical swipe up -> page up
+        let pageUp = expectation(description: "alternate-screen page-up output")
+        output.expectation = pageUp
         hostView.processScrollGesture(phase: .changed, translationY: -100, velocityY: -3000)
-        let receivedPageDown = String(decoding: ptyOutput, as: UTF8.self)
+        await fulfillment(of: [pageUp], timeout: 1)
+        output.expectation = nil
+        let receivedPageDown = String(decoding: output.data, as: UTF8.self)
         XCTAssertTrue(receivedPageDown.contains("\u{1b}[5~"), "Expected page up sequence: \(receivedPageDown)")
 
         hostView.processScrollGesture(phase: .ended, translationY: 0)
@@ -505,7 +543,7 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
-    func testHostViewTmuxFallbackWithoutRegisteredHandlerEmitsNavigationKeysAndNeverSwallowsScrolling() {
+    func testHostViewTmuxFallbackWithoutRegisteredHandlerEmitsNavigationKeysAndNeverSwallowsScrolling() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
             frame: CGRect(x: 0, y: 0, width: 393, height: 852),
@@ -531,23 +569,31 @@ extension TerminalScrollIntentTests {
         hostView.feed(text: "\u{1b}[?1049h")
         hostView.feed(text: "[tmux 0:bash*] dev@server:~$\r\n")
 
-        var ptyOutput = Data()
-        controller.onOutput = { ptyOutput.append($0) }
+        let output = TerminalOutputSink()
+        controller.onOutput = { output.receive($0) }
 
         // 1. Began phase
         hostView.processScrollGesture(phase: .began, translationY: 0)
-        XCTAssertTrue(ptyOutput.isEmpty, "Began phase must not send bytes to PTY")
+        XCTAssertTrue(output.data.isEmpty, "Began phase must not send bytes to PTY")
 
         // 2. Changed phase with physical swipe up -> arrow up
+        let arrowUp = expectation(description: "fallback arrow-up output")
+        output.expectation = arrowUp
         hostView.processScrollGesture(phase: .changed, translationY: -30)
-        let receivedUp = String(decoding: ptyOutput, as: UTF8.self)
+        await fulfillment(of: [arrowUp], timeout: 1)
+        output.expectation = nil
+        let receivedUp = String(decoding: output.data, as: UTF8.self)
         XCTAssertFalse(receivedUp.isEmpty, "Touch scrolling must never be swallowed when copy mode fallback handler is unwired")
         XCTAssertTrue(receivedUp.contains("\u{1b}[A") || receivedUp.contains("\u{1b}OA"), "Expected arrow up sequence: \(receivedUp)")
 
-        ptyOutput.removeAll()
+        output.data.removeAll()
         // 3. Changed phase with high velocity physical swipe up -> page up
+        let pageUp = expectation(description: "fallback page-up output")
+        output.expectation = pageUp
         hostView.processScrollGesture(phase: .changed, translationY: -100, velocityY: -3000)
-        let receivedPageDown = String(decoding: ptyOutput, as: UTF8.self)
+        await fulfillment(of: [pageUp], timeout: 1)
+        output.expectation = nil
+        let receivedPageDown = String(decoding: output.data, as: UTF8.self)
         XCTAssertFalse(receivedPageDown.isEmpty, "Touch scrolling must emit page navigation keys")
         XCTAssertTrue(receivedPageDown.contains("\u{1b}[5~"), "Expected page up sequence: \(receivedPageDown)")
 
