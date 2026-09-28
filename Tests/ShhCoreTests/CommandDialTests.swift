@@ -342,6 +342,40 @@ final class CommandDialTests: XCTestCase {
         haptics.emit(.open)
     }
 
+    func testRadialHitTestingMatchesVisibleCardExtents() throws {
+        let layout = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: CGSize(width: 112, height: 74),
+            count: 3,
+            placement: .trailing
+        )
+        let card = try XCTUnwrap(layout.point(at: 1))
+        XCTAssertEqual(layout.index(at: CGPoint(x: card.x + 54, y: card.y + 32)), 1)
+        XCTAssertNil(layout.index(at: CGPoint(x: card.x + 70, y: card.y + 50)))
+    }
+
+    func testLeadingDragUsesTheSameChildArcAsTheVisibleLayout() throws {
+        let model = CommandDialModel(connected: true)
+        let inner = DialRadialLayout.corner(
+            center: CGPoint(x: 72, y: 700), radius: 145, itemRadius: 38,
+            count: model.roots.count, placement: .leading)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let outer = DialRadialLayout.corner(
+            center: inner.center, radius: 245, itemRadius: 38,
+            count: input.children.count, placement: .leading)
+        var drag = CommandDialDrag()
+        drag.update(
+            at: try XCTUnwrap(inner.point(at: 0)), inner: inner, outer: outer, nodes: model.roots)
+        let childPoint = try XCTUnwrap(outer.point(at: 1))
+        drag.update(at: childPoint, inner: inner, outer: outer, nodes: model.roots)
+        XCTAssertEqual(drag.childID, "input.keyboard")
+        XCTAssertEqual(
+            drag.releasedNode(at: childPoint, inner: inner, outer: outer, nodes: model.roots)?.id,
+            "input.keyboard")
+    }
+
     func testRadialLayoutEdgeCases() {
         let layout = DialRadialLayout(
             center: CGPoint(x: 100, y: 100),

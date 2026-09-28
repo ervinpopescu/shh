@@ -130,20 +130,6 @@ struct CommandDialSurface: View {
         return nodes
     }
 
-    private var currentNode: DialNode? {
-        guard !navigation.path.isEmpty else { return nil }
-        var nodes = model.roots
-        var result: DialNode?
-        for id in navigation.path {
-            result = nodes.first(where: { $0.id == id })
-            guard let result else { return nil }
-            nodes = result.children
-        }
-        return result
-    }
-
-    private var currentTitle: String { currentNode?.title ?? "Command Center" }
-
     private var highlightedNode: DialNode? {
         currentNodes.first(where: { $0.id == drag.parentID ?? navigation.selectedNodeID })
     }
@@ -164,7 +150,7 @@ struct CommandDialSurface: View {
             let layout = radialLayout(in: proxy)
             ZStack {
                 Color(red: 0.035, green: 0.05, blue: 0.06)
-                    .opacity(contrast == .increased ? 0.96 : 0.88)
+                    .opacity(contrast == .increased ? 0.34 : 0.12)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { onDismiss() }
@@ -179,7 +165,7 @@ struct CommandDialSurface: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-                if dynamicTypeSize.isAccessibilitySize || Self.usesListLayout(height: proxy.size.height) {
+                if Self.usesListLayout(dynamicTypeSize: dynamicTypeSize) {
                     accessibilityLayout(proxy: proxy)
                         .zIndex(3)
                 } else {
@@ -206,7 +192,7 @@ struct CommandDialSurface: View {
                 value: navigation.path
             )
             .onChange(of: triggerDrag) { _, event in
-                guard let event, !Self.usesListLayout(height: proxy.size.height) else { return }
+                guard let event, !Self.usesListLayout(dynamicTypeSize: dynamicTypeSize) else { return }
                 let frame = proxy.frame(in: .global)
                 let point = CGPoint(x: event.location.x - frame.minX, y: event.location.y - frame.minY)
                 handleDrag(at: point, ended: event.ended, outer: layout)
@@ -219,7 +205,9 @@ struct CommandDialSurface: View {
         }
     }
 
-    static func usesListLayout(height: CGFloat) -> Bool { height < 620 }
+    static func usesListLayout(dynamicTypeSize: DynamicTypeSize) -> Bool {
+        dynamicTypeSize.isAccessibilitySize
+    }
 
     private func radialLayout(in proxy: GeometryProxy) -> DialRadialLayout {
         Self.computeRadialLayout(
@@ -259,6 +247,7 @@ struct CommandDialSurface: View {
             center: CGPoint(x: centerX, y: centerY),
             radius: radius,
             itemRadius: itemRadius,
+            itemSize: CGSize(width: cardHalfWidth * 2, height: cardHalfHeight * 2),
             count: max(nodeCount, 1),
             placement: placement
         )
@@ -290,13 +279,6 @@ struct CommandDialSurface: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
 
-            if !navigation.path.isEmpty || drag.parentID != nil {
-                Text(drag.parentID.flatMap { id in currentNodes.first { $0.id == id }?.title }
-                    ?? currentTitle)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(coolAccent)
-                    .lineLimit(1)
-            }
         }
         .padding(12)
         .frame(maxWidth: min(proxy.size.width - 32, 540), alignment: .leading)
@@ -410,7 +392,8 @@ struct CommandDialSurface: View {
     private func innerLayout(for outer: DialRadialLayout) -> DialRadialLayout {
         DialRadialLayout.corner(
             center: outer.center, radius: outer.orbitRadius * 0.69,
-            itemRadius: outer.itemRadius, count: currentNodes.count, placement: placement)
+            itemRadius: outer.itemRadius, itemSize: outer.itemSize,
+            count: currentNodes.count, placement: placement)
     }
 
     private func wheel(layout: DialRadialLayout) -> some View {
@@ -426,8 +409,8 @@ struct CommandDialSurface: View {
             if let parent = highlightedNode, !parent.children.isEmpty {
                 let outer = DialRadialLayout.corner(
                     center: layout.center, radius: layout.orbitRadius,
-                    itemRadius: layout.itemRadius, count: parent.children.count,
-                    placement: placement)
+                    itemRadius: layout.itemRadius, itemSize: layout.itemSize,
+                    count: parent.children.count, placement: placement)
                 ForEach(Array(parent.children.enumerated()), id: \.element.id) { index, child in
                     if let point = outer.point(at: index) {
                         radialNodeButton(child, point: point, highlighted: drag.childID == child.id)
@@ -571,8 +554,8 @@ struct CommandDialSurface: View {
         let parent = currentNodes.first { $0.id == drag.parentID }
         let outer = DialRadialLayout.corner(
             center: outerLayout.center, radius: outerLayout.orbitRadius,
-            itemRadius: outerLayout.itemRadius, count: parent?.children.count ?? 0,
-            placement: placement)
+            itemRadius: outerLayout.itemRadius, itemSize: outerLayout.itemSize,
+            count: parent?.children.count ?? 0, placement: placement)
         let previous = drag
         drag.update(at: point, inner: inner, outer: outer, nodes: currentNodes)
         if drag.parentID != previous.parentID || drag.childID != previous.childID {
