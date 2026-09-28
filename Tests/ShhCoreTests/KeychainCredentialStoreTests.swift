@@ -24,7 +24,14 @@ final class KeychainCredentialStoreTests: XCTestCase {
         XCTAssertTrue(genericStatus.localizedDescription.contains("-25244"))
     }
 
-    func testKeychainCredentialStoreFallbackWhenAccessGroupIsInvalid() async throws {
+    #if os(macOS)
+    func testHostKeychainStoreDoesNotConfigureSharedAccessGroup() {
+        XCTAssertNil(KeychainCredentialStore.defaultSharedAccessGroup)
+    }
+    #endif
+
+    #if targetEnvironment(simulator)
+    func testSimulatorKeychainCredentialStoreFallbackWhenAccessGroupIsInvalid() async throws {
         #if canImport(Security)
         let invalidAccessGroup = "INVALID_GROUP_123.group.com.ervinpopescu.shh"
         let store = KeychainCredentialStore(
@@ -33,31 +40,42 @@ final class KeychainCredentialStoreTests: XCTestCase {
         )
         let reference = "test-ref-\(UUID().uuidString)"
         let secretData = Data("sample-secret-payload".utf8)
+        var saveCompleted = false
+        var operationError: Error?
 
         // Saving should not throw even if the access group is invalid, because it falls back to local Keychain.
         // Under unsigned simulator test environments without Keychain entitlements, Keychain access is disallowed
         // by the system and throws errSecMissingEntitlement (-34018).
         do {
             try await store.save(secretData, reference: reference)
+            saveCompleted = true
             let loaded = try await store.load(reference: reference)
             XCTAssertEqual(loaded, secretData)
-            try await store.delete(reference: reference)
-        } catch KeychainError.status(let code) {
-            #if targetEnvironment(simulator)
-            XCTAssertEqual(code, errSecMissingEntitlement, "Unsigned simulator tests without Keychain entitlements must fail explicitly with errSecMissingEntitlement (-34018)")
-            #elseif os(macOS)
-            if code == errSecInteractionNotAllowed {
-                throw XCTSkip("The host Keychain is unavailable to this non-interactive test process")
-            }
-            XCTFail("Keychain fallback operation failed with status code: \(code)")
-            #else
-            XCTFail("Keychain fallback operation failed with status code: \(code)")
-            #endif
         } catch {
-            XCTFail("Keychain fallback operation failed: \(error)")
+            operationError = error
+        }
+
+        // Always remove an item once saving completed, including when a later load assertion or operation fails.
+        if saveCompleted {
+            do {
+                try await store.delete(reference: reference)
+            } catch {
+                XCTFail("Keychain fallback cleanup failed: \(error)")
+            }
+        }
+
+        if let operationError {
+            if saveCompleted {
+                XCTFail("Keychain fallback operation failed after save: \(operationError)")
+            } else if case KeychainError.status(let code) = operationError {
+                XCTAssertEqual(code, errSecMissingEntitlement, "Unsigned simulator tests without Keychain entitlements must fail explicitly with errSecMissingEntitlement (-34018)")
+            } else {
+                XCTFail("Keychain fallback operation failed: \(operationError)")
+            }
         }
         #endif
     }
+    #endif
 
     func testCatalogReconciliationPreservesMissingHostReferenceAndFindsDuplicateLabels() throws {
         let first = try IdentityDescriptor(name: "Build Key", kind: .privateKey, publicFingerprint: "SHA256:first", keychainReference: "synthetic-first")
