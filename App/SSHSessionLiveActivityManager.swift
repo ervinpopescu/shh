@@ -74,9 +74,9 @@ final class SSHSessionLiveActivityManager {
 
   private func enqueue(_ operation: @escaping @MainActor () async -> Void) {
     let previous = operationTask
-    operationTask = Task { @MainActor [weak self] in
+    operationTask = Task { @MainActor in
       _ = await previous?.value
-      guard let self, !Task.isCancelled else { return }
+      guard !Task.isCancelled else { return }
       await operation()
     }
   }
@@ -128,7 +128,7 @@ final class SSHSessionLiveActivityManager {
       hostLabel: hostLabel
     )
     do {
-      activity = try await Activity.request(
+      activity = try Activity.request(
         attributes: attributes,
         content: ActivityContent(state: state, staleDate: staleDate(for: state)),
         pushType: nil
