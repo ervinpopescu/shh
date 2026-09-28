@@ -118,7 +118,7 @@ final class SSHSessionLiveActivityManager {
     }
 
     if let activity, activity.attributes.sessionID == sessionID, Self.isAlive(activity) {
-      await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
+      await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(for: state)))
       return
     }
 
@@ -130,7 +130,7 @@ final class SSHSessionLiveActivityManager {
     do {
       activity = try Activity.request(
         attributes: attributes,
-        content: ActivityContent(state: state, staleDate: staleDate(for: state)),
+        content: ActivityContent(state: state, staleDate: Self.staleDate(for: state)),
         pushType: nil
       )
     } catch {
@@ -154,7 +154,7 @@ final class SSHSessionLiveActivityManager {
     guard let activity, activity.attributes.sessionID == sessionID, Self.isAlive(activity) else {
       return
     }
-    await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
+    await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(for: state)))
   }
 
   private func performEnd(sessionID: UUID?) async {
@@ -186,8 +186,19 @@ final class SSHSessionLiveActivityManager {
     }
   }
 
-  private func staleDate(for state: Attributes.ContentState) -> Date {
-    state.updatedAt.addingTimeInterval(state.status == .connected ? 15 * 60 : 5 * 60)
+  /// Connected snapshots are intentionally short-lived. If the app is suspended,
+  /// ActivityKit marks the snapshot stale and the widget must stop asserting that
+  /// the transport is currently connected.
+  nonisolated static let connectedStatusFreshness: TimeInterval = 60
+  nonisolated static let otherStatusFreshness: TimeInterval = 5 * 60
+
+  nonisolated static func staleDate(
+    for state: Attributes.ContentState,
+    now: Date = Date()
+  ) -> Date {
+    now.addingTimeInterval(
+      state.status == .connected ? connectedStatusFreshness : otherStatusFreshness
+    )
   }
 
   nonisolated static func safeDisplayName(_ name: String) -> String {

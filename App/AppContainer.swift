@@ -979,6 +979,7 @@ final class AppContainer: ObservableObject {
             default:
                 activeSession?.state = .failed
             }
+            syncLiveActivityState()
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
@@ -986,6 +987,7 @@ final class AppContainer: ObservableObject {
             self.lastConnectionFailure = failure
             let message = failure.reason
             activeSession?.state = .failed
+            syncLiveActivityState()
             terminalText = message
             terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
         }
@@ -1031,6 +1033,7 @@ final class AppContainer: ObservableObject {
                         } else {
                             self.activeSession?.state = .failed
                         }
+                        self.syncLiveActivityState()
                         self.detachCallbacks()
                         self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
                         self.redactor = Redactor()
@@ -1063,6 +1066,7 @@ final class AppContainer: ObservableObject {
                         } else {
                             self.activeSession?.state = .failed
                         }
+                        self.syncLiveActivityState()
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
                         self.terminalText += "\n" + message
@@ -1092,6 +1096,7 @@ final class AppContainer: ObservableObject {
                 self.isProbingHerdr = false
                 self.hasObservedTransportError = true
                 self.activeSession?.state = .failed
+                self.syncLiveActivityState()
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
                 self.terminalText += "\n" + message
@@ -1122,6 +1127,7 @@ final class AppContainer: ObservableObject {
             if activeSession?.state != .failed,
                !hasObservedTransportError {
                 activeSession?.state = .disconnected
+                syncLiveActivityState()
             }
             reconnectState = .failed(reason: "Network unavailable.")
             return
@@ -1391,6 +1397,7 @@ final class AppContainer: ObservableObject {
                 if activeSession?.state != .failed,
                    !hasObservedTransportError {
                     activeSession?.state = .disconnected
+                    syncLiveActivityState()
                 }
                 reconnectState = .failed(reason: "Network unavailable.")
             }
@@ -1450,6 +1457,7 @@ final class AppContainer: ObservableObject {
             // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
             activeSession?.state = .disconnected
+            syncLiveActivityState()
             detachCallbacks()
             eventTask?.cancel()
             eventTask = nil
@@ -1531,6 +1539,7 @@ final class AppContainer: ObservableObject {
                         // the UI never claims a dead socket is ready.
                         self.isForegroundRecoveryInProgress = true
                         self.activeSession?.state = .connecting
+                        self.syncLiveActivityState()
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
                         guard self.lifecycleGeneration == generation,
                               !self.isExplicitDisconnect,
@@ -1560,6 +1569,7 @@ final class AppContainer: ObservableObject {
                             await deadConn?.close()
                             self.isForegroundRecoveryInProgress = false
                             self.activeSession?.state = .disconnected
+                            self.syncLiveActivityState()
                             if let host = self.activeHost {
                                 self.handleConnectionDrop(host: host)
                             }
