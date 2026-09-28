@@ -308,8 +308,8 @@ final class AppContainerTests: XCTestCase {
             await container.connect(to: host)
         }
 
-        // Give task a moment to enter connecting state
-        try await Task.sleep(nanoseconds: 30_000_000)
+        // Wait for the lifecycle transition instead of assuming a fixed scheduler delay.
+        try await waitUntil { container.activeSession?.state == .connecting }
         XCTAssertEqual(container.activeSession?.state, .connecting)
 
         // User explicitly disconnects while connection is in-flight
@@ -349,7 +349,10 @@ final class AppContainerTests: XCTestCase {
             await container.connect(to: hostA)
         }
 
-        try await Task.sleep(nanoseconds: 30_000_000)
+        try await waitUntil {
+            container.activeSession?.state == .connecting
+                && container.activeSession?.hostID == hostA.id
+        }
         XCTAssertEqual(container.activeSession?.state, .connecting)
         XCTAssertEqual(container.activeSession?.hostID, hostA.id)
 
@@ -388,7 +391,7 @@ final class AppContainerTests: XCTestCase {
             await container.connect(to: host)
         }
 
-        try await Task.sleep(nanoseconds: 30_000_000)
+        try await waitUntil { container.activeSession?.state == .connecting }
         XCTAssertEqual(container.activeSession?.state, .connecting)
 
         // User disconnects while in-flight
