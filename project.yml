@@ -181,7 +181,7 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - FileProviderExtension
-      - Shared
+      - path: Shared/SharedContainerResolver.swift
       - path: Resources/PrivacyInfo.xcprivacy
         buildPhase: resources
     dependencies:
