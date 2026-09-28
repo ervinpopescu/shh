@@ -448,6 +448,44 @@ final class LiveActivityTests: XCTestCase {
     await activity.end(nil, dismissalPolicy: .immediate)
   }
 
+  func testConnectedActivityUsesFiniteFreshnessAndHonestStalePresentation() {
+    let confirmedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let state = ShhSSHSessionActivityAttributes.ContentState(
+      status: .connected,
+      updatedAt: confirmedAt
+    )
+    let staleDate = SSHSessionLiveActivityManager.staleDate(for: state, now: confirmedAt)
+
+    XCTAssertEqual(
+      staleDate.timeIntervalSince(confirmedAt),
+      SSHSessionLiveActivityManager.connectedStatusFreshness
+    )
+    XCTAssertEqual(state.displayName(isStale: false), "Connected")
+    XCTAssertEqual(state.displayName(isStale: true), "Status unverified")
+    XCTAssertEqual(state.lastConfirmedLabel, "Last confirmed")
+  }
+
+  @MainActor
+  func testLiveActivityCardRendersStatusUnverifiedWhenStale() {
+    let renderer = ImageRenderer(
+      content: ShhLiveActivityCardView(
+        displayName: "bastion",
+        hostLabel: "bastion.internal:22",
+        state: ShhSSHSessionActivityAttributes.ContentState(
+          status: .connected,
+          updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ),
+        isStale: true
+      )
+      .frame(width: 360, height: 180)
+    )
+    renderer.scale = 1
+
+    let image = renderer.uiImage
+    XCTAssertEqual(image?.size, CGSize(width: 360, height: 180))
+    XCTAssertNotNil(image?.pngData())
+  }
+
   func testStatusDisplayNamesDescribeEveryLifecycleState() {
     XCTAssertEqual(
       ShhSSHSessionActivityAttributes.ContentState.Status.connected.displayName,
@@ -624,6 +662,38 @@ final class LiveActivityTests: XCTestCase {
     for _ in 0..<10 {
       await Task.yield()
     }
+  }
+
+  @MainActor
+  func testForegroundProbeStopsClaimingConnectedUntilTransportConfirms() async throws {
+    let connection = MockSSHConnection()
+    connection.onTestResponsiveness = { _ in
+      try? await Task.sleep(nanoseconds: 200_000_000)
+      return true
+    }
+    let transport = ControllableTransport()
+    transport.onConnect = { _ in connection }
+    let container = AppContainer(
+      transport: transport,
+      reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+      reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+    )
+    let host = try Host(name: "Foreground Host", hostname: "foreground.invalid", username: "dev")
+
+    await container.connect(to: host)
+    let sessionID = try XCTUnwrap(container.activeSession?.id)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+
+    container.handleScenePhaseChange(.background)
+    container.handleScenePhaseChange(.active)
+
+    try await waitForLiveActivityState(sessionID: sessionID, status: .disconnected)
+    XCTAssertEqual(container.activeSession?.state, .connecting)
+
+    try await Task.sleep(nanoseconds: 250_000_000)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+    XCTAssertEqual(container.activeSession?.state, .connected)
+    await container.disconnect()
   }
 
   @MainActor
