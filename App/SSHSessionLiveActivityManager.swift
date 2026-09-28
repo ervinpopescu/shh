@@ -118,7 +118,7 @@ final class SSHSessionLiveActivityManager {
     }
 
     if let activity, activity.attributes.sessionID == sessionID, Self.isAlive(activity) {
-      await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
+      await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(for: state)))
       return
     }
 
@@ -130,7 +130,7 @@ final class SSHSessionLiveActivityManager {
     do {
       activity = try Activity.request(
         attributes: attributes,
-        content: ActivityContent(state: state, staleDate: staleDate(for: state)),
+        content: ActivityContent(state: state, staleDate: Self.staleDate(for: state)),
         pushType: nil
       )
     } catch {
@@ -154,7 +154,7 @@ final class SSHSessionLiveActivityManager {
     guard let activity, activity.attributes.sessionID == sessionID, Self.isAlive(activity) else {
       return
     }
-    await activity.update(ActivityContent(state: state, staleDate: staleDate(for: state)))
+    await activity.update(ActivityContent(state: state, staleDate: Self.staleDate(for: state)))
   }
 
   private func performEnd(sessionID: UUID?) async {
@@ -186,8 +186,20 @@ final class SSHSessionLiveActivityManager {
     }
   }
 
-  private func staleDate(for state: Attributes.ContentState) -> Date {
-    state.updatedAt.addingTimeInterval(state.status == .connected ? 15 * 60 : 5 * 60)
+  /// Connected snapshots are bounded to five minutes. Transport events and the
+  /// foreground probe update the activity promptly while the app runs; we do not
+  /// poll solely to refresh ActivityKit once per minute. If iOS suspends the
+  /// process, this finite window limits how long the widget can imply connected.
+  nonisolated static let connectedStatusFreshness: TimeInterval = 5 * 60
+  nonisolated static let otherStatusFreshness: TimeInterval = 5 * 60
+
+  nonisolated static func staleDate(
+    for state: Attributes.ContentState,
+    now: Date = Date()
+  ) -> Date {
+    now.addingTimeInterval(
+      state.status == .connected ? connectedStatusFreshness : otherStatusFreshness
+    )
   }
 
   nonisolated static func safeDisplayName(_ name: String) -> String {
