@@ -45,6 +45,11 @@ final class KeychainCredentialStoreTests: XCTestCase {
         } catch KeychainError.status(let code) {
             #if targetEnvironment(simulator)
             XCTAssertEqual(code, errSecMissingEntitlement, "Unsigned simulator tests without Keychain entitlements must fail explicitly with errSecMissingEntitlement (-34018)")
+            #elseif os(macOS)
+            if code == errSecInteractionNotAllowed {
+                throw XCTSkip("The host Keychain is unavailable to this non-interactive test process")
+            }
+            XCTFail("Keychain fallback operation failed with status code: \(code)")
             #else
             XCTFail("Keychain fallback operation failed with status code: \(code)")
             #endif
