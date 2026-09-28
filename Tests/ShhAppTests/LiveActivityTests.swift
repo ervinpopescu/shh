@@ -474,7 +474,7 @@ final class LiveActivityTests: XCTestCase {
       updatedAt: Date(timeIntervalSince1970: 1_700_000_000),
       reconnectAttempt: 2
     )
-    var renderer = ImageRenderer(
+    let renderer = ImageRenderer(
       content: ShhLiveActivityCardView(
         displayName: "bastion",
         hostLabel: "bastion.internal:22",
@@ -580,7 +580,7 @@ final class LiveActivityTests: XCTestCase {
     ]
 
     for state in states {
-      var renderer = ImageRenderer(
+      let renderer = ImageRenderer(
         content: ShhLiveActivityCardView(
           displayName: "workstation",
           hostLabel: "workstation.internal:22",
