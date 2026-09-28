@@ -156,9 +156,9 @@ final class TmuxAppTests: XCTestCase {
         _ = state
     }
 
-    func testCommandDialKeyboardVisibleUsesScrollableActions() {
-        XCTAssertTrue(CommandDialSurface.usesListLayout(height: 500))
-        XCTAssertFalse(CommandDialSurface.usesListLayout(height: 852))
+    func testCommandDialKeyboardVisibleKeepsRadialActionsVisible() {
+        XCTAssertFalse(CommandDialSurface.usesListLayout(dynamicTypeSize: .large))
+        XCTAssertTrue(CommandDialSurface.usesListLayout(dynamicTypeSize: .accessibility3))
         var navigation = CommandDialNavigation(isOpen: true)
         let model = CommandDialModel(connected: true)
         let surface = CommandDialSurface(
@@ -190,7 +190,7 @@ final class TmuxAppTests: XCTestCase {
             hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
         }
         let attachment = XCTAttachment(image: image)
-        attachment.name = "command-dial-keyboard-viewport"
+        attachment.name = "command-dial-keyboard-viewport-radial"
         attachment.lifetime = .keepAlways
         add(attachment)
         _ = navigation
