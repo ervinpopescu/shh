@@ -603,8 +603,8 @@ final class AppContainerTests: XCTestCase {
         let firstConnection = MockSSHConnection()
         let replacementConnection = MockSSHConnection()
         let transport = ControllableTransport()
-        var connections = [firstConnection, replacementConnection]
-        transport.onConnect = { _ in connections.removeFirst() }
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
 
         let container = AppContainer(
             transport: transport,
@@ -1472,6 +1472,19 @@ final class ControllableTransport: SSHTransport, @unchecked Sendable {
             return try await onConnect(host)
         }
         return MockSSHConnection()
+    }
+}
+
+actor ConnectionSequence {
+    private var connections: [MockSSHConnection]
+
+    init(_ connections: [MockSSHConnection]) {
+        self.connections = connections
+    }
+
+    func next() -> MockSSHConnection {
+        precondition(!connections.isEmpty, "No mock connections remain")
+        return connections.removeFirst()
     }
 }
 
