@@ -12,9 +12,14 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
     private var eventContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     private var pendingEvents: [TerminalEvent] = []
     private var stateContinuations: [UUID: AsyncStream<MoshState>.Continuation] = [:]
+    private static let teardownTimeoutNanoseconds: UInt64 = 1_000_000_000
     private var receiveTask: Task<Void, Never>?
+    private var closeTask: Task<Void, Never>?
+    private var activeDatagramOperations = 0
     private var sequenceNumber: UInt64 = 0
-    private var isClosed: Bool = false
+    private(set) var isClosed: Bool = false
+    private(set) var didQuarantine = false
+    private var terminalError: TransportError?
 
     public init(
         sessionInfo: MoshSessionInfo,
@@ -33,12 +38,24 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
 
     public func start() async throws {
         try await channel.start()
+        guard !isClosed else { return }
         startReceiveLoop()
         transitionState(to: .connected)
     }
 
     public func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
         AsyncThrowingStream { continuation in
+            if self.isClosed {
+                if let terminalError = self.terminalError {
+                    continuation.yield(.error(terminalError))
+                    continuation.finish(throwing: terminalError)
+                } else {
+                    continuation.yield(.closed)
+                    continuation.finish()
+                }
+                return
+            }
+
             self.eventContinuation = continuation
             for event in self.pendingEvents {
                 continuation.yield(event)
@@ -77,9 +94,8 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
     }
 
     public func send(_ data: Data) async throws {
-        guard !isClosed else {
-            throw TransportError.networkUnavailable
-        }
+        try beginDatagramOperation()
+        defer { finishDatagramOperation() }
         sequenceNumber &+= 1
         let datagram = MoshDatagram(
             kind: .data,
@@ -90,9 +106,8 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
     }
 
     public func resize(_ size: TerminalSize) async throws {
-        guard !isClosed else {
-            throw TransportError.networkUnavailable
-        }
+        try beginDatagramOperation()
+        defer { finishDatagramOperation() }
         sequenceNumber &+= 1
         var payload = Data()
         var cols = UInt16(size.columns).bigEndian
@@ -110,6 +125,8 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
 
     public func handleNetworkRoaming(_ newState: NetworkRoamingState) async throws {
         guard !isClosed else { return }
+        try beginDatagramOperation()
+        defer { finishDatagramOperation() }
 
         // Transition to roaming state
         transitionState(to: .roaming(newState))
@@ -134,35 +151,133 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
         try await channel.send(datagram: probe.encode())
 
         // Roaming transition successfully complete, back to connected
+        guard !isClosed else { throw TransportError.networkUnavailable }
         transitionState(to: .connected)
     }
 
     public func close() async {
-        guard !isClosed else { return }
+        await close(with: nil)
+    }
+
+    private func close(with terminalError: TransportError?) async {
+        if let closeTask {
+            await closeTask.value
+            return
+        }
+
         isClosed = true
-
+        self.terminalError = terminalError
+        let receiveTask = self.receiveTask
+        self.receiveTask = nil
         receiveTask?.cancel()
-        receiveTask = nil
-
-        // Attempt graceful teardown packet transmission
-        sequenceNumber &+= 1
-        let teardown = MoshDatagram(kind: .teardown, sequenceNumber: sequenceNumber)
-        try? await channel.send(datagram: teardown.encode())
-
-        await channel.close()
-
-        // Zero and redact the key from memory on teardown!
-        sessionInfo.zeroize()
-
-        transitionState(to: .disconnected(reason: "Session closed"))
+        transitionState(
+            to: .disconnected(reason: terminalError?.localizedDescription ?? "Session closed")
+        )
         for continuation in stateContinuations.values {
             continuation.finish()
         }
         stateContinuations.removeAll()
+        finishEventStream(with: terminalError)
 
-        eventContinuation?.yield(.closed)
-        eventContinuation?.finish()
+        let task: Task<Void, Never> = Task { [weak self] in
+            guard let self else { return }
+            await self.finishClose(receiveTask: receiveTask)
+        }
+        closeTask = task
+        await task.value
+    }
+
+    private func finishClose(receiveTask: Task<Void, Never>?) async {
+        let deadline = teardownDeadline()
+        let datagramsDrained = await waitForDatagramDrain(until: deadline)
+        if !datagramsDrained {
+            didQuarantine = true
+        }
+
+        if datagramsDrained && deadline > DispatchTime.now().uptimeNanoseconds {
+            sequenceNumber &+= 1
+            let teardown = MoshDatagram(kind: .teardown, sequenceNumber: sequenceNumber)
+            let teardownTask = Task<Void, Never> { [channel] in
+                try? await channel.send(datagram: teardown.encode())
+            }
+            if !(await waitForCompletion(teardownTask, until: deadline)) {
+                didQuarantine = true
+            }
+        }
+
+        let channelCloseTask = Task<Void, Never> { [channel] in
+            await channel.close()
+        }
+        if !(await waitForCompletion(channelCloseTask, until: deadline)) {
+            didQuarantine = true
+            await Task.yield()
+        }
+        let receiveDrained = await waitForCompletion(receiveTask, until: deadline)
+        if !receiveDrained, receiveTask != nil {
+            didQuarantine = true
+        }
+
+        // Zero and redact the key from memory on teardown!
+        sessionInfo.zeroize()
+    }
+
+    private func beginDatagramOperation() throws {
+        guard !isClosed else {
+            throw TransportError.networkUnavailable
+        }
+        activeDatagramOperations += 1
+    }
+
+    private func finishDatagramOperation() {
+        activeDatagramOperations = max(0, activeDatagramOperations - 1)
+    }
+
+    private func waitForDatagramDrain(until deadline: UInt64) async -> Bool {
+        while activeDatagramOperations > 0 {
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return false }
+            try? await Task.sleep(nanoseconds: min(deadline - now, 1_000_000))
+        }
+        return true
+    }
+
+    private func finishEventStream(with error: TransportError?) {
+        if let error {
+            eventContinuation?.yield(.error(error))
+            eventContinuation?.finish(throwing: error)
+        } else {
+            eventContinuation?.yield(.closed)
+            eventContinuation?.finish()
+        }
         eventContinuation = nil
+        pendingEvents.removeAll()
+    }
+
+    private func teardownDeadline() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds &+ Self.teardownTimeoutNanoseconds
+    }
+
+    private func waitForCompletion(
+        _ task: Task<Void, Never>?,
+        until deadline: UInt64
+    ) async -> Bool {
+        guard let task else { return true }
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard deadline > now else { return false }
+        let signal = AsyncStream<Bool> { continuation in
+            Task {
+                await task.value
+                continuation.yield(true)
+                continuation.finish()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: deadline - now)
+                continuation.yield(false)
+                continuation.finish()
+            }
+        }
+        var iterator = signal.makeAsyncIterator()
+        return await iterator.next() ?? false
     }
 
     public func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
@@ -209,13 +324,9 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
         }
     }
 
-    private func handleChannelError(_ error: Error) {
+    private func handleChannelError(_ error: Error) async {
         guard !isClosed else { return }
-        transitionState(to: .disconnected(reason: error.localizedDescription))
-        eventContinuation?.yield(.error(.networkUnavailable))
-        Task { [weak self] in
-            await self?.close()
-        }
+        await close(with: .networkUnavailable)
     }
 }
 
