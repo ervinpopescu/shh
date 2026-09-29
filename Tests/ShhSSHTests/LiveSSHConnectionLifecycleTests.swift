@@ -8,7 +8,7 @@ import XCTest
 
 final class LiveSSHConnectionLifecycleTests: XCTestCase {
     func testCloseDrainsAdmittedSendAndRejectsNewSend() async throws {
-        let (connection, blocker, group, peerSocket) = try await makeConnection()
+        let (connection, blocker, group, peerSocket, _) = try await makeConnection()
 
         let pendingSend = Task {
             try await connection.send(Data("admitted".utf8))
@@ -40,7 +40,7 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
     }
 
     func testCloseQuarantinesUncooperativeWriteAfterDeadline() async throws {
-        let (connection, blocker, group, peerSocket) = try await makeConnection()
+        let (connection, blocker, group, peerSocket, _) = try await makeConnection()
         let pendingSend = Task {
             try await connection.send(Data("uncooperative".utf8))
         }
@@ -55,8 +55,18 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
         try await group.shutdownGracefully()
     }
 
+    func testForwardedChannelRegistrationIsRejectedAfterClose() async throws {
+        let (connection, _, group, peerSocket, channel) = try await makeConnection()
+
+        await connection.close()
+        XCTAssertNil(connection.trackForwardedChannel(channel))
+
+        Darwin.close(peerSocket)
+        try await group.shutdownGracefully()
+    }
+
     func testEventsAfterCloseReturnFinishedStream() async throws {
-        let (connection, _, group, peerSocket) = try await makeConnection()
+        let (connection, _, group, peerSocket, _) = try await makeConnection()
 
         await connection.close()
         let stream = await connection.events()
@@ -74,7 +84,8 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
         LiveSSHConnection,
         BlockingWriteHandler,
         MultiThreadedEventLoopGroup,
-        CInt
+        CInt,
+        Channel
     ) {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         var socketFDs: [CInt] = [-1, -1]
@@ -94,7 +105,7 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
             eventLoopGroup: nil,
             ownsGroup: false
         )
-        return (connection, blocker, group, socketFDs[1])
+        return (connection, blocker, group, socketFDs[1], channel)
     }
 }
 

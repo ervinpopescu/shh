@@ -87,16 +87,16 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         defer { finishWriteOperation() }
 
         let eventLoop = parentChannel.eventLoop
+        let requestPromise = eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
         let requestFuture = eventLoop.flatSubmit {
             self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { handler in
-                let promise = eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
                 // cancel-tcpip-forward never creates a listener. It is a
                 // harmless global request that receives a protocol response.
                 handler.sendTCPForwardingRequest(
                     .cancel(host: "127.0.0.1", port: 0),
-                    promise: promise
+                    promise: requestPromise
                 )
-                return promise.futureResult.map { _ in () }
+                return requestPromise.futureResult.map { _ in () }
             }
         }
 
@@ -108,7 +108,11 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         // socket.
         let responsePromise = eventLoop.makePromise(of: Void.self)
         let timeoutTask = eventLoop.scheduleTask(in: .milliseconds(Int64(max(0.1, timeout) * 1_000))) {
+            // Fail the request promise so its future completes, then close the
+            // parent channel to cancel the protocol-level outstanding request.
+            requestPromise.fail(TransportError.timeout)
             responsePromise.fail(TransportError.timeout)
+            self.parentChannel.close(promise: nil)
         }
         requestFuture.whenComplete { result in
             timeoutTask.cancel()
@@ -307,22 +311,18 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             throw TransportError.remoteFailure(activeRedactor.redact("Failed to send exec request: \(error.localizedDescription)"))
         }
 
+        let timeoutTask = effectiveTimeout > 0
+            ? execChannel.eventLoop.scheduleTask(
+                in: .milliseconds(Int64(effectiveTimeout * 1_000))
+            ) {
+                execHandler.failAndClose(TransportError.timeout)
+            }
+            : nil
+        defer { timeoutTask?.cancel() }
+
         do {
             let result = try await withTaskCancellationHandler {
-                try await withThrowingTaskGroup(of: SSHCommandResult.self) { group in
-                    group.addTask {
-                        try await promise.futureResult.get()
-                    }
-                    if effectiveTimeout > 0 {
-                        group.addTask {
-                            try await Task.sleep(nanoseconds: UInt64(effectiveTimeout * 1_000_000_000))
-                            throw TransportError.timeout
-                        }
-                    }
-                    let first = try await group.next()!
-                    group.cancelAll()
-                    return first
-                }
+                try await promise.futureResult.get()
             } onCancel: {
                 execHandler.failAndClose(TransportError.cancelled)
             }
@@ -387,8 +387,14 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         }.get()
 
         let id = UUID()
-        lock.withLock {
+        let registered = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
             self.activeForwardedChannels[id] = channel
+            return true
+        }
+        guard registered else {
+            channel.close(promise: nil)
+            throw TransportError.remoteFailure("SSH connection is closed")
         }
         channel.closeFuture.whenComplete { [weak self] _ in
             self?.lock.withLock {
@@ -446,10 +452,16 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         inboundRouter?.register(handler)
     }
 
-    func trackForwardedChannel(_ channel: Channel) -> UUID {
+    func trackForwardedChannel(_ channel: Channel) -> UUID? {
         let id = UUID()
-        lock.withLock {
+        let registered = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
             self.activeForwardedChannels[id] = channel
+            return true
+        }
+        guard registered else {
+            channel.close(promise: nil)
+            return nil
         }
         channel.closeFuture.whenComplete { [weak self] _ in
             self?.lock.withLock {
