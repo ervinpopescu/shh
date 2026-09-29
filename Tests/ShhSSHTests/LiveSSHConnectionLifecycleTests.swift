@@ -1,6 +1,7 @@
 import Darwin
 import NIOCore
 import NIOPosix
+@preconcurrency import NIOSSH
 import XCTest
 
 @testable import ShhCore
@@ -9,19 +10,19 @@ import XCTest
 final class LiveSSHConnectionLifecycleTests: XCTestCase {
     func testCloseDrainsAdmittedSendAndRejectsNewSend() async throws {
         let (connection, blocker, group, peerSocket, _) = try await makeConnection()
-
         let pendingSend = Task {
             try await connection.send(Data("admitted".utf8))
         }
         await blocker.waitForPendingWrite()
-
         let firstClose = Task {
             await connection.close()
         }
         let secondClose = Task {
             await connection.close()
         }
-        await Task.yield()
+        while !connection.isClosed {
+            await Task.yield()
+        }
 
         do {
             try await connection.send(Data("rejected".utf8))
@@ -55,6 +56,17 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
         try await group.shutdownGracefully()
     }
 
+    func testKeepaliveBlackholeClosesWithoutDuplicatePromiseCompletion() async throws {
+        let (connection, group, peerSocket) = try await makeBlackholeConnection()
+
+        let responsive = await connection.testResponsiveness(timeout: 0.1)
+        XCTAssertFalse(responsive)
+        await connection.close()
+
+        Darwin.close(peerSocket)
+        try await group.shutdownGracefully()
+    }
+
     func testForwardedChannelRegistrationIsRejectedAfterClose() async throws {
         let (connection, _, group, peerSocket, channel) = try await makeConnection()
 
@@ -78,6 +90,49 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
         XCTAssertNil(secondEvent)
         Darwin.close(peerSocket)
         try await group.shutdownGracefully()
+    }
+
+    private func makeBlackholeConnection() async throws -> (
+        LiveSSHConnection,
+        MultiThreadedEventLoopGroup,
+        CInt
+    ) {
+        let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
+        var socketFDs: [CInt] = [-1, -1]
+        guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &socketFDs) == 0 else {
+            throw POSIXError(.EIO)
+        }
+        let clientConfiguration = SSHClientConfiguration(
+            userAuthDelegate: BlackholeAuthDelegate(),
+            serverAuthDelegate: BlackholeHostKeyDelegate()
+        )
+        let channel = try await ClientBootstrap(group: group)
+            .channelInitializer { channel in
+                let handler = UncheckedSendableBox(
+                    NIOSSHHandler(
+                        role: .client(clientConfiguration),
+                        allocator: channel.allocator,
+                        inboundChildChannelInitializer: { childChannel, _ in
+                            childChannel.close()
+                        }
+                    )
+                )
+                do {
+                    try channel.pipeline.syncOperations.addHandler(handler.value)
+                    return channel.eventLoop.makeSucceededFuture(())
+                } catch {
+                    return channel.eventLoop.makeFailedFuture(error)
+                }
+            }
+            .withConnectedSocket(socketFDs[0])
+            .get()
+        let connection = LiveSSHConnection(
+            childChannel: channel,
+            parentChannel: channel,
+            eventLoopGroup: nil,
+            ownsGroup: false
+        )
+        return (connection, group, socketFDs[1])
     }
 
     private func makeConnection() async throws -> (
@@ -106,6 +161,32 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
             ownsGroup: false
         )
         return (connection, blocker, group, socketFDs[1], channel)
+    }
+}
+
+private final class UncheckedSendableBox<Value>: @unchecked Sendable {
+    let value: Value
+
+    init(_ value: Value) {
+        self.value = value
+    }
+}
+
+private struct BlackholeAuthDelegate: NIOSSHClientUserAuthenticationDelegate {
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        nextChallengePromise.succeed(nil)
+    }
+}
+
+private struct BlackholeHostKeyDelegate: NIOSSHClientServerAuthenticationDelegate {
+    func validateHostKey(
+        hostKey: NIOSSHPublicKey,
+        validationCompletePromise: EventLoopPromise<Void>
+    ) {
+        validationCompletePromise.succeed(())
     }
 }
 
