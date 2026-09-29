@@ -47,6 +47,23 @@ doctor device="iphone" udid="":
         echo "Simulator available: $target"
     fi
 
+# List simulator states and connected physical devices.
+devices:
+    #!/usr/bin/env bash
+    developer_dir="{{ xcode_developer_dir }}"
+    [[ -d "$developer_dir" ]] || { echo "Error: Xcode is unavailable at $developer_dir" >&2; exit 1; }
+    export DEVELOPER_DIR="$developer_dir"
+    command -v xcrun >/dev/null 2>&1 || { echo "Error: missing required tool: xcrun" >&2; exit 1; }
+    echo "== Simulators =="
+    xcrun simctl list devices
+    echo
+    echo "== Physical Devices =="
+    if xcrun --find devicectl >/dev/null 2>&1; then
+        xcrun devicectl list devices --timeout 5 2>&1 || echo "Note: devicectl failed to list physical devices"
+    else
+        echo "Note: devicectl is unavailable in this Xcode environment"
+    fi
+
 # Generate the ignored Xcode project from project.yml.
 generate:
     #!/usr/bin/env bash
