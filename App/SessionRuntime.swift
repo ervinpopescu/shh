@@ -40,9 +40,23 @@ final class SessionRuntime {
 
     private var callbackGeneration: UInt64 = 0
     private var transportGeneration: UInt64 = 0
+    private var eventReadyWaiters: [CheckedContinuation<Void, Never>] = []
     private var closedTransportGeneration: UInt64?
 
     private static let teardownTimeoutNanoseconds: UInt64 = 250_000_000
+
+    /// Receives already-redacted terminal bytes after this runtime feeds the
+    /// shared terminal controller. AppContainer uses this projection to retain
+    /// its legacy terminal text API without owning the event stream.
+    var onOutput: (@MainActor (Data) -> Void)?
+
+    /// Receives successful terminal resize projections for legacy app state.
+    var onResize: (@MainActor (TerminalSize) -> Void)?
+
+    /// Receives terminal termination after the runtime has invalidated callbacks
+    /// and closed the transport. The runtime remains the owner of the transport;
+    /// the owner may use this hook to start recovery or update projections.
+    var onTermination: (@MainActor (TerminalEvent?) async -> Void)?
 
     convenience init(
         host: Host,
@@ -97,6 +111,16 @@ final class SessionRuntime {
         reconnectState = .connected
         installCallbacks()
         startEventMonitoring()
+    }
+
+    /// Activates the runtime and waits until the transport event stream has
+    /// been subscribed. This closes the admission race for callers that emit
+    /// an event immediately after connect returns.
+    func activateAndWait() async {
+        activate()
+        await withCheckedContinuation { continuation in
+            eventReadyWaiters.append(continuation)
+        }
     }
 
     /// Replaces only this session's transport. The session identity and terminal
@@ -223,6 +247,7 @@ final class SessionRuntime {
                 guard self.accepts(token) else { return false }
                 self.session.terminalSize = size
                 self.terminalGrid.resize(size)
+                self.onResize?(size)
                 return true
             } catch {
                 return false
@@ -237,10 +262,14 @@ final class SessionRuntime {
         let eventsConnection = connection
         let token = callbackToken
         eventTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             do {
                 let events = await eventsConnection.events()
+                let waiters = self.eventReadyWaiters
+                self.eventReadyWaiters.removeAll()
+                waiters.forEach { $0.resume() }
                 for try await event in events {
-                    guard let self, self.accepts(token), !Task.isCancelled else { return }
+                    guard self.accepts(token), !Task.isCancelled else { return }
                     switch event {
                     case .bytes(let data):
                         self.consume(data)
@@ -251,32 +280,36 @@ final class SessionRuntime {
                             state: .disconnected,
                             reconnectState: .idle
                         )
+                        await self.onTermination?(.closed)
                         return
-                    case .error:
+                    case .error(let error):
                         await self.terminate(
                             connection: eventsConnection,
                             token: token,
                             state: .failed,
                             reconnectState: .failed(reason: "Connection failed.")
                         )
+                        await self.onTermination?(.error(error))
                         return
                     }
                 }
-                guard let self, self.accepts(token), !Task.isCancelled else { return }
+                guard self.accepts(token), !Task.isCancelled else { return }
                 await self.terminate(
                     connection: eventsConnection,
                     token: token,
                     state: .disconnected,
                     reconnectState: .idle
                 )
+                await self.onTermination?(.closed)
             } catch {
-                guard let self, self.accepts(token), !Task.isCancelled else { return }
+                guard self.accepts(token), !Task.isCancelled else { return }
                 await self.terminate(
                     connection: eventsConnection,
                     token: token,
                     state: .failed,
                     reconnectState: .failed(reason: "Connection failed.")
                 )
+                await self.onTermination?(nil)
             }
         }
     }
@@ -306,6 +339,7 @@ final class SessionRuntime {
         terminalText += String(decoding: redacted, as: UTF8.self)
         ansiParser.consume(redacted, into: &terminalGrid)
         terminalController.feed(redacted)
+        onOutput?(redacted)
     }
 
     private func invalidateCallbacks() -> PendingTasks {
@@ -317,6 +351,8 @@ final class SessionRuntime {
         )
         eventTask?.cancel()
         eventTask = nil
+        eventReadyWaiters.forEach { $0.resume() }
+        eventReadyWaiters.removeAll()
         outboundTask?.cancel()
         outboundTask = nil
         terminalResizeTask?.cancel()
