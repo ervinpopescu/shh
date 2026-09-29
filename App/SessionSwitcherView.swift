@@ -81,43 +81,56 @@ struct SessionTabItem: View {
     }
 
     var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(statusColor)
-                .frame(width: 7, height: 7)
-
+        HStack(spacing: 2) {
             Button(action: onSelect) {
-                Text(hostName)
-                    .font(.caption.weight(isSelected ? .semibold : .regular))
-                    .lineLimit(1)
-                    .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(statusColor)
+                        .frame(width: 7, height: 7)
+
+                    Text(hostName)
+                        .font(.caption.weight(isSelected ? .semibold : .regular))
+                        .lineLimit(1)
+                        .foregroundStyle(isSelected ? Color.primary : Color.secondary)
+                }
+                .padding(.leading, 10)
+                .padding(.trailing, 4)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel(
+                "Session \(hostName), \(statusText), \(isSelected ? "selected" : "not selected")"
+            )
+            .accessibilityHint("Double tap to switch to this session")
+            .accessibilityIdentifier("session-tab-\(session.id)")
+            .accessibilityAddTraits(isSelected ? [.isSelected, .isButton] : [.isButton])
+            .accessibilityAction(named: "Close session \(hostName)") {
+                onClose()
+            }
 
             Button(action: onClose) {
                 Image(systemName: "xmark.circle.fill")
-                    .font(.caption2)
+                    .font(.caption)
                     .foregroundStyle(Color.secondary.opacity(0.8))
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close session \(hostName)")
+            .accessibilityHint("Closes this session")
             .accessibilityIdentifier("session-close-\(session.id)")
+            .accessibilityAddTraits(.isButton)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 5)
+        .padding(.trailing, 2)
         .background(isSelected ? Color.accentColor.opacity(0.15) : Color(.tertiarySystemFill))
         .overlay(
             Capsule()
                 .stroke(isSelected ? Color.accentColor : Color.clear, lineWidth: 1.5)
         )
         .clipShape(Capsule())
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "Session \(hostName), \(statusText), \(isSelected ? "selected" : "not selected")"
-        )
-        .accessibilityHint("Double tap to switch to this session")
-        .accessibilityIdentifier("session-tab-\(session.id)")
-        .accessibilityAddTraits(isSelected ? [.isSelected] : [])
+        .accessibilityElement(children: .contain)
     }
 }
 

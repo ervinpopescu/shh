@@ -1458,7 +1458,9 @@ struct SessionView: View {
                 alignment: container.commandDialPreferences.placement == .leading
                     ? .bottomLeading : .bottomTrailing
             ) {
-                if horizontalSizeClass == .regular && container.secondaryPaneMode != .none {
+                if horizontalSizeClass == .regular && container.secondaryPaneMode != .none
+                    && container.openSessions.count <= 1
+                {
                     splitPaneArea
                 } else {
                     terminalSurfaceArea

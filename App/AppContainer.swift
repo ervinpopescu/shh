@@ -133,6 +133,7 @@ final class AppContainer: ObservableObject {
     }
     @Published public private(set) var openSessions: [TerminalSession] = []
     @Published public private(set) var selectedSessionID: UUID?
+    @Published public private(set) var pendingConnectingSession: TerminalSession?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
@@ -296,7 +297,8 @@ final class AppContainer: ObservableObject {
     }
 
     public var isConnectingSession: Bool {
-        sessionRuntimes.values.contains { $0.session.state == .connecting }
+        pendingConnectingSession != nil
+            || sessionRuntimes.values.contains { $0.session.state == .connecting }
             || activeSession?.state == .connecting
     }
 
@@ -310,6 +312,12 @@ final class AppContainer: ObservableObject {
 
     func selectSession(id: UUID) {
         guard let runtime = sessionRuntimes[id] else { return }
+        if case .sftp(let host) = secondaryPaneMode, host.id != runtime.host.id {
+            closeSecondaryPane()
+        }
+        if case .terminal(let host) = secondaryPaneMode, host.id != runtime.host.id {
+            closeSecondaryPane()
+        }
         selectedSessionID = id
         activeSession = runtime.session
         activeHost = runtime.host
@@ -886,6 +894,9 @@ final class AppContainer: ObservableObject {
             return
         }
 
+        // Close secondary pane before opening a new session to avoid cross-host leak
+        closeSecondaryPane()
+
         lifecycleGeneration += 1
         isSceneInBackground = false
         isForegroundRecoveryInProgress = false
@@ -897,7 +908,10 @@ final class AppContainer: ObservableObject {
         resetVoiceState()
         isExplicitDisconnect = false
 
-        if sessionRuntimes.isEmpty {
+        let isFirstSession = sessionRuntimes.isEmpty
+        let priorSelectedSessionID = selectedSessionID
+
+        if isFirstSession {
             liveActivityManager.endAll()
             foregroundRecoveryTask?.cancel()
             foregroundRecoveryTask = nil
@@ -952,7 +966,7 @@ final class AppContainer: ObservableObject {
         terminalController.synchronizeViewportMeasurement()
         let initialTerminalSize = terminalController.size
 
-        let session = TerminalSession(
+        var session = TerminalSession(
             id: sessionID ?? UUID(),
             hostID: host.id,
             state: .connecting,
@@ -968,10 +982,16 @@ final class AppContainer: ObservableObject {
             )
         )
 
-        activeHost = host
-        activeSession = session
-        terminalText = ""
-        reconnectState = .idle
+        pendingConnectingSession = session
+        if isFirstSession {
+            activeHost = host
+            activeSession = session
+            terminalText = ""
+            reconnectState = .idle
+        }
+
+        var openedConnection: (any SSHConnection)? = nil
+        var createdRuntime: SessionRuntime? = nil
         do {
             // Resolve descriptor by UUID before invoking transport. Never let a
             // missing descriptor degrade into password auth or an arbitrary
@@ -979,10 +999,14 @@ final class AppContainer: ObservableObject {
             // host-key acceptance.
             let selectedIdentity = try await resolveIdentity(for: host)
             // Identity resolution may yield to SwiftUI layout. Capture the
-            // latest measured geometry immediately before PTY initialization.
-            terminalController.synchronizeViewportMeasurement()
-            let initialSize = terminalController.size
-            activeSession?.terminalSize = initialSize
+            // latest measured geometry immediately before PTY initialization
+            // using the new runtime controller.
+            runtimeTerminalController.synchronizeViewportMeasurement()
+            let initialSize = runtimeTerminalController.size
+            session.terminalSize = initialSize
+            if isFirstSession {
+                activeSession?.terminalSize = initialSize
+            }
             let connection: any SSHConnection
             if case .mosh = host.connection {
                 connection = try await moshTransport.connect(
@@ -999,12 +1023,17 @@ final class AppContainer: ObservableObject {
                     initialSize: initialSize
                 )
             }
-            guard activeSession?.id == session.id,
-                activeSession?.state == .connecting,
+            openedConnection = connection
+            guard pendingConnectingSession?.id == session.id,
                 lifecycleGeneration == connectionGeneration,
                 !isSceneInBackground
             else {
                 await connection.close()
+                openedConnection = nil
+                pendingConnectingSession = nil
+                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                    selectSession(id: priorID)
+                }
                 return
             }
             if let moshController = connection as? any MoshSessionControlling {
@@ -1018,12 +1047,16 @@ final class AppContainer: ObservableObject {
             }
             // Host key is accepted and connection succeeded; load redaction secret if available
             await loadRedactionSecret(for: host)
-            guard activeSession?.id == session.id,
-                activeSession?.state == .connecting,
+            guard pendingConnectingSession?.id == session.id,
                 lifecycleGeneration == connectionGeneration,
                 !isSceneInBackground
             else {
                 await connection.close()
+                openedConnection = nil
+                pendingConnectingSession = nil
+                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                    selectSession(id: priorID)
+                }
                 return
             }
             let runtime = SessionRuntime(
@@ -1033,6 +1066,7 @@ final class AppContainer: ObservableObject {
                 terminalController: runtimeTerminalController,
                 redactor: redactor
             )
+            createdRuntime = runtime
             configureSessionRuntime(runtime, session: session, host: host)
             sessionRuntimes[session.id] = runtime
             if !sessionOrder.contains(session.id) {
@@ -1042,7 +1076,9 @@ final class AppContainer: ObservableObject {
             selectSession(id: session.id)
             await runtime.activateAndWait()
             activeSession?.state = .connected
+            updateOpenSessions()
             syncLiveActivityState()
+            pendingConnectingSession = nil
 
             let targetSession = await automaticTmuxTarget(
                 for: host,
@@ -1083,34 +1119,71 @@ final class AppContainer: ObservableObject {
                 }
             }
         } catch let error as TransportError {
-            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
-                return
+            if let openedConnection {
+                await openedConnection.close()
             }
+            if let createdRuntime {
+                await createdRuntime.disconnect()
+                sessionRuntimes.removeValue(forKey: session.id)
+                sessionOrder.removeAll { $0 == session.id }
+                updateOpenSessions()
+            }
+            pendingConnectingSession = nil
+
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = Self.statusMessage(for: error)
-            terminalText = message
             runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-            switch error {
-            case .hostKeyApprovalRequired(let challenge):
-                pendingTrustChallenge = challenge
-                pendingTrustHost = host
-                activeSession?.state = .disconnected
-            case .cancelled:
-                activeSession?.state = .disconnected
-            default:
-                activeSession?.state = .failed
+
+            if isFirstSession {
+                terminalText = message
+                switch error {
+                case .hostKeyApprovalRequired(let challenge):
+                    pendingTrustChallenge = challenge
+                    pendingTrustHost = host
+                    activeSession?.state = .disconnected
+                case .cancelled:
+                    activeSession?.state = .disconnected
+                default:
+                    activeSession?.state = .failed
+                }
+            } else {
+                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                    selectSession(id: priorID)
+                }
+                switch error {
+                case .hostKeyApprovalRequired(let challenge):
+                    pendingTrustChallenge = challenge
+                    pendingTrustHost = host
+                default:
+                    break
+                }
             }
         } catch {
-            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
-                return
+            if let openedConnection {
+                await openedConnection.close()
             }
+            if let createdRuntime {
+                await createdRuntime.disconnect()
+                sessionRuntimes.removeValue(forKey: session.id)
+                sessionOrder.removeAll { $0 == session.id }
+                updateOpenSessions()
+            }
+            pendingConnectingSession = nil
+
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = failure.reason
-            activeSession?.state = .failed
-            terminalText = message
             runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+
+            if isFirstSession {
+                activeSession?.state = .failed
+                terminalText = message
+            } else {
+                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                    selectSession(id: priorID)
+                }
+            }
         }
     }
 
@@ -1616,41 +1689,72 @@ final class AppContainer: ObservableObject {
                         return
                     }
 
-                    if let session = self.activeSession, session.state == .connected,
-                        let conn = self.connection
+                    // Collect all runtimes that were connected before backgrounding
+                    let connectedRuntimes: [SessionRuntime]
+                    if !self.sessionRuntimes.isEmpty {
+                        connectedRuntimes = self.sessionRuntimes.values.filter {
+                            $0.session.state == .connected
+                        }
+                    } else if let runtime = self.sessionRuntime, runtime.session.state == .connected
                     {
-                        // A process may have been suspended after the finite
-                        // background grace period. Report the session as
-                        // connecting while the bounded transport probe runs so
-                        // the UI never claims a dead socket is ready.
-                        self.isForegroundRecoveryInProgress = true
-                        self.activeSession?.state = .connecting
-                        let isResponsive = await conn.testResponsiveness(timeout: 2.5)
-                        guard self.lifecycleGeneration == generation,
-                            !self.isExplicitDisconnect,
-                            self.activeSession?.id == session.id,
-                            self.activeSession?.state == .connecting,
-                            self.connection != nil
-                        else { return }
+                        connectedRuntimes = [runtime]
+                    } else {
+                        connectedRuntimes = []
+                    }
 
-                        if isResponsive {
-                            self.isForegroundRecoveryInProgress = false
-                            self.activeSession?.state = .connected
-                            self.syncLiveActivityState()
-                            // Session is instantly ready with 0 delay and NO reconnect cycle.
-                            self.updateIdleTimerState()
-                            return
-                        } else {
-                            // Connection was severed by OS during deep sleep / suspension.
-                            await self.sessionRuntime?.disconnect()
-                            self.forwardingStreamTask?.cancel()
-                            self.forwardingStreamTask = nil
-                            await self.portForwardingManager?.stopAll()
-                            self.forwardingSessions = []
-                            self.isForegroundRecoveryInProgress = false
-                            self.activeSession?.state = .disconnected
-                            if let host = self.activeHost {
-                                self.handleConnectionDrop(host: host)
+                    if !connectedRuntimes.isEmpty {
+                        // Mark active/probed sessions as connecting during probe
+                        for runtime in connectedRuntimes {
+                            runtime.updateSessionState(.connecting)
+                            if runtime.session.id == self.selectedSessionID {
+                                self.isForegroundRecoveryInProgress = true
+                                self.activeSession?.state = .connecting
+                            }
+                        }
+                        self.updateOpenSessions()
+
+                        await withTaskGroup(of: Void.self) { group in
+                            for runtime in connectedRuntimes {
+                                let targetSessionID = runtime.session.id
+                                let targetConnection = runtime.connection
+                                let targetHost = runtime.host
+                                group.addTask { @MainActor [weak self] in
+                                    guard let self else { return }
+                                    let isResponsive = await targetConnection.testResponsiveness(
+                                        timeout: 2.5)
+
+                                    // Stale-generation guards: ensure state was not superseded
+                                    guard self.lifecycleGeneration == generation,
+                                        !self.isExplicitDisconnect,
+                                        let currentRuntime = self.sessionRuntimes[targetSessionID],
+                                        (currentRuntime.connection as AnyObject)
+                                            === (targetConnection as AnyObject)
+                                    else { return }
+
+                                    if isResponsive {
+                                        currentRuntime.updateSessionState(.connected)
+                                        if self.selectedSessionID == targetSessionID {
+                                            self.isForegroundRecoveryInProgress = false
+                                            self.activeSession?.state = .connected
+                                            self.syncLiveActivityState()
+                                            self.updateIdleTimerState()
+                                        }
+                                        self.updateOpenSessions()
+                                    } else {
+                                        await currentRuntime.disconnect()
+                                        self.updateOpenSessions()
+
+                                        if self.selectedSessionID == targetSessionID {
+                                            self.forwardingStreamTask?.cancel()
+                                            self.forwardingStreamTask = nil
+                                            await self.portForwardingManager?.stopAll()
+                                            self.forwardingSessions = []
+                                            self.isForegroundRecoveryInProgress = false
+                                            self.activeSession?.state = .disconnected
+                                            self.handleConnectionDrop(host: targetHost)
+                                        }
+                                    }
+                                }
                             }
                         }
                     } else if let host = self.activeHost,
@@ -1730,7 +1834,10 @@ final class AppContainer: ObservableObject {
         // socket, NIO event loop, port forwarding channels, and terminal stream
         // remain completely active.
         #if canImport(UIKit)
-        if activeSession?.state == .connected {
+        let hasConnectedRuntime =
+            activeSession?.state == .connected
+            || sessionRuntimes.values.contains { $0.session.state == .connected }
+        if hasConnectedRuntime {
             endCurrentBackgroundTask()
             let taskBox = BackgroundTaskBox()
             let taskID = backgroundTaskManager.beginBackgroundTask(
