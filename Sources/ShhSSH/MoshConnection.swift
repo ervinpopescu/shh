@@ -324,9 +324,13 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
         }
     }
 
-    private func handleChannelError(_ error: Error) async {
+    private func handleChannelError(_ error: Error) {
         guard !isClosed else { return }
-        await close(with: .networkUnavailable)
+        // The receive task must return before close drains it; otherwise close
+        // would wait on its own task until the quarantine deadline.
+        Task { [weak self] in
+            await self?.close(with: .networkUnavailable)
+        }
     }
 }
 

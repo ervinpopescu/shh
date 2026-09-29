@@ -63,6 +63,27 @@ final class MoshConnectionLifecycleTests: XCTestCase {
         _ = try? await pendingSend.value
     }
 
+    func testReceiveStreamErrorClosesPromptlyWithoutQuarantine() async throws {
+        let channel = ControlledMoshDatagramChannel()
+        let connection = makeConnection(channel: channel)
+        try await connection.start()
+        let stream = await connection.events()
+        var iterator = stream.makeAsyncIterator()
+
+        channel.finishIncomingWithError()
+        let event = try await iterator.next()
+        XCTAssertEqual(event, .error(.networkUnavailable))
+
+        for _ in 0..<20 {
+            if await connection.isClosed { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let isQuarantined = await connection.didQuarantine
+        let isClosed = await connection.isClosed
+        XCTAssertTrue(isClosed)
+        XCTAssertFalse(isQuarantined)
+    }
+
     func testEventsAfterCloseReturnClosedFinishedStream() async throws {
         let channel = ControlledMoshDatagramChannel()
         let connection = makeConnection(channel: channel)
@@ -140,6 +161,14 @@ private final class ControlledMoshDatagramChannel: MoshDatagramChannel, @uncheck
                 streamContinuation = continuation
             }
         }
+    }
+
+    func finishIncomingWithError() {
+        let continuation = lock.withLock {
+            defer { streamContinuation = nil }
+            return streamContinuation
+        }
+        continuation?.finish(throwing: TransportError.networkUnavailable)
     }
 
     func updateEndpoint(host: String, port: UInt16) async throws {}
