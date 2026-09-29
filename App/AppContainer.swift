@@ -1116,10 +1116,11 @@ final class AppContainer: ObservableObject {
               activeHost?.id == host.id else { return }
         isForegroundRecoveryInProgress = false
         guard reachabilityMonitor.isReachable else {
-            // A transport error is already represented as failed and must not be
-            // downgraded to disconnected while recovery waits for the network.
-            // Clean close paths set disconnected before reaching this branch.
-            if activeSession?.state != .failed {
+            // Preserve an observed transport error while recovery waits for the
+            // network. The error path may transiently expose disconnected before
+            // the terminal close event promotes the session to failed.
+            if activeSession?.state != .failed,
+               !hasObservedTransportError {
                 activeSession?.state = .disconnected
             }
             reconnectState = .failed(reason: "Network unavailable.")
@@ -1387,7 +1388,8 @@ final class AppContainer: ObservableObject {
             } else if activeSession != nil {
                 // Do not erase an actionable transport failure when the path
                 // update arrives after the failure event.
-                if activeSession?.state != .failed {
+                if activeSession?.state != .failed,
+                   !hasObservedTransportError {
                     activeSession?.state = .disconnected
                 }
                 reconnectState = .failed(reason: "Network unavailable.")
