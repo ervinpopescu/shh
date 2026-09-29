@@ -721,6 +721,43 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.hostID, hostB.id)
     }
 
+    func testSessionRuntimeRoutesEventsAndOwnsReconnectTeardown() async throws {
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let host = try Host(name: "Runtime Host", hostname: "runtime.invalid", username: "user")
+        await container.connect(to: host)
+
+        firstConnection.emit(.bytes(Data("first-output\\n".utf8)))
+        try await waitUntil { container.terminalText.contains("first-output") }
+        XCTAssertTrue(container.terminalController.onOutput != nil)
+        XCTAssertTrue(container.terminalController.onResize != nil)
+
+        container.terminalController.handleResize(columns: 111, rows: 37)
+        container.terminalController.flushResize()
+        try await waitUntil { firstConnection.resizeCalls.last == TerminalSize(columns: 111, rows: 37) }
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 111, rows: 37))
+
+        try await container.performReconnect(to: host, attempt: 1)
+        XCTAssertTrue(firstConnection.isClosed)
+        replacementConnection.emit(.bytes(Data("replacement-output\\n".utf8)))
+        try await waitUntil { container.terminalText.contains("replacement-output") }
+        XCTAssertFalse(container.terminalText.contains("first-output"))
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        await container.disconnect()
+        XCTAssertTrue(replacementConnection.isClosed)
+        XCTAssertNil(container.terminalController.onOutput)
+        XCTAssertNil(container.terminalController.onResize)
+    }
+
     func testRedactionBeforeFeedInProductionSurface() async throws {
         let credStore = InMemoryCredentialStore()
         let secretValue = "super-secret-ssh-token-42"

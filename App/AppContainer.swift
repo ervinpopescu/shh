@@ -266,11 +266,12 @@ final class AppContainer: ObservableObject {
     private var lifecycleGeneration = 0
     private var foregroundRecoveryTask: Task<Void, Never>?
     private var pendingTrustHost: Host?
-    private(set) var connection: (any SSHConnection)?
-    private var eventTask: Task<Void, Never>?
-    private var eventMonitoringGeneration = 0
-    private var outboundTask: Task<Void, Never>?
-    private var terminalResizeTask: Task<Bool, Never>?
+    /// Legacy projection of the selected transport. SessionRuntime owns the
+    /// connection and all terminal lifecycle callbacks.
+    var connection: (any SSHConnection)? {
+        sessionRuntime?.connection
+    }
+    private var sessionRuntime: SessionRuntime?
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
@@ -788,16 +789,8 @@ final class AppContainer: ObservableObject {
         activeHerdrWorkspaceID = nil
         await reconnectCoordinator.cancel()
         reconnectState = .idle
-        detachCallbacks()
-        let previousEventTask = eventTask
-        eventMonitoringGeneration &+= 1
-        eventTask?.cancel()
-        eventTask = nil
-
-        let oldConnection = connection
-        connection = nil
-        await oldConnection?.close()
-        _ = await previousEventTask?.result
+        await sessionRuntime?.disconnect()
+        sessionRuntime = nil
         hasObservedTransportError = false
         pendingTrustChallenge = nil
         pendingTrustHost = nil
@@ -893,8 +886,16 @@ final class AppContainer: ObservableObject {
                 await connection.close()
                 return
             }
-            self.connection = connection
-            (connection as? LiveSSHConnection)?.setRedactor(redactor)
+            let runtime = SessionRuntime(
+                host: host,
+                session: session,
+                connection: connection,
+                terminalController: terminalController,
+                redactor: redactor
+            )
+            configureSessionRuntime(runtime, session: session, host: host)
+            sessionRuntime = runtime
+            await runtime.activateAndWait()
             activeSession?.state = .connected
             syncLiveActivityState()
 
@@ -903,29 +904,6 @@ final class AppContainer: ObservableObject {
                 explicitTarget: restoringTmuxSessionID,
                 allowStoredTarget: restoringTmuxSessionID != nil
             )
-
-            // Wire debounced resize callback to active connection
-            terminalController.onResize = { [weak self, sessionID = session.id] newSize in
-                Task { @MainActor [weak self] in
-                    guard let self,
-                          self.activeSession?.id == sessionID,
-                          self.activeSession?.state == .connected,
-                          let activeConnection = self.connection else { return }
-                    _ = await self.resizePTY(
-                        newSize,
-                        on: activeConnection,
-                        sessionID: sessionID
-                    )
-                }
-            }
-
-            // Wire interactive terminal output to raw outbound path
-            terminalController.onOutput = { [weak self, sessionID = session.id] data in
-                guard let self,
-                      self.activeSession?.id == sessionID,
-                      self.activeSession?.state == .connected else { return }
-                self.enqueueRawInteractive(data, sessionID: sessionID)
-            }
 
             // Auto-attach tmux session if requested by host preferences or restored.
             // The attachment boundary performs the final viewport reconciliation
@@ -936,9 +914,6 @@ final class AppContainer: ObservableObject {
             } else {
                 _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
             }
-
-            let events = await connection.events()
-            startEventMonitoring(for: connection, events: events, session: session, host: host)
 
             // Wire port forwarding manager and auto-start enabled rules
             let pfManager: any PortForwardingManaging
@@ -963,7 +938,6 @@ final class AppContainer: ObservableObject {
             }
         } catch let error as TransportError {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
-            detachCallbacks()
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = Self.statusMessage(for: error)
@@ -981,7 +955,6 @@ final class AppContainer: ObservableObject {
             }
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
-            detachCallbacks()
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = failure.reason
@@ -991,122 +964,74 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    private func startEventMonitoring(
-        for connection: any SSHConnection,
-        events: AsyncThrowingStream<TerminalEvent, Error>,
+    private func configureSessionRuntime(
+        _ runtime: SessionRuntime,
         session: TerminalSession,
         host: Host
     ) {
-        eventMonitoringGeneration &+= 1
-        let monitoringGeneration = eventMonitoringGeneration
-        eventTask?.cancel()
-        eventTask = Task { @MainActor [weak self] in
-            do {
-                for try await event in events {
-                    guard let self,
-                          !Task.isCancelled,
-                          self.eventMonitoringGeneration == monitoringGeneration,
-                          self.activeSession?.id == session.id,
-                          !self.isExplicitDisconnect else { return }
-                    switch event {
-                    case .bytes(let data):
-                        let redactedData = self.redacted(data)
-                        self.terminalController.feed(redactedData)
-                    case .closed:
-                        guard !Task.isCancelled,
-                              self.eventMonitoringGeneration == monitoringGeneration,
-                              !self.isExplicitDisconnect,
-                              self.activeSession?.id == session.id else { return }
-                        self.tmuxRefreshGeneration += 1
-                        self.herdrRefreshGeneration += 1
-                        self.stopHerdrPolling()
-                        self.isProbingTmux = false
-                        self.isProbingHerdr = false
-                        // Closing is the terminal event for a clean drop. If a
-                        // transport error was already observed for this session,
-                        // retain failed so the actionable error remains visible.
-                        if self.activeSession?.state != .failed,
-                           !self.hasObservedTransportError {
-                            self.activeSession?.state = .disconnected
-                        } else {
-                            self.activeSession?.state = .failed
-                        }
-                        self.detachCallbacks()
-                        self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
-                        self.redactor = Redactor()
-                        self.forwardingStreamTask?.cancel()
-                        self.forwardingStreamTask = nil
-                        await self.portForwardingManager?.stopAll()
-                        guard !Task.isCancelled,
-                              self.eventMonitoringGeneration == monitoringGeneration,
-                              !self.isExplicitDisconnect,
-                              self.activeSession?.id == session.id else { return }
-                        self.forwardingSessions = []
-                        self.handleConnectionDrop(host: host)
-                    case .error(let error):
-                        guard !Task.isCancelled,
-                              self.eventMonitoringGeneration == monitoringGeneration,
-                              !self.isExplicitDisconnect,
-                              self.activeSession?.id == session.id else { return }
-                        self.tmuxRefreshGeneration += 1
-                        self.herdrRefreshGeneration += 1
-                        self.stopHerdrPolling()
-                        self.isProbingTmux = false
-                        self.isProbingHerdr = false
-                        self.hasObservedTransportError = true
-                        if error == .networkUnavailable,
-                           !self.reachabilityMonitor.isReachable {
-                            // An established session with no network is disconnected,
-                            // not failed. Keep the transport error marker so a later
-                            // close still preserves the actionable failure state.
-                            self.activeSession?.state = .disconnected
-                        } else {
-                            self.activeSession?.state = .failed
-                        }
-                        self.detachCallbacks()
-                        let message = Self.statusMessage(for: error)
-                        self.terminalText += "\n" + message
-                        self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                        self.redactor = Redactor()
-                        self.forwardingStreamTask?.cancel()
-                        self.forwardingStreamTask = nil
-                        await self.portForwardingManager?.stopAll()
-                        guard !Task.isCancelled,
-                              self.eventMonitoringGeneration == monitoringGeneration,
-                              !self.isExplicitDisconnect,
-                              self.activeSession?.id == session.id else { return }
-                        self.forwardingSessions = []
-                        self.handleConnectionDrop(host: host)
-                    }
-                }
-            } catch {
-                guard let self,
-                      !Task.isCancelled,
-                      self.eventMonitoringGeneration == monitoringGeneration,
-                      !self.isExplicitDisconnect,
-                      self.activeSession?.id == session.id else { return }
-                self.tmuxRefreshGeneration += 1
-                self.herdrRefreshGeneration += 1
-                self.stopHerdrPolling()
-                self.isProbingTmux = false
-                self.isProbingHerdr = false
-                self.hasObservedTransportError = true
-                self.activeSession?.state = .failed
-                self.detachCallbacks()
-                let message = Self.statusMessage(for: error)
-                self.terminalText += "\n" + message
-                self.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-                self.redactor = Redactor()
-                self.forwardingStreamTask?.cancel()
-                self.forwardingStreamTask = nil
-                await self.portForwardingManager?.stopAll()
-                guard !Task.isCancelled,
-                      !self.isExplicitDisconnect,
-                      self.activeSession?.id == session.id else { return }
-                self.forwardingSessions = []
-                self.handleConnectionDrop(host: host)
-            }
+        runtime.onOutput = { [weak self] data in
+            guard let self,
+                  self.activeSession?.id == session.id,
+                  self.sessionRuntime === runtime else { return }
+            self.terminalText += String(decoding: data, as: UTF8.self)
         }
+        runtime.onResize = { [weak self] size in
+            guard let self,
+                  self.activeSession?.id == session.id,
+                  self.sessionRuntime === runtime else { return }
+            self.activeSession?.terminalSize = size
+        }
+        runtime.onTermination = { [weak self] event in
+            await self?.handleSessionRuntimeTermination(event, session: session, host: host)
+        }
+    }
+
+    private func handleSessionRuntimeTermination(
+        _ event: TerminalEvent?,
+        session: TerminalSession,
+        host: Host
+    ) async {
+        guard !isExplicitDisconnect,
+              activeSession?.id == session.id,
+              sessionRuntime?.session.id == session.id else { return }
+
+        tmuxRefreshGeneration += 1
+        herdrRefreshGeneration += 1
+        stopHerdrPolling()
+        isProbingTmux = false
+        isProbingHerdr = false
+
+        let transportError: TransportError?
+        if case .error(let error) = event {
+            transportError = error
+        } else {
+            transportError = nil
+        }
+        if transportError != nil {
+            hasObservedTransportError = true
+        }
+        if event == nil || transportError != nil {
+            activeSession?.state = .failed
+        } else if activeSession?.state != .failed, !hasObservedTransportError {
+            activeSession?.state = .disconnected
+        }
+        let failureReason = transportError.map { Self.statusMessage(for: $0) } ?? "Connection failed."
+        reconnectState = activeSession?.state == .failed
+            ? .failed(reason: failureReason)
+            : .idle
+        redactor = Redactor()
+        if let transportError {
+            let message = Self.statusMessage(for: transportError)
+            terminalText += "\n" + message
+            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+        } else if case .closed = event {
+            terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
+        }
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        await portForwardingManager?.stopAll()
+        forwardingSessions = []
+        handleConnectionDrop(host: host)
     }
 
     private func handleConnectionDrop(host: Host) {
@@ -1154,9 +1079,8 @@ final class AppContainer: ObservableObject {
             throw TransportError.cancelled
         }
         let connectionGeneration = lifecycleGeneration
-        // Invalidate the previous stream before replacing the transport. A late
-        // event from that stream must not change the new session's Live Activity.
-        eventMonitoringGeneration &+= 1
+        // SessionRuntime invalidates the previous event stream atomically when
+        // the replacement transport is admitted.
         // Keep the last selected target independent from transient tmux refreshes
         // while the replacement transport is being established.
         let recoveryTmuxTarget = activeTmuxSessionID
@@ -1244,33 +1168,17 @@ final class AppContainer: ObservableObject {
             await connection.close()
             throw TransportError.cancelled
         }
-        let oldConnection = self.connection
-        self.connection = connection
-        (connection as? LiveSSHConnection)?.setRedactor(redactor)
+        guard let runtime = sessionRuntime,
+              await runtime.reconnect(with: connection) else {
+            await connection.close()
+            throw TransportError.cancelled
+        }
+        configureSessionRuntime(runtime, session: session, host: host)
+        await loadRedactionSecret(for: host)
+        runtime.setRedactor(redactor)
         activeSession?.state = .connected
+        reconnectState = .connected
         syncLiveActivityState()
-        await oldConnection?.close()
-
-        terminalController.onResize = { [weak self, sessionID = session.id] newSize in
-            Task { @MainActor [weak self] in
-                guard let self,
-                      self.activeSession?.id == sessionID,
-                      self.activeSession?.state == .connected,
-                      let activeConnection = self.connection else { return }
-                _ = await self.resizePTY(
-                    newSize,
-                    on: activeConnection,
-                    sessionID: sessionID
-                )
-            }
-        }
-
-        terminalController.onOutput = { [weak self, sessionID = session.id] data in
-            guard let self,
-                  self.activeSession?.id == sessionID,
-                  self.activeSession?.state == .connected else { return }
-            self.enqueueRawInteractive(data, sessionID: sessionID)
-        }
 
         let targetSession = await automaticTmuxTarget(
             for: host,
@@ -1293,9 +1201,6 @@ final class AppContainer: ObservableObject {
             await refreshHerdrState()
             await restoreHerdrTargetIfNeeded(for: host, session: session)
         }
-
-        let events = await connection.events()
-        startEventMonitoring(for: connection, events: events, session: session, host: host)
 
         let pfManager: any PortForwardingManaging
         if let custom = self.customPortForwardingManager {
@@ -1341,15 +1246,8 @@ final class AppContainer: ObservableObject {
         moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
-        detachCallbacks()
-        let previousEventTask = eventTask
-        eventMonitoringGeneration &+= 1
-        eventTask?.cancel()
-        eventTask = nil
-        let oldConnection = connection
-        connection = nil
-        await oldConnection?.close()
-        _ = await previousEventTask?.result
+        await sessionRuntime?.disconnect()
+        sessionRuntime = nil
         activeSession?.state = .disconnected
         updateIdleTimerState()
     }
@@ -1442,19 +1340,14 @@ final class AppContainer: ObservableObject {
                 await performFastSessionRecovery()
             }
         } else if let host = activeHost,
-                  activeSession?.state == .connected,
-                  let oldConnection = connection {
+                  activeSession?.state == .connected {
             // A path/interface change can leave an established TCP socket
             // half-alive without producing a channel callback. Replace it
             // through the normal reconnect path, but first detach the old
             // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
             activeSession?.state = .disconnected
-            detachCallbacks()
-            eventTask?.cancel()
-            eventTask = nil
-            connection = nil
-            await oldConnection.close()
+            await sessionRuntime?.disconnect()
             isNetworkRecoveryInProgress = false
             handleConnectionDrop(host: host)
         }
@@ -1547,17 +1440,11 @@ final class AppContainer: ObservableObject {
                             return
                         } else {
                             // Connection was severed by OS during deep sleep / suspension.
-                            self.detachCallbacks()
-                            self.eventMonitoringGeneration &+= 1
-                            self.eventTask?.cancel()
-                            self.eventTask = nil
-                            let deadConn = self.connection
-                            self.connection = nil
+                            await self.sessionRuntime?.disconnect()
                             self.forwardingStreamTask?.cancel()
                             self.forwardingStreamTask = nil
                             await self.portForwardingManager?.stopAll()
                             self.forwardingSessions = []
-                            await deadConn?.close()
                             self.isForegroundRecoveryInProgress = false
                             self.activeSession?.state = .disconnected
                             if let host = self.activeHost {
@@ -1758,13 +1645,8 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func sendRawInteractive(_ data: Data) async -> Bool {
         guard activeSession?.state == .connected,
-              let connection else { return false }
-        do {
-            try await connection.send(data)
-            return true
-        } catch {
-            return false
-        }
+              let runtime = sessionRuntime else { return false }
+        return await runtime.send(data)
     }
 
     @discardableResult
@@ -1782,16 +1664,14 @@ final class AppContainer: ObservableObject {
     func sendValidatedCommand(_ command: String, approved: Bool = false) async -> Bool {
         guard CommandPolicy().canSend(command, approved: approved),
               activeSession?.state == .connected,
-              let connection else { return false }
-        do {
-            try await connection.send(Data(command.utf8))
-            return true
-        } catch {
-            let message = "Send failed: \(error.localizedDescription)"
+              let runtime = sessionRuntime else { return false }
+        let sent = await runtime.send(Data(command.utf8))
+        if !sent {
+            let message = "Send failed: Connection failed."
             terminalText += "\n" + message
             terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
-            return false
         }
+        return sent
     }
 
     @discardableResult
@@ -1828,13 +1708,8 @@ final class AppContainer: ObservableObject {
         liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
         await reconnectCoordinator.cancel()
         reconnectState = .idle
-        detachCallbacks()
-        let previousEventTask = eventTask
-        eventMonitoringGeneration &+= 1
-        eventTask?.cancel()
-        eventTask = nil
-        let oldConnection = connection
-        connection = nil
+        await sessionRuntime?.disconnect()
+        sessionRuntime = nil
 
         // Reset port forwarding state before closing SSH connection
         forwardingStreamTask?.cancel()
@@ -1846,8 +1721,6 @@ final class AppContainer: ObservableObject {
         forwardingSessions = []
         forwardingErrorMessage = nil
 
-        await oldConnection?.close()
-        _ = await previousEventTask?.result
         activeSession?.state = .disconnected
         redactor = Redactor()
         activeTmuxSessionID = nil
@@ -1904,24 +1777,6 @@ final class AppContainer: ObservableObject {
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
         updateIdleTimerState()
-    }
-
-    private func detachCallbacks() {
-        terminalController.onResize = nil
-        terminalController.onOutput = nil
-        outboundTask?.cancel()
-        outboundTask = nil
-    }
-
-    private func enqueueRawInteractive(_ data: Data, sessionID: UUID) {
-        let previousTask = outboundTask
-        outboundTask = Task { @MainActor [weak self] in
-            _ = await previousTask?.value
-            guard let self,
-                  self.activeSession?.id == sessionID,
-                  self.activeSession?.state == .connected else { return }
-            _ = await self.sendRawInteractive(data)
-        }
     }
 
     /// Resolves the exact identity selected by a host without exposing secret
@@ -2360,40 +2215,19 @@ final class AppContainer: ObservableObject {
         on conn: any SSHConnection,
         sessionID: UUID
     ) async -> Bool {
-        let previousResize = terminalResizeTask
-        let resizeTask = Task { @MainActor [weak self] in
-            _ = await previousResize?.value
-            guard let self,
-                  self.activeSession?.id == sessionID,
-                  self.activeSession?.state == .connected,
-                  !self.isExplicitDisconnect,
-                  let currentConnection = self.connection,
-                  (currentConnection as AnyObject) === (conn as AnyObject) else {
-                return false
-            }
-            do {
-                try await conn.resize(size)
-            } catch {
-                guard self.activeSession?.id == sessionID,
-                      self.activeSession?.state == .connected,
-                      !self.isExplicitDisconnect,
-                      (self.connection as AnyObject) === (conn as AnyObject) else {
-                    return false
-                }
-                self.tmuxError = "Failed to resize terminal: \(error.localizedDescription)"
-                return false
-            }
-            guard self.activeSession?.id == sessionID,
-                  self.activeSession?.state == .connected,
-                  !self.isExplicitDisconnect,
-                  (self.connection as AnyObject) === (conn as AnyObject) else {
-                return false
-            }
-            self.activeSession?.terminalSize = size
-            return true
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              let currentConnection = connection,
+              (currentConnection as AnyObject) === (conn as AnyObject),
+              let runtime = sessionRuntime else {
+            return false
         }
-        terminalResizeTask = resizeTask
-        return await resizeTask.value
+        let resized = await runtime.resize(size)
+        if !resized {
+            tmuxError = "Failed to resize terminal."
+        }
+        return resized
     }
 
     private func synchronizeViewportAndResize(
