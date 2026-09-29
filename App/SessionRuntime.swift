@@ -42,6 +42,8 @@ final class SessionRuntime {
     private var transportGeneration: UInt64 = 0
     private var closedTransportGeneration: UInt64?
 
+    private static let teardownTimeoutNanoseconds: UInt64 = 250_000_000
+
     convenience init(
         host: Host,
         session: TerminalSession,
@@ -100,21 +102,31 @@ final class SessionRuntime {
     /// Replaces only this session's transport. The session identity and terminal
     /// model remain stable, while the generation rejects callbacks from the old
     /// connection even if its event stream races cancellation.
-    func reconnect(with replacement: any SSHConnection) async {
+    @discardableResult
+    func reconnect(with replacement: any SSHConnection) async -> Bool {
         let previous = connection
         let previousTransportGeneration = transportGeneration
         let pending = invalidateCallbacks()
-        await closeConnectionIfNeeded(previous, generation: previousTransportGeneration)
-        _ = await pending.outbound?.value
-        _ = await pending.resize?.value
-        _ = await pending.event?.value
-
-        connection = replacement
         transportGeneration &+= 1
         reconnectGeneration &+= 1
         reconnectState = .connecting(attempt: Int(reconnectGeneration))
-        redactor = Redactor()
         session.state = .connecting
+        redactor = Redactor()
+
+        let deadline = teardownDeadline()
+        guard
+            await closeAndAwaitQuiescence(
+                previous,
+                generation: previousTransportGeneration,
+                pending: pending,
+                deadline: deadline
+            )
+        else {
+            failTeardown()
+            return false
+        }
+
+        connection = replacement
         terminalGrid = TerminalGrid(size: session.terminalSize)
         ansiParser = ANSIParser()
         terminalText = ""
@@ -123,6 +135,7 @@ final class SessionRuntime {
         reconnectState = .connected
         installCallbacks()
         startEventMonitoring()
+        return true
     }
 
     @discardableResult
@@ -158,10 +171,12 @@ final class SessionRuntime {
         session.state = .disconnected
         reconnectState = .idle
         redactor = Redactor()
-        await closeConnectionIfNeeded(activeConnection, generation: activeTransportGeneration)
-        _ = await pending.outbound?.value
-        _ = await pending.resize?.value
-        _ = await pending.event?.value
+        _ = await closeAndAwaitQuiescence(
+            activeConnection,
+            generation: activeTransportGeneration,
+            pending: pending,
+            deadline: teardownDeadline()
+        )
     }
 
     private func installCallbacks() {
@@ -277,9 +292,12 @@ final class SessionRuntime {
         self.reconnectState = reconnectState
         redactor = Redactor()
         let pending = invalidateCallbacks()
-        await closeConnectionIfNeeded(connection, generation: token.transportGeneration)
-        _ = await pending.outbound?.value
-        _ = await pending.resize?.value
+        _ = await closeAndAwaitQuiescence(
+            connection,
+            generation: token.transportGeneration,
+            pending: PendingTasks(event: nil, outbound: pending.outbound, resize: pending.resize),
+            deadline: teardownDeadline()
+        )
         // The event task invokes this method and must not await itself.
     }
 
@@ -308,12 +326,94 @@ final class SessionRuntime {
         return pending
     }
 
-    private func closeConnectionIfNeeded(
+    private func teardownDeadline() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds &+ Self.teardownTimeoutNanoseconds
+    }
+
+    private func closeAndAwaitQuiescence(
         _ connection: any SSHConnection,
-        generation: UInt64
-    ) async {
-        guard closedTransportGeneration != generation else { return }
-        closedTransportGeneration = generation
-        await connection.close()
+        generation: UInt64,
+        pending: PendingTasks,
+        deadline: UInt64
+    ) async -> Bool {
+        if closedTransportGeneration != generation {
+            guard
+                await waitForCompletion(
+                    until: deadline,
+                    operation: {
+                        await connection.close()
+                    })
+            else {
+                return false
+            }
+            closedTransportGeneration = generation
+        }
+
+        if let outbound = pending.outbound {
+            guard
+                await waitForCompletion(
+                    until: deadline,
+                    operation: {
+                        _ = await outbound.value
+                    })
+            else {
+                return false
+            }
+        }
+        if let resize = pending.resize {
+            guard
+                await waitForCompletion(
+                    until: deadline,
+                    operation: {
+                        _ = await resize.value
+                    })
+            else {
+                return false
+            }
+        }
+        if let event = pending.event {
+            guard
+                await waitForCompletion(
+                    until: deadline,
+                    operation: {
+                        _ = await event.value
+                    })
+            else {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func waitForCompletion(
+        until deadline: UInt64,
+        operation: @escaping @Sendable () async -> Void
+    ) async -> Bool {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard deadline > now else { return false }
+        let remaining = deadline - now
+
+        let signal = AsyncStream<Bool> { continuation in
+            Task {
+                await operation()
+                continuation.yield(true)
+                continuation.finish()
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: remaining)
+                continuation.yield(false)
+                continuation.finish()
+            }
+        }
+        var iterator = signal.makeAsyncIterator()
+        return await iterator.next() ?? false
+    }
+
+    private func failTeardown() {
+        session.state = .failed
+        reconnectState = .failed(reason: "Connection shutdown timed out.")
+        redactor = Redactor()
+        terminalController.onOutput = nil
+        terminalController.onResize = nil
     }
 }

@@ -2,6 +2,7 @@ import ShhCore
 import ShhSSH
 import ShhTerminal
 import XCTest
+
 @testable import Shh
 
 @MainActor
@@ -176,6 +177,74 @@ final class SessionRuntimeTests: XCTestCase {
         )
     }
 
+    func testReconnectQuiescesBeforeConcurrentSend() async throws {
+        let host = try Host(name: "Quiesce", hostname: "quiesce.invalid", username: "dev")
+        let original = RuntimeControlledConnection(blocksClose: true)
+        let replacement = RuntimeControlledConnection()
+        let runtime = SessionRuntime(
+            host: host,
+            session: TerminalSession(hostID: host.id, state: .connecting),
+            connection: original
+        )
+        runtime.activate()
+        await original.waitForEventsSubscription()
+
+        let reconnectTask = Task { @MainActor in
+            await runtime.reconnect(with: replacement)
+        }
+        await original.waitForCloseStart()
+
+        let sentDuringReconnect = await runtime.send(Data("stale-output".utf8))
+        let originalDuringReconnect = await original.snapshot()
+        XCTAssertFalse(sentDuringReconnect)
+        XCTAssertEqual(originalDuringReconnect.sentData, [])
+
+        await original.releaseClose()
+        let reconnectSucceeded = await reconnectTask.value
+        XCTAssertTrue(reconnectSucceeded)
+        await replacement.waitForEventsSubscription()
+        let replacementSent = await runtime.send(Data("replacement-output".utf8))
+        let replacementSnapshot = await replacement.snapshot()
+        XCTAssertTrue(replacementSent)
+        XCTAssertEqual(replacementSnapshot.sentData, [Data("replacement-output".utf8)])
+    }
+
+    func testReconnectFailsWithinBoundForNonCooperativeConnection() async throws {
+        let host = try Host(
+            name: "Uncooperative", hostname: "uncooperative.invalid", username: "dev")
+        let original = RuntimeControlledConnection(
+            blocksIO: true,
+            cooperativeIO: false,
+            interruptsIOOnClose: false
+        )
+        let replacement = RuntimeControlledConnection()
+        let runtime = SessionRuntime(
+            host: host,
+            session: TerminalSession(hostID: host.id, state: .connecting),
+            connection: original
+        )
+        runtime.activate()
+        await original.waitForEventsSubscription()
+        let pendingSend = Task { @MainActor in
+            await runtime.send(Data("blocked-output".utf8))
+        }
+        await original.waitForSendStart()
+
+        let reconnectSucceeded = await runtime.reconnect(with: replacement)
+        let replacementSnapshot = await replacement.snapshot()
+        let originalSnapshot = await original.snapshot()
+        let rejectedSend = await runtime.send(Data("rejected-output".utf8))
+        XCTAssertFalse(reconnectSucceeded)
+        XCTAssertEqual(runtime.session.state, .failed)
+        XCTAssertEqual(runtime.reconnectState, .failed(reason: "Connection shutdown timed out."))
+        XCTAssertFalse(rejectedSend)
+        XCTAssertEqual(replacementSnapshot.closeCallCount, 0)
+        XCTAssertEqual(originalSnapshot.closeCallCount, 1)
+        pendingSend.cancel()
+        await original.releaseIO()
+        _ = await pendingSend.value
+    }
+
     func testRedactorAndErrorCleanupRemainPerRuntime() async throws {
         let hostA = try Host(name: "Redacted A", hostname: "redacted-a.invalid", username: "dev")
         let hostB = try Host(name: "Redacted B", hostname: "redacted-b.invalid", username: "dev")
@@ -226,18 +295,31 @@ final class SessionRuntimeTests: XCTestCase {
 
 private actor RuntimeControlledConnection: SSHConnection {
     private let blocksIO: Bool
+    private let cooperativeIO: Bool
+    private let interruptsIOOnClose: Bool
+    private let blocksClose: Bool
     private let finishEventsOnClose: Bool
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     private var sendContinuation: CheckedContinuation<Void, Error>?
     private var resizeContinuation: CheckedContinuation<Void, Error>?
+    private var closeContinuation: CheckedContinuation<Void, Never>?
     private var sendCallCount = 0
     private var resizeCallCount = 0
     private(set) var sentData: [Data] = []
     private(set) var resizeCalls: [TerminalSize] = []
     private(set) var closeCallCount = 0
 
-    init(blocksIO: Bool = false, finishEventsOnClose: Bool = true) {
+    init(
+        blocksIO: Bool = false,
+        cooperativeIO: Bool = true,
+        interruptsIOOnClose: Bool = true,
+        blocksClose: Bool = false,
+        finishEventsOnClose: Bool = true
+    ) {
         self.blocksIO = blocksIO
+        self.cooperativeIO = cooperativeIO
+        self.interruptsIOOnClose = interruptsIOOnClose
+        self.blocksClose = blocksClose
         self.finishEventsOnClose = finishEventsOnClose
     }
 
@@ -251,6 +333,7 @@ private actor RuntimeControlledConnection: SSHConnection {
         sentData.append(data)
         sendCallCount += 1
         guard blocksIO else { return }
+        let shouldCancelIO = cooperativeIO
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<Void, Error>) in
@@ -261,7 +344,9 @@ private actor RuntimeControlledConnection: SSHConnection {
                 }
             }
         } onCancel: {
-            Task { await self.cancelSend() }
+            if shouldCancelIO {
+                Task { await self.cancelSend() }
+            }
         }
         try Task.checkCancellation()
     }
@@ -270,6 +355,7 @@ private actor RuntimeControlledConnection: SSHConnection {
         resizeCalls.append(size)
         resizeCallCount += 1
         guard blocksIO else { return }
+        let shouldCancelIO = cooperativeIO
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation {
                 (continuation: CheckedContinuation<Void, Error>) in
@@ -280,15 +366,24 @@ private actor RuntimeControlledConnection: SSHConnection {
                 }
             }
         } onCancel: {
-            Task { await self.cancelResize() }
+            if shouldCancelIO {
+                Task { await self.cancelResize() }
+            }
         }
         try Task.checkCancellation()
     }
 
     func close() async {
         closeCallCount += 1
-        cancelSend()
-        cancelResize()
+        if blocksClose {
+            await withCheckedContinuation { continuation in
+                closeContinuation = continuation
+            }
+        }
+        if interruptsIOOnClose {
+            cancelSend()
+            cancelResize()
+        }
         if finishEventsOnClose {
             streamContinuation?.finish()
         }
@@ -314,6 +409,22 @@ private actor RuntimeControlledConnection: SSHConnection {
         while resizeCallCount == 0 {
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
+    }
+
+    func waitForCloseStart() async {
+        while closeContinuation == nil {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
+    func releaseClose() {
+        closeContinuation?.resume()
+        closeContinuation = nil
+    }
+
+    func releaseIO() {
+        cancelSend()
+        cancelResize()
     }
 
     func snapshot() -> (closeCallCount: Int, sentData: [Data], resizeCalls: [TerminalSize]) {
