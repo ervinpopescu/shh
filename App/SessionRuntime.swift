@@ -41,7 +41,9 @@ final class SessionRuntime {
     private var callbackGeneration: UInt64 = 0
     private var transportGeneration: UInt64 = 0
     private var eventReadyWaiters: [CheckedContinuation<Void, Never>] = []
-    private var closedTransportGeneration: UInt64?
+    /// Marks a transport before invoking close so timeout paths cannot invoke
+    /// a second close on the same object during later teardown attempts.
+    private var closeStartedConnectionIdentity: ObjectIdentifier?
 
     private static let teardownTimeoutNanoseconds: UInt64 = 250_000_000
 
@@ -127,9 +129,11 @@ final class SessionRuntime {
     /// model remain stable, while the generation rejects callbacks from the old
     /// connection even if its event stream races cancellation.
     @discardableResult
-    func reconnect(with replacement: any SSHConnection) async -> Bool {
+    func reconnect(
+        with replacement: any SSHConnection,
+        redactor replacementRedactor: Redactor = Redactor()
+    ) async -> Bool {
         let previous = connection
-        let previousTransportGeneration = transportGeneration
         let pending = invalidateCallbacks()
         transportGeneration &+= 1
         reconnectGeneration &+= 1
@@ -141,7 +145,6 @@ final class SessionRuntime {
         guard
             await closeAndAwaitQuiescence(
                 previous,
-                generation: previousTransportGeneration,
                 pending: pending,
                 deadline: deadline
             )
@@ -151,6 +154,7 @@ final class SessionRuntime {
         }
 
         connection = replacement
+        redactor = replacementRedactor
         terminalGrid = TerminalGrid(size: session.terminalSize)
         ansiParser = ANSIParser()
         terminalText = ""
@@ -190,14 +194,12 @@ final class SessionRuntime {
 
     func disconnect() async {
         let activeConnection = connection
-        let activeTransportGeneration = transportGeneration
         let pending = invalidateCallbacks()
         session.state = .disconnected
         reconnectState = .idle
         redactor = Redactor()
         _ = await closeAndAwaitQuiescence(
             activeConnection,
-            generation: activeTransportGeneration,
             pending: pending,
             deadline: teardownDeadline()
         )
@@ -327,7 +329,6 @@ final class SessionRuntime {
         let pending = invalidateCallbacks()
         _ = await closeAndAwaitQuiescence(
             connection,
-            generation: token.transportGeneration,
             pending: PendingTasks(event: nil, outbound: pending.outbound, resize: pending.resize),
             deadline: teardownDeadline()
         )
@@ -368,11 +369,14 @@ final class SessionRuntime {
 
     private func closeAndAwaitQuiescence(
         _ connection: any SSHConnection,
-        generation: UInt64,
         pending: PendingTasks,
         deadline: UInt64
     ) async -> Bool {
-        if closedTransportGeneration != generation {
+        let connectionIdentity = ObjectIdentifier(connection as AnyObject)
+        if closeStartedConnectionIdentity != connectionIdentity {
+            // Record close ownership before awaiting. The close operation may
+            // outlive the bounded wait when a transport is non-cooperative.
+            closeStartedConnectionIdentity = connectionIdentity
             guard
                 await waitForCompletion(
                     until: deadline,
@@ -382,7 +386,6 @@ final class SessionRuntime {
             else {
                 return false
             }
-            closedTransportGeneration = generation
         }
 
         if let outbound = pending.outbound {

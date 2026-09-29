@@ -1160,22 +1160,41 @@ final class AppContainer: ObservableObject {
             startMoshMonitoring(for: moshController, session: session)
         }
 
-        await loadRedactionSecret(for: host)
-        guard activeSession?.id == session.id,
-              lifecycleGeneration == connectionGeneration,
-              !isExplicitDisconnect,
-              !isSceneInBackground else {
-            await connection.close()
-            throw TransportError.cancelled
-        }
-        guard let runtime = sessionRuntime,
-              await runtime.reconnect(with: connection) else {
+        guard let runtime = sessionRuntime else {
             await connection.close()
             throw TransportError.cancelled
         }
         configureSessionRuntime(runtime, session: session, host: host)
+        let previousConnection = runtime.connection
         await loadRedactionSecret(for: host)
-        runtime.setRedactor(redactor)
+        guard activeSession?.id == session.id,
+              activeSession?.state == .connecting,
+              lifecycleGeneration == connectionGeneration,
+              !isExplicitDisconnect,
+              !isSceneInBackground,
+              sessionRuntime === runtime,
+              (runtime.connection as AnyObject) === (previousConnection as AnyObject) else {
+            redactor = Redactor()
+            await runtime.disconnect()
+            await connection.close()
+            throw TransportError.cancelled
+        }
+        guard await runtime.reconnect(with: connection, redactor: redactor) else {
+            redactor = Redactor()
+            throw TransportError.cancelled
+        }
+        guard activeSession?.id == session.id,
+              activeSession?.state == .connecting,
+              lifecycleGeneration == connectionGeneration,
+              !isExplicitDisconnect,
+              !isSceneInBackground,
+              sessionRuntime === runtime,
+              let currentConnection = self.connection,
+              (currentConnection as AnyObject) === (connection as AnyObject) else {
+            redactor = Redactor()
+            await runtime.disconnect()
+            throw TransportError.cancelled
+        }
         activeSession?.state = .connected
         reconnectState = .connected
         syncLiveActivityState()
@@ -1799,6 +1818,7 @@ final class AppContainer: ObservableObject {
     /// ProxyJump bastions with the terminal redactor. All readable credentials are
     /// protected unconditionally regardless of catalog collision status.
     func loadRedactionSecret(for host: Host) async {
+        let currentLifecycle = lifecycleGeneration
         redactor = Redactor()
         var secrets: [String] = []
         let identities = (try? await catalog.identities()) ?? []
@@ -1836,6 +1856,9 @@ final class AppContainer: ObservableObject {
             if !key.isEmpty {
                 secrets.append(key)
             }
+        }
+        guard lifecycleGeneration == currentLifecycle, !isExplicitDisconnect else {
+            return
         }
         if !secrets.isEmpty {
             redactor = Redactor(secrets: secrets)
