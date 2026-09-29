@@ -240,9 +240,44 @@ final class SessionRuntimeTests: XCTestCase {
         XCTAssertFalse(rejectedSend)
         XCTAssertEqual(replacementSnapshot.closeCallCount, 0)
         XCTAssertEqual(originalSnapshot.closeCallCount, 1)
+        await runtime.disconnect()
+        let repeatedDisconnectSnapshot = await original.snapshot()
+        XCTAssertEqual(
+            repeatedDisconnectSnapshot.closeCallCount,
+            1,
+            "A timed-out transport must retain close ownership"
+        )
         pendingSend.cancel()
         await original.releaseIO()
         _ = await pendingSend.value
+    }
+
+    func testReplacementOutputUsesRedactorBeforeEventAdmission() async throws {
+        let host = try Host(
+            name: "Replacement Redactor",
+            hostname: "replacement.invalid",
+            username: "dev"
+        )
+        let original = RuntimeControlledConnection()
+        let replacement = RuntimeControlledConnection()
+        let runtime = SessionRuntime(
+            host: host,
+            session: TerminalSession(hostID: host.id, state: .connecting),
+            connection: original
+        )
+        runtime.activate()
+        await original.waitForEventsSubscription()
+
+        let replacementRedactor = Redactor(secrets: ["replacement-secret"])
+        let reconnected = await runtime.reconnect(with: replacement, redactor: replacementRedactor)
+        XCTAssertTrue(reconnected)
+        await replacement.waitForEventsSubscription()
+        await replacement.emit(.bytes(Data("replacement-secret\\n".utf8)))
+        await waitForCallbacks()
+
+        XCTAssertEqual(runtime.redactor.secrets, ["replacement-secret"])
+        XCTAssertFalse(runtime.terminalText.contains("replacement-secret"))
+        XCTAssertTrue(runtime.terminalText.contains("[REDACTED]"))
     }
 
     func testRedactorAndErrorCleanupRemainPerRuntime() async throws {

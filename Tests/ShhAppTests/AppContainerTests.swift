@@ -29,6 +29,46 @@ final class CountingCredentialStore: CredentialStore, @unchecked Sendable {
     }
 }
 
+final class BlockingCredentialStore: CredentialStore, @unchecked Sendable {
+    private let inner = InMemoryCredentialStore()
+    private let lock = NSLock()
+    private var blockNext = false
+    private let started = Gate()
+    private let release = Gate()
+
+    func blockNextLoad() {
+        lock.withLock { blockNext = true }
+    }
+
+    func waitForBlockedLoad() async {
+        await started.wait()
+    }
+
+    func releaseBlockedLoad() async {
+        await release.open()
+    }
+
+    func save(_ secret: Data, reference: String) async throws {
+        try await inner.save(secret, reference: reference)
+    }
+
+    func load(reference: String) async throws -> Data {
+        let shouldBlock = lock.withLock {
+            defer { blockNext = false }
+            return blockNext
+        }
+        if shouldBlock {
+            await started.open()
+            await release.wait()
+        }
+        return try await inner.load(reference: reference)
+    }
+
+    func delete(reference: String) async throws {
+        try await inner.delete(reference: reference)
+    }
+}
+
 @MainActor
 final class AppContainerTests: XCTestCase {
 
@@ -756,6 +796,42 @@ final class AppContainerTests: XCTestCase {
         XCTAssertTrue(replacementConnection.isClosed)
         XCTAssertNil(container.terminalController.onOutput)
         XCTAssertNil(container.terminalController.onResize)
+    }
+
+    func testDisconnectDuringReconnectSecretLoadCannotPublishReplacement() async throws {
+        let credentialStore = BlockingCredentialStore()
+        try await credentialStore.save(Data("secret-value".utf8), reference: "blocked-secret")
+        let identity = try IdentityDescriptor(
+            name: "Blocked Secret", kind: .password, keychainReference: "blocked-secret")
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(credentialStore: credentialStore, transport: transport)
+        try await container.catalog.save(identity)
+        let host = try Host(
+            name: "Blocked Runtime Host",
+            hostname: "blocked-runtime.invalid",
+            username: "user",
+            identityID: identity.id
+        )
+        await container.connect(to: host)
+        credentialStore.blockNextLoad()
+
+        let reconnectTask = Task { @MainActor in
+            try? await container.performReconnect(to: host, attempt: 1)
+        }
+        await credentialStore.waitForBlockedLoad()
+        await container.disconnect()
+        await credentialStore.releaseBlockedLoad()
+        await reconnectTask.value
+
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertNil(container.connection)
+        XCTAssertTrue(replacementConnection.isClosed)
+        XCTAssertTrue(container.redactor.secrets.isEmpty)
     }
 
     func testRedactionBeforeFeedInProductionSurface() async throws {
