@@ -269,6 +269,8 @@ final class AppContainer: ObservableObject {
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
     private var eventMonitoringGeneration = 0
+    /// Invalidates foreground probes when a drop or replacement transport starts.
+    private var transportRecoveryEpoch: UInt64 = 0
     private var outboundTask: Task<Void, Never>?
     private var terminalResizeTask: Task<Bool, Never>?
     private var terminalGrid = TerminalGrid()
@@ -999,6 +1001,7 @@ final class AppContainer: ObservableObject {
         session: TerminalSession,
         host: Host
     ) {
+        transportRecoveryEpoch &+= 1
         eventMonitoringGeneration &+= 1
         let monitoringGeneration = eventMonitoringGeneration
         eventTask?.cancel()
@@ -1024,6 +1027,7 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
+                        self.transportRecoveryEpoch &+= 1
                         // Closing is the terminal event for a clean drop. If a
                         // transport error was already observed for this session,
                         // retain failed so the actionable error remains visible.
@@ -1056,6 +1060,7 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
+                        self.transportRecoveryEpoch &+= 1
                         self.hasObservedTransportError = true
                         if error == .networkUnavailable,
                            !self.reachabilityMonitor.isReachable {
@@ -1094,6 +1099,7 @@ final class AppContainer: ObservableObject {
                 self.stopHerdrPolling()
                 self.isProbingTmux = false
                 self.isProbingHerdr = false
+                self.transportRecoveryEpoch &+= 1
                 self.hasObservedTransportError = true
                 self.activeSession?.state = .failed
                 self.syncLiveActivityState()
@@ -1159,6 +1165,7 @@ final class AppContainer: ObservableObject {
               activeHost?.id == host.id else {
             throw TransportError.cancelled
         }
+        transportRecoveryEpoch &+= 1
         let connectionGeneration = lifecycleGeneration
         // Invalidate the previous stream before replacing the transport. A late
         // event from that stream must not change the new session's Live Activity.
@@ -1456,6 +1463,7 @@ final class AppContainer: ObservableObject {
             // through the normal reconnect path, but first detach the old
             // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
+            transportRecoveryEpoch &+= 1
             activeSession?.state = .disconnected
             syncLiveActivityState()
             detachCallbacks()
@@ -1533,6 +1541,8 @@ final class AppContainer: ObservableObject {
                     guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
 
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
+                        let probeConnectionID = ObjectIdentifier(conn as AnyObject)
+                        let probeRecoveryEpoch = self.transportRecoveryEpoch
                         // A process may have been suspended after the finite
                         // background grace period. Report the session as
                         // connecting while the bounded transport probe runs so
@@ -1542,10 +1552,13 @@ final class AppContainer: ObservableObject {
                         self.syncLiveActivityState()
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
                         guard self.lifecycleGeneration == generation,
+                              self.transportRecoveryEpoch == probeRecoveryEpoch,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id,
                               self.activeSession?.state == .connecting,
-                              self.connection != nil else { return }
+                              self.connection.map({ ObjectIdentifier($0 as AnyObject) }) == probeConnectionID else {
+                            return
+                        }
 
                         if isResponsive {
                             self.isForegroundRecoveryInProgress = false
