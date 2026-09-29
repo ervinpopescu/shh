@@ -834,6 +834,62 @@ final class AppContainerTests: XCTestCase {
         XCTAssertTrue(container.redactor.secrets.isEmpty)
     }
 
+    func testReconnectClosesReplacementWhenRuntimeTeardownTimesOut() async throws {
+        let closeGate = Gate()
+        let firstConnection = MockSSHConnection()
+        firstConnection.onClose = {
+            await closeGate.wait()
+        }
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let host = try Host(name: "Timeout Host", hostname: "timeout.invalid", username: "user")
+        await container.connect(to: host)
+
+        do {
+            try await container.performReconnect(to: host, attempt: 1)
+            XCTFail("performReconnect should have thrown TransportError.cancelled")
+        } catch let error as TransportError {
+            guard case .cancelled = error else {
+                XCTFail("Expected TransportError.cancelled, got \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(
+            replacementConnection.isClosed,
+            "Replacement connection must be closed when runtime teardown fails"
+        )
+        XCTAssertEqual(replacementConnection.closeCallCount, 1)
+        XCTAssertEqual(firstConnection.closeCallCount, 1)
+        XCTAssertFalse(firstConnection.isClosed)
+
+        // Release the uncooperative connection teardown so background tasks quiesce
+        await closeGate.open()
+        try await waitUntil { firstConnection.isClosed }
+        XCTAssertTrue(firstConnection.isClosed)
+
+        await container.disconnect()
+        XCTAssertEqual(
+            firstConnection.closeCallCount,
+            1,
+            "Timed-out connection must retain close ownership and not be closed again"
+        )
+        XCTAssertEqual(
+            replacementConnection.closeCallCount,
+            1,
+            "Replacement connection must not be closed a second time during disconnect"
+        )
+    }
+
     func testRedactionBeforeFeedInProductionSurface() async throws {
         let credStore = InMemoryCredentialStore()
         let secretValue = "super-secret-ssh-token-42"
@@ -1500,6 +1556,7 @@ private actor Gate {
 final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
+    private(set) var closeCallCount = 0
     var isResponsive: Bool = true
     var onTestResponsiveness: (@Sendable (TimeInterval) async -> Bool)?
     private(set) var sentData: [Data] = []
@@ -1508,6 +1565,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
     var onResize: (@Sendable (TerminalSize) async throws -> Void)?
     var onSend: (@Sendable (Data) async throws -> Void)?
+    var onClose: (@Sendable () async -> Void)?
 
     func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
         if let onTestResponsiveness {
@@ -1544,6 +1602,12 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     }
 
     func close() async {
+        lock.withLock {
+            closeCallCount += 1
+        }
+        if let onClose {
+            await onClose()
+        }
         lock.withLock {
             isClosed = true
             streamContinuation?.finish()
