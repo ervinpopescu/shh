@@ -186,11 +186,12 @@ final class SSHSessionLiveActivityManager {
     }
   }
 
-  /// Connected snapshots are bounded to five minutes. Transport events and the
+  /// Connected snapshots are bounded to one minute. Transport events and the
   /// foreground probe update the activity promptly while the app runs; we do not
-  /// poll solely to refresh ActivityKit once per minute. If iOS suspends the
-  /// process, this finite window limits how long the widget can imply connected.
-  nonisolated static let connectedStatusFreshness: TimeInterval = 5 * 60
+  /// add a continuous heartbeat because iOS suspension cannot make it reliable.
+  /// A healthy foreground session may become conservatively unverified after the
+  /// TTL, while opening or foregrounding the app refreshes the state.
+  nonisolated static let connectedStatusFreshness: TimeInterval = 60
   nonisolated static let otherStatusFreshness: TimeInterval = 5 * 60
 
   nonisolated static func staleDate(
