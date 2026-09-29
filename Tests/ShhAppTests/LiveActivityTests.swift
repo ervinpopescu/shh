@@ -515,6 +515,7 @@ final class LiveActivityTests: XCTestCase {
     )
     let staleDate = SSHSessionLiveActivityManager.staleDate(for: state, now: confirmedAt)
 
+    XCTAssertEqual(staleDate.timeIntervalSince(confirmedAt), 5 * 60)
     XCTAssertEqual(
       staleDate.timeIntervalSince(confirmedAt),
       SSHSessionLiveActivityManager.connectedStatusFreshness
