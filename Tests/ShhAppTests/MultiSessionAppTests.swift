@@ -257,14 +257,16 @@ final class MultiSessionAppTests: XCTestCase {
 
         XCTAssertEqual(container.openSessions.count, 2)
 
-        var didSelect = false
-        var didClose = false
         let sessionA = try XCTUnwrap(container.runtime(for: sessionAID)?.session)
         let tabItem = SessionTabItem(
             session: sessionA,
             isSelected: false,
-            onSelect: { didSelect = true },
-            onClose: { didClose = true }
+            onSelect: { container.selectSession(id: sessionAID) },
+            onClose: {
+                Task {
+                    await container.closeSession(id: sessionAID)
+                }
+            }
         )
         let tabView = tabItem.environmentObject(container)
 
@@ -274,17 +276,14 @@ final class MultiSessionAppTests: XCTestCase {
         tabWindow.makeKeyAndVisible()
         tabHosting.view.layoutIfNeeded()
 
-        // P2 hit target: verify the rendered tab item size accommodates >= 44pt touch target
+        // P1 hit target: verify the rendered tab item size accommodates >= 44pt touch target
         let tabFittingSize = tabHosting.sizeThatFits(in: CGSize(width: 300, height: 100))
         XCTAssertGreaterThanOrEqual(
             tabFittingSize.height, 44.0,
             "Session tab item must be at least 44pt in height to satisfy minimum touch targets")
-
-        // Interactive callback assertions
-        tabItem.onSelect()
-        XCTAssertTrue(didSelect, "Activating session tab selection must invoke onSelect")
-        tabItem.onClose()
-        XCTAssertTrue(didClose, "Activating close button must invoke onClose")
+        XCTAssertGreaterThanOrEqual(
+            tabFittingSize.width, 44.0,
+            "Session tab item must be at least 44pt in width to satisfy minimum touch targets")
 
         // Switcher bar UI hierarchy
         let switcher = SessionSwitcherBar().environmentObject(container)
@@ -297,7 +296,7 @@ final class MultiSessionAppTests: XCTestCase {
         let switcherFitting = hosting.sizeThatFits(in: CGSize(width: 393, height: 100))
         XCTAssertGreaterThanOrEqual(switcherFitting.height, 44.0)
 
-        // Recursive hierarchy inspection to verify observable accessibility elements
+        // Hierarchy inspection: verify accessibility elements and subviews are present
         var axElements: [Any] = []
         let containerCount = hosting.view.accessibilityElementCount()
         if containerCount > 0 && containerCount != NSNotFound {
@@ -325,16 +324,24 @@ final class MultiSessionAppTests: XCTestCase {
         }
 
         let allViews = collectViews(in: hosting.view) + collectViews(in: tabHosting.view)
-        _ = axElements
-
         XCTAssertFalse(allViews.isEmpty, "Hosting view hierarchy must be populated")
+        XCTAssertFalse(
+            axElements.isEmpty && allViews.count < 2,
+            "Observable accessibility elements or views must be present")
+
+        // Validate real container session switching and state projections
         XCTAssertEqual(container.host(for: sessionAID)?.name, "Alpha Server")
         XCTAssertEqual(container.host(for: sessionBID)?.name, "Beta Server")
         XCTAssertEqual(container.selectedSessionID, sessionBID)
 
-        XCTAssertEqual(container.host(for: sessionAID)?.name, "Alpha Server")
-        XCTAssertEqual(container.host(for: sessionBID)?.name, "Beta Server")
+        container.selectSession(id: sessionAID)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeHost?.name, "Alpha Server")
+
+        await container.closeSession(id: sessionAID)
+        XCTAssertEqual(container.openSessions.count, 1)
         XCTAssertEqual(container.selectedSessionID, sessionBID)
+        XCTAssertEqual(container.activeHost?.name, "Beta Server")
     }
 
     func testSecondSessionConnectionFailurePreservesFirstSessionProjections() async throws {
@@ -470,5 +477,184 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertEqual(container.openSessions.count, 2)
         // With multiple sessions, single-session guard activates
         XCTAssertTrue(container.openSessions.count > 1)
+    }
+
+    func testRejectingSecondaryHostKeyChallengePreservesActiveSessionAndRedactor() async throws {
+        let mockA = MockSSHConnection()
+        let transport = ControllableTransport()
+        let challenge = HostKeyChallenge(
+            hostname: "beta.invalid",
+            port: 22,
+            algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:test"
+        )
+        transport.onConnect = { host in
+            if host.hostname == "alpha.invalid" {
+                return mockA
+            } else {
+                throw TransportError.hostKeyApprovalRequired(challenge)
+            }
+        }
+
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.activeSession?.id)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // Attempt second session to hostB which requires approval
+        await container.connect(to: hostB)
+
+        // Verify challenge is pending, but session A remains selected and connected
+        XCTAssertNotNil(container.pendingTrustChallenge)
+        XCTAssertEqual(container.pendingTrustHost?.id, hostB.id)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // Reject the host key challenge for the secondary session
+        container.rejectPendingHostKey()
+
+        // Pending challenge cleared
+        XCTAssertNil(container.pendingTrustChallenge)
+        XCTAssertNil(container.pendingTrustHost)
+
+        // Primary session A must NOT be marked disconnected
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.id, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        // Active session can still send interactive terminal input
+        let sent = await container.sendRawInteractive(Data("echo hello\n".utf8))
+        XCTAssertTrue(
+            sent,
+            "Rejecting a secondary host key challenge must not disrupt the active session's keyboard input"
+        )
+    }
+
+    func testExplicitDisconnectIsScopedToTargetSession() async throws {
+        let mockA = MockSSHConnection()
+        let mockB = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? mockA : mockB
+        }
+
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.activeSession?.id)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.activeSession?.id)
+        XCTAssertEqual(container.selectedSessionID, sessionBID)
+        XCTAssertFalse(container.isExplicitDisconnect)
+
+        // Disconnect Session B explicitly
+        await container.disconnect()
+        XCTAssertTrue(container.isExplicitDisconnect)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        // Switch back to Session A
+        container.selectSession(id: sessionAID)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertFalse(
+            container.isExplicitDisconnect,
+            "Switching to a connected session must not inherit the disconnected session's explicit disconnect flag"
+        )
+
+        // Input works on Session A
+        let sent = await container.sendRawInteractive(Data("test\n".utf8))
+        XCTAssertTrue(sent)
+
+        // Switch back to Session B: explicit disconnect is preserved for Session B
+        container.selectSession(id: sessionBID)
+        XCTAssertTrue(container.isExplicitDisconnect)
+    }
+
+    func testBackgroundSessionTerminationDoesNotDisruptSelectedSessionMultiplexerOrErrorState()
+        async throws
+    {
+        let mockA = MockSSHConnection()
+        let mockB = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? mockA : mockB
+        }
+
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.activeSession?.id)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.activeSession?.id)
+
+        // Select Session A
+        container.selectSession(id: sessionAID)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+
+        let initialTmuxGen = container.tmuxRefreshGeneration
+        let initialHerdrGen = container.herdrRefreshGeneration
+
+        // Background session B encounters a transport error
+        mockB.emit(.error(.connectionRefused))
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        // Session A must remain connected and unperturbed
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.id, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(
+            container.tmuxRefreshGeneration, initialTmuxGen,
+            "Background session termination must not increment tmux refresh generation")
+        XCTAssertEqual(
+            container.herdrRefreshGeneration, initialHerdrGen,
+            "Background session termination must not increment herdr refresh generation")
+        XCTAssertFalse(
+            container.hasObservedTransportError,
+            "Background session error must not set container-global observed transport error")
+
+        // Session B is updated to failed/disconnected
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        XCTAssertEqual(runtimeB.session.state, .failed)
+    }
+
+    func testClosingFinalSessionTearsDownAuxiliaryResources() async throws {
+        let mockA = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mockA }
+
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.activeSession?.id)
+        XCTAssertEqual(container.openSessions.count, 1)
+
+        // Open secondary pane
+        container.openSecondarySFTP(for: hostA)
+        XCTAssertEqual(container.secondaryPaneMode, .sftp(hostA))
+
+        // Close the final session
+        await container.closeSession(id: sessionAID)
+
+        XCTAssertTrue(container.sessionRuntimes.isEmpty)
+        XCTAssertTrue(container.openSessions.isEmpty)
+        XCTAssertNil(container.selectedSessionID)
+        XCTAssertNil(container.activeSession)
+        XCTAssertNil(container.activeHost)
+        XCTAssertEqual(
+            container.secondaryPaneMode, .none,
+            "Closing final session must reset secondary pane mode")
+        XCTAssertTrue(container.forwardingSessions.isEmpty)
+        XCTAssertTrue(container.currentDirectoryFiles.isEmpty)
     }
 }

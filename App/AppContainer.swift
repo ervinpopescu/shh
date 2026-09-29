@@ -170,7 +170,7 @@ final class AppContainer: ObservableObject {
     @Published public var isPollingHerdr: Bool = false
     @Published public var herdrError: String? = nil
     @Published public var activeHerdrWorkspaceID: String? = nil
-    private var herdrRefreshGeneration: Int = 0
+    private(set) var herdrRefreshGeneration: Int = 0
     private var herdrPollingGeneration: Int = 0
     private var herdrPollingTask: Task<Void, Never>?
 
@@ -266,7 +266,27 @@ final class AppContainer: ObservableObject {
     private let directoryCacheTTL: TimeInterval = 60.0
 
     private(set) var activeHost: Host?
-    private(set) var isExplicitDisconnect = false
+    private(set) var explicitlyDisconnectedSessionIDs: Set<UUID> = []
+    private var fallbackExplicitDisconnect = false
+
+    private(set) var isExplicitDisconnect: Bool {
+        get {
+            if let id = activeSession?.id {
+                return explicitlyDisconnectedSessionIDs.contains(id)
+            }
+            return fallbackExplicitDisconnect
+        }
+        set {
+            if let id = activeSession?.id {
+                if newValue {
+                    explicitlyDisconnectedSessionIDs.insert(id)
+                } else {
+                    explicitlyDisconnectedSessionIDs.remove(id)
+                }
+            }
+            fallbackExplicitDisconnect = newValue
+        }
+    }
     // iOS manages background execution with finite grace periods via beginBackgroundTask.
     // While backgrounded, active SSH sessions, NIO channels, and port forwarding remain alive.
     // If iOS suspends the app (e.g. after the grace period expires), the process cannot
@@ -275,16 +295,16 @@ final class AppContainer: ObservableObject {
     // deciding whether to reconnect, preserving the session with zero delay if it survived.
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
-    private var hasObservedTransportError = false
+    private(set) var hasObservedTransportError = false
     private var lifecycleGeneration = 0
     private var foregroundRecoveryTask: Task<Void, Never>?
-    private var pendingTrustHost: Host?
+    private(set) var pendingTrustHost: Host?
     /// Legacy projection of the selected transport. SessionRuntime owns the
     /// connection and all terminal lifecycle callbacks.
     var connection: (any SSHConnection)? {
         sessionRuntime?.connection
     }
-    private var sessionRuntimes: [UUID: SessionRuntime] = [:]
+    private(set) var sessionRuntimes: [UUID: SessionRuntime] = [:]
     private var sessionOrder: [UUID] = []
 
     public var selectedSessionRuntime: SessionRuntime? {
@@ -345,9 +365,17 @@ final class AppContainer: ObservableObject {
     func closeSession(id: UUID) async {
         guard let runtime = sessionRuntimes.removeValue(forKey: id) else { return }
         sessionOrder.removeAll { $0 == id }
+        explicitlyDisconnectedSessionIDs.remove(id)
         await runtime.disconnect()
         liveActivityManager.end(sessionID: id)
         updateOpenSessions()
+
+        if case .sftp(let host) = secondaryPaneMode, host.id == runtime.host.id {
+            closeSecondaryPane()
+        }
+        if case .terminal(let host) = secondaryPaneMode, host.id == runtime.host.id {
+            closeSecondaryPane()
+        }
 
         if selectedSessionID == id {
             if let nextID = sessionOrder.last {
@@ -358,9 +386,21 @@ final class AppContainer: ObservableObject {
                 activeHost = nil
                 terminalText = ""
                 reconnectState = .idle
+                fallbackExplicitDisconnect = false
                 liveActivityManager.endAll()
                 try? await restorationStore.clear()
+                await teardownAuxiliaryResources()
             }
+        } else if sessionOrder.isEmpty {
+            selectedSessionID = nil
+            activeSession = nil
+            activeHost = nil
+            terminalText = ""
+            reconnectState = .idle
+            fallbackExplicitDisconnect = false
+            liveActivityManager.endAll()
+            try? await restorationStore.clear()
+            await teardownAuxiliaryResources()
         }
     }
 
@@ -963,11 +1003,13 @@ final class AppContainer: ObservableObject {
 
         pendingTrustChallenge = nil
         pendingTrustHost = nil
+        let newSessionID = sessionID ?? UUID()
+        explicitlyDisconnectedSessionIDs.remove(newSessionID)
         terminalController.synchronizeViewportMeasurement()
         let initialTerminalSize = terminalController.size
 
         var session = TerminalSession(
-            id: sessionID ?? UUID(),
+            id: newSessionID,
             hostID: host.id,
             state: .connecting,
             terminalSize: initialTerminalSize,
@@ -1214,14 +1256,8 @@ final class AppContainer: ObservableObject {
         session: TerminalSession,
         host: Host
     ) async {
-        guard !isExplicitDisconnect else { return }
+        guard !explicitlyDisconnectedSessionIDs.contains(session.id) else { return }
         guard let runtime = sessionRuntimes[session.id] ?? sessionRuntime else { return }
-
-        tmuxRefreshGeneration += 1
-        herdrRefreshGeneration += 1
-        stopHerdrPolling()
-        isProbingTmux = false
-        isProbingHerdr = false
 
         let transportError: TransportError?
         if case .error(let error) = event {
@@ -1229,9 +1265,7 @@ final class AppContainer: ObservableObject {
         } else {
             transportError = nil
         }
-        if transportError != nil {
-            hasObservedTransportError = true
-        }
+
         updateOpenSessions()
 
         if let transportError {
@@ -1242,6 +1276,16 @@ final class AppContainer: ObservableObject {
         }
 
         if selectedSessionID == session.id {
+            tmuxRefreshGeneration += 1
+            herdrRefreshGeneration += 1
+            stopHerdrPolling()
+            isProbingTmux = false
+            isProbingHerdr = false
+
+            if transportError != nil {
+                hasObservedTransportError = true
+            }
+
             activeSession?.state = runtime.session.state
             let failureReason =
                 transportError.map { Self.statusMessage(for: $0) } ?? "Connection failed."
@@ -1666,7 +1710,10 @@ final class AppContainer: ObservableObject {
             #if canImport(UIKit)
             endCurrentBackgroundTask()
             #endif
-            guard !isExplicitDisconnect else { return }
+            let hasConnectedSessions = self.sessionRuntimes.values.contains {
+                $0.session.state == .connected
+            }
+            guard hasConnectedSessions || !isExplicitDisconnect else { return }
 
             if wasInBackground {
                 let generation = lifecycleGeneration
@@ -1674,7 +1721,7 @@ final class AppContainer: ObservableObject {
                 let recoveryTask = Task { @MainActor [weak self] in
                     guard let self,
                         self.lifecycleGeneration == generation,
-                        !self.isExplicitDisconnect
+                        hasConnectedSessions || !self.isExplicitDisconnect
                     else { return }
                     // Ensure a reconnect that was invalidated by backgrounding
                     // cannot cancel the new foreground recovery after it starts.
@@ -1685,7 +1732,9 @@ final class AppContainer: ObservableObject {
                         await self.reconnectCoordinator.cancel()
                         self.reconnectState = await self.reconnectCoordinator.state
                     }
-                    guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else {
+                    guard self.lifecycleGeneration == generation,
+                        hasConnectedSessions || !self.isExplicitDisconnect
+                    else {
                         return
                     }
 
@@ -1725,7 +1774,8 @@ final class AppContainer: ObservableObject {
 
                                     // Stale-generation guards: ensure state was not superseded
                                     guard self.lifecycleGeneration == generation,
-                                        !self.isExplicitDisconnect,
+                                        !self.explicitlyDisconnectedSessionIDs.contains(
+                                            targetSessionID),
                                         let currentRuntime = self.sessionRuntimes[targetSessionID],
                                         (currentRuntime.connection as AnyObject)
                                             === (targetConnection as AnyObject)
@@ -1960,10 +2010,13 @@ final class AppContainer: ObservableObject {
     }
 
     func rejectPendingHostKey() {
+        let rejectedHost = pendingTrustHost
         pendingTrustChallenge = nil
         pendingTrustHost = nil
-        activeSession?.state = .disconnected
-        redactor = Redactor()
+        if sessionRuntimes.isEmpty || activeHost?.id == rejectedHost?.id {
+            activeSession?.state = .disconnected
+            redactor = Redactor()
+        }
     }
 
     @discardableResult
@@ -2038,27 +2091,37 @@ final class AppContainer: ObservableObject {
         reconnectState = .idle
         await selectedSessionRuntime?.disconnect()
 
-        // Reset port forwarding state before closing SSH connection if single session
-        if sessionRuntimes.count <= 1 {
-            forwardingStreamTask?.cancel()
-            forwardingStreamTask = nil
-            await portForwardingManager?.stopAll()
-            if !isDemo {
-                portForwardingManager = nil
-            }
-            forwardingSessions = []
-            forwardingErrorMessage = nil
-
-            activeTmuxSessionID = nil
-            tmuxSessions = []
-            isTmuxServerRunning = false
-            isProbingTmux = false
-            tmuxAvailability = .unavailable(reason: "Not connected")
-        }
-
         activeSession?.state = .disconnected
         redactor = Redactor()
         updateOpenSessions()
+        tmuxError = nil
+
+        if sessionRuntimes.count <= 1 {
+            await teardownAuxiliaryResources()
+        } else {
+            closeSecondaryPane()
+        }
+    }
+
+    /// Teardown auxiliary services (port forwarding, SFTP, telemetry, multiplexer)
+    /// safely and idempotently when closing or disconnecting single/final sessions.
+    func teardownAuxiliaryResources() async {
+        closeSecondaryPane()
+
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = nil
+        await portForwardingManager?.stopAll()
+        if !isDemo {
+            portForwardingManager = nil
+        }
+        forwardingSessions = []
+        forwardingErrorMessage = nil
+
+        activeTmuxSessionID = nil
+        tmuxSessions = []
+        isTmuxServerRunning = false
+        isProbingTmux = false
+        tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
 
         herdrRefreshGeneration += 1
@@ -2070,7 +2133,9 @@ final class AppContainer: ObservableObject {
         activeHerdrWorkspaceID = nil
 
         // Server Telemetry
-        telemetryPollers.values.forEach { $0.stopPolling() }
+        for poller in telemetryPollers.values {
+            poller.stopPolling()
+        }
         telemetryPollers.removeAll()
 
         moshStateTask?.cancel()
@@ -2107,6 +2172,7 @@ final class AppContainer: ObservableObject {
         }
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
+        fallbackTerminalController.reset()
         updateIdleTimerState()
     }
 

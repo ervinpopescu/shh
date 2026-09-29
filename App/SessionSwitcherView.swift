@@ -31,10 +31,12 @@ struct SessionSwitcherBar: View {
                     Label("New Session", systemImage: "plus")
                         .font(.caption.weight(.medium))
                         .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
+                        .frame(minHeight: 44)
                         .background(Color(.secondarySystemFill))
                         .clipShape(Capsule())
                 }
+                .frame(minWidth: 44, minHeight: 44)
+                .contentShape(Rectangle())
                 .accessibilityLabel("Open new session")
                 .accessibilityIdentifier("session-switcher-add-button")
                 .disabled(container.openSessions.count >= AppContainer.maximumConcurrentSessions)
@@ -95,13 +97,13 @@ struct SessionTabItem: View {
                 }
                 .padding(.leading, 10)
                 .padding(.trailing, 4)
-                .padding(.vertical, 8)
+                .frame(minWidth: 44, minHeight: 44)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .combine)
             .accessibilityLabel(
-                "Session \(hostName), \(statusText), \(isSelected ? "selected" : "not selected")"
+                "Session \(hostName), \(statusText)"
             )
             .accessibilityHint("Double tap to switch to this session")
             .accessibilityIdentifier("session-tab-\(session.id)")
