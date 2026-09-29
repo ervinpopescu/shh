@@ -2379,6 +2379,8 @@ struct SessionView: View {
                 Image(systemName: "xmark.circle.fill")
                     .font(.body)
                     .foregroundStyle(.secondary)
+                    .frame(minWidth: 44, minHeight: 44)
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityLabel("Close secondary pane")
