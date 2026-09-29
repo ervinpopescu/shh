@@ -125,6 +125,11 @@ final class SessionRuntime {
         }
     }
 
+    /// Updates the session state projection for external lifecycle probes.
+    func updateSessionState(_ state: TerminalSessionState) {
+        session.state = state
+    }
+
     /// Replaces only this session's transport. The session identity and terminal
     /// model remain stable, while the generation rejects callbacks from the old
     /// connection even if its event stream races cancellation.
