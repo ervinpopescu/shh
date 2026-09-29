@@ -12,7 +12,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private let ownsGroup: Bool
     private let inboundRouter: InboundChildChannelRouter?
     private let lock = NSLock()
-    private var isClosed = false
+    private(set) var isClosed = false
     private var closeTask: Task<Void, Never>?
     private var activeWriteOperations = 0
     private(set) var didQuarantine = false
@@ -107,16 +107,24 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         // foreground recovery path a deterministic bound even on a black-holed
         // socket.
         let responsePromise = eventLoop.makePromise(of: Void.self)
+        var responseCompleted = false
+        let completeResponse: (Result<Void, Error>) -> Void = { result in
+            guard !responseCompleted else { return }
+            responseCompleted = true
+            responsePromise.completeWith(result)
+        }
         let timeoutTask = eventLoop.scheduleTask(in: .milliseconds(Int64(max(0.1, timeout) * 1_000))) {
-            // Fail the request promise so its future completes, then close the
-            // parent channel to cancel the protocol-level outstanding request.
-            requestPromise.fail(TransportError.timeout)
+            guard !responseCompleted else { return }
+            responseCompleted = true
             responsePromise.fail(TransportError.timeout)
+            // Let NIOSSH fail its own request promise from handlerRemoved;
+            // closing the parent is the cancellation path for the protocol
+            // request and avoids completing that promise twice.
             self.parentChannel.close(promise: nil)
         }
         requestFuture.whenComplete { result in
             timeoutTask.cancel()
-            responsePromise.completeWith(result.map { _ in () })
+            completeResponse(result.map { _ in () })
         }
 
         try await responsePromise.futureResult.get()
