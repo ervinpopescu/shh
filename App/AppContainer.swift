@@ -1111,7 +1111,6 @@ final class AppContainer: ObservableObject {
             capabilities: ["ansi", "resize"]
         )
         activeSession = session
-        activeSession = session
         let connection: any SSHConnection
         do {
             let selectedIdentity = try await resolveIdentity(for: host)
@@ -1181,6 +1180,7 @@ final class AppContainer: ObservableObject {
         }
         guard await runtime.reconnect(with: connection, redactor: redactor) else {
             redactor = Redactor()
+            await connection.close()
             throw TransportError.cancelled
         }
         guard activeSession?.id == session.id,
