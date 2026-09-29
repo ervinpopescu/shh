@@ -98,6 +98,7 @@ installation.
 | Run focused app tests | `just test-focused test=ShhAppTests/AppContainerTests device=iphone` | The `test` value can name a test class or method. |
 | Build the app | `just build iphone` | Generates the project and builds for a simulator or explicit device UDID. |
 | Inspect simulator/device readiness | `just doctor device=ipad` | Pass `udid=<id>` to inspect a specific target. |
+| List simulators and connected devices | `just devices` | Read-only inventory of simulator states and connected physical devices. |
 
 The package tests use the in-process server and test doubles in
 `Tests/ShhSSHTests/`; they do not require the Docker fixture. The optional
@@ -129,6 +130,7 @@ these values when needed:
 Useful lifecycle commands are:
 
 ```sh
+just devices
 just boot iphone
 just deploy iphone
 just deploy-device <simulator-or-device-udid>
