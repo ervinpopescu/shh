@@ -946,7 +946,7 @@ final class AppContainer: ObservableObject {
         lastConnectionFailure = nil
         await cancelVoiceRecording()
         resetVoiceState()
-        isExplicitDisconnect = false
+        fallbackExplicitDisconnect = false
 
         let isFirstSession = sessionRuntimes.isEmpty
         let priorSelectedSessionID = selectedSessionID

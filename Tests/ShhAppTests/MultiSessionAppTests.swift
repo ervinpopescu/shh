@@ -577,6 +577,93 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertTrue(container.isExplicitDisconnect)
     }
 
+    func testConnectingSecondSessionPreservesPriorSessionExplicitDisconnectState() async throws {
+        let mockA = MockSSHConnection()
+        let mockB = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            if host.hostname == "alpha.invalid" {
+                return mockA
+            } else if host.hostname == "beta.invalid" {
+                return mockB
+            } else {
+                throw TransportError.connectionRefused
+            }
+        }
+
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+        let hostFailed = try Host(name: "Fail Host", hostname: "failed.invalid", username: "dev")
+
+        // 1. Connect Session A
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.activeSession?.id)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertFalse(container.isExplicitDisconnect)
+
+        // 2. Explicitly disconnect Session A while selected
+        await container.disconnect()
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(container.isExplicitDisconnect)
+        XCTAssertTrue(container.explicitlyDisconnectedSessionIDs.contains(sessionAID))
+
+        // 3. Attempt connecting to a failing second host while Session A remains selected
+        await container.connect(to: hostFailed)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(
+            container.isExplicitDisconnect,
+            "Failed second connection attempt must preserve prior session's explicit disconnect state"
+        )
+        XCTAssertTrue(container.explicitlyDisconnectedSessionIDs.contains(sessionAID))
+
+        // 4. Complete connecting Session B while Session A remains selected and explicitly disconnected
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.activeSession?.id)
+        XCTAssertNotEqual(sessionAID, sessionBID)
+        XCTAssertEqual(container.selectedSessionID, sessionBID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertFalse(container.isExplicitDisconnect)
+        XCTAssertFalse(container.explicitlyDisconnectedSessionIDs.contains(sessionBID))
+
+        // Verify Session B can send commands
+        let sentOnB = await container.sendRawInteractive(Data("echo from b\n".utf8))
+        XCTAssertTrue(sentOnB)
+
+        // 5. Switch back to Session A
+        container.selectSession(id: sessionAID)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.id, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        // Assert Session A remains explicitly disconnected
+        XCTAssertTrue(
+            container.isExplicitDisconnect,
+            "Connecting a second session must not clear the explicit disconnect state of the previously selected session"
+        )
+        XCTAssertTrue(container.explicitlyDisconnectedSessionIDs.contains(sessionAID))
+
+        // 6. Assert Session A cannot be automatically reconnected or probed due to cleared state
+        container.handleReachabilityChange(true)
+        XCTAssertFalse(
+            container.reconnectState.isReconnecting,
+            "Explicitly disconnected session must not initiate reconnection on reachability changes"
+        )
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+
+        container.handleScenePhaseChange(.background)
+        container.handleScenePhaseChange(.active)
+        XCTAssertFalse(
+            container.reconnectState.isReconnecting,
+            "Explicitly disconnected session must not initiate reconnection on foreground return"
+        )
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertTrue(container.isExplicitDisconnect)
+    }
+
     func testBackgroundSessionTerminationDoesNotDisruptSelectedSessionMultiplexerOrErrorState()
         async throws
     {
