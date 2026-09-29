@@ -1,5 +1,12 @@
-import Foundation
+import Combine
 import Crypto
+import Foundation
+import ShhCore
+import ShhSSH
+import ShhTerminal
+import ShhVoice
+import SwiftUI
+
 #if canImport(FileProvider)
 import FileProvider
 #endif
@@ -8,7 +15,8 @@ import UIKit
 
 /// Coordinates finite background execution tasks during scene transitions.
 public protocol BackgroundTaskManaging: AnyObject, Sendable {
-    func beginBackgroundTask(withName name: String?, expirationHandler: (@Sendable () -> Void)?) -> UIBackgroundTaskIdentifier
+    func beginBackgroundTask(withName name: String?, expirationHandler: (@Sendable () -> Void)?)
+        -> UIBackgroundTaskIdentifier
     func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier)
 }
 
@@ -16,8 +24,11 @@ public protocol BackgroundTaskManaging: AnyObject, Sendable {
 public final class UIKitBackgroundTaskManager: BackgroundTaskManaging, @unchecked Sendable {
     public static let shared = UIKitBackgroundTaskManager()
 
-    public func beginBackgroundTask(withName name: String?, expirationHandler: (@Sendable () -> Void)?) -> UIBackgroundTaskIdentifier {
-        UIApplication.shared.beginBackgroundTask(withName: name, expirationHandler: expirationHandler)
+    public func beginBackgroundTask(
+        withName name: String?, expirationHandler: (@Sendable () -> Void)?
+    ) -> UIBackgroundTaskIdentifier {
+        UIApplication.shared.beginBackgroundTask(
+            withName: name, expirationHandler: expirationHandler)
     }
 
     public func endBackgroundTask(_ identifier: UIBackgroundTaskIdentifier) {
@@ -44,12 +55,6 @@ private final class BackgroundTaskBox: @unchecked Sendable {
     }
 }
 #endif
-import ShhCore
-import ShhSSH
-import ShhTerminal
-import ShhVoice
-import SwiftUI
-import Combine
 
 private final class VoiceInterruptionBridge: @unchecked Sendable {
     var onInterruption: (@Sendable () -> Void)?
@@ -76,8 +81,12 @@ final class AppContainer: ObservableObject {
     let voiceRecorder: any AudioRecorder
     let voiceRouter: VoiceCommandRouter
     private let customTranscriber: (any LocalTranscriber)?
-    let terminalController: ShhTerminalController
+    public static let maximumConcurrentSessions = 8
+    private let fallbackTerminalController: ShhTerminalController
     public let secondaryTerminalController: ShhTerminalController
+    public var terminalController: ShhTerminalController {
+        selectedSessionRuntime?.terminalController ?? fallbackTerminalController
+    }
     @Published public var secondaryPaneMode: SecondaryPaneMode = .none
     let restorationStore: any SessionRestorationStore
     #if canImport(UIKit)
@@ -96,9 +105,9 @@ final class AppContainer: ObservableObject {
     @Published public private(set) var missingHostIdentityIDs: Set<UUID> = []
 
     private static var isRunningInTestEnvironment: Bool {
-        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil ||
-            ProcessInfo.processInfo.arguments.contains("-XCTest") ||
-            NSClassFromString("XCTestCase") != nil
+        ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil
+            || ProcessInfo.processInfo.arguments.contains("-XCTest")
+            || NSClassFromString("XCTestCase") != nil
     }
 
     private var isRunningInTestEnvironment: Bool {
@@ -122,6 +131,8 @@ final class AppContainer: ObservableObject {
             syncLiveActivityState()
         }
     }
+    @Published public private(set) var openSessions: [TerminalSession] = []
+    @Published public private(set) var selectedSessionID: UUID?
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
@@ -151,7 +162,8 @@ final class AppContainer: ObservableObject {
     }
 
     // MARK: - Herdr Multiplexer & Agent State
-    @Published public var herdrAvailability: HerdrAvailability = .unavailable(reason: "Not connected")
+    @Published public var herdrAvailability: HerdrAvailability = .unavailable(
+        reason: "Not connected")
     @Published public var herdrWorkspaces: [HerdrWorkspace] = []
     @Published public var isProbingHerdr: Bool = false
     @Published public var isPollingHerdr: Bool = false
@@ -271,7 +283,82 @@ final class AppContainer: ObservableObject {
     var connection: (any SSHConnection)? {
         sessionRuntime?.connection
     }
-    private var sessionRuntime: SessionRuntime?
+    private var sessionRuntimes: [UUID: SessionRuntime] = [:]
+    private var sessionOrder: [UUID] = []
+
+    public var selectedSessionRuntime: SessionRuntime? {
+        guard let id = selectedSessionID else { return nil }
+        return sessionRuntimes[id]
+    }
+
+    private var sessionRuntime: SessionRuntime? {
+        selectedSessionRuntime
+    }
+
+    public var isConnectingSession: Bool {
+        sessionRuntimes.values.contains { $0.session.state == .connecting }
+            || activeSession?.state == .connecting
+    }
+
+    public func host(for sessionID: UUID) -> Host? {
+        sessionRuntimes[sessionID]?.host
+    }
+
+    public func runtime(for sessionID: UUID) -> SessionRuntime? {
+        sessionRuntimes[sessionID]
+    }
+
+    func selectSession(id: UUID) {
+        guard let runtime = sessionRuntimes[id] else { return }
+        selectedSessionID = id
+        activeSession = runtime.session
+        activeHost = runtime.host
+        terminalText = runtime.terminalText
+        reconnectState = runtime.reconnectState
+        redactor = runtime.redactor
+        syncLiveActivityState()
+
+        let targetConnection = runtime.connection
+        Task { [weak self] in
+            guard let self, self.selectedSessionID == id else { return }
+            _ = await self.synchronizeViewportAndResize(targetConnection, sessionID: id)
+        }
+
+        Task { [weak self] in
+            guard let self, let session = self.activeSession, let host = self.activeHost else {
+                return
+            }
+            let metadata = self.restorationMetadata(
+                hostID: host.id, sessionID: session.id, target: nil)
+            try? await self.restorationStore.save(metadata)
+        }
+    }
+
+    func closeSession(id: UUID) async {
+        guard let runtime = sessionRuntimes.removeValue(forKey: id) else { return }
+        sessionOrder.removeAll { $0 == id }
+        await runtime.disconnect()
+        liveActivityManager.end(sessionID: id)
+        updateOpenSessions()
+
+        if selectedSessionID == id {
+            if let nextID = sessionOrder.last {
+                selectSession(id: nextID)
+            } else {
+                selectedSessionID = nil
+                activeSession = nil
+                activeHost = nil
+                terminalText = ""
+                reconnectState = .idle
+                liveActivityManager.endAll()
+                try? await restorationStore.clear()
+            }
+        }
+    }
+
+    private func updateOpenSessions() {
+        openSessions = sessionOrder.compactMap { sessionRuntimes[$0]?.session }
+    }
     private var terminalGrid = TerminalGrid()
     private var ansiParser = ANSIParser()
     private(set) var redactor = Redactor()
@@ -324,9 +411,19 @@ final class AppContainer: ObservableObject {
 
     func setTerminalTheme(_ value: TerminalThemePreset) {
         terminalTheme = value
-        terminalController.setTerminalTheme(value)
+        fallbackTerminalController.setTerminalTheme(value)
         secondaryTerminalController.setTerminalTheme(value)
+        for runtime in sessionRuntimes.values {
+            runtime.terminalController.setTerminalTheme(value)
+        }
         UserDefaults.standard.set(value.rawValue, forKey: Self.terminalThemePreferenceKey)
+    }
+
+    func setTerminalFontSize(_ size: Double) {
+        fallbackTerminalController.setTerminalFontSize(size)
+        for runtime in sessionRuntimes.values {
+            runtime.terminalController.setTerminalFontSize(size)
+        }
     }
 
     public func setKeepScreenAwake(_ enabled: Bool) {
@@ -405,16 +502,19 @@ final class AppContainer: ObservableObject {
         #endif
         self.fileProviderHelper = fileProviderHelper
         self.didProvideCustomCatalog = (catalog != nil)
-        let resolvedCredentialStore = credentialStore ?? KeychainCredentialStore(accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
+        let resolvedCredentialStore =
+            credentialStore
+            ?? KeychainCredentialStore(
+                accessGroup: KeychainCredentialStore.defaultSharedAccessGroup)
 
         let resolvedCatalog: InMemoryCatalog
         let persistenceState: CatalogPersistenceReadState
         if let catalog {
             resolvedCatalog = catalog
             persistenceState = .notFound
-        } else if !Self.isRunningInTestEnvironment ||
-                    fileProviderHelper.customContainerURL != nil ||
-                    fileProviderHelper.customLocalContainerURL != nil {
+        } else if !Self.isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil
+            || fileProviderHelper.customLocalContainerURL != nil
+        {
             let result = fileProviderHelper.loadCatalogSnapshot()
             persistenceState = result.state
             if let snapshot = result.snapshot {
@@ -431,47 +531,54 @@ final class AppContainer: ObservableObject {
         }
         self.catalog = resolvedCatalog
         if catalog == nil {
-            self.persistenceWriteBlocked = persistenceState == .invalid || persistenceState == .unavailable
+            self.persistenceWriteBlocked =
+                persistenceState == .invalid || persistenceState == .unavailable
         }
         if catalog == nil && !fileProviderHelper.isSharedContainerAvailable {
-            self.persistenceReadinessMessage = "Shared App Group unavailable. Saved hosts remain available from local storage until provisioning is restored."
+            self.persistenceReadinessMessage =
+                "Shared App Group unavailable. Saved hosts remain available from local storage until provisioning is restored."
         }
 
         let resolvedTrustStore: InMemoryTrustStore
         if let trustStore {
             resolvedTrustStore = trustStore
-        } else if (!Self.isRunningInTestEnvironment ||
-                    fileProviderHelper.customContainerURL != nil ||
-                    fileProviderHelper.customLocalContainerURL != nil),
-                  let records = fileProviderHelper.loadSharedTrustRecords(),
-                  !records.isEmpty {
+        } else if !Self.isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil
+            || fileProviderHelper.customLocalContainerURL != nil,
+            let records = fileProviderHelper.loadSharedTrustRecords(),
+            !records.isEmpty
+        {
             resolvedTrustStore = InMemoryTrustStore(records: records)
         } else {
             resolvedTrustStore = InMemoryTrustStore()
         }
         self.trustStore = resolvedTrustStore
         self.credentialStore = resolvedCredentialStore
-        let resolvedHostResolver: LiveSSHTransport.HostResolver = hostResolver ?? { [resolvedCatalog] (hostID: UUID) async throws -> (Host, IdentityDescriptor?) in
-            let hosts = try await resolvedCatalog.listHosts()
-            if let bastion = hosts.first(where: { $0.id == hostID }) {
-                var ident: IdentityDescriptor? = nil
-                if let identityID = bastion.identityID {
-                    let idents = try await resolvedCatalog.identities()
-                    ident = idents.first(where: { $0.id == identityID })
+        let resolvedHostResolver: LiveSSHTransport.HostResolver =
+            hostResolver ?? {
+                [resolvedCatalog] (hostID: UUID) async throws -> (Host, IdentityDescriptor?) in
+                let hosts = try await resolvedCatalog.listHosts()
+                if let bastion = hosts.first(where: { $0.id == hostID }) {
+                    var ident: IdentityDescriptor? = nil
+                    if let identityID = bastion.identityID {
+                        let idents = try await resolvedCatalog.identities()
+                        ident = idents.first(where: { $0.id == identityID })
+                    }
+                    return (bastion, ident)
                 }
-                return (bastion, ident)
+                let idents = try await resolvedCatalog.identities()
+                if let ident = idents.first(where: { $0.id == hostID }) {
+                    let placeholder = try Host(
+                        name: ident.name, hostname: "localhost", username: "unknown")
+                    return (placeholder, ident)
+                }
+                throw TransportError.invalidConfiguration
             }
-            let idents = try await resolvedCatalog.identities()
-            if let ident = idents.first(where: { $0.id == hostID }) {
-                let placeholder = try Host(name: ident.name, hostname: "localhost", username: "unknown")
-                return (placeholder, ident)
-            }
-            throw TransportError.invalidConfiguration
-        }
-        let resolvedTransport = transport ?? LiveSSHTransport(
-            credentialStore: resolvedCredentialStore,
-            hostResolver: resolvedHostResolver
-        )
+        let resolvedTransport =
+            transport
+            ?? LiveSSHTransport(
+                credentialStore: resolvedCredentialStore,
+                hostResolver: resolvedHostResolver
+            )
         self.transport = resolvedTransport
         self.moshTransport = moshTransport ?? LiveMoshTransport(sshTransport: resolvedTransport)
         self.customTranscriber = transcriber
@@ -506,13 +613,17 @@ final class AppContainer: ObservableObject {
         }
         self.voiceRouter = voiceRouter
         self.transcriber = transcriber ?? resolvedRegistry.activeTranscriber()
-        let storedAppearance = AppearanceSetting(
-            rawValue: UserDefaults.standard.string(forKey: Self.appearancePreferenceKey) ?? ""
-        ) ?? .default
-        let storedTheme = TerminalThemePreset(
-            rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey) ?? ""
-        ) ?? .default
-        let storedKeepScreenAwake = UserDefaults.standard.object(forKey: Self.keepScreenAwakePreferenceKey) as? Bool ?? true
+        let storedAppearance =
+            AppearanceSetting(
+                rawValue: UserDefaults.standard.string(forKey: Self.appearancePreferenceKey) ?? ""
+            ) ?? .default
+        let storedTheme =
+            TerminalThemePreset(
+                rawValue: UserDefaults.standard.string(forKey: Self.terminalThemePreferenceKey)
+                    ?? ""
+            ) ?? .default
+        let storedKeepScreenAwake =
+            UserDefaults.standard.object(forKey: Self.keepScreenAwakePreferenceKey) as? Bool ?? true
         let storedDialPreferences: CommandDialPreferences = {
             guard let data = UserDefaults.standard.data(forKey: Self.commandDialPreferenceKey),
                 let value = try? JSONDecoder().decode(CommandDialPreferences.self, from: data)
@@ -525,7 +636,7 @@ final class AppContainer: ObservableObject {
         self.terminalTheme = storedTheme
         self.keepScreenAwake = storedKeepScreenAwake
         self.commandDialPreferences = storedDialPreferences
-        self.terminalController = ShhTerminalController(
+        self.fallbackTerminalController = ShhTerminalController(
             configuration: ShhTerminalConfiguration(initialTheme: storedTheme)
         )
         self.secondaryTerminalController = ShhTerminalController(
@@ -571,7 +682,8 @@ final class AppContainer: ObservableObject {
             await coordinator.setGenerationStateChangeHandler { [weak self] newState, generation in
                 Task { @MainActor [weak self] in
                     guard let self,
-                          await coordinator.currentGeneration == generation else { return }
+                        await coordinator.currentGeneration == generation
+                    else { return }
                     self.reconnectState = newState
                     switch newState {
                     case .idle, .connected, .cancelled, .exhausted, .failed:
@@ -642,9 +754,10 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func loadSharedStateIfNeeded() async -> CatalogPersistenceReadState {
         guard !didProvideCustomCatalog else { return .notFound }
-        guard !isRunningInTestEnvironment ||
-                fileProviderHelper.customContainerURL != nil ||
-                fileProviderHelper.customLocalContainerURL != nil else { return .unavailable }
+        guard
+            !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil
+                || fileProviderHelper.customLocalContainerURL != nil
+        else { return .unavailable }
         let result = fileProviderHelper.loadCatalogSnapshot()
         if let snapshot = result.snapshot {
             await catalog.replace(with: snapshot)
@@ -677,16 +790,21 @@ final class AppContainer: ObservableObject {
     ) -> AppContainer {
         let demoRecorder = voiceRecorder ?? DemoAudioRecorder()
         let demoTranscriber = transcriber ?? DemoTranscriber()
-        let demoModelsDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhDemoModels_\(UUID().uuidString)")
-        let demoManager = modelManager ?? WhisperModelManager(
-            modelsDirectory: demoModelsDir,
-            downloader: DemoWhisperDownloader()
-        )
-        let demoRegistry = voiceRegistry ?? VoiceProviderRegistry(
-            whisperTranscriber: demoTranscriber,
-            appleSpeechTranscriber: demoTranscriber,
-            initialSelectedID: VoiceProviderRegistry.whisperProviderID
-        )
+        let demoModelsDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhDemoModels_\(UUID().uuidString)")
+        let demoManager =
+            modelManager
+            ?? WhisperModelManager(
+                modelsDirectory: demoModelsDir,
+                downloader: DemoWhisperDownloader()
+            )
+        let demoRegistry =
+            voiceRegistry
+            ?? VoiceProviderRegistry(
+                whisperTranscriber: demoTranscriber,
+                appleSpeechTranscriber: demoTranscriber,
+                initialSelectedID: VoiceProviderRegistry.whisperProviderID
+            )
         return AppContainer(
             catalog: catalog,
             trustStore: trustStore,
@@ -700,10 +818,11 @@ final class AppContainer: ObservableObject {
             voiceRouter: voiceRouter,
             restorationStore: restorationStore ?? InMemorySessionRestorationStore(),
             reachabilityMonitor: reachabilityMonitor ?? MockReachabilityMonitor(isReachable: true),
-            reconnectCoordinator: reconnectCoordinator ?? ReconnectCoordinator(
-                clock: { _ in },
-                jitter: ReconnectCoordinator.zeroJitter
-            ),
+            reconnectCoordinator: reconnectCoordinator
+                ?? ReconnectCoordinator(
+                    clock: { _ in },
+                    jitter: ReconnectCoordinator.zeroJitter
+                ),
             sftpRepository: sftpRepository ?? DemoSFTPRepository(seedDemoData: true),
             portForwardingManager: portForwardingManager ?? DemoPortForwardingManager(),
             fileProviderHelper: fileProviderHelper,
@@ -721,7 +840,8 @@ final class AppContainer: ObservableObject {
         case .missingCredential:
             return "Saved credential could not be found in Keychain."
         case .missingIdentity:
-            return "The saved host identity is missing. Edit the host and select an available identity."
+            return
+                "The saved host identity is missing. Edit the host and select an available identity."
         case .identityCollision:
             return "The saved host identity is ambiguous. Remove duplicate records or references."
         case .invalidPrivateKey:
@@ -752,10 +872,20 @@ final class AppContainer: ObservableObject {
         restoringTmuxSessionID: String? = nil,
         sessionID: UUID? = nil
     ) async {
-        guard activeSession?.state != .connecting else { return }
-        liveActivityManager.endAll()
-        foregroundRecoveryTask?.cancel()
-        foregroundRecoveryTask = nil
+        guard !isConnectingSession else { return }
+        guard sessionRuntimes.count < Self.maximumConcurrentSessions else {
+            let failure = ConnectionFailure(
+                stage: .tcp,
+                reason: "Maximum concurrent sessions reached (\(Self.maximumConcurrentSessions)).",
+                technicalDetail:
+                    "Cannot open more than \(Self.maximumConcurrentSessions) concurrent SSH sessions simultaneously.",
+                recoveryAction:
+                    "Close an existing session from the switcher before opening a new one."
+            )
+            lastConnectionFailure = failure
+            return
+        }
+
         lifecycleGeneration += 1
         isSceneInBackground = false
         isForegroundRecoveryInProgress = false
@@ -765,75 +895,83 @@ final class AppContainer: ObservableObject {
         lastConnectionFailure = nil
         await cancelVoiceRecording()
         resetVoiceState()
-        tmuxRefreshGeneration += 1
-        herdrRefreshGeneration += 1
-        stopHerdrPolling()
-        herdrWorkspaces = []
-        isProbingHerdr = false
-        herdrAvailability = .unavailable(reason: "Not connected")
-        herdrError = nil
         isExplicitDisconnect = false
-        activeHost = host
-        activeTmuxSessionID = nil
-        tmuxSessions = []
-        isTmuxServerRunning = false
-        tmuxAvailability = .unavailable(reason: "Not connected")
-        tmuxError = nil
-        isProbingTmux = false
-        moshStateTask?.cancel()
-        moshStateTask = nil
-        moshState = nil
-        moshSessionInfo?.zeroize()
-        moshSessionInfo = nil
-        networkRoamingState = nil
-        activeHerdrWorkspaceID = nil
-        await reconnectCoordinator.cancel()
-        reconnectState = .idle
-        await sessionRuntime?.disconnect()
-        sessionRuntime = nil
-        hasObservedTransportError = false
+
+        if sessionRuntimes.isEmpty {
+            liveActivityManager.endAll()
+            foregroundRecoveryTask?.cancel()
+            foregroundRecoveryTask = nil
+            tmuxRefreshGeneration += 1
+            herdrRefreshGeneration += 1
+            stopHerdrPolling()
+            herdrWorkspaces = []
+            isProbingHerdr = false
+            herdrAvailability = .unavailable(reason: "Not connected")
+            herdrError = nil
+            activeTmuxSessionID = nil
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            tmuxAvailability = .unavailable(reason: "Not connected")
+            tmuxError = nil
+            isProbingTmux = false
+            moshStateTask?.cancel()
+            moshStateTask = nil
+            moshState = nil
+            moshSessionInfo?.zeroize()
+            moshSessionInfo = nil
+            networkRoamingState = nil
+            activeHerdrWorkspaceID = nil
+            await reconnectCoordinator.cancel()
+            reconnectState = .idle
+            cancelSendImageForLifecycle()
+            closePreview()
+            closeEditor()
+            currentDirectoryFiles = []
+            currentPath = RemotePath("/home/dev")
+            directoryErrorMessage = nil
+            sftpErrorMessage = nil
+            for (_, task) in activeTransferTasks {
+                task.cancel()
+            }
+            activeTransferTasks.removeAll()
+            drainPendingConflicts()
+            directoryCache.removeAll()
+            forwardingStreamTask?.cancel()
+            forwardingStreamTask = nil
+            await portForwardingManager?.stopAll()
+            if !isDemo {
+                portForwardingManager = nil
+            }
+            forwardingSessions = []
+            forwardingErrorMessage = nil
+            fallbackTerminalController.reset()
+        }
+
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         terminalController.synchronizeViewportMeasurement()
-        terminalGrid = TerminalGrid()
-        ansiParser = ANSIParser()
-        terminalText = ""
-        redactor = Redactor()
-        terminalController.reset()
-
-        // Reset previous SFTP session, editor, preview, and transfers on connecting to new host
-        cancelSendImageForLifecycle()
-        closePreview()
-        closeEditor()
-        currentDirectoryFiles = []
-        currentPath = RemotePath("/home/dev")
-        directoryErrorMessage = nil
-        sftpErrorMessage = nil
-        for (_, task) in activeTransferTasks {
-            task.cancel()
-        }
-        activeTransferTasks.removeAll()
-        drainPendingConflicts()
-        directoryCache.removeAll()
-
-        // Reset port forwarding state
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = nil
-        await portForwardingManager?.stopAll()
-        if !isDemo {
-            portForwardingManager = nil
-        }
-        forwardingSessions = []
-        forwardingErrorMessage = nil
+        let initialTerminalSize = terminalController.size
 
         let session = TerminalSession(
             id: sessionID ?? UUID(),
             hostID: host.id,
             state: .connecting,
-            terminalSize: terminalController.size,
+            terminalSize: initialTerminalSize,
             capabilities: ["ansi", "resize"]
         )
+
+        let runtimeTerminalController = ShhTerminalController(
+            configuration: ShhTerminalConfiguration(
+                initialSize: initialTerminalSize,
+                initialFontSize: terminalController.terminalFontSize,
+                initialTheme: terminalTheme
+            )
+        )
+
+        activeHost = host
         activeSession = session
+        terminalText = ""
+        reconnectState = .idle
         do {
             // Resolve descriptor by UUID before invoking transport. Never let a
             // missing descriptor degrade into password auth or an arbitrary
@@ -862,9 +1000,10 @@ final class AppContainer: ObservableObject {
                 )
             }
             guard activeSession?.id == session.id,
-                  activeSession?.state == .connecting,
-                  lifecycleGeneration == connectionGeneration,
-                  !isSceneInBackground else {
+                activeSession?.state == .connecting,
+                lifecycleGeneration == connectionGeneration,
+                !isSceneInBackground
+            else {
                 await connection.close()
                 return
             }
@@ -880,9 +1019,10 @@ final class AppContainer: ObservableObject {
             // Host key is accepted and connection succeeded; load redaction secret if available
             await loadRedactionSecret(for: host)
             guard activeSession?.id == session.id,
-                  activeSession?.state == .connecting,
-                  lifecycleGeneration == connectionGeneration,
-                  !isSceneInBackground else {
+                activeSession?.state == .connecting,
+                lifecycleGeneration == connectionGeneration,
+                !isSceneInBackground
+            else {
                 await connection.close()
                 return
             }
@@ -890,11 +1030,16 @@ final class AppContainer: ObservableObject {
                 host: host,
                 session: session,
                 connection: connection,
-                terminalController: terminalController,
+                terminalController: runtimeTerminalController,
                 redactor: redactor
             )
             configureSessionRuntime(runtime, session: session, host: host)
-            sessionRuntime = runtime
+            sessionRuntimes[session.id] = runtime
+            if !sessionOrder.contains(session.id) {
+                sessionOrder.append(session.id)
+            }
+            updateOpenSessions()
+            selectSession(id: session.id)
             await runtime.activateAndWait()
             activeSession?.state = .connected
             syncLiveActivityState()
@@ -915,34 +1060,37 @@ final class AppContainer: ObservableObject {
                 _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
             }
 
-            // Wire port forwarding manager and auto-start enabled rules
-            let pfManager: any PortForwardingManaging
-            if let custom = self.customPortForwardingManager {
-                pfManager = custom
-            } else if self.isDemo {
-                pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
-            } else if let live = connection as? LiveSSHConnection {
-                pfManager = PortForwardingManager(connection: live)
-            } else {
-                pfManager = UnavailablePortForwardingManager()
-            }
-            self.portForwardingManager = pfManager
-            await self.autoStartForwardingRules(for: host, manager: pfManager)
-            self.startForwardingMonitoring(manager: pfManager)
+            if sessionRuntimes.count == 1 {
+                let pfManager: any PortForwardingManaging
+                if let custom = self.customPortForwardingManager {
+                    pfManager = custom
+                } else if self.isDemo {
+                    pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
+                } else if let live = connection as? LiveSSHConnection {
+                    pfManager = PortForwardingManager(connection: live)
+                } else {
+                    pfManager = UnavailablePortForwardingManager()
+                }
+                self.portForwardingManager = pfManager
+                await self.autoStartForwardingRules(for: host, manager: pfManager)
+                self.startForwardingMonitoring(manager: pfManager)
 
-            Task { [weak self] in
-                await self?.refreshTmuxState()
-            }
-            Task { [weak self] in
-                await self?.setupSFTPForHost(host)
+                Task { [weak self] in
+                    await self?.refreshTmuxState()
+                }
+                Task { [weak self] in
+                    await self?.setupSFTPForHost(host)
+                }
             }
         } catch let error as TransportError {
-            guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
+            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
+                return
+            }
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = Self.statusMessage(for: error)
             terminalText = message
-            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
             switch error {
             case .hostKeyApprovalRequired(let challenge):
                 pendingTrustChallenge = challenge
@@ -954,13 +1102,15 @@ final class AppContainer: ObservableObject {
                 activeSession?.state = .failed
             }
         } catch {
-            guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
+            guard activeSession?.id == session.id, activeSession?.state == .connecting else {
+                return
+            }
             let failure = ConnectionFailure.from(error: error, host: host)
             self.lastConnectionFailure = failure
             let message = failure.reason
             activeSession?.state = .failed
             terminalText = message
-            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
         }
     }
 
@@ -970,16 +1120,16 @@ final class AppContainer: ObservableObject {
         host: Host
     ) {
         runtime.onOutput = { [weak self] data in
-            guard let self,
-                  self.activeSession?.id == session.id,
-                  self.sessionRuntime === runtime else { return }
-            self.terminalText += String(decoding: data, as: UTF8.self)
+            guard let self else { return }
+            if self.selectedSessionID == session.id {
+                self.terminalText = runtime.terminalText
+            }
         }
         runtime.onResize = { [weak self] size in
-            guard let self,
-                  self.activeSession?.id == session.id,
-                  self.sessionRuntime === runtime else { return }
-            self.activeSession?.terminalSize = size
+            guard let self else { return }
+            if self.selectedSessionID == session.id {
+                self.activeSession?.terminalSize = size
+            }
         }
         runtime.onTermination = { [weak self] event in
             await self?.handleSessionRuntimeTermination(event, session: session, host: host)
@@ -991,9 +1141,8 @@ final class AppContainer: ObservableObject {
         session: TerminalSession,
         host: Host
     ) async {
-        guard !isExplicitDisconnect,
-              activeSession?.id == session.id,
-              sessionRuntime?.session.id == session.id else { return }
+        guard !isExplicitDisconnect else { return }
+        guard let runtime = sessionRuntimes[session.id] ?? sessionRuntime else { return }
 
         tmuxRefreshGeneration += 1
         herdrRefreshGeneration += 1
@@ -1010,42 +1159,50 @@ final class AppContainer: ObservableObject {
         if transportError != nil {
             hasObservedTransportError = true
         }
-        if event == nil || transportError != nil {
-            activeSession?.state = .failed
-        } else if activeSession?.state != .failed, !hasObservedTransportError {
-            activeSession?.state = .disconnected
-        }
-        let failureReason = transportError.map { Self.statusMessage(for: $0) } ?? "Connection failed."
-        reconnectState = activeSession?.state == .failed
-            ? .failed(reason: failureReason)
-            : .idle
-        redactor = Redactor()
+        updateOpenSessions()
+
         if let transportError {
             let message = Self.statusMessage(for: transportError)
-            terminalText += "\n" + message
-            terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
+            runtime.terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
         } else if case .closed = event {
-            terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
+            runtime.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
         }
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = nil
-        await portForwardingManager?.stopAll()
-        forwardingSessions = []
-        handleConnectionDrop(host: host)
+
+        if selectedSessionID == session.id {
+            activeSession?.state = runtime.session.state
+            let failureReason =
+                transportError.map { Self.statusMessage(for: $0) } ?? "Connection failed."
+            reconnectState =
+                activeSession?.state == .failed
+                ? .failed(reason: failureReason)
+                : .idle
+            redactor = Redactor()
+            if let transportError {
+                terminalText += "\n" + Self.statusMessage(for: transportError)
+            }
+            syncLiveActivityState()
+            forwardingStreamTask?.cancel()
+            forwardingStreamTask = nil
+            await portForwardingManager?.stopAll()
+            forwardingSessions = []
+            handleConnectionDrop(host: host)
+        }
     }
 
     private func handleConnectionDrop(host: Host) {
         cancelSendImageForLifecycle()
         guard !isExplicitDisconnect, !isSceneInBackground,
-              !isNetworkRecoveryInProgress,
-              activeHost?.id == host.id else { return }
+            !isNetworkRecoveryInProgress,
+            activeHost?.id == host.id
+        else { return }
         isForegroundRecoveryInProgress = false
         guard reachabilityMonitor.isReachable else {
             // Preserve an observed transport error while recovery waits for the
             // network. The error path may transiently expose disconnected before
             // the terminal close event promotes the session to failed.
             if activeSession?.state != .failed,
-               !hasObservedTransportError {
+                !hasObservedTransportError
+            {
                 activeSession?.state = .disconnected
             }
             reconnectState = .failed(reason: "Network unavailable.")
@@ -1057,9 +1214,10 @@ final class AppContainer: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard !self.isExplicitDisconnect,
-                  !self.isSceneInBackground,
-                  self.activeHost?.id == host.id,
-                  self.reachabilityMonitor.isReachable else {
+                !self.isSceneInBackground,
+                self.activeHost?.id == host.id,
+                self.reachabilityMonitor.isReachable
+            else {
                 self.isNetworkRecoveryInProgress = false
                 self.reconnectState = .failed(reason: "Network unavailable.")
                 return
@@ -1074,8 +1232,9 @@ final class AppContainer: ObservableObject {
 
     func performReconnect(to host: Host, attempt: Int) async throws {
         guard !isExplicitDisconnect,
-              !isSceneInBackground,
-              activeHost?.id == host.id else {
+            !isSceneInBackground,
+            activeHost?.id == host.id
+        else {
             throw TransportError.cancelled
         }
         let connectionGeneration = lifecycleGeneration
@@ -1142,9 +1301,10 @@ final class AppContainer: ObservableObject {
         }
 
         guard activeSession?.id == session.id,
-              lifecycleGeneration == connectionGeneration,
-              !isExplicitDisconnect,
-              !isSceneInBackground else {
+            lifecycleGeneration == connectionGeneration,
+            !isExplicitDisconnect,
+            !isSceneInBackground
+        else {
             await connection.close()
             throw TransportError.cancelled
         }
@@ -1159,7 +1319,7 @@ final class AppContainer: ObservableObject {
             startMoshMonitoring(for: moshController, session: session)
         }
 
-        guard let runtime = sessionRuntime else {
+        guard let runtime = sessionRuntimes[session.id] ?? sessionRuntime else {
             await connection.close()
             throw TransportError.cancelled
         }
@@ -1167,12 +1327,13 @@ final class AppContainer: ObservableObject {
         let previousConnection = runtime.connection
         await loadRedactionSecret(for: host)
         guard activeSession?.id == session.id,
-              activeSession?.state == .connecting,
-              lifecycleGeneration == connectionGeneration,
-              !isExplicitDisconnect,
-              !isSceneInBackground,
-              sessionRuntime === runtime,
-              (runtime.connection as AnyObject) === (previousConnection as AnyObject) else {
+            activeSession?.state == .connecting,
+            lifecycleGeneration == connectionGeneration,
+            !isExplicitDisconnect,
+            !isSceneInBackground,
+            (sessionRuntimes[session.id] ?? sessionRuntime) === runtime,
+            (runtime.connection as AnyObject) === (previousConnection as AnyObject)
+        else {
             redactor = Redactor()
             await runtime.disconnect()
             await connection.close()
@@ -1184,19 +1345,21 @@ final class AppContainer: ObservableObject {
             throw TransportError.cancelled
         }
         guard activeSession?.id == session.id,
-              activeSession?.state == .connecting,
-              lifecycleGeneration == connectionGeneration,
-              !isExplicitDisconnect,
-              !isSceneInBackground,
-              sessionRuntime === runtime,
-              let currentConnection = self.connection,
-              (currentConnection as AnyObject) === (connection as AnyObject) else {
+            activeSession?.state == .connecting,
+            lifecycleGeneration == connectionGeneration,
+            !isExplicitDisconnect,
+            !isSceneInBackground,
+            (sessionRuntimes[session.id] ?? sessionRuntime) === runtime,
+            let currentConnection = self.connection,
+            (currentConnection as AnyObject) === (connection as AnyObject)
+        else {
             redactor = Redactor()
             await runtime.disconnect()
             throw TransportError.cancelled
         }
         activeSession?.state = .connected
         reconnectState = .connected
+        updateOpenSessions()
         syncLiveActivityState()
 
         let targetSession = await automaticTmuxTarget(
@@ -1210,12 +1373,16 @@ final class AppContainer: ObservableObject {
             _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
         }
 
-        let shouldRestoreHerdr = (try? await restorationStore.load())
+        let shouldRestoreHerdr =
+            (try? await restorationStore.load())
             .flatMap { metadata -> LastUsedMultiplexerTarget? in
                 guard metadata.hostID == host.id else { return nil }
                 return lastUsedTarget(from: metadata)
             }
-            .map { if case .herdr = $0 { return true }; return false } ?? false
+            .map {
+                if case .herdr = $0 { return true }
+                return false
+            } ?? false
         if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil || shouldRestoreHerdr {
             await refreshHerdrState()
             await restoreHerdrTargetIfNeeded(for: host, session: session)
@@ -1265,9 +1432,9 @@ final class AppContainer: ObservableObject {
         moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
-        await sessionRuntime?.disconnect()
-        sessionRuntime = nil
+        await selectedSessionRuntime?.disconnect()
         activeSession?.state = .disconnected
+        updateOpenSessions()
         updateIdleTimerState()
     }
 
@@ -1306,7 +1473,8 @@ final class AppContainer: ObservableObject {
                 // Do not erase an actionable transport failure when the path
                 // update arrives after the failure event.
                 if activeSession?.state != .failed,
-                   !hasObservedTransportError {
+                    !hasObservedTransportError
+                {
                     activeSession?.state = .disconnected
                 }
                 reconnectState = .failed(reason: "Network unavailable.")
@@ -1332,7 +1500,9 @@ final class AppContainer: ObservableObject {
 
     // MARK: - Mosh Network Roaming & Fast Session Recovery
 
-    private func startMoshMonitoring(for controller: any MoshSessionControlling, session: TerminalSession) {
+    private func startMoshMonitoring(
+        for controller: any MoshSessionControlling, session: TerminalSession
+    ) {
         moshStateTask?.cancel()
         moshStateTask = Task { @MainActor [weak self] in
             let updates = await controller.moshStateUpdates()
@@ -1346,7 +1516,9 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    func handleNetworkInterfaceChange(_ newInterface: NetworkInterfaceType, roamingState: NetworkRoamingState) async {
+    func handleNetworkInterfaceChange(
+        _ newInterface: NetworkInterfaceType, roamingState: NetworkRoamingState
+    ) async {
         guard !isExplicitDisconnect else { return }
         cancelSendImageForLifecycle()
         self.networkRoamingState = roamingState
@@ -1359,7 +1531,8 @@ final class AppContainer: ObservableObject {
                 await performFastSessionRecovery()
             }
         } else if let host = activeHost,
-                  activeSession?.state == .connected {
+            activeSession?.state == .connected
+        {
             // A path/interface change can leave an established TCP socket
             // half-alive without producing a channel callback. Replace it
             // through the normal reconnect path, but first detach the old
@@ -1375,8 +1548,12 @@ final class AppContainer: ObservableObject {
     func performFastSessionRecovery() async {
         guard let host = activeHost, !isExplicitDisconnect else { return }
 
-        if reachabilityMonitor.isReachable, let moshController = connection as? any MoshSessionControlling {
-            let roaming = networkRoamingState ?? NetworkRoamingState(currentInterface: reachabilityMonitor.currentInterfaceType)
+        if reachabilityMonitor.isReachable,
+            let moshController = connection as? any MoshSessionControlling
+        {
+            let roaming =
+                networkRoamingState
+                ?? NetworkRoamingState(currentInterface: reachabilityMonitor.currentInterfaceType)
             do {
                 try await moshController.handleNetworkRoaming(roaming)
                 self.moshState = await moshController.moshState
@@ -1423,8 +1600,9 @@ final class AppContainer: ObservableObject {
                 foregroundRecoveryTask?.cancel()
                 let recoveryTask = Task { @MainActor [weak self] in
                     guard let self,
-                          self.lifecycleGeneration == generation,
-                          !self.isExplicitDisconnect else { return }
+                        self.lifecycleGeneration == generation,
+                        !self.isExplicitDisconnect
+                    else { return }
                     // Ensure a reconnect that was invalidated by backgrounding
                     // cannot cancel the new foreground recovery after it starts.
                     // Healthy sessions do not need a coordinator generation bump;
@@ -1434,9 +1612,13 @@ final class AppContainer: ObservableObject {
                         await self.reconnectCoordinator.cancel()
                         self.reconnectState = await self.reconnectCoordinator.state
                     }
-                    guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
+                    guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else {
+                        return
+                    }
 
-                    if let session = self.activeSession, session.state == .connected, let conn = self.connection {
+                    if let session = self.activeSession, session.state == .connected,
+                        let conn = self.connection
+                    {
                         // A process may have been suspended after the finite
                         // background grace period. Report the session as
                         // connecting while the bounded transport probe runs so
@@ -1445,10 +1627,11 @@ final class AppContainer: ObservableObject {
                         self.activeSession?.state = .connecting
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
                         guard self.lifecycleGeneration == generation,
-                              !self.isExplicitDisconnect,
-                              self.activeSession?.id == session.id,
-                              self.activeSession?.state == .connecting,
-                              self.connection != nil else { return }
+                            !self.isExplicitDisconnect,
+                            self.activeSession?.id == session.id,
+                            self.activeSession?.state == .connecting,
+                            self.connection != nil
+                        else { return }
 
                         if isResponsive {
                             self.isForegroundRecoveryInProgress = false
@@ -1470,7 +1653,10 @@ final class AppContainer: ObservableObject {
                                 self.handleConnectionDrop(host: host)
                             }
                         }
-                    } else if let host = self.activeHost, (self.activeSession?.state == .failed || self.activeSession?.state == .disconnected) {
+                    } else if let host = self.activeHost,
+                        self.activeSession?.state == .failed
+                            || self.activeSession?.state == .disconnected
+                    {
                         self.isForegroundRecoveryInProgress = false
                         // The foreground transition already invalidated any
                         // prior coordinator generation. Preserve its backoff
@@ -1481,7 +1667,9 @@ final class AppContainer: ObservableObject {
                     }
                 }
                 foregroundRecoveryTask = recoveryTask
-            } else if let host = activeHost, (activeSession?.state == .failed || activeSession?.state == .disconnected) {
+            } else if let host = activeHost,
+                activeSession?.state == .failed || activeSession?.state == .disconnected
+            {
                 // An already-running coordinator owns its backoff. Do not
                 // restart it for repeated .active notifications.
                 if !reconnectState.isReconnecting {
@@ -1526,7 +1714,8 @@ final class AppContainer: ObservableObject {
                 let previous = try? await self.restorationStore.load()
                 let target = activeTarget ?? previous.flatMap { self.lastUsedTarget(from: $0) }
                 guard self.lifecycleGeneration == backgroundGeneration,
-                      !self.isExplicitDisconnect else { return }
+                    !self.isExplicitDisconnect
+                else { return }
                 let metadata = self.restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
@@ -1544,7 +1733,9 @@ final class AppContainer: ObservableObject {
         if activeSession?.state == .connected {
             endCurrentBackgroundTask()
             let taskBox = BackgroundTaskBox()
-            let taskID = backgroundTaskManager.beginBackgroundTask(withName: "com.ervinpopescu.shh.keepalive") { [weak self, taskBox] in
+            let taskID = backgroundTaskManager.beginBackgroundTask(
+                withName: "com.ervinpopescu.shh.keepalive"
+            ) { [weak self, taskBox] in
                 let id = taskBox.value
                 self?.backgroundTaskManager.endBackgroundTask(id)
                 Task { @MainActor [weak self] in
@@ -1600,8 +1791,9 @@ final class AppContainer: ObservableObject {
 
     func restoreLastSession() async {
         guard let metadata = try? await restorationStore.load(),
-              let hosts = try? await catalog.listHosts(),
-              let host = hosts.first(where: { $0.id == metadata.hostID }) else {
+            let hosts = try? await catalog.listHosts(),
+            let host = hosts.first(where: { $0.id == metadata.hostID })
+        else {
             return
         }
         let target: String?
@@ -1618,14 +1810,20 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func openLiveActivitySession(sessionID: UUID) async -> Bool {
         if let activeSession,
-           activeSession.id == sessionID,
-           activeSession.state != .disconnected {
+            activeSession.id == sessionID,
+            activeSession.state != .disconnected
+        {
+            return true
+        }
+        if let runtime = sessionRuntimes[sessionID], runtime.session.state != .disconnected {
+            selectSession(id: sessionID)
             return true
         }
         guard let metadata = try? await restorationStore.load(),
-              metadata.sessionID == sessionID,
-              let hosts = try? await catalog.listHosts(),
-              let host = hosts.first(where: { $0.id == metadata.hostID }) else {
+            metadata.sessionID == sessionID,
+            let hosts = try? await catalog.listHosts(),
+            let host = hosts.first(where: { $0.id == metadata.hostID })
+        else {
             return false
         }
         let target: String?
@@ -1664,7 +1862,8 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func sendRawInteractive(_ data: Data) async -> Bool {
         guard activeSession?.state == .connected,
-              let runtime = sessionRuntime else { return false }
+            let runtime = sessionRuntime
+        else { return false }
         return await runtime.send(data)
     }
 
@@ -1682,8 +1881,9 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func sendValidatedCommand(_ command: String, approved: Bool = false) async -> Bool {
         guard CommandPolicy().canSend(command, approved: approved),
-              activeSession?.state == .connected,
-              let runtime = sessionRuntime else { return false }
+            activeSession?.state == .connected,
+            let runtime = sessionRuntime
+        else { return false }
         let sent = await runtime.send(Data(command.utf8))
         if !sent {
             let message = "Send failed: Connection failed."
@@ -1714,39 +1914,44 @@ final class AppContainer: ObservableObject {
         isSceneInBackground = false
         tmuxRefreshGeneration += 1
         if let host = activeHost,
-           let session = activeSession,
-           let target = activeTmuxSessionID.flatMap({ LastUsedMultiplexerTarget.tmuxTarget($0) })
-                ?? activeHerdrWorkspaceID.flatMap({ LastUsedMultiplexerTarget.herdrTarget($0) }) {
-            try? await restorationStore.save(restorationMetadata(
-                hostID: host.id,
-                sessionID: session.id,
-                target: target
-            ))
+            let session = activeSession,
+            let target = activeTmuxSessionID.flatMap({ LastUsedMultiplexerTarget.tmuxTarget($0) })
+                ?? activeHerdrWorkspaceID.flatMap({ LastUsedMultiplexerTarget.herdrTarget($0) })
+        {
+            try? await restorationStore.save(
+                restorationMetadata(
+                    hostID: host.id,
+                    sessionID: session.id,
+                    target: target
+                ))
         }
         activeHost = nil
         liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
         await reconnectCoordinator.cancel()
         reconnectState = .idle
-        await sessionRuntime?.disconnect()
-        sessionRuntime = nil
+        await selectedSessionRuntime?.disconnect()
 
-        // Reset port forwarding state before closing SSH connection
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = nil
-        await portForwardingManager?.stopAll()
-        if !isDemo {
-            portForwardingManager = nil
+        // Reset port forwarding state before closing SSH connection if single session
+        if sessionRuntimes.count <= 1 {
+            forwardingStreamTask?.cancel()
+            forwardingStreamTask = nil
+            await portForwardingManager?.stopAll()
+            if !isDemo {
+                portForwardingManager = nil
+            }
+            forwardingSessions = []
+            forwardingErrorMessage = nil
+
+            activeTmuxSessionID = nil
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            isProbingTmux = false
+            tmuxAvailability = .unavailable(reason: "Not connected")
         }
-        forwardingSessions = []
-        forwardingErrorMessage = nil
 
         activeSession?.state = .disconnected
         redactor = Redactor()
-        activeTmuxSessionID = nil
-        tmuxSessions = []
-        isTmuxServerRunning = false
-        isProbingTmux = false
-        tmuxAvailability = .unavailable(reason: "Not connected")
+        updateOpenSessions()
         tmuxError = nil
 
         herdrRefreshGeneration += 1
@@ -1823,9 +2028,10 @@ final class AppContainer: ObservableObject {
         var secrets: [String] = []
         let identities = (try? await catalog.identities()) ?? []
         if let identityID = host.identityID,
-           let identity = identities.first(where: { $0.id == identityID }),
-           let secret = try? await credentialStore.load(reference: identity.keychainReference),
-           let value = String(data: secret, encoding: .utf8), !value.isEmpty {
+            let identity = identities.first(where: { $0.id == identityID }),
+            let secret = try? await credentialStore.load(reference: identity.keychainReference),
+            let value = String(data: secret, encoding: .utf8), !value.isEmpty
+        {
             secrets.append(value)
         }
         if case .proxyJump(let jumpOpts) = host.connection {
@@ -1839,9 +2045,11 @@ final class AppContainer: ObservableObject {
                     idID = ep.identityID
                 }
                 if let idID,
-                   let ident = identities.first(where: { $0.id == idID }),
-                   let secret = try? await credentialStore.load(reference: ident.keychainReference),
-                   let value = String(data: secret, encoding: .utf8), !value.isEmpty {
+                    let ident = identities.first(where: { $0.id == idID }),
+                    let secret = try? await credentialStore.load(
+                        reference: ident.keychainReference),
+                    let value = String(data: secret, encoding: .utf8), !value.isEmpty
+                {
                     secrets.append(value)
                 }
             }
@@ -1877,7 +2085,9 @@ final class AppContainer: ObservableObject {
         return activeID == session.sessionID || activeID == session.name
     }
 
-    func updateActiveHostPreferences(autoAttachTmux: Bool, defaultTmuxSession: String? = nil) async throws {
+    func updateActiveHostPreferences(autoAttachTmux: Bool, defaultTmuxSession: String? = nil)
+        async throws
+    {
         guard let host = activeHost else { return }
 
         // The legacy default target is intentionally ignored. Automatic attachment
@@ -1914,16 +2124,19 @@ final class AppContainer: ObservableObject {
             return LastUsedMultiplexerTarget.tmuxTarget(trimmed) == nil ? nil : trimmed
         }
         guard allowStoredTarget || host.autoAttachTmux,
-              let metadata = try? await restorationStore.load(),
-              metadata.hostID == host.id,
-              let target = lastUsedTarget(from: metadata),
-              case .tmux(let sessionID) = target else {
+            let metadata = try? await restorationStore.load(),
+            metadata.hostID == host.id,
+            let target = lastUsedTarget(from: metadata),
+            case .tmux(let sessionID) = target
+        else {
             return nil
         }
         return sessionID
     }
 
-    private func lastUsedTarget(from metadata: SessionRestorationMetadata) -> LastUsedMultiplexerTarget? {
+    private func lastUsedTarget(from metadata: SessionRestorationMetadata)
+        -> LastUsedMultiplexerTarget?
+    {
         if let target = metadata.lastUsedMultiplexerTarget {
             return target
         }
@@ -1958,15 +2171,18 @@ final class AppContainer: ObservableObject {
 
     private func restoreHerdrTargetIfNeeded(for host: Host, session: TerminalSession) async {
         guard let metadata = try? await restorationStore.load(),
-              metadata.hostID == host.id,
-              let target = lastUsedTarget(from: metadata),
-              case .herdr(let workspaceID) = target else { return }
+            metadata.hostID == host.id,
+            let target = lastUsedTarget(from: metadata),
+            case .herdr(let workspaceID) = target
+        else { return }
         guard activeSession?.id == session.id,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect else { return }
+            activeSession?.state == .connected,
+            !isExplicitDisconnect
+        else { return }
         guard let workspace = herdrWorkspaces.first(where: { $0.id == workspaceID }) else {
             activeHerdrWorkspaceID = nil
-            herdrError = "Remembered Herdr workspace is no longer available. Select a workspace to recover it."
+            herdrError =
+                "Remembered Herdr workspace is no longer available. Select a workspace to recover it."
             return
         }
         activeHerdrWorkspaceID = workspace.id
@@ -1983,34 +2199,40 @@ final class AppContainer: ObservableObject {
         if trimmed.hasPrefix("$") {
             if let executor = connection as? SSHCommandExecuting {
                 do {
-                    let check = try await executor.executeCommand(TmuxCommand.hasSession(id: trimmed), timeout: 5.0)
+                    let check = try await executor.executeCommand(
+                        TmuxCommand.hasSession(id: trimmed), timeout: 5.0)
                     guard activeSession?.id == session.id,
-                          activeSession?.state == .connected,
-                          !isExplicitDisconnect,
-                          (self.connection as AnyObject) === (connection as AnyObject) else {
+                        activeSession?.state == .connected,
+                        !isExplicitDisconnect,
+                        (self.connection as AnyObject) === (connection as AnyObject)
+                    else {
                         return false
                     }
                     if !check.isSuccess {
                         self.activeTmuxSessionID = nil
-                        self.tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
+                        self.tmuxError =
+                            "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
                         return false
                     }
                 } catch {
                     guard activeSession?.id == session.id,
-                          activeSession?.state == .connected,
-                          !isExplicitDisconnect,
-                          (self.connection as AnyObject) === (connection as AnyObject) else {
+                        activeSession?.state == .connected,
+                        !isExplicitDisconnect,
+                        (self.connection as AnyObject) === (connection as AnyObject)
+                    else {
                         return false
                     }
                     self.activeTmuxSessionID = nil
-                    self.tmuxError = "Failed to verify tmux session \(trimmed): \(error.localizedDescription) Select a session to recover it."
+                    self.tmuxError =
+                        "Failed to verify tmux session \(trimmed): \(error.localizedDescription) Select a session to recover it."
                     return false
                 }
             }
             guard activeSession?.id == session.id,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (self.connection as AnyObject) === (connection as AnyObject) else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (self.connection as AnyObject) === (connection as AnyObject)
+            else {
                 return false
             }
             return await attachTmuxSession(id: trimmed)
@@ -2020,16 +2242,22 @@ final class AppContainer: ObservableObject {
             guard let executor = connection as? SSHCommandExecuting else { return false }
             let result = try? await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
             guard activeSession?.id == session.id,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (self.connection as AnyObject) === (connection as AnyObject),
-                  let result,
-                  result.isSuccess else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (self.connection as AnyObject) === (connection as AnyObject),
+                let result,
+                result.isSuccess
+            else {
                 return false
             }
-            guard let match = try? TmuxListSessionsParser.parse(result.stdout).first(where: { $0.name == trimmed }) else {
+            guard
+                let match = try? TmuxListSessionsParser.parse(result.stdout).first(where: {
+                    $0.name == trimmed
+                })
+            else {
                 activeTmuxSessionID = nil
-                tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
+                tmuxError =
+                    "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
                 return false
             }
             return await attachTmuxSession(id: match.sessionID)
@@ -2043,7 +2271,8 @@ final class AppContainer: ObservableObject {
             return tmuxAvailability
         }
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             let avail = TmuxAvailability.unavailable(reason: "Not connected")
             if activeSession == nil || activeSession?.state != .connected {
                 tmuxAvailability = avail
@@ -2055,9 +2284,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(TmuxCommand.probe, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = TmuxAvailability.parse(result: result)
@@ -2065,9 +2295,10 @@ final class AppContainer: ObservableObject {
             return avail
         } catch {
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = TmuxAvailability.unavailable(reason: error.localizedDescription)
@@ -2079,7 +2310,8 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func listTmuxSessions(expectedGeneration: Int? = nil) async -> [TmuxSessionInfo] {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             tmuxSessions = []
             isTmuxServerRunning = false
             return []
@@ -2089,19 +2321,22 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(TmuxCommand.listSessions, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj,
-                  expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj,
+                expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration
+            else {
                 return []
             }
             if result.isSuccess {
-                guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration
+                else {
                     return []
                 }
                 do {
                     let parsed = try TmuxListSessionsParser.parse(result.stdout)
-                    guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                    guard expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration
+                    else {
                         return []
                     }
                     tmuxSessions = parsed
@@ -2109,16 +2344,21 @@ final class AppContainer: ObservableObject {
                     tmuxError = nil
 
                     if let active = activeTmuxSessionID {
-                        if let matched = parsed.first(where: { $0.sessionID == active || $0.name == active }) {
+                        if let matched = parsed.first(where: {
+                            $0.sessionID == active || $0.name == active
+                        }) {
                             if active != matched.sessionID {
                                 activeTmuxSessionID = matched.sessionID
                                 if let host = activeHost,
-                                   let target = LastUsedMultiplexerTarget.tmuxTarget(matched.sessionID) {
-                                    try? await restorationStore.save(restorationMetadata(
-                                        hostID: host.id,
-                                        sessionID: sessionID,
-                                        target: target
-                                    ))
+                                    let target = LastUsedMultiplexerTarget.tmuxTarget(
+                                        matched.sessionID)
+                                {
+                                    try? await restorationStore.save(
+                                        restorationMetadata(
+                                            hostID: host.id,
+                                            sessionID: sessionID,
+                                            target: target
+                                        ))
                                 }
                             }
                         } else {
@@ -2126,7 +2366,8 @@ final class AppContainer: ObservableObject {
                             // failed selection. Keep the last target for an
                             // explicit recovery attempt.
                             activeTmuxSessionID = nil
-                            tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
+                            tmuxError =
+                                "Remembered tmux session is no longer available. Select a session to recover it."
                         }
                     }
 
@@ -2136,9 +2377,11 @@ final class AppContainer: ObservableObject {
                     isTmuxServerRunning = true
                     let parseMessage: String
                     if let parseError = error as? TmuxParseError {
-                        parseMessage = "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version. (\(parseError.localizedDescription))"
+                        parseMessage =
+                            "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version. (\(parseError.localizedDescription))"
                     } else {
-                        parseMessage = "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version."
+                        parseMessage =
+                            "Failed to parse tmux sessions due to format incompatibility. Refresh sessions or check remote tmux version."
                     }
                     tmuxError = parseMessage
                     return []
@@ -2151,7 +2394,8 @@ final class AppContainer: ObservableObject {
                     tmuxError = nil
                     if activeTmuxSessionID != nil {
                         activeTmuxSessionID = nil
-                        tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
+                        tmuxError =
+                            "Remembered tmux session is no longer available. Select a session to recover it."
                     }
                 } else if combinedErr.contains("no sessions") {
                     tmuxSessions = []
@@ -2159,21 +2403,25 @@ final class AppContainer: ObservableObject {
                     tmuxError = nil
                     if activeTmuxSessionID != nil {
                         activeTmuxSessionID = nil
-                        tmuxError = "Remembered tmux session is no longer available. Select a session to recover it."
+                        tmuxError =
+                            "Remembered tmux session is no longer available. Select a session to recover it."
                     }
                 } else {
                     tmuxSessions = []
                     isTmuxServerRunning = false
                     let msg = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                    tmuxError = msg.isEmpty ? "Failed to list tmux sessions (exit code \(result.exitCode))" : msg
+                    tmuxError =
+                        msg.isEmpty
+                        ? "Failed to list tmux sessions (exit code \(result.exitCode))" : msg
                 }
                 return []
             }
         } catch {
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return []
             }
             tmuxSessions = []
@@ -2188,7 +2436,8 @@ final class AppContainer: ObservableObject {
             return
         }
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let currentConnection = connection, currentConnection is SSHCommandExecuting else {
+            let currentConnection = connection, currentConnection is SSHCommandExecuting
+        else {
             tmuxAvailability = .unavailable(reason: "Not connected")
             tmuxSessions = []
             isTmuxServerRunning = false
@@ -2207,20 +2456,22 @@ final class AppContainer: ObservableObject {
 
         let availability = await probeTmux()
         guard tmuxRefreshGeneration == generation,
-              activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
+            activeSession?.id == sessionID,
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
             return
         }
 
         if availability.isAvailable {
             _ = await listTmuxSessions(expectedGeneration: generation)
             guard tmuxRefreshGeneration == generation,
-                  activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.id == sessionID,
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return
             }
         } else {
@@ -2239,11 +2490,12 @@ final class AppContainer: ObservableObject {
         sessionID: UUID
     ) async -> Bool {
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              let currentConnection = connection,
-              (currentConnection as AnyObject) === (conn as AnyObject),
-              let runtime = sessionRuntime else {
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            let currentConnection = connection,
+            (currentConnection as AnyObject) === (conn as AnyObject),
+            let runtime = sessionRuntime
+        else {
             return false
         }
         let resized = await runtime.resize(size)
@@ -2258,10 +2510,11 @@ final class AppContainer: ObservableObject {
         sessionID: UUID
     ) async -> Bool {
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              let currentConnection = connection,
-              (currentConnection as AnyObject) === (conn as AnyObject) else {
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            let currentConnection = connection,
+            (currentConnection as AnyObject) === (conn as AnyObject)
+        else {
             return false
         }
 
@@ -2276,11 +2529,12 @@ final class AppContainer: ObservableObject {
             let requestedSize = terminalController.size
             guard await resizePTY(requestedSize, on: conn, sessionID: sessionID) else {
                 if tmuxError == nil,
-                   activeSession?.id == sessionID,
-                   activeSession?.state == .connected,
-                   !isExplicitDisconnect,
-                   let currentConnection = connection,
-                   (currentConnection as AnyObject) === (conn as AnyObject) {
+                    activeSession?.id == sessionID,
+                    activeSession?.state == .connected,
+                    !isExplicitDisconnect,
+                    let currentConnection = connection,
+                    (currentConnection as AnyObject) === (conn as AnyObject)
+                {
                     tmuxError = "Failed to resize terminal."
                 }
                 return false
@@ -2292,7 +2546,8 @@ final class AppContainer: ObservableObject {
             }
         }
 
-        tmuxError = "Terminal viewport changed repeatedly while resizing; tmux attachment cancelled."
+        tmuxError =
+            "Terminal viewport changed repeatedly while resizing; tmux attachment cancelled."
         return false
     }
 
@@ -2377,9 +2632,10 @@ final class AppContainer: ObservableObject {
             sessionID: sessionID
         )
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
             return false
         }
         if sent {
@@ -2390,11 +2646,12 @@ final class AppContainer: ObservableObject {
                 guard let target = LastUsedMultiplexerTarget.tmuxTarget(validatedID.value) else {
                     return false
                 }
-                try? await restorationStore.save(restorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    target: target
-                ))
+                try? await restorationStore.save(
+                    restorationMetadata(
+                        hostID: host.id,
+                        sessionID: session.id,
+                        target: target
+                    ))
             }
             return true
         } else {
@@ -2477,7 +2734,8 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func probeHerdr() async -> HerdrAvailability {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             let avail = HerdrAvailability.unavailable(reason: "Not connected")
             if activeSession == nil || activeSession?.state != .connected {
                 herdrAvailability = avail
@@ -2489,9 +2747,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(HerdrCommand.probe, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = HerdrAvailability.parse(result: result)
@@ -2499,9 +2758,10 @@ final class AppContainer: ObservableObject {
             return avail
         } catch {
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return .unavailable(reason: "Session disconnected")
             }
             let avail = HerdrAvailability.unavailable(reason: error.localizedDescription)
@@ -2513,7 +2773,8 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func listHerdrWorkspaces() async -> [HerdrWorkspace] {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             herdrWorkspaces = []
             return []
         }
@@ -2523,9 +2784,10 @@ final class AppContainer: ObservableObject {
             let cmd = HerdrCommand.workspaceList().renderedCommand
             let result = try await executor.executeCommand(cmd, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return []
             }
             if result.isSuccess {
@@ -2543,14 +2805,19 @@ final class AppContainer: ObservableObject {
                 herdrWorkspaces = []
                 let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                 let out = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                herdrError = !err.isEmpty ? err : (!out.isEmpty ? out : "Failed to list Herdr workspaces (exit code \(result.exitCode))")
+                herdrError =
+                    !err.isEmpty
+                    ? err
+                    : (!out.isEmpty
+                        ? out : "Failed to list Herdr workspaces (exit code \(result.exitCode))")
                 return []
             }
         } catch {
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return []
             }
             herdrWorkspaces = []
@@ -2562,22 +2829,25 @@ final class AppContainer: ObservableObject {
     @discardableResult
     func selectHerdrWorkspace(id: String) async -> Bool {
         guard let target = LastUsedMultiplexerTarget.herdrTarget(id),
-              activeSession?.state == .connected else {
+            activeSession?.state == .connected
+        else {
             herdrError = "Not connected."
             return false
         }
         guard let workspace = herdrWorkspaces.first(where: { $0.id == id }) else {
-            herdrError = "Herdr workspace is not available. Refresh and select an existing workspace."
+            herdrError =
+                "Herdr workspace is not available. Refresh and select an existing workspace."
             return false
         }
         guard let host = activeHost, let session = activeSession else { return false }
         activeHerdrWorkspaceID = workspace.id
         herdrError = nil
-        try? await restorationStore.save(restorationMetadata(
-            hostID: host.id,
-            sessionID: session.id,
-            target: target
-        ))
+        try? await restorationStore.save(
+            restorationMetadata(
+                hostID: host.id,
+                sessionID: session.id,
+                target: target
+            ))
         return true
     }
 
@@ -2586,7 +2856,8 @@ final class AppContainer: ObservableObject {
             return
         }
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let currentConnection = connection, currentConnection is SSHCommandExecuting else {
+            let currentConnection = connection, currentConnection is SSHCommandExecuting
+        else {
             herdrAvailability = .unavailable(reason: "Not connected")
             herdrWorkspaces = []
             return
@@ -2604,10 +2875,11 @@ final class AppContainer: ObservableObject {
 
         let availability = await probeHerdr()
         guard herdrRefreshGeneration == generation,
-              activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
+            activeSession?.id == sessionID,
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
             return
         }
 
@@ -2631,9 +2903,10 @@ final class AppContainer: ObservableObject {
             }
             while !Task.isCancelled {
                 guard let self,
-                      self.herdrPollingGeneration == generation,
-                      self.activeSession?.state == .connected,
-                      !self.isExplicitDisconnect else {
+                    self.herdrPollingGeneration == generation,
+                    self.activeSession?.state == .connected,
+                    !self.isExplicitDisconnect
+                else {
                     break
                 }
                 await self.refreshHerdrState()
@@ -2654,7 +2927,9 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func runHerdrPaneCommand(paneID: String, command: String, approved: Bool = false) async -> (success: Bool, error: String?) {
+    func runHerdrPaneCommand(paneID: String, command: String, approved: Bool = false) async -> (
+        success: Bool, error: String?
+    ) {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             let msg = "Command cannot be empty."
@@ -2662,7 +2937,8 @@ final class AppContainer: ObservableObject {
             return (false, msg)
         }
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             let msg = "Not connected."
             herdrError = msg
             return (false, msg)
@@ -2689,9 +2965,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(rendered, timeout: 10.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return (false, "Session disconnected")
             }
             if result.isSuccess {
@@ -2701,7 +2978,9 @@ final class AppContainer: ObservableObject {
             } else {
                 let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                 let out = result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
-                let msg = !err.isEmpty ? err : (!out.isEmpty ? out : "Command failed with code \(result.exitCode)")
+                let msg =
+                    !err.isEmpty
+                    ? err : (!out.isEmpty ? out : "Command failed with code \(result.exitCode)")
                 herdrError = msg
                 return (false, msg)
             }
@@ -2712,9 +2991,12 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func splitHerdrPane(paneID: String, direction: String = "right") async -> (success: Bool, error: String?) {
+    func splitHerdrPane(paneID: String, direction: String = "right") async -> (
+        success: Bool, error: String?
+    ) {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             let msg = "Not connected."
             herdrError = msg
             return (false, msg)
@@ -2734,9 +3016,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(cmd, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return (false, "Session disconnected")
             }
             if result.isSuccess {
@@ -2755,9 +3038,12 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    func readHerdrPaneOutput(paneID: String, source: String = "recent-unwrapped") async throws -> String {
+    func readHerdrPaneOutput(paneID: String, source: String = "recent-unwrapped") async throws
+        -> String
+    {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             throw HerdrParseError.emptyOutput
         }
         let sessionID = currentSession.id
@@ -2766,22 +3052,27 @@ final class AppContainer: ObservableObject {
         let cmd = HerdrCommand.paneRead(pane: paneID, source: source).renderedCommand
         let result = try await executor.executeCommand(cmd, timeout: 5.0)
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
             throw HerdrParseError.emptyOutput
         }
         guard result.isSuccess else {
             let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw HerdrParseError.executionFailed(!err.isEmpty ? err : "Read failed with code \(result.exitCode)")
+            throw HerdrParseError.executionFailed(
+                !err.isEmpty ? err : "Read failed with code \(result.exitCode)")
         }
         let unwrapped = HerdrOutputParser.parseRecentUnwrapped(from: result.stdout)
         return redactor.redact(unwrapped)
     }
 
-    func waitHerdrAgentStatus(paneID: String? = nil, status: String? = nil, timeout: TimeInterval = 10.0) async throws -> HerdrAgentState {
+    func waitHerdrAgentStatus(
+        paneID: String? = nil, status: String? = nil, timeout: TimeInterval = 10.0
+    ) async throws -> HerdrAgentState {
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             throw HerdrParseError.emptyOutput
         }
         let sessionID = currentSession.id
@@ -2790,14 +3081,16 @@ final class AppContainer: ObservableObject {
         let cmd = HerdrCommand.waitAgentStatus(pane: paneID, status: status).renderedCommand
         let result = try await executor.executeCommand(cmd, timeout: timeout)
         guard activeSession?.id == sessionID,
-              activeSession?.state == .connected,
-              !isExplicitDisconnect,
-              (connection as AnyObject) === connObj else {
-                throw HerdrParseError.emptyOutput
+            activeSession?.state == .connected,
+            !isExplicitDisconnect,
+            (connection as AnyObject) === connObj
+        else {
+            throw HerdrParseError.emptyOutput
         }
         guard result.isSuccess else {
             let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw HerdrParseError.executionFailed(!err.isEmpty ? err : "Wait failed with code \(result.exitCode)")
+            throw HerdrParseError.executionFailed(
+                !err.isEmpty ? err : "Wait failed with code \(result.exitCode)")
         }
         let state = try HerdrOutputParser.parseAgentState(from: result.stdout)
         await refreshHerdrState()
@@ -2805,7 +3098,9 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func createHerdrWorkspace(label: String, cwd: String = ".") async -> (success: Bool, error: String?) {
+    func createHerdrWorkspace(label: String, cwd: String = ".") async -> (
+        success: Bool, error: String?
+    ) {
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty else {
             let msg = "Workspace label cannot be empty."
@@ -2813,7 +3108,8 @@ final class AppContainer: ObservableObject {
             return (false, msg)
         }
         guard let currentSession = activeSession, currentSession.state == .connected,
-              let executor = connection as? SSHCommandExecuting else {
+            let executor = connection as? SSHCommandExecuting
+        else {
             let msg = "Not connected."
             herdrError = msg
             return (false, msg)
@@ -2834,9 +3130,10 @@ final class AppContainer: ObservableObject {
         do {
             let result = try await executor.executeCommand(cmd, timeout: 5.0)
             guard activeSession?.id == sessionID,
-                  activeSession?.state == .connected,
-                  !isExplicitDisconnect,
-                  (connection as AnyObject) === connObj else {
+                activeSession?.state == .connected,
+                !isExplicitDisconnect,
+                (connection as AnyObject) === connObj
+            else {
                 return (false, "Session disconnected")
             }
             if result.isSuccess {
@@ -2845,7 +3142,8 @@ final class AppContainer: ObservableObject {
                 return (true, nil)
             } else {
                 let err = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-                let msg = !err.isEmpty ? err : "Failed to create workspace (exit code \(result.exitCode))"
+                let msg =
+                    !err.isEmpty ? err : "Failed to create workspace (exit code \(result.exitCode))"
                 herdrError = msg
                 return (false, msg)
             }
@@ -2883,7 +3181,9 @@ final class AppContainer: ObservableObject {
             _ = try await voiceModelManager.downloadModel(tier) { [weak self] fraction in
                 Task { @MainActor [weak self] in
                     guard let self else { return }
-                    if let index = self.voiceModels.firstIndex(where: { $0.id == tier.defaultModelID }) {
+                    if let index = self.voiceModels.firstIndex(where: {
+                        $0.id == tier.defaultModelID
+                    }) {
                         self.voiceModels[index].state = .downloading(fractionCompleted: fraction)
                     }
                 }
@@ -2922,7 +3222,8 @@ final class AppContainer: ObservableObject {
         }
         let effectiveMode = mode ?? defaultVoiceMode
         guard host.voicePolicy.allowedModes.contains(effectiveMode) else {
-            let message = "Voice mode '\(effectiveMode.displayName)' is not permitted by host policy for '\(host.name)'."
+            let message =
+                "Voice mode '\(effectiveMode.displayName)' is not permitted by host policy for '\(host.name)'."
             voiceErrorMessage = message
             let err = TranscriptionError.transcriptionFailed(reason: message)
             speechState = .failed(err)
@@ -2933,7 +3234,8 @@ final class AppContainer: ObservableObject {
             guard hasModel else {
                 let message = "Download required: on-device Whisper model is not installed."
                 voiceErrorMessage = message
-                let err = TranscriptionError.modelNotInstalled(modelID: WhisperModelTier.tiny.defaultModelID)
+                let err = TranscriptionError.modelNotInstalled(
+                    modelID: WhisperModelTier.tiny.defaultModelID)
                 speechState = .failed(err)
                 throw err
             }
@@ -3000,9 +3302,12 @@ final class AppContainer: ObservableObject {
             }
             try Task.checkCancellation()
             let transcriber = activeTranscriber
-            let transcript = try await transcriber.transcribe(recording: handle) { [weak self] fraction in
+            let transcript = try await transcriber.transcribe(recording: handle) {
+                [weak self] fraction in
                 Task { @MainActor [weak self] in
-                    guard let self, self.voiceTranscriptionGeneration == gen, self.isTranscribingVoice else { return }
+                    guard let self, self.voiceTranscriptionGeneration == gen,
+                        self.isTranscribingVoice
+                    else { return }
                     self.voiceProgressFraction = fraction
                     self.speechState = .transcribingWithProgress(fractionCompleted: fraction)
                 }
@@ -3089,7 +3394,9 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func sendAgentMessage(preview: VoicePreviewState, confirmedProduction: Bool = false) async -> Bool {
+    func sendAgentMessage(preview: VoicePreviewState, confirmedProduction: Bool = false) async
+        -> Bool
+    {
         guard preview.mode == .agentMessage else { return false }
         let value = preview.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !value.isEmpty else { return false }
@@ -3496,7 +3803,8 @@ final class AppContainer: ObservableObject {
                 return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
             case .name:
                 let result = lhs.name.localizedStandardCompare(rhs.name)
-                return sortAscending ? (result == .orderedAscending) : (result == .orderedDescending)
+                return sortAscending
+                    ? (result == .orderedAscending) : (result == .orderedDescending)
             case .date:
                 let lDate = lhs.modificationDate ?? Date.distantPast
                 let rDate = rhs.modificationDate ?? Date.distantPast
@@ -3528,7 +3836,9 @@ final class AppContainer: ObservableObject {
             return
         }
 
-        if !bypassCache, let cached = directoryCache[path], Date().timeIntervalSince(cached.timestamp) < directoryCacheTTL {
+        if !bypassCache, let cached = directoryCache[path],
+            Date().timeIntervalSince(cached.timestamp) < directoryCacheTTL
+        {
             currentPath = path
             currentDirectoryFiles = cached.files
             directoryErrorMessage = nil
@@ -3594,7 +3904,8 @@ final class AppContainer: ObservableObject {
             return nil
         }
 
-        let defaultDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhDownloads", isDirectory: true)
+        let defaultDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhDownloads", isDirectory: true)
         try? FileManager.default.createDirectory(at: defaultDir, withIntermediateDirectories: true)
         let targetURL = destinationURL ?? defaultDir.appendingPathComponent(safeFileName)
 
@@ -3663,7 +3974,8 @@ final class AppContainer: ObservableObject {
                 if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
                     await self.transferCoordinator.cancel(id: taskID)
                 } else {
-                    await self.transferCoordinator.markFailed(id: taskID, error: error.localizedDescription)
+                    await self.transferCoordinator.markFailed(
+                        id: taskID, error: error.localizedDescription)
                 }
                 self.transferQueueState = await self.transferCoordinator.snapshot()
             }
@@ -3686,7 +3998,8 @@ final class AppContainer: ObservableObject {
 
         let dir = destinationDirectory ?? currentPath
         let fileName = localURL.lastPathComponent
-        guard !fileName.isEmpty && fileName != "." && fileName != ".." && !fileName.contains("/") else {
+        guard !fileName.isEmpty && fileName != "." && fileName != ".." && !fileName.contains("/")
+        else {
             directoryErrorMessage = "Invalid upload file name: '\(fileName)'"
             return nil
         }
@@ -3698,7 +4011,7 @@ final class AppContainer: ObservableObject {
         var existsRemote = false
         if currentPath == dir && currentDirectoryFiles.contains(where: { $0.name == fileName }) {
             existsRemote = true
-        } else if let _ = try? await repo.fetchAttributes(at: remotePath) {
+        } else if (try? await repo.fetchAttributes(at: remotePath)) != nil {
             existsRemote = true
         }
 
@@ -3719,7 +4032,9 @@ final class AppContainer: ObservableObject {
 
         guard proceed else { return nil }
 
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        let fileSize =
+            (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? NSNumber)?
+            .int64Value ?? 0
 
         let task = await transferCoordinator.enqueue(
             direction: .upload,
@@ -3759,7 +4074,8 @@ final class AppContainer: ObservableObject {
                 if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
                     await self.transferCoordinator.cancel(id: taskID)
                 } else {
-                    await self.transferCoordinator.markFailed(id: taskID, error: error.localizedDescription)
+                    await self.transferCoordinator.markFailed(
+                        id: taskID, error: error.localizedDescription)
                 }
                 self.transferQueueState = await self.transferCoordinator.snapshot()
             }
@@ -3783,7 +4099,9 @@ final class AppContainer: ObservableObject {
             let file = RemoteFile(name: task.remotePath.lastComponent, path: task.remotePath)
             _ = await enqueueDownload(file: file, destinationURL: task.localURL, overwrite: true)
         } else {
-            _ = await enqueueUpload(localURL: task.localURL, destinationDirectory: task.remotePath.parent, overwrite: true)
+            _ = await enqueueUpload(
+                localURL: task.localURL, destinationDirectory: task.remotePath.parent,
+                overwrite: true)
         }
     }
 
@@ -3839,26 +4157,38 @@ final class AppContainer: ObservableObject {
 
     private func cleanTemporaryTransfersDirectory(removeAll: Bool = false) {
         let fileManager = FileManager.default
-        let downloadDir = fileManager.temporaryDirectory.appendingPathComponent("ShhDownloads", isDirectory: true)
-        let uploadDir = fileManager.temporaryDirectory.appendingPathComponent("ShhUploads", isDirectory: true)
+        let downloadDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "ShhDownloads", isDirectory: true)
+        let uploadDir = fileManager.temporaryDirectory.appendingPathComponent(
+            "ShhUploads", isDirectory: true)
 
         if removeAll {
             try? fileManager.removeItem(at: downloadDir)
             try? fileManager.removeItem(at: uploadDir)
         } else {
-            if let contents = try? fileManager.contentsOfDirectory(at: downloadDir, includingPropertiesForKeys: nil) {
-                let activeLocalURLs = Set(transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
+            if let contents = try? fileManager.contentsOfDirectory(
+                at: downloadDir, includingPropertiesForKeys: nil)
+            {
+                let activeLocalURLs = Set(
+                    transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
                 for fileURL in contents {
                     if !activeLocalURLs.contains(fileURL.standardizedFileURL) {
                         try? fileManager.removeItem(at: fileURL)
                     }
                 }
             }
-            if let stagedDirs = try? fileManager.contentsOfDirectory(at: uploadDir, includingPropertiesForKeys: nil) {
-                let activeLocalURLs = Set(transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
+            if let stagedDirs = try? fileManager.contentsOfDirectory(
+                at: uploadDir, includingPropertiesForKeys: nil)
+            {
+                let activeLocalURLs = Set(
+                    transferQueueState.activeTasks.map(\.localURL.standardizedFileURL))
                 for stagedDir in stagedDirs {
-                    if let files = try? fileManager.contentsOfDirectory(at: stagedDir, includingPropertiesForKeys: nil) {
-                        let anyActive = files.contains { activeLocalURLs.contains($0.standardizedFileURL) }
+                    if let files = try? fileManager.contentsOfDirectory(
+                        at: stagedDir, includingPropertiesForKeys: nil)
+                    {
+                        let anyActive = files.contains {
+                            activeLocalURLs.contains($0.standardizedFileURL)
+                        }
                         if !anyActive {
                             try? fileManager.removeItem(at: stagedDir)
                         }
@@ -3904,7 +4234,9 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.connectionClosed
         }
         if file.isDirectory && destinationDirectory.isDescendantOrEqual(to: file.path) {
-            throw SFTPRepositoryError.invalidPath("Cannot move directory into itself or descendant: '\(destinationDirectory.description)'")
+            throw SFTPRepositoryError.invalidPath(
+                "Cannot move directory into itself or descendant: '\(destinationDirectory.description)'"
+            )
         }
         let targetPath = try destinationDirectory.appendingSafely(file.name)
         try await repo.rename(from: file.path, to: targetPath)
@@ -3949,13 +4281,19 @@ final class AppContainer: ObservableObject {
             return
         }
         if file.isSymlink {
-            if let attrs = try? await sftpRepository?.fetchAttributes(at: file.path), attrs.isDirectory {
+            if let attrs = try? await sftpRepository?.fetchAttributes(at: file.path),
+                attrs.isDirectory
+            {
                 await navigateTo(file.path)
                 return
             }
             if let targetStr = file.symlinkTarget {
-                let resolvedPath = targetStr.hasPrefix("/") ? RemotePath(targetStr) : file.path.parent.appending(targetStr)
-                if let attrs = try? await sftpRepository?.fetchAttributes(at: resolvedPath), attrs.isDirectory {
+                let resolvedPath =
+                    targetStr.hasPrefix("/")
+                    ? RemotePath(targetStr) : file.path.parent.appending(targetStr)
+                if let attrs = try? await sftpRepository?.fetchAttributes(at: resolvedPath),
+                    attrs.isDirectory
+                {
                     await navigateTo(file.path)
                     return
                 }
@@ -3970,9 +4308,10 @@ final class AppContainer: ObservableObject {
         previewData = nil
         previewErrorMessage = nil
 
-        let maxPreviewSize: Int64 = 5 * 1024 * 1024 // 5 MB
+        let maxPreviewSize: Int64 = 5 * 1024 * 1024  // 5 MB
         if file.size > maxPreviewSize {
-            previewErrorMessage = "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 5 MB preview limit. Please download to view."
+            previewErrorMessage =
+                "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 5 MB preview limit. Please download to view."
             isPreviewLoading = false
             return
         }
@@ -4002,9 +4341,11 @@ final class AppContainer: ObservableObject {
         isSavingFile = false
         editorErrorMessage = nil
 
-        let maxEditorSize: Int64 = 2 * 1024 * 1024 // 2 MB
+        let maxEditorSize: Int64 = 2 * 1024 * 1024  // 2 MB
         if file.size > maxEditorSize {
-            let err = SFTPRepositoryError.remoteFailure("File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 2 MB editor limit. Please download to view.")
+            let err = SFTPRepositoryError.remoteFailure(
+                "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 2 MB editor limit. Please download to view."
+            )
             editorErrorMessage = err.localizedDescription
             throw err
         }
@@ -4012,7 +4353,8 @@ final class AppContainer: ObservableObject {
         do {
             let data = try await repo.readFile(at: file.path)
             guard let text = String(data: data, encoding: .utf8) else {
-                let err = SFTPRepositoryError.remoteFailure("Cannot edit '\(file.name)': File contains non-UTF-8 or binary data.")
+                let err = SFTPRepositoryError.remoteFailure(
+                    "Cannot edit '\(file.name)': File contains non-UTF-8 or binary data.")
                 editorErrorMessage = err.localizedDescription
                 throw err
             }
@@ -4038,7 +4380,8 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.connectionClosed
         }
         guard activeHost?.id == activeEditingHostID else {
-            throw SFTPRepositoryError.remoteFailure("Host mismatch: File editor session belongs to a different host.")
+            throw SFTPRepositoryError.remoteFailure(
+                "Host mismatch: File editor session belongs to a different host.")
         }
         isSavingFile = true
         editorErrorMessage = nil
@@ -4070,7 +4413,8 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async {
+    private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async
+    {
         var started: [ForwardingSessionState] = []
         for rule in host.forwardingRules where rule.enabled {
             if rule.requiresNonLoopbackApproval {
@@ -4141,7 +4485,9 @@ final class AppContainer: ObservableObject {
         }
     }
 
-    public func addForwardingRule(_ rule: PortForwardingRule, for host: Host, autoStartIfConnected: Bool = true) async throws {
+    public func addForwardingRule(
+        _ rule: PortForwardingRule, for host: Host, autoStartIfConnected: Bool = true
+    ) async throws {
         var updatedHost = (activeHost?.id == host.id ? activeHost! : host)
         if let idx = updatedHost.forwardingRules.firstIndex(where: { $0.id == rule.id }) {
             updatedHost.forwardingRules[idx] = rule
@@ -4179,12 +4525,19 @@ final class AppContainer: ObservableObject {
             switch hop {
             case .hostID(let id):
                 if let bastion = hosts.first(where: { $0.id == id }) {
-                    let ident = bastion.identityID.flatMap { identID in idents.first(where: { $0.id == identID }) }
+                    let ident = bastion.identityID.flatMap { identID in
+                        idents.first(where: { $0.id == identID })
+                    }
                     result.append((bastion, ident))
                 }
             case .endpoint(let ep):
-                if let epHost = try? Host(name: ep.hostname, hostname: ep.hostname, port: ep.port, username: ep.username, identityID: ep.identityID) {
-                    let ident = ep.identityID.flatMap { identID in idents.first(where: { $0.id == identID }) }
+                if let epHost = try? Host(
+                    name: ep.hostname, hostname: ep.hostname, port: ep.port, username: ep.username,
+                    identityID: ep.identityID)
+                {
+                    let ident = ep.identityID.flatMap { identID in
+                        idents.first(where: { $0.id == identID })
+                    }
                     result.append((epHost, ident))
                 }
             }
@@ -4200,9 +4553,10 @@ final class AppContainer: ObservableObject {
     // MARK: - Host Management & Shared Catalog Sync
 
     public func syncSharedCatalogAndTrust() async throws {
-        guard !isRunningInTestEnvironment ||
-                fileProviderHelper.customContainerURL != nil ||
-                fileProviderHelper.customLocalContainerURL != nil else { return }
+        guard
+            !isRunningInTestEnvironment || fileProviderHelper.customContainerURL != nil
+                || fileProviderHelper.customLocalContainerURL != nil
+        else { return }
         let snapshot = await catalog.snapshot()
         let records = await trustStore.allRecords()
         #if canImport(FileProvider)
@@ -4242,14 +4596,18 @@ final class AppContainer: ObservableObject {
     public func createEd25519Identity(
         name: String,
         comment: String? = nil,
-        keyPair: (privateKey: Curve25519.Signing.PrivateKey, openSSHPrivateKey: String, openSSHPublicKey: String, fingerprint: String)? = nil
+        keyPair: (
+            privateKey: Curve25519.Signing.PrivateKey, openSSHPrivateKey: String,
+            openSSHPublicKey: String, fingerprint: String
+        )? = nil
     ) async throws -> IdentityDescriptor {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
             throw ShhValidationError.empty(field: "identity name")
         }
         let commentValue = comment?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let effectiveComment = (commentValue?.isEmpty == false) ? (commentValue ?? trimmedName) : trimmedName
+        let effectiveComment =
+            (commentValue?.isEmpty == false) ? (commentValue ?? trimmedName) : trimmedName
         let generated = keyPair ?? Ed25519Parser.generateKeyPair(comment: effectiveComment)
         let reference = "id-\(UUID().uuidString)"
         try await credentialStore.save(Data(generated.openSSHPrivateKey.utf8), reference: reference)
@@ -4267,7 +4625,9 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    public func importPrivateKeyIdentity(name: String, privateKeyText: String) async throws -> IdentityDescriptor {
+    public func importPrivateKeyIdentity(name: String, privateKeyText: String) async throws
+        -> IdentityDescriptor
+    {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
             throw ShhValidationError.empty(field: "identity name")
@@ -4302,7 +4662,9 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    public func createPasswordIdentity(name: String, password: String) async throws -> IdentityDescriptor {
+    public func createPasswordIdentity(name: String, password: String) async throws
+        -> IdentityDescriptor
+    {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else {
             throw ShhValidationError.empty(field: "identity name")
@@ -4331,7 +4693,9 @@ final class AppContainer: ObservableObject {
     public func deleteIdentity(id: UUID) async throws {
         let identities = try await catalog.identities()
         if let target = identities.first(where: { $0.id == id }) {
-            let hasOtherReferences = identities.contains { $0.id != id && $0.keychainReference == target.keychainReference }
+            let hasOtherReferences = identities.contains {
+                $0.id != id && $0.keychainReference == target.keychainReference
+            }
             if !hasOtherReferences {
                 try? await credentialStore.delete(reference: target.keychainReference)
             }
@@ -4348,14 +4712,18 @@ final class AppContainer: ObservableObject {
         try? await syncSharedCatalogAndTrust()
     }
 
-    public func openSSHPublicKey(for identity: IdentityDescriptor, comment: String? = nil) async throws -> String? {
+    public func openSSHPublicKey(for identity: IdentityDescriptor, comment: String? = nil)
+        async throws -> String?
+    {
         guard identity.kind == .privateKey else { return nil }
         let data = try await credentialStore.load(reference: identity.keychainReference)
         let privateKey = try Ed25519Parser.parse(from: data)
-        let effectiveComment = (comment?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+        let effectiveComment =
+            (comment?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? comment!
             : identity.name
-        return Ed25519Parser.openSSHPublicKeyString(from: privateKey.publicKey, comment: effectiveComment)
+        return Ed25519Parser.openSSHPublicKeyString(
+            from: privateKey.publicKey, comment: effectiveComment)
     }
 
     // MARK: - File Provider Domains
@@ -4367,7 +4735,8 @@ final class AppContainer: ObservableObject {
             throw err
         }
         guard fileProviderHelper.appGroupContainerURL != nil else {
-            let err = FileProviderManagerError.containerUnavailable(fileProviderHelper.appGroupIdentifier)
+            let err = FileProviderManagerError.containerUnavailable(
+                fileProviderHelper.appGroupIdentifier)
             self.fileProviderDomainError = err.localizedDescription
             throw err
         }
@@ -4489,7 +4858,9 @@ final class AppContainer: ObservableObject {
             return
         }
 
-        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else { return }
+        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else {
+            return
+        }
         let poller = telemetryPollers[host.id] ?? ServerTelemetryPoller(executor: executor)
         telemetryPollers[host.id] = poller
         if let telemetry = try? await poller.fetchTelemetry() {
@@ -4510,7 +4881,9 @@ final class AppContainer: ObservableObject {
             return
         }
 
-        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else { return }
+        guard activeHost?.id == host.id, let executor = connection as? SSHCommandExecuting else {
+            return
+        }
         let poller = telemetryPollers[host.id] ?? ServerTelemetryPoller(executor: executor)
         telemetryPollers[host.id] = poller
 

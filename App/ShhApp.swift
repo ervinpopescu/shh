@@ -9,8 +9,9 @@ struct ShhApp: App {
     @StateObject private var container: AppContainer
 
     init() {
-        if ProcessInfo.processInfo.arguments.contains("--demo") ||
-            ProcessInfo.processInfo.environment["SHH_DEMO_MODE"] == "1" {
+        if ProcessInfo.processInfo.arguments.contains("--demo")
+            || ProcessInfo.processInfo.environment["SHH_DEMO_MODE"] == "1"
+        {
             _container = StateObject(wrappedValue: AppContainer.demo())
         } else {
             _container = StateObject(wrappedValue: AppContainer())
@@ -39,11 +40,20 @@ private func preferredColorScheme(for appearance: AppearanceSetting) -> ColorSch
 }
 
 extension View {
-    @ViewBuilder func tagChip() -> some View { self.font(.caption2).padding(.horizontal, 5).padding(.vertical, 2).background(Color.accentColor.opacity(0.15), in: Capsule()) }
+    @ViewBuilder func tagChip() -> some View {
+        self.font(.caption2).padding(.horizontal, 5).padding(.vertical, 2).background(
+            Color.accentColor.opacity(0.15), in: Capsule())
+    }
 }
 
 enum AppSection: String, CaseIterable, Identifiable {
-    case hosts = "Hosts", sessions = "Sessions", files = "Files", keys = "Keys", snippets = "Snippets", monitoring = "Monitoring", settings = "Settings"
+    case hosts = "Hosts"
+    case sessions = "Sessions"
+    case files = "Files"
+    case keys = "Keys"
+    case snippets = "Snippets"
+    case monitoring = "Monitoring"
+    case settings = "Settings"
     var id: String { rawValue }
     var systemImage: String {
         switch self {
@@ -116,7 +126,13 @@ struct HostListView: View {
             _showingEditor = State(initialValue: true)
         }
     }
-    private var filtered: [Host] { hosts.filter { (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.address.localizedCaseInsensitiveContains(search)) && (!healthyOnly || $0.health == .healthy) } }
+    private var filtered: [Host] {
+        hosts.filter {
+            (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)
+                || $0.address.localizedCaseInsensitiveContains(search))
+                && (!healthyOnly || $0.health == .healthy)
+        }
+    }
     var body: some View {
         List {
             if let discoveryMessage = container.bonjourDiscovery.state.message {
@@ -217,10 +233,13 @@ struct HostListView: View {
                 Button("Add", systemImage: "plus") { showingEditor = true }
             }
         }
-        .sheet(isPresented: $showingEditor, onDismiss: {
-            selectedDiscoveredService = nil
-            Task { await reload() }
-        }) { HostEditorView(prefillService: selectedDiscoveredService).environmentObject(container) }
+        .sheet(
+            isPresented: $showingEditor,
+            onDismiss: {
+                selectedDiscoveredService = nil
+                Task { await reload() }
+            }
+        ) { HostEditorView(prefillService: selectedDiscoveredService).environmentObject(container) }
         .onAppear {
             container.bonjourDiscovery.startDiscovery()
         }
@@ -258,7 +277,8 @@ struct HostRow: View {
                 HStack {
                     if host.groupID != nil { Text("Group").tagChip() }
                     if !host.tagIDs.isEmpty {
-                        Text("\(host.tagIDs.count) tag\(host.tagIDs.count == 1 ? "" : "s")").tagChip()
+                        Text("\(host.tagIDs.count) tag\(host.tagIDs.count == 1 ? "" : "s")")
+                            .tagChip()
                     }
                 }
             }
@@ -302,7 +322,9 @@ struct HostDetailView: View {
                                     .foregroundStyle(.secondary)
                             }
                             .accessibilityElement(children: .combine)
-                            .accessibilityLabel("Hop \(index + 1): \(hopDescription(index: index, hop: hop))")
+                            .accessibilityLabel(
+                                "Hop \(index + 1): \(hopDescription(index: index, hop: hop))"
+                            )
                             .accessibilityIdentifier("host-detail-hop-\(index)")
                         }
                     }
@@ -328,7 +350,9 @@ struct HostDetailView: View {
                             }
                             Spacer()
                             if isHostActiveSession {
-                                let live = container.forwardingSessions.first(where: { $0.ruleID == rule.id })
+                                let live = container.forwardingSessions.first(where: {
+                                    $0.ruleID == rule.id
+                                })
                                 ForwardingStatusPill(status: live?.status ?? .stopped)
                             } else {
                                 Text(rule.enabled ? "Auto-start" : "Disabled")
@@ -345,7 +369,9 @@ struct HostDetailView: View {
                     Button {
                         showPortForwarding = true
                     } label: {
-                        Label("Manage Forwarders (\(container.activeForwardersCount) active)", systemImage: "arrow.triangle.swap")
+                        Label(
+                            "Manage Forwarders (\(container.activeForwardersCount) active)",
+                            systemImage: "arrow.triangle.swap")
                     }
                     .accessibilityIdentifier("host-detail-manage-forwarders-button")
                     .accessibilityLabel("Manage active port forwarders")
@@ -357,11 +383,13 @@ struct HostDetailView: View {
                 Label("Unknown host keys require approval", systemImage: "checkmark.shield")
             }
             Section("Voice & Environment") {
-                LabeledContent("Voice input", value: host.isVoiceEnabled ? "Enabled" : "Disabled (Default)")
+                LabeledContent(
+                    "Voice input", value: host.isVoiceEnabled ? "Enabled" : "Disabled (Default)")
                 LabeledContent("Environment", value: host.isProduction ? "Production" : "Standard")
             }
             if let failure = container.lastConnectionFailure,
-               (container.activeSession?.hostID == host.id || container.activeHost?.id == host.id) {
+                container.activeSession?.hostID == host.id || container.activeHost?.id == host.id
+            {
                 Section {
                     ConnectionFailureCard(
                         failure: failure,
@@ -374,8 +402,10 @@ struct HostDetailView: View {
             }
 
             Section {
-                Button("Connect", systemImage: "bolt.horizontal") { Task { await container.connect(to: host) } }
-                    .disabled(isConnectDisabled)
+                Button("Connect", systemImage: "bolt.horizontal") {
+                    Task { await container.connect(to: host) }
+                }
+                .disabled(isConnectDisabled)
                 Button("Edit", systemImage: "pencil") { showEditor = true }
             }
         }
@@ -384,11 +414,17 @@ struct HostDetailView: View {
         .task {
             bastionHops = await container.resolveBastionNames(for: host)
         }
-        .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
-        .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }
+        .sheet(isPresented: $showEditor) {
+            HostEditorView(existing: host).environmentObject(container)
+        }
+        .sheet(isPresented: $showPortForwarding) {
+            PortForwardingSheet().environmentObject(container)
+        }
         .safeAreaInset(edge: .bottom) {
-            if let session = container.activeSession, session.hostID == host.id {
-                NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding()
+            if container.openSessions.contains(where: { $0.hostID == host.id }) {
+                NavigationLink("Open session", destination: SessionView()).buttonStyle(
+                    .borderedProminent
+                ).padding()
             }
         }
     }
@@ -398,8 +434,8 @@ struct HostDetailView: View {
     }
 
     private var isConnectDisabled: Bool {
-        container.activeSession?.state == .connecting ||
-            (container.activeSession?.hostID == host.id && container.activeSession?.state == .connected)
+        container.isConnectingSession
+            || container.openSessions.count >= AppContainer.maximumConcurrentSessions
     }
 
     private var isFailedForThisHost: Bool {
@@ -411,7 +447,8 @@ struct HostDetailView: View {
         case .ssh:
             return container.isDemo ? "SSH (demo adapter)" : "SSH (live adapter)"
         case .proxyJump(let opts):
-            return "ProxyJump (\(opts.config.hops.count) hop\(opts.config.hops.count == 1 ? "" : "s"))"
+            return
+                "ProxyJump (\(opts.config.hops.count) hop\(opts.config.hops.count == 1 ? "" : "s"))"
         case .mosh:
             return container.isDemo ? "Mosh (demo adapter)" : "Mosh (UDP)"
         case .cloudflareAccess:
@@ -511,8 +548,11 @@ struct ConnectionFailureCard: View {
                         copied = false
                     }
                 } label: {
-                    Label(copied ? "Copied!" : "Copy Diagnostics", systemImage: copied ? "checkmark" : "doc.on.doc")
-                        .font(.caption)
+                    Label(
+                        copied ? "Copied!" : "Copy Diagnostics",
+                        systemImage: copied ? "checkmark" : "doc.on.doc"
+                    )
+                    .font(.caption)
                 }
                 .buttonStyle(.borderless)
                 .controlSize(.small)
@@ -627,8 +667,10 @@ struct HostEditorView: View {
             initialBastions = []
             _moshServerCommand = State(initialValue: moshOpts.serverCommand)
             _moshUseCustomPortRange = State(initialValue: moshOpts.portRange != nil)
-            _moshPortRangeStart = State(initialValue: moshOpts.portRange.map { String($0.start) } ?? "60001")
-            _moshPortRangeEnd = State(initialValue: moshOpts.portRange.map { String($0.end) } ?? "60999")
+            _moshPortRangeStart = State(
+                initialValue: moshOpts.portRange.map { String($0.start) } ?? "60001")
+            _moshPortRangeEnd = State(
+                initialValue: moshOpts.portRange.map { String($0.end) } ?? "60999")
             _moshPredictionMode = State(initialValue: moshOpts.predictionMode)
             _cloudflareClientID = State(initialValue: "")
             _cloudflareClientSecret = State(initialValue: "")
@@ -701,15 +743,20 @@ struct HostEditorView: View {
     private var pickerIdentities: [IdentityDescriptor] {
         identities.sorted {
             let nameOrder = $0.name.localizedCaseInsensitiveCompare($1.name)
-            return nameOrder == .orderedSame ? $0.id.uuidString < $1.id.uuidString : nameOrder == .orderedAscending
+            return nameOrder == .orderedSame
+                ? $0.id.uuidString < $1.id.uuidString : nameOrder == .orderedAscending
         }
     }
 
     /// Disambiguates identities with identical names by appending their
     /// public key fingerprint suffix.
     private func identityLabel(_ identity: IdentityDescriptor) -> String {
-        let duplicateName = identities.filter { $0.name.caseInsensitiveCompare(identity.name) == .orderedSame }.count > 1
-        guard duplicateName, let fingerprint = identity.publicFingerprint else { return identity.name }
+        let duplicateName =
+            identities.filter { $0.name.caseInsensitiveCompare(identity.name) == .orderedSame }
+            .count > 1
+        guard duplicateName, let fingerprint = identity.publicFingerprint else {
+            return identity.name
+        }
         return "\(identity.name) (\(fingerprint.suffix(8)))"
     }
 
@@ -792,7 +839,8 @@ struct HostEditorView: View {
                         Picker("Identity", selection: $identityID) {
                             Text("None").tag(UUID?.none)
                             if let selectedID = identityID,
-                               !identities.contains(where: { $0.id == selectedID }) {
+                                !identities.contains(where: { $0.id == selectedID })
+                            {
                                 Text("Missing identity (\(selectedID.uuidString.prefix(8)))")
                                     .tag(Optional(selectedID))
                             }
@@ -822,11 +870,14 @@ struct HostEditorView: View {
 
                     if connectionType == .proxyJump {
                         if bastionHops.isEmpty {
-                            Text("No jump bastions selected. Add one or more hops from saved hosts.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                "No jump bastions selected. Add one or more hops from saved hosts."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         } else {
-                            ForEach(Array(bastionHops.enumerated()), id: \.element.id) { index, hop in
+                            ForEach(Array(bastionHops.enumerated()), id: \.element.id) {
+                                index, hop in
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
                                         Text("Hop \(index + 1)")
@@ -931,29 +982,41 @@ struct HostEditorView: View {
                         .accessibilityIdentifier("host-editor-mosh-prediction-picker")
                         .accessibilityLabel("Mosh prediction mode picker")
                     } else if connectionType == .cloudflareAccess {
-                        TextField("Tunnel Domain", text: $cloudflareTunnelDomain, prompt: Text("e.g. ssh.example.com"))
-                            .accessibilityIdentifier("host-editor-cf-tunnel-domain-field")
-                            .accessibilityLabel("Cloudflare Tunnel Domain")
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        TextField(
+                            "Tunnel Domain", text: $cloudflareTunnelDomain,
+                            prompt: Text("e.g. ssh.example.com")
+                        )
+                        .accessibilityIdentifier("host-editor-cf-tunnel-domain-field")
+                        .accessibilityLabel("Cloudflare Tunnel Domain")
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
 
-                        TextField("Service Token Client ID", text: $cloudflareClientID, prompt: Text("e.g. xxxxxxxx.access"))
-                            .accessibilityIdentifier("host-editor-cf-client-id-field")
-                            .accessibilityLabel("Cloudflare Access Client ID")
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        TextField(
+                            "Service Token Client ID", text: $cloudflareClientID,
+                            prompt: Text("e.g. xxxxxxxx.access")
+                        )
+                        .accessibilityIdentifier("host-editor-cf-client-id-field")
+                        .accessibilityLabel("Cloudflare Access Client ID")
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
 
-                        SecureField("Service Token Client Secret", text: $cloudflareClientSecret, prompt: Text("Saved securely to Keychain"))
-                            .accessibilityIdentifier("host-editor-cf-client-secret-field")
-                            .accessibilityLabel("Cloudflare Access Client Secret")
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        SecureField(
+                            "Service Token Client Secret", text: $cloudflareClientSecret,
+                            prompt: Text("Saved securely to Keychain")
+                        )
+                        .accessibilityIdentifier("host-editor-cf-client-secret-field")
+                        .accessibilityLabel("Cloudflare Access Client Secret")
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     } else if connectionType == .tailscale {
-                        TextField("Tailscale Hostname or IP", text: $tailscaleHostname, prompt: Text("e.g. node.tailscale.net"))
-                            .accessibilityIdentifier("host-editor-tailscale-hostname-field")
-                            .accessibilityLabel("Tailscale Hostname or IP")
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
+                        TextField(
+                            "Tailscale Hostname or IP", text: $tailscaleHostname,
+                            prompt: Text("e.g. node.tailscale.net")
+                        )
+                        .accessibilityIdentifier("host-editor-tailscale-hostname-field")
+                        .accessibilityLabel("Tailscale Hostname or IP")
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
 
                         Toggle("Strict Host Key Checking", isOn: $tailscaleCheckHostKey)
                             .accessibilityIdentifier("host-editor-tailscale-check-key-toggle")
@@ -1032,15 +1095,19 @@ struct HostEditorView: View {
                     Toggle("Production environment", isOn: $isProductionHost)
                         .accessibilityIdentifier("host-editor-production-toggle")
                     if isProductionHost {
-                        Text("Production hosts require extra confirmation before dispatching agent messages.")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
+                        Text(
+                            "Production hosts require extra confirmation before dispatching agent messages."
+                        )
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                     }
                 }
                 Section {
-                    Text("Passwords and private keys are selected through Keychain identities and never stored in this form.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        "Passwords and private keys are selected through Keychain identities and never stored in this form."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1075,13 +1142,19 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
+                        .disabled(
+                            name.isEmpty || hostname.isEmpty || username.isEmpty
+                                || (connectionType == .proxyJump && bastionHops.isEmpty)
+                                || !isMoshPortRangeValid
+                        )
                         .accessibilityIdentifier("host-editor-save-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button {
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil,
+                            for: nil)
                     } label: {
                         Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
                     }
@@ -1102,8 +1175,9 @@ struct HostEditorView: View {
     private var isMoshPortRangeValid: Bool {
         guard connectionType == .mosh && moshUseCustomPortRange else { return true }
         guard let start = UInt16(moshPortRangeStart),
-              let end = UInt16(moshPortRangeEnd),
-              start > 0, end > 0 else { return false }
+            let end = UInt16(moshPortRangeEnd),
+            start > 0, end > 0
+        else { return false }
         return true
     }
 
@@ -1134,40 +1208,50 @@ struct HostEditorView: View {
         } else if connectionType == .mosh {
             let portRange: MoshPortRange?
             if moshUseCustomPortRange,
-               let start = UInt16(moshPortRangeStart),
-               let end = UInt16(moshPortRangeEnd) {
+                let start = UInt16(moshPortRangeStart),
+                let end = UInt16(moshPortRangeEnd)
+            {
                 portRange = MoshPortRange(start: start, end: end)
             } else {
                 portRange = nil
             }
-            let serverCmd = moshServerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let serverCmd =
+                moshServerCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? "mosh-server"
                 : moshServerCommand.trimmingCharacters(in: .whitespacesAndNewlines)
 
-            profile = .mosh(MoshOptions(
-                serverCommand: serverCmd,
-                portRange: portRange,
-                predictionMode: moshPredictionMode,
-                sshOptions: existingSSH
-            ))
+            profile = .mosh(
+                MoshOptions(
+                    serverCommand: serverCmd,
+                    portRange: portRange,
+                    predictionMode: moshPredictionMode,
+                    sshOptions: existingSSH
+                ))
         } else if connectionType == .cloudflareAccess {
-            let effectiveTunnel = cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let effectiveTunnel =
+                cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? hostname.trimmingCharacters(in: .whitespacesAndNewlines)
                 : cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines)
-            let ref = secretRef ?? (cloudflareClientSecretKeychainRef.isEmpty ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef)
-            profile = .cloudflareAccess(CloudflareAccessOptions(
-                clientID: cloudflareClientID.trimmingCharacters(in: .whitespacesAndNewlines),
-                clientSecretKeychainRef: ref,
-                tunnelDomain: effectiveTunnel
-            ))
+            let ref =
+                secretRef
+                ?? (cloudflareClientSecretKeychainRef.isEmpty
+                    ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef)
+            profile = .cloudflareAccess(
+                CloudflareAccessOptions(
+                    clientID: cloudflareClientID.trimmingCharacters(in: .whitespacesAndNewlines),
+                    clientSecretKeychainRef: ref,
+                    tunnelDomain: effectiveTunnel
+                ))
         } else if connectionType == .tailscale {
-            let effectiveTSHostname = tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let effectiveTSHostname =
+                tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 ? hostname.trimmingCharacters(in: .whitespacesAndNewlines)
                 : tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines)
-            profile = .tailscale(TailscaleOptions(
-                tailscaleHostname: effectiveTSHostname,
-                checkHostKey: tailscaleCheckHostKey
-            ))
+            profile = .tailscale(
+                TailscaleOptions(
+                    tailscaleHostname: effectiveTSHostname,
+                    checkHostKey: tailscaleCheckHostKey
+                ))
         } else {
             profile = .ssh(existingSSH)
         }
@@ -1175,9 +1259,11 @@ struct HostEditorView: View {
         let effectiveHostname: String
         if hostname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             if connectionType == .tailscale {
-                effectiveHostname = tailscaleHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+                effectiveHostname = tailscaleHostname.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
             } else if connectionType == .cloudflareAccess {
-                effectiveHostname = cloudflareTunnelDomain.trimmingCharacters(in: .whitespacesAndNewlines)
+                effectiveHostname = cloudflareTunnelDomain.trimmingCharacters(
+                    in: .whitespacesAndNewlines)
             } else {
                 effectiveHostname = hostname
             }
@@ -1206,24 +1292,37 @@ struct HostEditorView: View {
 
     func save() {
         let trimmedSecret = cloudflareClientSecret.trimmingCharacters(in: .whitespacesAndNewlines)
-        let secretRef = cloudflareClientSecretKeychainRef.isEmpty ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef
+        let secretRef =
+            cloudflareClientSecretKeychainRef.isEmpty
+            ? "cf-secret-\(UUID().uuidString)" : cloudflareClientSecretKeychainRef
 
         Task {
             if connectionType == .cloudflareAccess && !trimmedSecret.isEmpty {
-                try? await container.credentialStore.save(Data(trimmedSecret.utf8), reference: secretRef)
+                try? await container.credentialStore.save(
+                    Data(trimmedSecret.utf8), reference: secretRef)
             }
             guard let host = buildHost(secretRef: secretRef) else { return }
             do {
                 try await container.saveHost(host)
                 dismiss()
-            } catch { }
+            } catch {}
         }
     }
 }
 
 struct SessionDashboardView: View {
     @EnvironmentObject private var container: AppContainer
-    var body: some View { Group { if container.activeSession != nil { SessionView() } else { ContentUnavailableView("No active sessions", systemImage: "rectangle.split.2x1", description: Text("Connect a host to create a foreground session.")) } }.navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline) }
+    var body: some View {
+        Group {
+            if container.activeSession != nil {
+                SessionView()
+            } else {
+                ContentUnavailableView(
+                    "No active sessions", systemImage: "rectangle.split.2x1",
+                    description: Text("Connect a host to create a foreground session."))
+            }
+        }.navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline)
+    }
 }
 
 struct PendingCommand: Identifiable {
@@ -1240,6 +1339,7 @@ struct SessionView: View {
     @State private var blockedCommand = ""
     @State private var showMultiplexer = false
     @State private var showVoice = false
+    @State private var showNewSessionSheet = false
     @State private var isCommandDrawerExpanded = false
     @State private var isSearchPresented = false
     @State private var searchQuery = ""
@@ -1271,7 +1371,9 @@ struct SessionView: View {
     }
 
     private func terminalColor(_ value: TerminalColor) -> Color {
-        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+        Color(
+            red: Double(value.red) / 255, green: Double(value.green) / 255,
+            blue: Double(value.blue) / 255)
     }
 
     private var connectionStatusColor: Color {
@@ -1315,6 +1417,12 @@ struct SessionView: View {
             // Reconnect status banner if coordinator is active
             reconnectBanner
 
+            // Multi-Session Switcher Bar
+            if !container.openSessions.isEmpty {
+                SessionSwitcherBar()
+                Divider()
+            }
+
             // Search Bar (if presented)
             if isSearchPresented {
                 TerminalSearchBar(
@@ -1330,7 +1438,9 @@ struct SessionView: View {
             }
 
             // Connection Failure Banner (if failed)
-            if let failure = container.lastConnectionFailure, container.activeSession?.state == .failed {
+            if let failure = container.lastConnectionFailure,
+                container.activeSession?.state == .failed
+            {
                 ConnectionFailureCard(
                     failure: failure,
                     onRetry: {
@@ -1412,7 +1522,10 @@ struct SessionView: View {
             // Collapsible Validated-Command Drawer
             commandDrawer
         }
-        .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
+        .navigationTitle(
+            container.terminalController.title.isEmpty
+                ? "Terminal" : container.terminalController.title
+        )
         .navigationBarTitleDisplayMode(.inline)
         .toolbar(isZenMode ? .hidden : .visible, for: .navigationBar)
         .navigationBarHidden(isZenMode)
@@ -1435,9 +1548,12 @@ struct SessionView: View {
                                 .lineLimit(1)
                         }
                     } else {
-                        Text(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
-                            .font(.subheadline.weight(.semibold))
-                            .lineLimit(1)
+                        Text(
+                            container.terminalController.title.isEmpty
+                                ? "Terminal" : container.terminalController.title
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        .lineLimit(1)
                     }
 
                     if let moshState = container.moshState, moshState.isRoaming {
@@ -1448,8 +1564,9 @@ struct SessionView: View {
                             .accessibilityLabel("Network roaming re-syncing")
                             .accessibilityIdentifier("mosh-roaming-indicator")
                     } else if container.activeSession?.state == .connected,
-                              (container.moshState == nil || container.moshState?.isConnected == true),
-                              let port = container.moshSessionPort {
+                        container.moshState == nil || container.moshState?.isConnected == true,
+                        let port = container.moshSessionPort
+                    {
                         Label("UDP :\(port)", systemImage: "bolt.horizontal.fill")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
@@ -1458,20 +1575,27 @@ struct SessionView: View {
                             .accessibilityIdentifier("mosh-connected-indicator")
                     }
 
-                    if container.activeForwardersCount > 0 {
+                    if container.openSessions.count <= 1 && container.activeForwardersCount > 0 {
                         Button(action: {
                             showPortForwarding = true
                         }) {
-                            Label("\(container.activeForwardersCount)", systemImage: "arrow.triangle.swap")
-                                .font(.caption2.bold())
-                                .foregroundStyle(Color.accentColor)
+                            Label(
+                                "\(container.activeForwardersCount)",
+                                systemImage: "arrow.triangle.swap"
+                            )
+                            .font(.caption2.bold())
+                            .foregroundStyle(Color.accentColor)
                         }
                         .buttonStyle(.plain)
-                        .accessibilityLabel("\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")")
+                        .accessibilityLabel(
+                            "\(container.activeForwardersCount) active port forwarder\(container.activeForwardersCount == 1 ? "" : "s")"
+                        )
                         .accessibilityIdentifier("session-forwarders-indicator")
                     }
 
-                    if let errorMsg = container.forwardingErrorMessage {
+                    if container.openSessions.count <= 1,
+                        let errorMsg = container.forwardingErrorMessage
+                    {
                         Button(action: {
                             showPortForwarding = true
                         }) {
@@ -1487,6 +1611,40 @@ struct SessionView: View {
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
+                Menu {
+                    Section("Open Sessions (\(container.openSessions.count))") {
+                        ForEach(container.openSessions) { session in
+                            let isCurrent = container.selectedSessionID == session.id
+                            let name = container.host(for: session.id)?.name ?? "Terminal"
+                            Button(action: {
+                                container.selectSession(id: session.id)
+                            }) {
+                                if isCurrent {
+                                    Label("\(name) (Active)", systemImage: "checkmark")
+                                } else {
+                                    Text(name)
+                                }
+                            }
+                            .accessibilityIdentifier("session-switcher-item-\(session.id)")
+                        }
+                    }
+
+                    Divider()
+
+                    Button(action: {
+                        showNewSessionSheet = true
+                    }) {
+                        Label("New Session...", systemImage: "plus")
+                    }
+                    .accessibilityIdentifier("session-switcher-new-session-button")
+                    .disabled(
+                        container.openSessions.count >= AppContainer.maximumConcurrentSessions)
+                } label: {
+                    Image(systemName: "rectangle.stack")
+                }
+                .accessibilityLabel("Session switcher, \(container.openSessions.count) open")
+                .accessibilityIdentifier("session-switcher-toolbar-button")
+
                 if horizontalSizeClass != .compact {
                     Button(action: {
                         isSearchPresented.toggle()
@@ -1503,7 +1661,9 @@ struct SessionView: View {
                         container.terminalController.recoverFirstResponder()
                     }) {
                         Image(systemName: "keyboard")
-                            .foregroundStyle(container.terminalController.isFirstResponder ? Color.primary : Color.accentColor)
+                            .foregroundStyle(
+                                container.terminalController.isFirstResponder
+                                    ? Color.primary : Color.accentColor)
                     }
                     .accessibilityLabel("Recover keyboard focus")
                 }
@@ -1513,7 +1673,9 @@ struct SessionView: View {
                     showVoice = true
                 }) {
                     Image(systemName: "mic")
-                        .foregroundStyle(container.activeHost?.isVoiceEnabled == true ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(
+                            container.activeHost?.isVoiceEnabled == true
+                                ? Color.accentColor : Color.secondary)
                 }
                 .accessibilityLabel("Voice command")
                 .accessibilityIdentifier("session-header-voice-button")
@@ -1546,14 +1708,18 @@ struct SessionView: View {
                         }) {
                             Label("Increase Size (Cmd +)", systemImage: "plus")
                         }
-                        .disabled(container.terminalController.terminalFontSize >= TerminalFontSize.maximumPointSize)
+                        .disabled(
+                            container.terminalController.terminalFontSize
+                                >= TerminalFontSize.maximumPointSize)
 
                         Button(action: {
                             container.terminalController.decreaseTerminalFontSize()
                         }) {
                             Label("Decrease Size (Cmd -)", systemImage: "minus")
                         }
-                        .disabled(container.terminalController.terminalFontSize <= TerminalFontSize.minimumPointSize)
+                        .disabled(
+                            container.terminalController.terminalFontSize
+                                <= TerminalFontSize.minimumPointSize)
 
                         Button(action: {
                             container.terminalController.resetTerminalFontSize()
@@ -1568,7 +1734,9 @@ struct SessionView: View {
                                 container.terminalController.setTerminalFontSize(Double(preset))
                             }) {
                                 let percentage = TerminalFontSize.percentage(for: Double(preset))
-                                if Int(container.terminalController.terminalFontSize.rounded()) == preset {
+                                if Int(container.terminalController.terminalFontSize.rounded())
+                                    == preset
+                                {
                                     Label("\(preset) pt (\(percentage)%)", systemImage: "checkmark")
                                 } else {
                                     Text("\(preset) pt (\(percentage)%)")
@@ -1576,13 +1744,17 @@ struct SessionView: View {
                             }
                         }
                     } label: {
-                        Label("Text Size (\(container.terminalController.terminalFontSizePercentage)%)", systemImage: "textformat.size")
+                        Label(
+                            "Text Size (\(container.terminalController.terminalFontSizePercentage)%)",
+                            systemImage: "textformat.size")
                     }
 
                     Divider()
 
                     Button(action: {
-                        if let selection = container.terminalController.getSelection(), !selection.isEmpty {
+                        if let selection = container.terminalController.getSelection(),
+                            !selection.isEmpty
+                        {
                             UIPasteboard.general.string = selection
                         }
                     }) {
@@ -1612,7 +1784,9 @@ struct SessionView: View {
                             isZenMode = true
                         }
                     }) {
-                        Label("Zen Mode (Full Screen)", systemImage: "arrow.up.left.and.arrow.down.right")
+                        Label(
+                            "Zen Mode (Full Screen)",
+                            systemImage: "arrow.up.left.and.arrow.down.right")
                     }
                     .accessibilityIdentifier("open-zen-mode-button")
                     .accessibilityLabel("Enter Zen Mode full screen")
@@ -1622,24 +1796,42 @@ struct SessionView: View {
                     Button(action: {
                         showMultiplexer = true
                     }) {
-                        Label("Multiplexer", systemImage: "rectangle.3.group")
+                        Label(
+                            container.openSessions.count > 1
+                                ? "Multiplexer (Single-session only)"
+                                : "Multiplexer",
+                            systemImage: "rectangle.3.group"
+                        )
                     }
+                    .disabled(container.openSessions.count > 1)
                     .accessibilityIdentifier("open-multiplexer-button")
                     .accessibilityLabel("Open remote multiplexer sheet")
 
                     Button(action: {
                         showPortForwarding = true
                     }) {
-                        Label("Port Forwarding", systemImage: "arrow.triangle.swap")
+                        Label(
+                            container.openSessions.count > 1
+                                ? "Port Forwarding (Single-session only)"
+                                : "Port Forwarding",
+                            systemImage: "arrow.triangle.swap"
+                        )
                     }
+                    .disabled(container.openSessions.count > 1)
                     .accessibilityIdentifier("open-port-forwarding-button")
                     .accessibilityLabel("Open port forwarding sheet")
 
                     Button(action: {
                         showTelemetry = true
                     }) {
-                        Label("Server Telemetry", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                        Label(
+                            container.openSessions.count > 1
+                                ? "Server Telemetry (Single-session only)"
+                                : "Server Telemetry",
+                            systemImage: "gauge.with.dots.needle.bottom.50percent"
+                        )
                     }
+                    .disabled(container.openSessions.count > 1)
                     .accessibilityIdentifier("open-telemetry-button")
                     .accessibilityLabel("Open server telemetry monitoring sheet")
 
@@ -1652,9 +1844,16 @@ struct SessionView: View {
                                     container.openSecondarySFTP(for: host)
                                 }
                             }) {
-                                Label("Split with SFTP Browser", systemImage: "folder")
+                                Label(
+                                    container.openSessions.count > 1
+                                        ? "Split with SFTP Browser (Single-session only)"
+                                        : "Split with SFTP Browser",
+                                    systemImage: "folder"
+                                )
                             }
-                            .disabled(container.activeHost == nil)
+                            .disabled(
+                                container.openSessions.count > 1 || container.activeHost == nil
+                            )
                             .accessibilityIdentifier("split-with-sftp-button")
 
                             if container.secondaryPaneMode != .none {
@@ -1673,6 +1872,15 @@ struct SessionView: View {
 
                     Divider()
 
+                    Button(role: .destructive) {
+                        if let id = container.selectedSessionID {
+                            Task { await container.closeSession(id: id) }
+                        }
+                    } label: {
+                        Label("Close Session", systemImage: "xmark.circle")
+                    }
+                    .accessibilityIdentifier("session-close-current-button")
+
                     Button("Disconnect", role: .destructive) {
                         Task { await container.disconnect() }
                     }
@@ -1682,10 +1890,25 @@ struct SessionView: View {
                 .accessibilityLabel("Session tools")
             }
         }
-        .sheet(isPresented: $showMultiplexer) { MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large]) }
-        .sheet(isPresented: $showVoice) { VoiceComposer().environmentObject(container).presentationDetents([.medium, .large]) }
-        .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container).presentationDetents([.medium, .large]) }
-        .sheet(isPresented: $showTelemetry) { ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium]) }
+        .sheet(isPresented: $showMultiplexer) {
+            MultiplexerPicker().environmentObject(container).presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showVoice) {
+            VoiceComposer().environmentObject(container).presentationDetents([.medium, .large])
+        }
+        .sheet(isPresented: $showPortForwarding) {
+            PortForwardingSheet().environmentObject(container).presentationDetents([
+                .medium, .large,
+            ])
+        }
+        .sheet(isPresented: $showTelemetry) {
+            ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium])
+        }
+        .sheet(isPresented: $showNewSessionSheet) {
+            NewSessionHostPickerSheet().environmentObject(container).presentationDetents([
+                .medium, .large,
+            ])
+        }
         .sheet(isPresented: $showSendImage) {
             SendImageView().environmentObject(container).presentationDetents([.medium, .large])
         }
@@ -1739,7 +1962,9 @@ struct SessionView: View {
                 pendingRiskyPaste = nil
             }
         } message: {
-            Text("The remote session does not have bracketed paste enabled. Pasting multiple lines may execute commands immediately without confirmation.")
+            Text(
+                "The remote session does not have bracketed paste enabled. Pasting multiple lines may execute commands immediately without confirmation."
+            )
         }
         .overlay(alignment: .topTrailing) {
             if isZenMode {
@@ -1821,7 +2046,9 @@ struct SessionView: View {
             .padding(.vertical, 6)
             .background(Color.orange.opacity(0.15))
             .accessibilityElement(children: .combine)
-            .accessibilityLabel("Network roaming re-syncing to \(container.networkRoamingState?.currentInterface.displayName ?? "new interface")")
+            .accessibilityLabel(
+                "Network roaming re-syncing to \(container.networkRoamingState?.currentInterface.displayName ?? "new interface")"
+            )
             .accessibilityIdentifier("mosh-roaming-banner")
             Divider()
         }
@@ -1846,39 +2073,17 @@ struct SessionView: View {
             .accessibilityIdentifier("foreground-recovery-banner")
         } else {
             switch container.reconnectState {
-        case .waiting(let attempt, let delay):
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Retry Now") {
-                        Task { await container.retryReconnect() }
-                    }
-                    .font(.caption.bold())
-                    .accessibilityIdentifier("reconnect-retry-button")
-                    .accessibilityLabel("Retry connection immediately")
-
-                    Button("Cancel") {
-                        Task { await container.cancelReconnect() }
-                    }
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("reconnect-cancel-button")
-                    .accessibilityLabel("Cancel reconnection")
-                }
-                VStack(alignment: .leading, spacing: 6) {
+            case .waiting(let attempt, let delay):
+                ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 12) {
+                        Text(
+                            "Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s..."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        Spacer()
                         Button("Retry Now") {
                             Task { await container.retryReconnect() }
                         }
@@ -1894,81 +2099,87 @@ struct SessionView: View {
                         .accessibilityIdentifier("reconnect-cancel-button")
                         .accessibilityLabel("Cancel reconnection")
                     }
-                }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 6)
-            .background(Color.yellow.opacity(0.15))
-            Divider()
-        case .connecting(let attempt):
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.small)
-                    Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Cancel") {
-                        Task { await container.cancelReconnect() }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(
+                                "Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts)) in \(Int(ceil(delay)))s..."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 12) {
+                            Button("Retry Now") {
+                                Task { await container.retryReconnect() }
+                            }
+                            .font(.caption.bold())
+                            .accessibilityIdentifier("reconnect-retry-button")
+                            .accessibilityLabel("Retry connection immediately")
+
+                            Button("Cancel") {
+                                Task { await container.cancelReconnect() }
+                            }
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("reconnect-cancel-button")
+                            .accessibilityLabel("Cancel reconnection")
+                        }
                     }
-                    .font(.caption.bold())
-                    .accessibilityIdentifier("reconnect-cancel-button")
-                    .accessibilityLabel("Cancel reconnection")
                 }
-                VStack(alignment: .leading, spacing: 6) {
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.yellow.opacity(0.15))
+                Divider()
+            case .connecting(let attempt):
+                ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         ProgressView()
                             .controlSize(.small)
-                        Text("Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))...")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Button("Cancel") {
-                        Task { await container.cancelReconnect() }
-                    }
-                    .font(.caption.bold())
-                    .accessibilityIdentifier("reconnect-cancel-button")
-                    .accessibilityLabel("Cancel reconnection")
-                }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 6)
-            .background(Color.blue.opacity(0.15))
-            Divider()
-        case .exhausted(let attempts):
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text("Reconnection failed after \(attempts) attempts.")
+                        Text(
+                            "Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))..."
+                        )
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Retry") {
-                        Task { await container.retryReconnect() }
+                        Spacer()
+                        Button("Cancel") {
+                            Task { await container.cancelReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-cancel-button")
+                        .accessibilityLabel("Cancel reconnection")
                     }
-                    .font(.caption.bold())
-                    .accessibilityIdentifier("reconnect-retry-button")
-                    .accessibilityLabel("Retry connection")
-
-                    Button("Cancel") {
-                        Task { await container.cancelReconnect() }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(
+                                "Reconnecting (attempt \(attempt)/\(ReconnectCoordinator.maxAttempts))..."
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        }
+                        Button("Cancel") {
+                            Task { await container.cancelReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-cancel-button")
+                        .accessibilityLabel("Cancel reconnection")
                     }
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
-                    .accessibilityIdentifier("reconnect-cancel-button")
-                    .accessibilityLabel("Dismiss reconnection")
                 }
-                VStack(alignment: .leading, spacing: 6) {
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.blue.opacity(0.15))
+                Divider()
+            case .exhausted(let attempts):
+                ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                         Text("Reconnection failed after \(attempts) attempts.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                    }
-                    HStack(spacing: 12) {
+                        Spacer()
                         Button("Retry") {
                             Task { await container.retryReconnect() }
                         }
@@ -1984,37 +2195,41 @@ struct SessionView: View {
                         .accessibilityIdentifier("reconnect-cancel-button")
                         .accessibilityLabel("Dismiss reconnection")
                     }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            Text("Reconnection failed after \(attempts) attempts.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        HStack(spacing: 12) {
+                            Button("Retry") {
+                                Task { await container.retryReconnect() }
+                            }
+                            .font(.caption.bold())
+                            .accessibilityIdentifier("reconnect-retry-button")
+                            .accessibilityLabel("Retry connection")
+
+                            Button("Cancel") {
+                                Task { await container.cancelReconnect() }
+                            }
+                            .font(.caption.bold())
+                            .foregroundStyle(.secondary)
+                            .accessibilityIdentifier("reconnect-cancel-button")
+                            .accessibilityLabel("Dismiss reconnection")
+                        }
+                    }
                 }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 6)
-            .background(Color.orange.opacity(0.15))
-            Divider()
-        case .failed(let reason):
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.red)
-                Text(reason)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Retry") {
-                    Task { await container.retryReconnect() }
-                }
-                .font(.caption.bold())
-                .accessibilityIdentifier("reconnect-retry-button")
-                .accessibilityLabel("Retry connection")
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 6)
-            .background(Color.red.opacity(0.15))
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("reconnect-failure-banner")
-            Divider()
-        case .cancelled:
-            ViewThatFits(in: .horizontal) {
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.orange.opacity(0.15))
+                Divider()
+            case .failed(let reason):
                 HStack(spacing: 8) {
-                    Text("Reconnection cancelled.")
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.red)
+                    Text(reason)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Spacer()
@@ -2025,22 +2240,42 @@ struct SessionView: View {
                     .accessibilityIdentifier("reconnect-retry-button")
                     .accessibilityLabel("Retry connection")
                 }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Reconnection cancelled.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Button("Retry") {
-                        Task { await container.retryReconnect() }
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.red.opacity(0.15))
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("reconnect-failure-banner")
+                Divider()
+            case .cancelled:
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        Text("Reconnection cancelled.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Retry") {
+                            Task { await container.retryReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-retry-button")
+                        .accessibilityLabel("Retry connection")
                     }
-                    .font(.caption.bold())
-                    .accessibilityIdentifier("reconnect-retry-button")
-                    .accessibilityLabel("Retry connection")
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Reconnection cancelled.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Button("Retry") {
+                            Task { await container.retryReconnect() }
+                        }
+                        .font(.caption.bold())
+                        .accessibilityIdentifier("reconnect-retry-button")
+                        .accessibilityLabel("Retry connection")
+                    }
                 }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 6)
-            .background(Color.gray.opacity(0.15))
-            Divider()
+                .padding(.horizontal)
+                .padding(.vertical, 6)
+                .background(Color.gray.opacity(0.15))
+                Divider()
             default:
                 EmptyView()
             }
@@ -2155,6 +2390,7 @@ struct SessionView: View {
     @ViewBuilder
     private var terminalSurfaceArea: some View {
         ShhTerminalView(controller: container.terminalController)
+            .id(container.selectedSessionID)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(Color.black)
             .accessibilityElement(children: .contain)
@@ -2184,7 +2420,8 @@ struct SessionView: View {
                 .background(Color(.secondarySystemBackground))
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isCommandDrawerExpanded ? "Collapse command drawer" : "Expand command drawer")
+            .accessibilityLabel(
+                isCommandDrawerExpanded ? "Collapse command drawer" : "Expand command drawer")
 
             if isCommandDrawerExpanded {
                 VStack(spacing: 8) {
@@ -2199,7 +2436,9 @@ struct SessionView: View {
                             command = ""
                         }
                         .buttonStyle(.borderedProminent)
-                        .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || container.activeSession?.state != .connected)
+                        .disabled(
+                            command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                || container.activeSession?.state != .connected)
 
                         Button("Speak", systemImage: "mic") {
                             container.resetVoiceState()
@@ -2209,10 +2448,12 @@ struct SessionView: View {
                         .accessibilityLabel("Push to talk")
                         .accessibilityIdentifier("command-drawer-voice-button")
                     }
-                    Text("Composed commands pass through CommandPolicy. Blocked commands are rejected.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                    Text(
+                        "Composed commands pass through CommandPolicy. Blocked commands are rejected."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .padding(.horizontal)
                 .padding(.bottom, 8)
@@ -2519,7 +2760,8 @@ struct TerminalAccessoryBar: View {
                 }
 
                 // Sticky Ctrl Toggle
-                AccessoryToggleKeyButton(title: "Ctrl", isActive: inputCoordinator.isControlActive) {
+                AccessoryToggleKeyButton(title: "Ctrl", isActive: inputCoordinator.isControlActive)
+                {
                     inputCoordinator.toggleControl()
                 }
 
@@ -2596,7 +2838,9 @@ struct TerminalAccessoryBar: View {
                         .font(.system(.subheadline, design: .monospaced).bold())
                         .padding(.horizontal, 10)
                         .frame(minHeight: 36)
-                        .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                        .background(
+                            Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6)
+                        )
                         .contentShape(Rectangle())
                 }
 
@@ -2616,7 +2860,9 @@ struct TerminalAccessoryBar: View {
                         .font(.system(.subheadline, design: .monospaced))
                         .padding(.horizontal, 8)
                         .frame(minHeight: 36)
-                        .background(Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                        .background(
+                            Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6)
+                        )
                         .contentShape(Rectangle())
                 }
 
@@ -2657,7 +2903,10 @@ struct AccessoryKeyButton: View {
                 .font(.system(.subheadline, design: .monospaced).weight(.medium))
                 .padding(.horizontal, 10)
                 .frame(minHeight: 36)
-                .background(role == .destructive ? Color.red.opacity(0.15) : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                .background(
+                    role == .destructive ? Color.red.opacity(0.15) : Color(.secondarySystemFill),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2676,7 +2925,10 @@ struct AccessoryToggleKeyButton: View {
                 .padding(.horizontal, 10)
                 .frame(minHeight: 36)
                 .foregroundStyle(isActive ? Color.white : Color.primary)
-                .background(isActive ? Color.accentColor : Color(.secondarySystemFill), in: RoundedRectangle(cornerRadius: 6))
+                .background(
+                    isActive ? Color.accentColor : Color(.secondarySystemFill),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -2709,7 +2961,9 @@ struct ApprovalSheet: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Exact command") { Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled) }
+                Section("Exact command") {
+                    Text(command).font(.system(.body, design: .monospaced)).textSelection(.enabled)
+                }
                 Toggle("I approve sending this command", isOn: $approved)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -2722,13 +2976,16 @@ struct ApprovalSheet: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Send") {
                         Task {
-                            if await container.sendValidatedCommand(command + "\n", approved: true) {
+                            if await container.sendValidatedCommand(command + "\n", approved: true)
+                            {
                                 onApproved?()
                                 dismiss()
                             }
                         }
                     }
-                    .disabled(!approved || policy.classify(command) == .blocked || container.activeSession?.state != .connected)
+                    .disabled(
+                        !approved || policy.classify(command) == .blocked
+                            || container.activeSession?.state != .connected)
                 }
             }
         }
@@ -2775,7 +3032,9 @@ struct MultiplexerPicker: View {
                         .accessibilityLabel("Close multiplexer sheet")
                         .accessibilityIdentifier("multiplexer-done-button")
                 }
-                if (selected == .tmux || selected == .herdr) && container.activeSession?.state == .connected {
+                if (selected == .tmux || selected == .herdr)
+                    && container.activeSession?.state == .connected
+                {
                     ToolbarItem(placement: .confirmationAction) {
                         Button(action: {
                             Task {
@@ -2786,16 +3045,24 @@ struct MultiplexerPicker: View {
                                 }
                             }
                         }) {
-                            if (selected == .tmux && container.isProbingTmux) || (selected == .herdr && container.isProbingHerdr) {
+                            if (selected == .tmux && container.isProbingTmux)
+                                || (selected == .herdr && container.isProbingHerdr)
+                            {
                                 ProgressView()
                                     .controlSize(.small)
                             } else {
                                 Image(systemName: "arrow.clockwise")
                             }
                         }
-                        .disabled((selected == .tmux && container.isProbingTmux) || (selected == .herdr && container.isProbingHerdr))
-                        .accessibilityLabel(selected == .tmux ? "Refresh tmux sessions" : "Refresh Herdr workspaces")
-                        .accessibilityIdentifier(selected == .tmux ? "refresh-tmux-button" : "refresh-herdr-button")
+                        .disabled(
+                            (selected == .tmux && container.isProbingTmux)
+                                || (selected == .herdr && container.isProbingHerdr)
+                        )
+                        .accessibilityLabel(
+                            selected == .tmux ? "Refresh tmux sessions" : "Refresh Herdr workspaces"
+                        )
+                        .accessibilityIdentifier(
+                            selected == .tmux ? "refresh-tmux-button" : "refresh-herdr-button")
                     }
                 }
             }
@@ -2852,9 +3119,12 @@ struct MultiplexerPicker: View {
                         case .available(let version):
                             Text(version)
                                 .font(.body.weight(.medium))
-                            Text(container.isTmuxServerRunning ? "Server running" : "No server running")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                            Text(
+                                container.isTmuxServerRunning
+                                    ? "Server running" : "No server running"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                         case .unavailable(let reason):
                             Text("Unavailable")
                                 .font(.body.weight(.medium))
@@ -2905,10 +3175,14 @@ struct MultiplexerPicker: View {
         if container.tmuxAvailability.isAvailable {
             Section("Sessions") {
                 if container.tmuxSessions.isEmpty {
-                    Text(container.isTmuxServerRunning ? "No active tmux sessions found. Create a session below to start." : "No tmux server running. Create a session below to start.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                        .accessibilityIdentifier("tmux-empty-sessions-label")
+                    Text(
+                        container.isTmuxServerRunning
+                            ? "No active tmux sessions found. Create a session below to start."
+                            : "No tmux server running. Create a session below to start."
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("tmux-empty-sessions-label")
                 } else {
                     ForEach(container.tmuxSessions) { session in
                         HStack {
@@ -2931,9 +3205,12 @@ struct MultiplexerPicker: View {
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
                                         .accessibilityHidden(true)
-                                    Text(session.isAttached ? "Attached (\(session.attachedClients))" : "Detached")
-                                        .font(.caption)
-                                        .foregroundStyle(session.isAttached ? .orange : .secondary)
+                                    Text(
+                                        session.isAttached
+                                            ? "Attached (\(session.attachedClients))" : "Detached"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(session.isAttached ? .orange : .secondary)
                                     Text("•")
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
@@ -2948,16 +3225,20 @@ struct MultiplexerPicker: View {
                                 Label("Attached", systemImage: "checkmark")
                                     .font(.caption.bold())
                                     .foregroundStyle(.green)
-                                    .accessibilityLabel("Session \(session.name) is currently attached")
+                                    .accessibilityLabel(
+                                        "Session \(session.name) is currently attached")
                             } else {
                                 Button(session.isAttached ? "Takeover" : "Attach") {
                                     Task {
-                                        let success = await container.attachTmuxSession(id: session.sessionID)
+                                        let success = await container.attachTmuxSession(
+                                            id: session.sessionID)
                                         if success { dismiss() }
                                     }
                                 }
                                 .buttonStyle(.bordered)
-                                .accessibilityLabel("\(session.isAttached ? "Take over" : "Attach to") session \(session.name), ID \(session.sessionID)")
+                                .accessibilityLabel(
+                                    "\(session.isAttached ? "Take over" : "Attach to") session \(session.name), ID \(session.sessionID)"
+                                )
                                 .accessibilityIdentifier("attach-session-\(session.sessionID)")
                             }
                         }
@@ -3020,15 +3301,22 @@ struct MultiplexerPicker: View {
     private var deferredMultiplexerContent: some View {
         Section {
             VStack(alignment: .leading, spacing: 8) {
-                Label("\(selected.rawValue.capitalized) is not enabled", systemImage: "clock.arrow.circlepath")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                Text("Multiplexer adapter \(selected.rawValue.capitalized) is visibly unavailable and deferred in this build. Tmux and Herdr are the supported remote multiplexers.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                Text("Zellij, Byobu, and Screen remain deferred pending terminal multiplexing contracts.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Label(
+                    "\(selected.rawValue.capitalized) is not enabled",
+                    systemImage: "clock.arrow.circlepath"
+                )
+                .font(.headline)
+                .foregroundStyle(.secondary)
+                Text(
+                    "Multiplexer adapter \(selected.rawValue.capitalized) is visibly unavailable and deferred in this build. Tmux and Herdr are the supported remote multiplexers."
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                Text(
+                    "Zellij, Byobu, and Screen remain deferred pending terminal multiplexing contracts."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             .padding(.vertical, 4)
             .accessibilityIdentifier("deferred-multiplexer-notice")
@@ -3038,7 +3326,8 @@ struct MultiplexerPicker: View {
     private var tmuxStatusAccessibilityLabel: String {
         switch container.tmuxAvailability {
         case .available(let version):
-            return "Tmux \(version), \(container.isTmuxServerRunning ? "server running" : "no server running")"
+            return
+                "Tmux \(version), \(container.isTmuxServerRunning ? "server running" : "no server running")"
         case .unavailable(let reason):
             return "Tmux unavailable: \(reason)"
         }
@@ -3288,7 +3577,9 @@ struct HerdrAgentCardView: View {
                 .lineLimit(1)
         }
         .buttonStyle(.bordered)
-        .accessibilityLabel("Read recent output for pane \(pane.label.isEmpty ? pane.id : pane.label)")
+        .accessibilityLabel(
+            "Read recent output for pane \(pane.label.isEmpty ? pane.id : pane.label)"
+        )
         .accessibilityHint("Opens sheet displaying unwrapped output")
         .accessibilityIdentifier("pane-read-output-\(pane.id)")
 
@@ -3498,9 +3789,11 @@ struct HerdrSendCommandSheet: View {
                             HStack(alignment: .top, spacing: 6) {
                                 Image(systemName: "exclamationmark.shield.fill")
                                     .foregroundStyle(.orange)
-                                Text("Review required: Command executes remotely in agent pane. Tap Run to approve.")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
+                                Text(
+                                    "Review required: Command executes remotely in agent pane. Tap Run to approve."
+                                )
+                                .font(.caption)
+                                .foregroundStyle(.orange)
                             }
                             .accessibilityIdentifier("herdr-command-review-notice")
                         case .safe:
@@ -3544,14 +3837,21 @@ struct HerdrSendCommandSheet: View {
                             Text("Run")
                         }
                     }
-                    .disabled(command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || commandRisk == .blocked || isExecuting)
-                    .accessibilityLabel(isExecuting ? "Executing command" : "Execute command in pane")
+                    .disabled(
+                        command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || commandRisk == .blocked || isExecuting
+                    )
+                    .accessibilityLabel(
+                        isExecuting ? "Executing command" : "Execute command in pane"
+                    )
                     .accessibilityIdentifier("herdr-command-run-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button {
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil,
+                            for: nil)
                     } label: {
                         Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
                     }
@@ -3569,7 +3869,8 @@ struct HerdrSendCommandSheet: View {
         guard !trimmed.isEmpty else { return }
         isExecuting = true
         executionError = nil
-        let result = await container.runHerdrPaneCommand(paneID: pane.id, command: trimmed, approved: true)
+        let result = await container.runHerdrPaneCommand(
+            paneID: pane.id, command: trimmed, approved: true)
         isExecuting = false
         if result.success {
             dismiss()
@@ -3645,14 +3946,18 @@ struct HerdrCreateWorkspaceSheet: View {
                             Text("Create")
                         }
                     }
-                    .disabled(label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating)
+                    .disabled(
+                        label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating
+                    )
                     .accessibilityLabel(isCreating ? "Creating workspace" : "Create workspace")
                     .accessibilityIdentifier("herdr-create-workspace-confirm-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
                     Spacer()
                     Button {
-                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        UIApplication.shared.sendAction(
+                            #selector(UIResponder.resignFirstResponder), to: nil, from: nil,
+                            for: nil)
                     } label: {
                         Label("Dismiss Keyboard", systemImage: "keyboard.chevron.compact.down")
                     }
@@ -3812,11 +4117,17 @@ struct HerdrAgentCardsView: View {
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 4)
-                        .background(container.isPollingHerdr ? Color.accentColor.opacity(0.15) : Color(uiColor: .tertiarySystemFill))
+                        .background(
+                            container.isPollingHerdr
+                                ? Color.accentColor.opacity(0.15)
+                                : Color(uiColor: .tertiarySystemFill)
+                        )
                         .cornerRadius(6)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel(container.isPollingHerdr ? "Stop live polling" : "Start live polling")
+                    .accessibilityLabel(
+                        container.isPollingHerdr ? "Stop live polling" : "Start live polling"
+                    )
                     .accessibilityIdentifier("herdr-polling-toggle-button")
                 }
             }
@@ -3881,21 +4192,30 @@ struct HerdrAgentCardsView: View {
                                     }
                                 }
                                 Spacer()
-                                Button(container.activeHerdrWorkspaceID == workspace.id ? "Selected" : "Select") {
-                                    Task { _ = await container.selectHerdrWorkspace(id: workspace.id) }
+                                Button(
+                                    container.activeHerdrWorkspaceID == workspace.id
+                                        ? "Selected" : "Select"
+                                ) {
+                                    Task {
+                                        _ = await container.selectHerdrWorkspace(id: workspace.id)
+                                    }
                                 }
                                 .buttonStyle(.bordered)
                                 .disabled(container.activeHerdrWorkspaceID == workspace.id)
                                 .accessibilityIdentifier("select-herdr-workspace-\(workspace.id)")
-                                Text("\(workspace.panes.count) \(workspace.panes.count == 1 ? "agent" : "agents")")
-                                    .font(.caption2.bold())
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color(uiColor: .tertiarySystemFill))
-                                    .cornerRadius(4)
+                                Text(
+                                    "\(workspace.panes.count) \(workspace.panes.count == 1 ? "agent" : "agents")"
+                                )
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color(uiColor: .tertiarySystemFill))
+                                .cornerRadius(4)
                             }
                             .accessibilityElement(children: .combine)
-                            .accessibilityLabel("Workspace \(workspace.label.isEmpty ? workspace.id : workspace.label), \(workspace.panes.count) agents, directory: \(workspace.cwd)")
+                            .accessibilityLabel(
+                                "Workspace \(workspace.label.isEmpty ? workspace.id : workspace.label), \(workspace.panes.count) agents, directory: \(workspace.cwd)"
+                            )
                             .accessibilityIdentifier("workspace-header-\(workspace.id)")
 
                             // Panes Layout
@@ -3905,7 +4225,9 @@ struct HerdrAgentCardsView: View {
                                     .foregroundStyle(.secondary)
                             } else if horizontalSizeClass == .regular {
                                 LazyVGrid(
-                                    columns: [GridItem(.adaptive(minimum: 300, maximum: 500), spacing: 12)],
+                                    columns: [
+                                        GridItem(.adaptive(minimum: 300, maximum: 500), spacing: 12)
+                                    ],
                                     spacing: 12
                                 ) {
                                     ForEach(workspace.panes) { pane in
@@ -3914,7 +4236,9 @@ struct HerdrAgentCardsView: View {
                                             onReadOutput: { selectedOutputPane = pane },
                                             onSendCommand: { selectedCommandPane = pane },
                                             onSplitPane: {
-                                                Task { await container.splitHerdrPane(paneID: pane.id) }
+                                                Task {
+                                                    await container.splitHerdrPane(paneID: pane.id)
+                                                }
                                             }
                                         )
                                     }
@@ -3927,7 +4251,9 @@ struct HerdrAgentCardsView: View {
                                             onReadOutput: { selectedOutputPane = pane },
                                             onSendCommand: { selectedCommandPane = pane },
                                             onSplitPane: {
-                                                Task { await container.splitHerdrPane(paneID: pane.id) }
+                                                Task {
+                                                    await container.splitHerdrPane(paneID: pane.id)
+                                                }
                                             }
                                         )
                                     }
@@ -3954,22 +4280,61 @@ struct HerdrAgentCardsView: View {
 struct SnippetsView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var snippets: [Snippet] = []
-    var body: some View { List(snippets) { snippet in NavigationLink { SnippetEditor(snippet: snippet) } label: { VStack(alignment: .leading) { Text(snippet.name); Text(snippet.body).font(.caption.monospaced()).foregroundStyle(.secondary) } } }.navigationTitle("Snippets").navigationBarTitleDisplayMode(.inline).task { snippets = (try? await container.catalog.snippets()) ?? [] } }
+    var body: some View {
+        List(snippets) { snippet in
+            NavigationLink {
+                SnippetEditor(snippet: snippet)
+            } label: {
+                VStack(alignment: .leading) {
+                    Text(snippet.name)
+                    Text(snippet.body).font(.caption.monospaced()).foregroundStyle(.secondary)
+                }
+            }
+        }.navigationTitle("Snippets").navigationBarTitleDisplayMode(.inline).task {
+            snippets = (try? await container.catalog.snippets()) ?? []
+        }
+    }
 }
 struct SnippetEditor: View {
     @EnvironmentObject private var container: AppContainer
     let snippet: Snippet
     @State private var bodyText: String
     @State private var showApproval = false
-    init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
-    var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").navigationBarTitleDisplayMode(.inline).sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
+    init(snippet: Snippet) {
+        self.snippet = snippet
+        _bodyText = State(initialValue: snippet.body)
+    }
+    var body: some View {
+        Form {
+            TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            Text("Run always shows this exact text and requires approval.").font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(
+                bodyText.isEmpty)
+        }.navigationTitle("Snippet").navigationBarTitleDisplayMode(.inline).sheet(
+            isPresented: $showApproval
+        ) { ApprovalSheet(command: bodyText).environmentObject(container) }
+    }
 }
-struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring").navigationBarTitleDisplayMode(.inline) } }
+struct MonitoringView: View {
+    var body: some View {
+        List {
+            Label("Health checks are opt-in", systemImage: "heart.text.square")
+            Label("Unknown is not authentication success", systemImage: "info.circle")
+            Label("Live monitoring is foreground-only", systemImage: "iphone")
+        }.navigationTitle("Monitoring").navigationBarTitleDisplayMode(.inline)
+    }
+}
 struct TerminalThemePickerView: View {
     @EnvironmentObject private var container: AppContainer
 
     private func color(_ value: TerminalColor) -> Color {
-        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+        Color(
+            red: Double(value.red) / 255, green: Double(value.green) / 255,
+            blue: Double(value.blue) / 255)
     }
 
     private var accentColorIndex: Int { 4 }
@@ -3979,7 +4344,9 @@ struct TerminalThemePickerView: View {
         let fg = color(palette.foreground)
         let bg = color(palette.background)
         let cursor = color(palette.cursor)
-        let accent = color(palette.ansi.count > accentColorIndex ? palette.ansi[accentColorIndex] : palette.selection)
+        let accent = color(
+            palette.ansi.count > accentColorIndex
+                ? palette.ansi[accentColorIndex] : palette.selection)
 
         return HStack(spacing: 4) {
             Circle().fill(fg).frame(width: 10, height: 10)
@@ -4029,7 +4396,9 @@ struct TerminalThemePreview: View {
     let theme: TerminalThemePreset
 
     private func color(_ value: TerminalColor) -> Color {
-        Color(red: Double(value.red) / 255, green: Double(value.green) / 255, blue: Double(value.blue) / 255)
+        Color(
+            red: Double(value.red) / 255, green: Double(value.green) / 255,
+            blue: Double(value.blue) / 255)
     }
 
     var body: some View {
@@ -4236,20 +4605,28 @@ struct SettingsView: View {
             }
             Section("Security") {
                 Toggle("Require biometric presence (hook)", isOn: .constant(false))
-                Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill")
+                Label(
+                    "Keychain accessibility: when unlocked, this device only",
+                    systemImage: "key.fill")
             }
             Section("Capabilities") {
-                Text("Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, and encrypted vault backup active. On-device WhisperKit and Apple Speech voice active. Full Mosh SSP encryption and physical device TestFlight validation pending.")
-                    .font(.caption)
+                Text(
+                    "Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, and encrypted vault backup active. On-device WhisperKit and Apple Speech voice active. Full Mosh SSP encryption and physical device TestFlight validation pending."
+                )
+                .font(.caption)
             }
             Section("Live Activities") {
-                Text("Live Activities display connection status on the Lock Screen and Dynamic Island. They do not extend background socket execution and never expose commands or credentials.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Live Activities display connection status on the Lock Screen and Dynamic Island. They do not extend background socket execution and never expose commands or credentials."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
             }
             Section("Privacy") {
-                Text("Zero transcript analytics. All speech processing is 100% on-device. Audio files are deleted immediately after transcription.")
-                    .font(.caption)
+                Text(
+                    "Zero transcript analytics. All speech processing is 100% on-device. Audio files are deleted immediately after transcription."
+                )
+                .font(.caption)
             }
         }
         .navigationTitle("Settings")
@@ -4333,8 +4710,15 @@ struct ServerTelemetryCard: View {
                         Capsule()
                             .fill(Color.secondary.opacity(0.2))
                         Capsule()
-                            .fill(cpuPercentage > 85 ? Color.red : (cpuPercentage > 60 ? Color.orange : Color.accentColor))
-                            .frame(width: max(0, min(geo.size.width, geo.size.width * (cpuPercentage / 100.0))))
+                            .fill(
+                                cpuPercentage > 85
+                                    ? Color.red
+                                    : (cpuPercentage > 60 ? Color.orange : Color.accentColor)
+                            )
+                            .frame(
+                                width: max(
+                                    0, min(geo.size.width, geo.size.width * (cpuPercentage / 100.0))
+                                ))
                     }
                 }
                 .frame(height: 6)
@@ -4353,8 +4737,17 @@ struct ServerTelemetryCard: View {
                         Capsule()
                             .fill(Color.secondary.opacity(0.2))
                         Capsule()
-                            .fill(memoryBarPercentage > 90 ? Color.red : (memoryBarPercentage > 75 ? Color.orange : Color.accentColor))
-                            .frame(width: max(0, min(geo.size.width, geo.size.width * (memoryBarPercentage / 100.0))))
+                            .fill(
+                                memoryBarPercentage > 90
+                                    ? Color.red
+                                    : (memoryBarPercentage > 75 ? Color.orange : Color.accentColor)
+                            )
+                            .frame(
+                                width: max(
+                                    0,
+                                    min(
+                                        geo.size.width,
+                                        geo.size.width * (memoryBarPercentage / 100.0))))
                     }
                 }
                 .frame(height: 6)
@@ -4370,7 +4763,9 @@ struct ServerTelemetryCard: View {
                 .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
         )
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Server Telemetry: \(cpuText), RAM: \(telemetry.formattedMemory), Load: \(loadText), Uptime: \(telemetry.formattedUptime)")
+        .accessibilityLabel(
+            "Server Telemetry: \(cpuText), RAM: \(telemetry.formattedMemory), Load: \(loadText), Uptime: \(telemetry.formattedUptime)"
+        )
         .accessibilityIdentifier("server-telemetry-card")
     }
 }
