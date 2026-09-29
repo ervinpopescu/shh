@@ -14,6 +14,13 @@ final class SessionRuntime {
     struct CallbackToken: Equatable, Sendable {
         let sessionID: UUID
         let generation: UInt64
+        let transportGeneration: UInt64
+    }
+
+    private struct PendingTasks {
+        let event: Task<Void, Never>?
+        let outbound: Task<Bool, Never>?
+        let resize: Task<Bool, Never>?
     }
 
     let host: Host
@@ -28,10 +35,12 @@ final class SessionRuntime {
     private(set) var reconnectGeneration: UInt64 = 0
 
     private(set) var eventTask: Task<Void, Never>?
-    private(set) var outboundTask: Task<Void, Never>?
+    private(set) var outboundTask: Task<Bool, Never>?
     private(set) var terminalResizeTask: Task<Bool, Never>?
 
     private var callbackGeneration: UInt64 = 0
+    private var transportGeneration: UInt64 = 0
+    private var closedTransportGeneration: UInt64?
 
     convenience init(
         host: Host,
@@ -64,7 +73,11 @@ final class SessionRuntime {
     }
 
     var callbackToken: CallbackToken {
-        CallbackToken(sessionID: session.id, generation: callbackGeneration)
+        CallbackToken(
+            sessionID: session.id,
+            generation: callbackGeneration,
+            transportGeneration: transportGeneration
+        )
     }
 
     func accepts(_ token: CallbackToken) -> Bool {
@@ -88,9 +101,16 @@ final class SessionRuntime {
     /// model remain stable, while the generation rejects callbacks from the old
     /// connection even if its event stream races cancellation.
     func reconnect(with replacement: any SSHConnection) async {
-        invalidateCallbacks()
         let previous = connection
+        let previousTransportGeneration = transportGeneration
+        let pending = invalidateCallbacks()
+        await closeConnectionIfNeeded(previous, generation: previousTransportGeneration)
+        _ = await pending.outbound?.value
+        _ = await pending.resize?.value
+        _ = await pending.event?.value
+
         connection = replacement
+        transportGeneration &+= 1
         reconnectGeneration &+= 1
         reconnectState = .connecting(attempt: Int(reconnectGeneration))
         redactor = Redactor()
@@ -103,7 +123,6 @@ final class SessionRuntime {
         reconnectState = .connected
         installCallbacks()
         startEventMonitoring()
-        await previous.close()
     }
 
     @discardableResult
@@ -111,37 +130,38 @@ final class SessionRuntime {
         guard session.state == .connected else { return false }
         let token = callbackToken
         let activeConnection = connection
-        do {
-            try await activeConnection.send(data)
-            return accepts(token)
-        } catch {
-            return false
+        let previous = outboundTask
+        let task = Task { @MainActor [weak self] in
+            _ = await previous?.value
+            guard let self, self.accepts(token) else { return false }
+            do {
+                try await activeConnection.send(data)
+                return self.accepts(token)
+            } catch {
+                return false
+            }
         }
+        outboundTask = task
+        return await task.value
     }
 
     @discardableResult
     func resize(_ size: TerminalSize) async -> Bool {
         guard session.state == .connected else { return false }
-        let token = callbackToken
-        let activeConnection = connection
-        do {
-            try await activeConnection.resize(size)
-            guard accepts(token) else { return false }
-            session.terminalSize = size
-            terminalGrid.resize(size)
-            return true
-        } catch {
-            return false
-        }
+        return await queueResize(size, token: callbackToken).value
     }
 
     func disconnect() async {
-        invalidateCallbacks()
+        let activeConnection = connection
+        let activeTransportGeneration = transportGeneration
+        let pending = invalidateCallbacks()
         session.state = .disconnected
         reconnectState = .idle
         redactor = Redactor()
-        let activeConnection = connection
-        await activeConnection.close()
+        await closeConnectionIfNeeded(activeConnection, generation: activeTransportGeneration)
+        _ = await pending.outbound?.value
+        _ = await pending.resize?.value
+        _ = await pending.event?.value
     }
 
     private func installCallbacks() {
@@ -155,28 +175,46 @@ final class SessionRuntime {
         terminalController.onResize = { [weak self] size in
             Task { @MainActor [weak self] in
                 guard let self, self.accepts(token) else { return }
-                self.enqueueResize(size, token: token)
+                _ = self.queueResize(size, token: token)
             }
         }
     }
 
     private func enqueue(_ data: Data, token: CallbackToken) {
+        guard accepts(token) else { return }
         let previous = outboundTask
-        outboundTask = Task { @MainActor [weak self] in
-            _ = await previous?.value
-            guard let self, self.accepts(token) else { return }
-            _ = await self.send(data)
-        }
-    }
-
-    private func enqueueResize(_ size: TerminalSize, token: CallbackToken) {
-        let previous = terminalResizeTask
+        let activeConnection = connection
         let task = Task { @MainActor [weak self] in
             _ = await previous?.value
             guard let self, self.accepts(token) else { return false }
-            return await self.resize(size)
+            do {
+                try await activeConnection.send(data)
+                return self.accepts(token)
+            } catch {
+                return false
+            }
+        }
+        outboundTask = task
+    }
+
+    private func queueResize(_ size: TerminalSize, token: CallbackToken) -> Task<Bool, Never> {
+        let previous = terminalResizeTask
+        let activeConnection = connection
+        let task = Task { @MainActor [weak self] in
+            _ = await previous?.value
+            guard let self, self.accepts(token) else { return false }
+            do {
+                try await activeConnection.resize(size)
+                guard self.accepts(token) else { return false }
+                self.session.terminalSize = size
+                self.terminalGrid.resize(size)
+                return true
+            } catch {
+                return false
+            }
         }
         terminalResizeTask = task
+        return task
     }
 
     private func startEventMonitoring() {
@@ -192,25 +230,57 @@ final class SessionRuntime {
                     case .bytes(let data):
                         self.consume(data)
                     case .closed:
-                        self.session.state = .disconnected
-                        self.reconnectState = .idle
-                        self.redactor = Redactor()
-                        self.detachCallbacks()
+                        await self.terminate(
+                            connection: eventsConnection,
+                            token: token,
+                            state: .disconnected,
+                            reconnectState: .idle
+                        )
+                        return
                     case .error:
-                        self.session.state = .failed
-                        self.reconnectState = .failed(reason: "Connection failed.")
-                        self.redactor = Redactor()
-                        self.detachCallbacks()
+                        await self.terminate(
+                            connection: eventsConnection,
+                            token: token,
+                            state: .failed,
+                            reconnectState: .failed(reason: "Connection failed.")
+                        )
+                        return
                     }
                 }
+                guard let self, self.accepts(token), !Task.isCancelled else { return }
+                await self.terminate(
+                    connection: eventsConnection,
+                    token: token,
+                    state: .disconnected,
+                    reconnectState: .idle
+                )
             } catch {
                 guard let self, self.accepts(token), !Task.isCancelled else { return }
-                self.session.state = .failed
-                self.reconnectState = .failed(reason: "Connection failed.")
-                self.redactor = Redactor()
-                self.detachCallbacks()
+                await self.terminate(
+                    connection: eventsConnection,
+                    token: token,
+                    state: .failed,
+                    reconnectState: .failed(reason: "Connection failed.")
+                )
             }
         }
+    }
+
+    private func terminate(
+        connection: any SSHConnection,
+        token: CallbackToken,
+        state: TerminalSessionState,
+        reconnectState: ReconnectState
+    ) async {
+        guard accepts(token) else { return }
+        session.state = state
+        self.reconnectState = reconnectState
+        redactor = Redactor()
+        let pending = invalidateCallbacks()
+        await closeConnectionIfNeeded(connection, generation: token.transportGeneration)
+        _ = await pending.outbound?.value
+        _ = await pending.resize?.value
+        // The event task invokes this method and must not await itself.
     }
 
     private func consume(_ data: Data) {
@@ -220,8 +290,13 @@ final class SessionRuntime {
         terminalController.feed(redacted)
     }
 
-    private func invalidateCallbacks() {
+    private func invalidateCallbacks() -> PendingTasks {
         callbackGeneration &+= 1
+        let pending = PendingTasks(
+            event: eventTask,
+            outbound: outboundTask,
+            resize: terminalResizeTask
+        )
         eventTask?.cancel()
         eventTask = nil
         outboundTask?.cancel()
@@ -230,14 +305,15 @@ final class SessionRuntime {
         terminalResizeTask = nil
         terminalController.onOutput = nil
         terminalController.onResize = nil
+        return pending
     }
 
-    private func detachCallbacks() {
-        outboundTask?.cancel()
-        outboundTask = nil
-        terminalResizeTask?.cancel()
-        terminalResizeTask = nil
-        terminalController.onOutput = nil
-        terminalController.onResize = nil
+    private func closeConnectionIfNeeded(
+        _ connection: any SSHConnection,
+        generation: UInt64
+    ) async {
+        guard closedTransportGeneration != generation else { return }
+        closedTransportGeneration = generation
+        await connection.close()
     }
 }
