@@ -177,6 +177,23 @@ final class CommandDialTests: XCTestCase {
         XCTAssertTrue(navigation.isOpen)
     }
 
+    func testNestedGroupActivationKeepsParentBeforeSiblingNavigation() throws {
+        let model = CommandDialModel()
+        var navigation = CommandDialNavigation(isOpen: true)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        let keyboard = try XCTUnwrap(input.children.first { $0.id == "input.keyboard" })
+
+        XCTAssertEqual(navigation.activate(input), .navigated(nodeID: input.id))
+        XCTAssertEqual(navigation.activate(navigate), .navigated(nodeID: navigate.id))
+        XCTAssertEqual(navigation.path, [input.id, navigate.id])
+
+        navigation.back()
+        XCTAssertEqual(navigation.path, [input.id])
+        XCTAssertEqual(navigation.activate(keyboard), .dispatch(.keyboard))
+        XCTAssertEqual(navigation.path, [input.id])
+    }
+
     func testCornerGeometryMirrorsPlacementAndInsetsSparsePages() throws {
         let leading = DialRadialLayout.corner(
             center: CGPoint(x: 70, y: 700), radius: 240, itemRadius: 38,

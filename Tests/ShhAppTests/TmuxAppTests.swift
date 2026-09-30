@@ -196,6 +196,20 @@ final class TmuxAppTests: XCTestCase {
         _ = navigation
     }
 
+    func testCommandDialCompactKeyboardViewportKeepsCardsBelowHeader() throws {
+        let layout = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .trailing,
+            nodeCount: 4,
+            containerSize: CGSize(width: 393, height: 500),
+            safeAreaInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
+        )
+        let topCard =
+            try XCTUnwrap(layout.positions.map { $0.y }.min()) - layout.itemSize.height / 2
+        XCTAssertGreaterThanOrEqual(topCard, 170)
+        XCTAssertLessThan(layout.orbitRadius, 254)
+    }
+
     func testCommandDialLeadingPlacementRadiusMatchesTrailing() {
         let insets = EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0)
         let phoneSize = CGSize(width: 393, height: 852)
