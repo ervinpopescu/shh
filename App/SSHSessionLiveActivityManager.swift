@@ -194,11 +194,8 @@ final class SSHSessionLiveActivityManager {
   nonisolated static let connectedStatusFreshness: TimeInterval = 60
   nonisolated static let otherStatusFreshness: TimeInterval = 5 * 60
 
-  nonisolated static func staleDate(
-    for state: Attributes.ContentState,
-    now: Date = Date()
-  ) -> Date {
-    now.addingTimeInterval(
+  nonisolated static func staleDate(for state: Attributes.ContentState) -> Date {
+    state.updatedAt.addingTimeInterval(
       state.status == .connected ? connectedStatusFreshness : otherStatusFreshness
     )
   }
