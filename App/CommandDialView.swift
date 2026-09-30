@@ -175,7 +175,12 @@ struct CommandDialSurface: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-                if Self.usesListLayout(dynamicTypeSize: dynamicTypeSize) {
+                if Self.usesListLayout(
+                    dynamicTypeSize: dynamicTypeSize,
+                    size: size,
+                    containerSize: proxy.size,
+                    safeAreaInsets: proxy.safeAreaInsets
+                ) {
                     accessibilityLayout(proxy: proxy)
                         .zIndex(3)
                 } else {
@@ -202,7 +207,14 @@ struct CommandDialSurface: View {
                 value: navigation.path
             )
             .onChange(of: triggerDrag) { _, event in
-                guard let event, !Self.usesListLayout(dynamicTypeSize: dynamicTypeSize) else {
+                guard let event,
+                    !Self.usesListLayout(
+                        dynamicTypeSize: dynamicTypeSize,
+                        size: size,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    )
+                else {
                     return
                 }
                 let frame = proxy.frame(in: .global)
@@ -218,8 +230,26 @@ struct CommandDialSurface: View {
         }
     }
 
-    static func usesListLayout(dynamicTypeSize: DynamicTypeSize) -> Bool {
-        dynamicTypeSize.isAccessibilitySize
+    static func usesListLayout(
+        dynamicTypeSize: DynamicTypeSize,
+        size: CommandDialSize = .compact,
+        containerSize: CGSize? = nil,
+        safeAreaInsets: EdgeInsets = EdgeInsets()
+    ) -> Bool {
+        guard !dynamicTypeSize.isAccessibilitySize, let containerSize else {
+            return dynamicTypeSize.isAccessibilitySize
+        }
+
+        let cardHalfHeight: CGFloat = size == .compact ? 39 : 44
+        let centerY = containerSize.height - safeAreaInsets.bottom - cardHalfHeight - 20
+        let headerReserve: CGFloat = size == .compact ? 178 : 192
+        let heightLimit = centerY - safeAreaInsets.top - headerReserve - cardHalfHeight
+
+        // A clamped radius of 132 points is not enough to keep a card inside a
+        // short keyboard-reduced viewport. Use the scrollable list before the
+        // radial layout reaches that clamp, while retaining the radial dial at
+        // normal phone and tablet heights.
+        return heightLimit < 132
     }
 
     private func radialLayout(in proxy: GeometryProxy) -> DialRadialLayout {

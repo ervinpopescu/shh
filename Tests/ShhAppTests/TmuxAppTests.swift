@@ -156,9 +156,25 @@ final class TmuxAppTests: XCTestCase {
         _ = state
     }
 
-    func testCommandDialKeyboardVisibleKeepsRadialActionsVisible() {
+    func testCommandDialKeyboardVisibleUsesSafeListFallback() {
         XCTAssertFalse(CommandDialSurface.usesListLayout(dynamicTypeSize: .large))
         XCTAssertTrue(CommandDialSurface.usesListLayout(dynamicTypeSize: .accessibility3))
+        XCTAssertTrue(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: CGSize(width: 568, height: 212),
+                safeAreaInsets: EdgeInsets()
+            )
+        )
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: CGSize(width: 568, height: 500),
+                safeAreaInsets: EdgeInsets()
+            )
+        )
         var navigation = CommandDialNavigation(isOpen: true)
         let model = CommandDialModel(connected: true)
         let surface = CommandDialSurface(
@@ -197,15 +213,38 @@ final class TmuxAppTests: XCTestCase {
     }
 
     func testCommandDialCompactKeyboardViewportKeepsCardsBelowHeader() throws {
+        let compactViewport = CGSize(width: 568, height: 212)
+        XCTAssertTrue(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: compactViewport,
+                safeAreaInsets: EdgeInsets()
+            )
+        )
+
+        let normalViewport = CGSize(width: 393, height: 500)
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: normalViewport,
+                safeAreaInsets: EdgeInsets()
+            )
+        )
         let layout = CommandDialSurface.computeRadialLayout(
             size: .compact,
             placement: .trailing,
             nodeCount: 4,
-            containerSize: CGSize(width: 393, height: 500),
-            safeAreaInsets: EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0)
+            containerSize: normalViewport,
+            safeAreaInsets: EdgeInsets()
         )
         let topCard =
             try XCTUnwrap(layout.positions.map { $0.y }.min()) - layout.itemSize.height / 2
+        let bottomCard =
+            try XCTUnwrap(layout.positions.map { $0.y }.max()) + layout.itemSize.height / 2
+        XCTAssertGreaterThanOrEqual(topCard, 0)
+        XCTAssertLessThanOrEqual(bottomCard, normalViewport.height)
         XCTAssertGreaterThanOrEqual(topCard, 170)
         XCTAssertLessThan(layout.orbitRadius, 254)
     }
