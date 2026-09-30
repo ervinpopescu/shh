@@ -507,14 +507,19 @@ final class LiveActivityTests: XCTestCase {
     await activity.end(nil, dismissalPolicy: .immediate)
   }
 
-  func testConnectedActivityUsesFiniteFreshnessAndHonestStalePresentation() {
+  func testConnectedActivityStaleDateUsesStateTimestamp() {
     let confirmedAt = Date(timeIntervalSince1970: 1_700_000_000)
     let state = ShhSSHSessionActivityAttributes.ContentState(
       status: .connected,
       updatedAt: confirmedAt
     )
-    let staleDate = SSHSessionLiveActivityManager.staleDate(for: state, now: confirmedAt)
+    // ActivityKit may execute the request after the state was created.
+    let staleDate = SSHSessionLiveActivityManager.staleDate(for: state)
 
+    XCTAssertEqual(
+      staleDate,
+      confirmedAt.addingTimeInterval(SSHSessionLiveActivityManager.connectedStatusFreshness)
+    )
     XCTAssertEqual(
       staleDate.timeIntervalSince(confirmedAt),
       SSHSessionLiveActivityManager.connectedStatusFreshness
