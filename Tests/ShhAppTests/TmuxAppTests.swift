@@ -275,8 +275,17 @@ final class TmuxAppTests: XCTestCase {
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
-        second.onExecuteCommand = { _ in
-            SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+        second.onExecuteCommand = { command in
+            if command == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            if command == TmuxCommand.listSessions {
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no sessions\n")
+            }
+            if command.contains("has-session") {
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no session\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
         }
 
         await container.connect(to: host)
