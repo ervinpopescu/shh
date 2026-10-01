@@ -74,7 +74,10 @@ final class TmuxAppTests: XCTestCase {
             case TmuxCommand.probe:
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             case TmuxExecutableDiscovery.loginPathCommand:
-                return SSHCommandResult(exitCode: 0, stdout: "profile notice\n\(discovered)\n")
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n\(discovered)\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
             case TmuxCommand.probe(executable: discovered):
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             case TmuxCommand.listSessions(executable: discovered):
@@ -93,6 +96,208 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertTrue(attached)
         let terminalOutput = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }.joined()
         XCTAssertTrue(terminalOutput.contains("env -u TMUX '\(discovered)' attach-session -d -t '$0'"))
+    }
+
+    func testRestorationResolvesExecutableBeforeSessionValidation() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let hostID = UUID()
+        let store = InMemorySessionRestorationStore(
+            initial: SessionRestorationMetadata(hostID: hostID, tmuxSessionID: "$0")
+        )
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(
+            id: hostID,
+            name: "Restored PATH Host",
+            hostname: "restored-path.test",
+            username: "user",
+            autoAttachTmux: true
+        )
+        let discovered = "/home/user/.local/bin/tmux"
+        let commands = LockedString("")
+        mock.onExecuteCommand = { command in
+            commands.value += command + "\n"
+            switch command {
+            case TmuxCommand.probe:
+                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+            case TmuxExecutableDiscovery.loginPathCommand:
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n\(discovered)\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            case TmuxCommand.probe(executable: discovered),
+                TmuxCommand.hasSession(id: "$0", executable: discovered):
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            default:
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+        }
+
+        await container.connect(to: host)
+        let executedCommands = commands.value.components(separatedBy: "\n")
+        XCTAssertEqual(
+            executedCommands.filter { $0 == TmuxExecutableDiscovery.loginPathCommand }.count,
+            1
+        )
+        XCTAssertEqual(
+            executedCommands.filter { $0 == TmuxCommand.probe(executable: discovered) }.count,
+            1
+        )
+        XCTAssertTrue(commands.value.contains(TmuxCommand.hasSession(id: "$0", executable: discovered)))
+        XCTAssertFalse(commands.value.contains(TmuxCommand.hasSession(id: "$0")))
+    }
+
+    func testTmuxResolutionInvalidatesAfterPerformReconnect() async throws {
+        let first = MockSSHConnection()
+        let second = MockSSHConnection()
+        let sequence = ConnectionSequence([first, second])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await sequence.next() }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Reconnecting PATH Host", hostname: "reconnect-path.test", username: "user")
+        let phase = LockedString("first")
+        let commands = LockedString("")
+        let discovered = "/opt/tmux/bin/tmux"
+        let replacement = "/new/tmux/bin/tmux"
+        let handler: @Sendable (String) async throws -> SSHCommandResult = { command in
+            commands.value += command + "\n"
+            if phase.value == "first" {
+                switch command {
+                case TmuxCommand.probe:
+                    return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+                case TmuxExecutableDiscovery.loginPathCommand:
+                    return SSHCommandResult(
+                        exitCode: 0,
+                        stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n\(discovered)\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                    )
+                case TmuxCommand.probe(executable: discovered):
+                    return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+                default:
+                    return SSHCommandResult(exitCode: 0, stdout: "")
+                }
+            }
+            switch command {
+            case TmuxCommand.probe(executable: discovered):
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            case TmuxCommand.probe:
+                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+            case TmuxExecutableDiscovery.loginPathCommand:
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n\(replacement)\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            case TmuxCommand.probe(executable: replacement):
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.5\n")
+            default:
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+        }
+        first.onExecuteCommand = handler
+        second.onExecuteCommand = handler
+
+        await container.connect(to: host)
+        _ = await container.probeTmux()
+        phase.value = "second"
+        try await container.performReconnect(to: host, attempt: 1)
+        let availability = await container.probeTmux()
+
+        XCTAssertTrue(first.isClosed)
+        XCTAssertTrue(availability.isAvailable)
+        XCTAssertTrue(commands.value.contains(TmuxExecutableDiscovery.loginPathCommand))
+        XCTAssertTrue(commands.value.contains(TmuxCommand.probe(executable: replacement)))
+    }
+
+    func testStaleTmuxResolutionCannotMutateAfterConnectionSwap() async throws {
+        let first = MockSSHConnection()
+        let second = MockSSHConnection()
+        let sequence = ConnectionSequence([first, second])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await sequence.next() }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Swap Host", hostname: "swap.test", username: "user")
+        let gate = AsyncGate()
+        first.onExecuteCommand = { command in
+            if command == TmuxCommand.probe {
+                await gate.wait()
+                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+        second.onExecuteCommand = { _ in
+            SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+        }
+
+        await container.connect(to: host)
+        let staleList = Task { @MainActor in await container.listTmuxSessions() }
+        await gate.waitForStart()
+        await container.connect(to: host)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        await gate.open()
+        _ = await staleList.value
+
+        XCTAssertNil(container.tmuxError)
+        XCTAssertTrue(container.tmuxSessions.isEmpty)
+    }
+
+    func testTmuxResolutionFallsBackAfterInvalidDefaultProbeOutput() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Empty Probe Host", hostname: "empty-probe.test", username: "user")
+        let phase = LockedString("initial")
+        let commands = LockedString("")
+        let discovered = "/opt/tmux/bin/tmux"
+        mock.onExecuteCommand = { command in
+            commands.value += command + "\n"
+            if phase.value == "initial" {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            switch command {
+            case TmuxCommand.probe:
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            case TmuxExecutableDiscovery.loginPathCommand:
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n\(discovered)\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            case TmuxCommand.probe(executable: discovered):
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            default:
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+        }
+
+        await container.connect(to: host)
+        let initialAvailability = await container.probeTmux()
+        XCTAssertTrue(initialAvailability.isAvailable)
+        phase.value = "empty"
+        let rediscoveredAvailability = await container.probeTmux()
+        XCTAssertTrue(rediscoveredAvailability.isAvailable)
+        XCTAssertTrue(commands.value.contains(TmuxExecutableDiscovery.loginPathCommand))
+        XCTAssertTrue(commands.value.contains(TmuxCommand.probe(executable: discovered)))
     }
 
     func testCommandDialControlRequiresApprovalAndUsesExecChannel() async throws {

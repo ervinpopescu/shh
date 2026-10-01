@@ -158,8 +158,6 @@ final class AppContainer: ObservableObject {
     @Published public var herdrError: String? = nil
     @Published public var activeHerdrWorkspaceID: String? = nil
     private var herdrRefreshGeneration: Int = 0
-    private var resolvedTmuxExecutable: String?
-    private var resolvedTmuxHostID: UUID?
     private var herdrPollingGeneration: Int = 0
     private var herdrPollingTask: Task<Void, Never>?
 
@@ -775,8 +773,6 @@ final class AppContainer: ObservableObject {
         herdrError = nil
         isExplicitDisconnect = false
         activeHost = host
-        resolvedTmuxExecutable = nil
-        resolvedTmuxHostID = nil
         activeTmuxSessionID = nil
         tmuxSessions = []
         isTmuxServerRunning = false
@@ -2099,15 +2095,11 @@ final class AppContainer: ObservableObject {
         activeHerdrWorkspaceID = workspace.id
     }
 
-    private func tmuxExecutable(for host: Host) -> String {
-        if resolvedTmuxHostID == host.id, let resolvedTmuxExecutable {
-            return resolvedTmuxExecutable
-        }
-        if let configured = host.tmuxPreferences.executablePath,
-           (try? TmuxControl(executable: configured)) != nil {
-            return configured
-        }
-        return resolvedTmuxExecutable ?? "tmux"
+    private struct TmuxResolution {
+        let availability: TmuxAvailability
+        let executable: String?
+
+        var isAvailable: Bool { availability.isAvailable }
     }
 
     private func tmuxProbeFailure(_ error: Error) -> String {
@@ -2119,38 +2111,49 @@ final class AppContainer: ObservableObject {
 
     private func resolveTmuxExecutable(
         using executor: any SSHCommandExecuting,
-        host: Host
-    ) async -> TmuxAvailability {
-        if resolvedTmuxHostID == host.id, let executable = resolvedTmuxExecutable {
-            do {
-                let result = try await executor.executeCommand(
-                    TmuxCommand.probe(executable: executable), timeout: 5.0
-                )
-                return TmuxAvailability.parse(result: result)
-            } catch {
-                return .unavailable(reason: tmuxProbeFailure(error))
-            }
+        host: Host,
+        connection: AnyObject
+    ) async -> TmuxResolution {
+        func isCurrentConnection() -> Bool {
+            guard let currentConnection = self.connection else { return false }
+            return (currentConnection as AnyObject) === connection && activeHost?.id == host.id
+        }
+        guard isCurrentConnection() else {
+            return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
         }
 
         if let configured = host.tmuxPreferences.executablePath,
            !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard (try? TmuxControl(executable: configured)) != nil else {
-                return .unavailable(reason: "Configured tmux executable path is invalid. Use an absolute path without whitespace or shell characters.")
+                return TmuxResolution(
+                    availability: .unavailable(reason: "Configured tmux executable path is invalid. Use an absolute path without whitespace or shell characters."),
+                    executable: nil
+                )
             }
             do {
                 let result = try await executor.executeCommand(
                     TmuxCommand.probe(executable: configured), timeout: 5.0
                 )
+                guard isCurrentConnection() else {
+                    return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
+                }
                 guard result.isSuccess else {
                     let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                     let suffix = detail.isEmpty ? "exit code \(result.exitCode)" : detail
-                    return .unavailable(reason: "Configured tmux executable \(configured) could not be run (\(suffix)). Verify the path and permissions.")
+                    return TmuxResolution(
+                        availability: .unavailable(reason: "Configured tmux executable \(configured) could not be run (\(suffix)). Verify the path and permissions."),
+                        executable: nil
+                    )
                 }
-                resolvedTmuxExecutable = configured
-                resolvedTmuxHostID = host.id
-                return TmuxAvailability.parse(result: result)
+                let availability = TmuxAvailability.parse(result: result)
+                guard availability.isAvailable else {
+                    return TmuxResolution(availability: availability, executable: nil)
+                }
+                return TmuxResolution(availability: availability, executable: configured)
             } catch {
-                return .unavailable(reason: tmuxProbeFailure(error))
+                return TmuxResolution(
+                    availability: .unavailable(reason: tmuxProbeFailure(error)), executable: nil
+                )
             }
         }
 
@@ -2158,49 +2161,81 @@ final class AppContainer: ObservableObject {
             let direct = try await executor.executeCommand(
                 TmuxCommand.probe, timeout: 5.0
             )
-            if direct.isSuccess {
-                resolvedTmuxExecutable = "tmux"
-                resolvedTmuxHostID = host.id
-                return TmuxAvailability.parse(result: direct)
+            guard isCurrentConnection() else {
+                return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
             }
-            guard direct.exitCode == 127 else {
+            if direct.isSuccess {
+                let availability = TmuxAvailability.parse(result: direct)
+                if availability.isAvailable {
+                    return TmuxResolution(availability: availability, executable: "tmux")
+                }
+                // A successful but unusable default probe must still try the
+                // login-PATH discovery fallback below.
+            } else if direct.exitCode != 127 {
                 let availability = TmuxAvailability.parse(result: direct)
                 if case .unavailable(let reason) = availability {
-                    return .unavailable(reason: "Tmux probe failed (exit code \(direct.exitCode)): \(reason)")
+                    return TmuxResolution(
+                        availability: .unavailable(reason: "Tmux probe failed (exit code \(direct.exitCode)): \(reason)"),
+                        executable: nil
+                    )
                 }
-                return .unavailable(reason: "Tmux probe failed with exit code \(direct.exitCode).")
+                return TmuxResolution(
+                    availability: .unavailable(reason: "Tmux probe failed with exit code \(direct.exitCode)."),
+                    executable: nil
+                )
             }
         } catch {
-            return .unavailable(reason: tmuxProbeFailure(error))
+            return TmuxResolution(
+                availability: .unavailable(reason: tmuxProbeFailure(error)), executable: nil
+            )
         }
 
         do {
             let discovery = try await executor.executeCommand(
                 TmuxExecutableDiscovery.loginPathCommand, timeout: 5.0
             )
+            guard isCurrentConnection() else {
+                return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
+            }
             guard let discoveredPath = TmuxExecutableDiscovery.parseExecutablePath(
-                from: discovery.stdout
+                result: discovery
             ) else {
-                return .unavailable(
-                    reason: "Tmux was not found in the SSH command PATH or the remote login PATH. Install tmux or configure its absolute executable path in host settings."
+                return TmuxResolution(
+                    availability: .unavailable(
+                        reason: "Tmux was not found in the SSH command PATH or the remote login PATH. Install tmux or configure its absolute executable path in host settings."
+                    ),
+                    executable: nil
                 )
             }
             guard (try? TmuxControl(executable: discoveredPath)) != nil else {
-                return .unavailable(reason: "The remote login shell reported an unsafe tmux path. Configure a trusted absolute executable path in host settings.")
+                return TmuxResolution(
+                    availability: .unavailable(reason: "The remote login shell reported an unsafe tmux path. Configure a trusted absolute executable path in host settings."),
+                    executable: nil
+                )
             }
             let result = try await executor.executeCommand(
                 TmuxCommand.probe(executable: discoveredPath), timeout: 5.0
             )
+            guard isCurrentConnection() else {
+                return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
+            }
             guard result.isSuccess else {
                 let detail = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
                 let suffix = detail.isEmpty ? "exit code \(result.exitCode)" : detail
-                return .unavailable(reason: "Tmux was found at \(discoveredPath), but its version probe failed (\(suffix)). Check executable permissions.")
+                return TmuxResolution(
+                    availability: .unavailable(reason: "Tmux was found at \(discoveredPath), but its version probe failed (\(suffix)). Check executable permissions."),
+                    executable: nil
+                )
             }
-            resolvedTmuxExecutable = discoveredPath
-            resolvedTmuxHostID = host.id
-            return TmuxAvailability.parse(result: result)
+            let availability = TmuxAvailability.parse(result: result)
+            guard availability.isAvailable else {
+                return TmuxResolution(availability: availability, executable: nil)
+            }
+            return TmuxResolution(availability: availability, executable: discoveredPath)
         } catch {
-            return .unavailable(reason: tmuxProbeFailure(error))
+            return TmuxResolution(
+                availability: .unavailable(reason: tmuxProbeFailure(error)), executable: nil
+            )
         }
     }
 
@@ -2213,15 +2248,24 @@ final class AppContainer: ObservableObject {
     ) async -> Bool {
         let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let executor = connection as? SSHCommandExecuting else { return false }
-        let availability = await resolveTmuxExecutable(using: executor, host: host)
-        guard availability.isAvailable else {
-            tmuxAvailability = availability
-            if case .unavailable(let reason) = availability {
+        let connectionObject = connection as AnyObject
+        let resolution = await resolveTmuxExecutable(
+            using: executor, host: host, connection: connectionObject
+        )
+        guard activeSession?.id == session.id,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (self.connection as AnyObject) === connectionObject else {
+            return false
+        }
+        guard resolution.isAvailable else {
+            tmuxAvailability = resolution.availability
+            if case .unavailable(let reason) = resolution.availability {
                 tmuxError = reason
             }
             return false
         }
-        let executable = tmuxExecutable(for: host)
+        guard let executable = resolution.executable else { return false }
         if trimmed.hasPrefix("$") {
             do {
                 let check = try await executor.executeCommand(
@@ -2255,7 +2299,7 @@ final class AppContainer: ObservableObject {
                   (self.connection as AnyObject) === (connection as AnyObject) else {
                 return false
             }
-            return await attachTmuxSession(id: trimmed)
+            return await attachTmuxSession(id: trimmed, resolvedExecutable: executable)
         } else if !trimmed.isEmpty {
             // A remembered name may be attached only if it already exists. Never
             // create a session during restoration.
@@ -2275,7 +2319,7 @@ final class AppContainer: ObservableObject {
                 tmuxError = "Remembered tmux session \(trimmed) no longer exists on remote host. Select a session to recover it."
                 return false
             }
-            return await attachTmuxSession(id: match.sessionID)
+            return await attachTmuxSession(id: match.sessionID, resolvedExecutable: executable)
         }
         return false
     }
@@ -2300,19 +2344,24 @@ final class AppContainer: ObservableObject {
             tmuxAvailability = avail
             return avail
         }
-        let avail = await resolveTmuxExecutable(using: executor, host: host)
+        let resolution = await resolveTmuxExecutable(
+            using: executor, host: host, connection: connObj
+        )
         guard activeSession?.id == sessionID,
               activeSession?.state == .connected,
               !isExplicitDisconnect,
               (connection as AnyObject) === connObj else {
             return .unavailable(reason: "Session disconnected")
         }
-        tmuxAvailability = avail
-        return avail
+        tmuxAvailability = resolution.availability
+        return resolution.availability
     }
 
     @discardableResult
-    func listTmuxSessions(expectedGeneration: Int? = nil) async -> [TmuxSessionInfo] {
+    func listTmuxSessions(
+        expectedGeneration: Int? = nil,
+        resolvedExecutable: String? = nil
+    ) async -> [TmuxSessionInfo] {
         guard let currentSession = activeSession, currentSession.state == .connected,
               let executor = connection as? SSHCommandExecuting else {
             tmuxSessions = []
@@ -2321,19 +2370,37 @@ final class AppContainer: ObservableObject {
         }
         let sessionID = currentSession.id
         let connObj = connection as AnyObject
-        if let host = activeHost,
-           resolvedTmuxHostID != host.id || resolvedTmuxExecutable == nil {
-            let availability = await resolveTmuxExecutable(using: executor, host: host)
-            guard availability.isAvailable else {
+        guard let host = activeHost else {
+            tmuxSessions = []
+            isTmuxServerRunning = false
+            tmuxError = "No active host"
+            return []
+        }
+        let executable: String
+        if let resolvedExecutable {
+            executable = resolvedExecutable
+        } else {
+            let resolution = await resolveTmuxExecutable(
+                using: executor, host: host, connection: connObj
+            )
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj,
+                  expectedGeneration == nil || expectedGeneration == tmuxRefreshGeneration else {
+                return []
+            }
+            guard resolution.isAvailable else {
                 tmuxSessions = []
                 isTmuxServerRunning = false
-                if case .unavailable(let reason) = availability {
+                if case .unavailable(let reason) = resolution.availability {
                     tmuxError = reason
                 }
                 return []
             }
+            guard let resolvedExecutable = resolution.executable else { return [] }
+            executable = resolvedExecutable
         }
-        let executable = activeHost.map { tmuxExecutable(for: $0) } ?? "tmux"
         do {
             let result = try await executor.executeCommand(
                 TmuxCommand.listSessions(executable: executable), timeout: 5.0
@@ -2586,21 +2653,34 @@ final class AppContainer: ObservableObject {
         guard activeSession?.state == .connected, let conn = connection,
             let executor = conn as? SSHCommandExecuting
         else { return false }
-        let sessionID = activeSession?.id
+        guard let sessionID = activeSession?.id else { return false }
         let connObj = conn as AnyObject
-        if case .tmux = action, let host = activeHost {
-            let availability = await resolveTmuxExecutable(using: executor, host: host)
-            guard availability.isAvailable else {
-                if case .unavailable(let reason) = availability { tmuxError = reason }
+        let tmuxExecutable: String?
+        if case .tmux = action {
+            guard let host = activeHost else { return false }
+            let resolution = await resolveTmuxExecutable(
+                using: executor, host: host, connection: connObj
+            )
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return false
             }
+            guard resolution.isAvailable else {
+                if case .unavailable(let reason) = resolution.availability { tmuxError = reason }
+                return false
+            }
+            tmuxExecutable = resolution.executable
+        } else {
+            tmuxExecutable = nil
         }
         let command: String
         do {
             switch action {
             case .tmux:
-                let executable = activeHost.map { tmuxExecutable(for: $0) } ?? "tmux"
-                command = try TmuxControl(executable: executable).command(for: action)
+                guard let tmuxExecutable else { return false }
+                command = try TmuxControl(executable: tmuxExecutable).command(for: action)
             case .herdr: command = try HerdrControl().command(for: action)
             }
         } catch { return false }
@@ -2624,20 +2704,37 @@ final class AppContainer: ObservableObject {
     }
 
     @discardableResult
-    func attachTmuxSession(id: String) async -> Bool {
+    func attachTmuxSession(id: String, resolvedExecutable: String? = nil) async -> Bool {
         guard activeSession?.state == .connected, let conn = connection else {
             tmuxError = "Not connected."
             return false
         }
         guard let sessionID = activeSession?.id else { return false }
         let connObj = conn as AnyObject
-        if let host = activeHost,
-           let executor = conn as? SSHCommandExecuting {
-            let availability = await resolveTmuxExecutable(using: executor, host: host)
-            guard availability.isAvailable else {
-                if case .unavailable(let reason) = availability { tmuxError = reason }
+        guard let executor = conn as? SSHCommandExecuting,
+              let host = activeHost else {
+            tmuxError = "Tmux requires an SSH command-capable connection."
+            return false
+        }
+        let executable: String
+        if let resolvedExecutable {
+            executable = resolvedExecutable
+        } else {
+            let resolution = await resolveTmuxExecutable(
+                using: executor, host: host, connection: connObj
+            )
+            guard activeSession?.id == sessionID,
+                  activeSession?.state == .connected,
+                  !isExplicitDisconnect,
+                  (connection as AnyObject) === connObj else {
                 return false
             }
+            guard resolution.isAvailable else {
+                if case .unavailable(let reason) = resolution.availability { tmuxError = reason }
+                return false
+            }
+            guard let resolvedExecutable = resolution.executable else { return false }
+            executable = resolvedExecutable
         }
         let validatedID: TmuxSessionID
         do {
@@ -2649,7 +2746,6 @@ final class AppContainer: ObservableObject {
 
         let cmd: String
         do {
-            let executable = activeHost.map { tmuxExecutable(for: $0) } ?? "tmux"
             cmd = try TmuxControl(executable: executable).command(for: .tmux(.attachSession(validatedID)))
         } catch {
             tmuxError = error.localizedDescription
@@ -2702,14 +2798,25 @@ final class AppContainer: ObservableObject {
         }
         guard let sessionID = activeSession?.id else { return false }
         let connObj = conn as AnyObject
-        if let host = activeHost,
-           let executor = conn as? SSHCommandExecuting {
-            let availability = await resolveTmuxExecutable(using: executor, host: host)
-            guard availability.isAvailable else {
-                if case .unavailable(let reason) = availability { tmuxError = reason }
-                return false
-            }
+        guard let executor = conn as? SSHCommandExecuting,
+              let host = activeHost else {
+            tmuxError = "Tmux requires an SSH command-capable connection."
+            return false
         }
+        let resolution = await resolveTmuxExecutable(
+            using: executor, host: host, connection: connObj
+        )
+        guard activeSession?.id == sessionID,
+              activeSession?.state == .connected,
+              !isExplicitDisconnect,
+              (connection as AnyObject) === connObj else {
+            return false
+        }
+        guard resolution.isAvailable else {
+            if case .unavailable(let reason) = resolution.availability { tmuxError = reason }
+            return false
+        }
+        guard let executable = resolution.executable else { return false }
         let validatedName: TmuxSessionName
         do {
             validatedName = try TmuxSessionName(name)
@@ -2720,7 +2827,6 @@ final class AppContainer: ObservableObject {
 
         let cmd: String
         do {
-            let executable = activeHost.map { tmuxExecutable(for: $0) } ?? "tmux"
             cmd = try TmuxControl(executable: executable).command(for: .tmux(.createSession(validatedName)))
         } catch {
             tmuxError = error.localizedDescription
@@ -2745,7 +2851,7 @@ final class AppContainer: ObservableObject {
         }
         if sent {
             tmuxRefreshGeneration += 1
-            _ = await listTmuxSessions()
+            _ = await listTmuxSessions(resolvedExecutable: executable)
             activeTmuxSessionID =
                 tmuxSessions.first(where: { $0.name == validatedName.value })?.sessionID
                 ?? validatedName.value

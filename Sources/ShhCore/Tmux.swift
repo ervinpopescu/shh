@@ -99,16 +99,28 @@ public enum TmuxAvailability: Equatable, Hashable, Sendable, Codable {
 // MARK: - Tmux Executable Discovery
 
 public enum TmuxExecutableDiscovery {
-    /// This asks the remote shell to apply its normal login-PATH rules without
-    /// embedding a profile path or sourcing a profile from Shh. Profile output
-    /// is treated as untrusted noise and only a valid absolute path is accepted.
-    public static let loginPathCommand = "sh -lc 'command -v tmux'"
+    /// The login shell is asked to apply its normal PATH rules, but only an
+    /// exact sentinel-delimited response is accepted. Profile output before,
+    /// between, or after the response invalidates discovery.
+    public static let beginSentinel = "__SHH_TMUX_DISCOVERY_BEGIN_7F5A1C__"
+    public static let endSentinel = "__SHH_TMUX_DISCOVERY_END_7F5A1C__"
+    public static let loginPathCommand =
+        "sh -lc 'printf \"%s\\n\" \"\(beginSentinel)\"; command -v tmux; printf \"%s\\n\" \"\(endSentinel)\"'"
 
-    public static func parseExecutablePath(from output: String) -> String? {
-        output
+    public static func parseExecutablePath(result: SSHCommandResult) -> String? {
+        guard result.exitCode == 0, result.stderr.isEmpty else {
+            return nil
+        }
+        let lines = result.stdout
             .split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first(where: isSafeAbsolutePath)
+            .map { String($0) }
+        guard lines.count == 3,
+              lines[0] == beginSentinel,
+              lines[2] == endSentinel else {
+            return nil
+        }
+        let path = lines[1]
+        return isSafeAbsolutePath(path) ? path : nil
     }
 
     public static func isSafeAbsolutePath(_ path: String) -> Bool {
