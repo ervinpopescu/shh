@@ -68,26 +68,8 @@ jobs:
       - name: Build Swift targets
         run: |
           set -euo pipefail
-          xcodebuild build \
-            -project Shh.xcodeproj \
-            -scheme Shh \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/DerivedData \
-            -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO
-
-          xcodebuild build \
-            -project Shh.xcodeproj \
-            -scheme ShhFileProvider \
-            -destination 'generic/platform=iOS' \
-            -derivedDataPath build/DerivedData \
-            -skipPackagePluginValidation \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO
-
+          # Build the test scheme's dependency closure once so CodeQL sees
+          # production, extension, package, and test sources together.
           xcodebuild build-for-testing \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
