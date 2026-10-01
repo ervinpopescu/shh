@@ -2159,7 +2159,7 @@ final class AppContainer: ObservableObject {
 
         do {
             let direct = try await executor.executeCommand(
-                TmuxCommand.probe, timeout: 5.0
+                TmuxCommand.probe(), timeout: 5.0
             )
             guard isCurrentConnection() else {
                 return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)

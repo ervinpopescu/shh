@@ -119,7 +119,7 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
             return try await onExecuteCommand(command)
         }
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+        if trimmed == TmuxCommand.probe() || trimmed == "tmux -V" {
             return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
         }
         if trimmed.contains("list-sessions") {

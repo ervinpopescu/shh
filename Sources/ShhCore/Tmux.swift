@@ -99,13 +99,15 @@ public enum TmuxAvailability: Equatable, Hashable, Sendable, Codable {
 // MARK: - Tmux Executable Discovery
 
 public enum TmuxExecutableDiscovery {
-    /// The login shell is asked to apply its normal PATH rules, but only an
-    /// exact sentinel-delimited response is accepted. Profile output before,
-    /// between, or after the response invalidates discovery.
+    /// The remote account's advertised login shell is asked to apply its
+    /// normal PATH rules. The shell path expansion is quoted as one command
+    /// name, and only an exact sentinel-delimited response is accepted.
+    /// Profile output before, between, or after the response invalidates
+    /// discovery.
     public static let beginSentinel = "__SHH_TMUX_DISCOVERY_BEGIN_7F5A1C__"
     public static let endSentinel = "__SHH_TMUX_DISCOVERY_END_7F5A1C__"
     public static let loginPathCommand =
-        "sh -lc 'printf \"%s\\n\" \"\(beginSentinel)\"; command -v tmux; printf \"%s\\n\" \"\(endSentinel)\"'"
+        "\"${SHELL:-/bin/sh}\" -lc 'printf \"%s\\n\" \"\(beginSentinel)\"; command -v tmux; printf \"%s\\n\" \"\(endSentinel)\"'"
 
     public static func parseExecutablePath(result: SSHCommandResult) -> String? {
         guard result.exitCode == 0, result.stderr.isEmpty else {
@@ -124,8 +126,9 @@ public enum TmuxExecutableDiscovery {
     }
 
     public static func isSafeAbsolutePath(_ path: String) -> Bool {
-        !path.isEmpty && path.count <= 512 && path.hasPrefix("/") &&
-            !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.properties.isWhitespace })
+        guard !path.isEmpty, path.count <= 512, path.hasPrefix("/") else { return false }
+        guard path.split(separator: "/").last.map(String.init) != "herdr" else { return false }
+        return !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.properties.isWhitespace })
     }
 }
 
@@ -476,7 +479,9 @@ public enum TmuxSessionIDError: Error, Equatable, Sendable, LocalizedError {
 
 public enum TmuxCommand: Sendable {
     /// Exact probe template: `tmux -V`
-    public static let probe: String = "tmux -V"
+    public static func probe(executable: String = "tmux") -> String {
+        "\(executableToken(executable)) -V"
+    }
 
     /// Printable collision-resistant delimiter format string with explicit shell escaping for list-sessions
     public static let listSessionsFormat: String = "#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}"
@@ -485,10 +490,6 @@ public enum TmuxCommand: Sendable {
     /// absolute path. Quoting here keeps discovered PATH content data, not shell syntax.
     private static func executableToken(_ executable: String) -> String {
         executable == "tmux" ? executable : ShellQuoting.quote(executable)
-    }
-
-    public static func probe(executable: String = "tmux") -> String {
-        "\(executableToken(executable)) -V"
     }
 
     /// Exact list-sessions command template
