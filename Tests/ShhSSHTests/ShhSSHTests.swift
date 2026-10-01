@@ -286,11 +286,15 @@ final class ShhSSHTests: XCTestCase {
 
         let closedExpectation = expectation(description: "Stream received closed")
         Task {
-            for try await event in events {
-                if case .closed = event {
-                    closedExpectation.fulfill()
-                    break
+            do {
+                for try await event in events {
+                    if case .closed = event {
+                        closedExpectation.fulfill()
+                        break
+                    }
                 }
+            } catch {
+                XCTFail("Event stream failed before close: \(error)")
             }
         }
 

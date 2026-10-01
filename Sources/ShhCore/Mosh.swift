@@ -384,7 +384,7 @@ public actor DemoMoshConnection: MoshSessionControlling, SSHConnection {
         AsyncThrowingStream { continuation in
             self.eventContinuation = continuation
             continuation.yield(.bytes(Data("[mosh connected to demo server: UDP port \(self.sessionInfo.udpPort)]\r\n$ ".utf8)))
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [weak self] _ in
                 Task { [weak self] in
                     await self?.close()
                 }
@@ -397,7 +397,7 @@ public actor DemoMoshConnection: MoshSessionControlling, SSHConnection {
             let id = UUID()
             self.stateContinuations[id] = continuation
             continuation.yield(self.moshState)
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [weak self] _ in
                 Task { [weak self] in
                     await self?.removeStateContinuation(id)
                 }

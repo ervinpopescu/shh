@@ -674,7 +674,7 @@ public struct LiveSSHTransport: SSHTransport {
             }
 
             let inboundRouter = InboundChildChannelRouter()
-            bootstrap = bootstrap.channelInitializer { channel in
+            bootstrap = bootstrap.channelInitializer { [inboundRouter] channel in
                 let sshHandler = NIOSSHHandler(
                     role: .client(clientConfig),
                     allocator: channel.allocator,
@@ -1050,7 +1050,7 @@ public struct LiveSSHTransport: SSHTransport {
             )
 
             let targetParentChannel = currentChannel
-            let targetTransportChannel = try await targetParentChannel.eventLoop.flatSubmit {
+            let targetTransportChannel = try await targetParentChannel.eventLoop.flatSubmit { [targetInboundRouter] in
                 do {
                     let currentSSHHandler = try targetParentChannel.pipeline.syncOperations.handler(
                         type: NIOSSHHandler.self
