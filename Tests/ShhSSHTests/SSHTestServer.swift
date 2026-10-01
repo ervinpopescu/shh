@@ -694,7 +694,7 @@ final class SSHTestServer: @unchecked Sendable {
             )
         }
 
-        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+        if trimmed == TmuxCommand.probe() || trimmed == "tmux -V" {
             if self.execMode == .loginPathOnly {
                 return SSHCommandTestResponse(
                     exitCode: 127,

@@ -24,6 +24,36 @@ final class TmuxAppTests: XCTestCase {
 
     // MARK: - 1. Probe Tmux
 
+    func testHostEditorRejectsHerdrAsTmuxExecutablePath() throws {
+        let invalidMessage = HostEditorView.tmuxExecutablePathValidationMessage(for: "herdr")
+        XCTAssertNotNil(invalidMessage)
+        XCTAssertNil(HostEditorView.tmuxExecutablePathValidationMessage(for: ""))
+        XCTAssertNil(HostEditorView.tmuxExecutablePathValidationMessage(for: "tmux"))
+        XCTAssertNil(
+            HostEditorView.tmuxExecutablePathValidationMessage(for: "/usr/local/bin/tmux"))
+        XCTAssertNotNil(
+            HostEditorView.tmuxExecutablePathValidationMessage(for: "/opt/bin/herdr"))
+
+        let invalidHost = try Host(
+            name: "Herdr Path Host",
+            hostname: "herdr-path.test",
+            username: "user",
+            tmuxPreferences: HostTmuxPreferences(executablePath: "herdr")
+        )
+        XCTAssertNil(HostEditorView(existing: invalidHost).buildHost())
+
+        let validHost = try Host(
+            name: "Custom Tmux Path Host",
+            hostname: "tmux-path.test",
+            username: "user",
+            tmuxPreferences: HostTmuxPreferences(executablePath: "/usr/local/bin/tmux")
+        )
+        XCTAssertEqual(
+            HostEditorView(existing: validHost).buildHost()?.tmuxPreferences.executablePath,
+            "/usr/local/bin/tmux"
+        )
+    }
+
     func testTmuxProbeSuccess() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
@@ -41,7 +71,7 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
@@ -71,7 +101,7 @@ final class TmuxAppTests: XCTestCase {
         mock.onExecuteCommand = { command in
             commands.value += command + "\n"
             switch command {
-            case TmuxCommand.probe:
+            case TmuxCommand.probe():
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             case TmuxExecutableDiscovery.loginPathCommand:
                 return SSHCommandResult(
@@ -90,7 +120,12 @@ final class TmuxAppTests: XCTestCase {
         let availability = await container.probeTmux()
         XCTAssertEqual(availability, .available(version: "tmux 3.4"))
         _ = await container.listTmuxSessions()
-        XCTAssertTrue(commands.value.contains(TmuxCommand.listSessions(executable: discovered)))
+        let executedCommands = commands.value.split(separator: "\n").map(String.init)
+        let discoveryIndex = try XCTUnwrap(
+            executedCommands.lastIndex(of: TmuxExecutableDiscovery.loginPathCommand))
+        let listIndex = try XCTUnwrap(
+            executedCommands.lastIndex(of: TmuxCommand.listSessions(executable: discovered)))
+        XCTAssertLessThan(discoveryIndex, listIndex)
 
         let attached = await container.attachTmuxSession(id: "$0")
         XCTAssertTrue(attached)
@@ -125,7 +160,7 @@ final class TmuxAppTests: XCTestCase {
         mock.onExecuteCommand = { command in
             commands.value += command + "\n"
             switch command {
-            case TmuxCommand.probe:
+            case TmuxCommand.probe():
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             case TmuxExecutableDiscovery.loginPathCommand:
                 return SSHCommandResult(
@@ -175,7 +210,7 @@ final class TmuxAppTests: XCTestCase {
             commands.value += command + "\n"
             if phase.value == "first" {
                 switch command {
-                case TmuxCommand.probe:
+                case TmuxCommand.probe():
                     return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
                 case TmuxExecutableDiscovery.loginPathCommand:
                     return SSHCommandResult(
@@ -191,7 +226,7 @@ final class TmuxAppTests: XCTestCase {
             switch command {
             case TmuxCommand.probe(executable: discovered):
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
-            case TmuxCommand.probe:
+            case TmuxCommand.probe():
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             case TmuxExecutableDiscovery.loginPathCommand:
                 return SSHCommandResult(
@@ -234,7 +269,7 @@ final class TmuxAppTests: XCTestCase {
         let host = try Host(name: "Swap Host", hostname: "swap.test", username: "user")
         let gate = AsyncGate()
         first.onExecuteCommand = { command in
-            if command == TmuxCommand.probe {
+            if command == TmuxCommand.probe() {
                 await gate.wait()
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             }
@@ -276,7 +311,7 @@ final class TmuxAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             switch command {
-            case TmuxCommand.probe:
+            case TmuxCommand.probe():
                 return SSHCommandResult(exitCode: 0, stdout: "")
             case TmuxExecutableDiscovery.loginPathCommand:
                 return SSHCommandResult(
@@ -318,7 +353,7 @@ final class TmuxAppTests: XCTestCase {
         let action = MultiplexerControlAction.tmux(.nextWindow(sessionID))
         let expected = try TmuxControl().command(for: action)
         mock.onExecuteCommand = { command in
-            if command == TmuxCommand.probe {
+            if command == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             return SSHCommandResult(exitCode: command == expected ? 0 : 1, stdout: "", stderr: "")
@@ -729,7 +764,7 @@ final class TmuxAppTests: XCTestCase {
         await container.connect(to: host)
 
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(
                     exitCode: 127, stdout: "", stderr: "bash: tmux: command not found\n")
             }
@@ -765,7 +800,7 @@ final class TmuxAppTests: XCTestCase {
         }
 
         mock.onExecuteCommand = { command in
-            if command == TmuxCommand.probe {
+            if command == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
@@ -796,7 +831,7 @@ final class TmuxAppTests: XCTestCase {
         await container.connect(to: host)
 
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
@@ -841,6 +876,9 @@ final class TmuxAppTests: XCTestCase {
         await container.connect(to: host)
 
         mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if cmd == TmuxCommand.listSessions {
                 return SSHCommandResult(
                     exitCode: 1, stdout: "", stderr: "no server running on /tmp/tmux-501/default\n")
@@ -870,6 +908,9 @@ final class TmuxAppTests: XCTestCase {
         await container.connect(to: host)
 
         mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if cmd == TmuxCommand.listSessions {
                 return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no sessions\n")
             }
@@ -1055,6 +1096,9 @@ final class TmuxAppTests: XCTestCase {
         let mock = MockSSHConnection()
         let validationGate = AsyncGate()
         mock.onExecuteCommand = { command in
+            if command == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if command.contains("has-session") {
                 await validationGate.wait()
             }
@@ -1134,7 +1178,7 @@ final class TmuxAppTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mock }
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe || cmd == "tmux -V" {
+            if cmd == TmuxCommand.probe() || cmd == "tmux -V" {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd.contains("list-sessions") {
@@ -1299,8 +1343,11 @@ final class TmuxAppTests: XCTestCase {
                 clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
         )
 
-        // Mock has-session to return failure (missing session)
+        // Mock the resolver before has-session so restoration reaches the intended failure.
         mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if cmd.contains("has-session") && cmd.contains("$99") {
                 return SSHCommandResult(
                     exitCode: 1, stdout: "", stderr: "can't find session: $99\n")
@@ -1619,7 +1666,7 @@ final class TmuxAppTests: XCTestCase {
 
         let gate = AsyncGate()
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 await gate.wait()
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
@@ -1670,6 +1717,9 @@ final class TmuxAppTests: XCTestCase {
 
         let gate = AsyncGate()
         mock.onExecuteCommand = { cmd in
+            if cmd == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if cmd.contains("has-session") {
                 await gate.wait()
                 return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no session")
@@ -1713,7 +1763,7 @@ final class TmuxAppTests: XCTestCase {
 
         let sessionsOutput = LockedString("$0\tother\t1\t1700000000\t1700000500\t0\n")
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
@@ -1795,7 +1845,7 @@ final class TmuxAppTests: XCTestCase {
         await container.connect(to: host)
 
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
@@ -1832,7 +1882,7 @@ final class TmuxAppTests: XCTestCase {
 
         // 1. Session disappears from successful list
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {
@@ -1852,7 +1902,7 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.activeTmuxSessionID, "$1")
 
         mock.onExecuteCommand = { cmd in
-            if cmd == TmuxCommand.probe {
+            if cmd == TmuxCommand.probe() {
                 return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
             }
             if cmd == TmuxCommand.listSessions {

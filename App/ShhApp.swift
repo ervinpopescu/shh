@@ -1015,9 +1015,16 @@ struct HostEditorView: View {
                         .autocorrectionDisabled()
                         .textInputAutocapitalization(.never)
                         .accessibilityIdentifier("host-editor-tmux-executable-path")
-                    Text("Leave blank to discover tmux from the SSH command PATH, then the remote login PATH.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    if let tmuxPathValidationMessage {
+                        Text(tmuxPathValidationMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("host-editor-tmux-executable-path-error")
+                    } else {
+                        Text("Leave blank to discover tmux from the SSH command PATH, then the remote login PATH.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Section("Image transfer") {
                     TextField("Private remote directory (optional)", text: $sendImageDestination)
@@ -1084,7 +1091,7 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid || tmuxPathValidationMessage != nil)
                         .accessibilityIdentifier("host-editor-save-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
@@ -1116,12 +1123,23 @@ struct HostEditorView: View {
         return true
     }
 
+    private var tmuxPathValidationMessage: String? {
+        Self.tmuxExecutablePathValidationMessage(for: tmuxExecutablePath)
+    }
+
+    static func tmuxExecutablePathValidationMessage(for path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed == "tmux" || TmuxExecutableDiscovery.isSafeAbsolutePath(trimmed) else {
+            return "Use a safe absolute tmux executable path, or leave this field blank."
+        }
+        return nil
+    }
+
     func buildHost(secretRef: String? = nil) -> Host? {
         guard isMoshPortRangeValid else { return nil }
         let trimmedTmuxPath = tmuxExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedTmuxPath.isEmpty, (try? TmuxControl(executable: trimmedTmuxPath)) == nil {
-            return nil
-        }
+        guard Self.tmuxExecutablePathValidationMessage(for: trimmedTmuxPath) == nil else { return nil }
         if connectionType == .proxyJump && bastionHops.isEmpty { return nil }
         var allowedModes: Set<VoiceInputMode> = []
         if allowShellCommand { allowedModes.insert(.shellCommand) }

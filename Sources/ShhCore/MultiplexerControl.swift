@@ -272,18 +272,15 @@ private func validatedHerdrIdentifier(_ value: String) throws -> String {
     return value
 }
 
-private func executablePrefix(_ executable: String) throws -> String {
-    guard
-        executable == "tmux" || executable == "herdr"
-            || (executable.hasPrefix("/") && executable.count <= 512
-                && !executable.unicodeScalars.contains(where: {
-                    $0.value < 0x20 || $0.properties.isWhitespace
-                }))
+private func executablePrefix(
+    _ executable: String, defaultExecutable: String
+) throws -> String {
+    guard executable == defaultExecutable
+        || TmuxExecutableDiscovery.isSafeAbsolutePath(executable)
     else {
         throw MultiplexerControlError.invalidIdentifier(executable)
     }
-    return executable == "tmux" || executable == "herdr"
-        ? executable : ShellQuoting.quote(executable)
+    return executable == defaultExecutable ? executable : ShellQuoting.quote(executable)
 }
 
 public struct TmuxControl: MultiplexerControl {
@@ -292,7 +289,7 @@ public struct TmuxControl: MultiplexerControl {
     public let executable: String
     private let executablePath: String
     public init(executable: String = "tmux") throws {
-        _ = try executablePrefix(executable)
+        _ = try executablePrefix(executable, defaultExecutable: "tmux")
         self.executablePath = executable
         self.executable = executable == "tmux" ? executable : ShellQuoting.quote(executable)
     }
@@ -350,7 +347,7 @@ public struct HerdrControl: MultiplexerControl {
     public let capabilities: MultiplexerCapabilities = .herdr
     public let executable: String
     public init(executable: String = "herdr") throws {
-        _ = try executablePrefix(executable)
+        _ = try executablePrefix(executable, defaultExecutable: "herdr")
         self.executable = executable == "herdr" ? executable : ShellQuoting.quote(executable)
     }
 

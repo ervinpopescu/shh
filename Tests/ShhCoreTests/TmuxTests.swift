@@ -507,7 +507,7 @@ final class TmuxTests: XCTestCase {
 
     func testVerifiedCommandTemplates() throws {
         // 1. Probe template: tmux -V
-        XCTAssertEqual(TmuxCommand.probe, "tmux -V")
+        XCTAssertEqual(TmuxCommand.probe(), "tmux -V")
 
         // 2. Delimited list-sessions fields
         XCTAssertEqual(
@@ -562,7 +562,10 @@ final class TmuxTests: XCTestCase {
         )
     }
 
-    func testTmuxExecutableDiscoveryRejectsProfileNoiseMissingExitAndAmbiguity() {
+    func testTmuxExecutableDiscoveryUsesRemoteLoginShellAndRejectsProfileNoise() {
+        XCTAssertTrue(TmuxExecutableDiscovery.loginPathCommand.hasPrefix("\"${SHELL:-/bin/sh}\" -lc "))
+        XCTAssertFalse(TmuxExecutableDiscovery.loginPathCommand.hasPrefix("sh -lc "))
+
         let validOutput = "\(TmuxExecutableDiscovery.beginSentinel)\n/Users/demo/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
         XCTAssertEqual(
             TmuxExecutableDiscovery.parseExecutablePath(

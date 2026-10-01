@@ -421,7 +421,7 @@ final class SSHExecIntegrationTests: XCTestCase {
         // A tmux binary available only after login-PATH initialization must be
         // discoverable and reusable through its absolute path.
         server.execMode = .loginPathOnly
-        let directProbe = try await connection.executeCommand(TmuxCommand.probe)
+        let directProbe = try await connection.executeCommand(TmuxCommand.probe())
         XCTAssertEqual(directProbe.exitCode, 127)
         let loginPath = try await connection.executeCommand(TmuxExecutableDiscovery.loginPathCommand)
         XCTAssertEqual(
@@ -476,7 +476,7 @@ final class SSHExecIntegrationTests: XCTestCase {
         let demo = DemoSSHConnection()
 
         // Probe
-        let probeResult = try await demo.executeCommand(TmuxCommand.probe)
+        let probeResult = try await demo.executeCommand(TmuxCommand.probe())
         XCTAssertTrue(probeResult.isSuccess)
         XCTAssertEqual(probeResult.stdout, "tmux 3.4\n")
 
