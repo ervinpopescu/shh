@@ -393,6 +393,29 @@ final class CommandDialTests: XCTestCase {
             "input.keyboard")
     }
 
+    func testRadialLayoutDefaultsAndCornerCardSize() {
+        let defaultSize = DialRadialLayout(
+            center: .zero,
+            orbitRadius: 50,
+            itemRadius: 10,
+            startAngle: 0,
+            endAngle: .pi,
+            count: 1
+        )
+        XCTAssertEqual(defaultSize.itemSize, CGSize(width: 20, height: 20))
+
+        let customSize = CGSize(width: 112, height: 74)
+        let corner = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: customSize,
+            count: 3,
+            placement: .trailing
+        )
+        XCTAssertEqual(corner.itemSize, customSize)
+    }
+
     func testRadialLayoutEdgeCases() {
         let layout = DialRadialLayout(
             center: CGPoint(x: 100, y: 100),
