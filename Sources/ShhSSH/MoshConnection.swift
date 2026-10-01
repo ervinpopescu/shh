@@ -44,7 +44,7 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
                 continuation.yield(event)
             }
             self.pendingEvents.removeAll()
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [weak self] _ in
                 Task { [weak self] in
                     await self?.close()
                 }
@@ -57,7 +57,7 @@ public actor MoshConnection: MoshSessionControlling, SSHConnection {
             let id = UUID()
             self.stateContinuations[id] = continuation
             continuation.yield(self.moshState)
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [weak self] _ in
                 Task { [weak self] in
                     await self?.removeStateContinuation(id)
                 }
