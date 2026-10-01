@@ -547,6 +547,31 @@ final class TmuxTests: XCTestCase {
         XCTAssertEqual(adapter.command(for: .list), TmuxCommand.listSessions)
         XCTAssertEqual(adapter.command(for: .attach(name: "$0")), "env -u TMUX tmux attach-session -d -t '$0'")
         XCTAssertEqual(adapter.command(for: .create(name: "work")), "tmux new-session -A -D -s 'work'")
+
+        XCTAssertEqual(
+            TmuxCommand.listSessions(executable: "/opt/tools/tmux"),
+            "'/opt/tools/tmux' list-sessions -F '#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}'"
+        )
+        XCTAssertEqual(
+            TmuxCommand.hasSession(id: "$0", executable: "/opt/tools/tmux"),
+            "'/opt/tools/tmux' has-session -t '$0'"
+        )
+        XCTAssertEqual(
+            TmuxCommand.attachSession(id: "$0", executable: "/opt/tools/tmux"),
+            "env -u TMUX '/opt/tools/tmux' attach-session -d -t '$0'"
+        )
+    }
+
+    func testTmuxExecutableDiscoveryRejectsProfileNoiseAndUnsafePaths() {
+        XCTAssertEqual(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                from: "profile warning\n/Users/demo/.local/bin/tmux\n"
+            ),
+            "/Users/demo/.local/bin/tmux"
+        )
+        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "tmux not found\n"))
+        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "/tmp/tmux path\n"))
+        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "/tmp/tmux;id\n"))
     }
 
     // MARK: - Tmux Availability

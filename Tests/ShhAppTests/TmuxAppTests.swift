@@ -53,6 +53,48 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.tmuxAvailability, .available(version: "tmux 3.4"))
     }
 
+    func testTmuxProbeDiscoversLoginPathAndReusesItForSessionsAndControls() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Login PATH Host", hostname: "login-path.test", username: "user")
+        await container.connect(to: host)
+
+        let discovered = "/home/user/.local/bin/tmux"
+        let commands = LockedString("")
+        mock.onExecuteCommand = { command in
+            commands.value += command + "\n"
+            switch command {
+            case TmuxCommand.probe:
+                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+            case TmuxExecutableDiscovery.loginPathCommand:
+                return SSHCommandResult(exitCode: 0, stdout: "profile notice\n\(discovered)\n")
+            case TmuxCommand.probe(executable: discovered):
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            case TmuxCommand.listSessions(executable: discovered):
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "no server running\n")
+            default:
+                return SSHCommandResult(exitCode: 0, stdout: "")
+            }
+        }
+
+        let availability = await container.probeTmux()
+        XCTAssertEqual(availability, .available(version: "tmux 3.4"))
+        _ = await container.listTmuxSessions()
+        XCTAssertTrue(commands.value.contains(TmuxCommand.listSessions(executable: discovered)))
+
+        let attached = await container.attachTmuxSession(id: "$0")
+        XCTAssertTrue(attached)
+        let terminalOutput = mock.sentData.compactMap { String(data: $0, encoding: .utf8) }.joined()
+        XCTAssertTrue(terminalOutput.contains("env -u TMUX '\(discovered)' attach-session -d -t '$0'"))
+    }
+
     func testCommandDialControlRequiresApprovalAndUsesExecChannel() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
@@ -71,7 +113,10 @@ final class TmuxAppTests: XCTestCase {
         let action = MultiplexerControlAction.tmux(.nextWindow(sessionID))
         let expected = try TmuxControl().command(for: action)
         mock.onExecuteCommand = { command in
-            SSHCommandResult(exitCode: command == expected ? 0 : 1, stdout: "", stderr: "")
+            if command == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
+            return SSHCommandResult(exitCode: command == expected ? 0 : 1, stdout: "", stderr: "")
         }
 
         let rejected = await container.executeMultiplexerControl(action)
@@ -491,6 +536,41 @@ final class TmuxAppTests: XCTestCase {
         XCTAssertEqual(container.tmuxAvailability, availability)
         XCTAssertFalse(container.isTmuxServerRunning)
         XCTAssertTrue(container.tmuxSessions.isEmpty)
+    }
+
+    func testTmuxProbeDiagnosticsDistinguishTimeoutAndMissingExecutable() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Diagnostic Host", hostname: "diagnostic.test", username: "user")
+        await container.connect(to: host)
+
+        mock.onExecuteCommand = { _ in throw TransportError.timeout }
+        let timeout = await container.probeTmux()
+        if case .unavailable(let reason) = timeout {
+            XCTAssertTrue(reason.contains("timed out"))
+        } else {
+            XCTFail("Expected timeout diagnostic")
+        }
+
+        mock.onExecuteCommand = { command in
+            if command == TmuxCommand.probe {
+                return SSHCommandResult(exitCode: 127, stdout: "", stderr: "tmux: not found\n")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+        let missing = await container.probeTmux()
+        if case .unavailable(let reason) = missing {
+            XCTAssertTrue(reason.contains("not found in the SSH command PATH"))
+        } else {
+            XCTFail("Expected missing-executable diagnostic")
+        }
     }
 
     // MARK: - 2. List Sessions

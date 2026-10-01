@@ -75,10 +75,11 @@ final class TestServerAuthDelegate: NIOSSHServerUserAuthenticationDelegate, @unc
     }
 }
 
-enum TestServerExecMode: Sendable {
+enum TestServerExecMode: Sendable, Equatable {
     case normal
     case noServer
     case notInstalled
+    case loginPathOnly
     case malformed
     case missingExitStatus
 }
@@ -600,6 +601,8 @@ final class SSHTestServer: @unchecked Sendable {
                 stdout: "",
                 stderr: "bash: line 1: tmux: command not found\n"
             )
+        case .loginPathOnly:
+            break
         case .malformed:
             return SSHCommandTestResponse(
                 exitCode: 0,
@@ -692,6 +695,31 @@ final class SSHTestServer: @unchecked Sendable {
         }
 
         if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+            if self.execMode == .loginPathOnly {
+                return SSHCommandTestResponse(
+                    exitCode: 127,
+                    stdout: "",
+                    stderr: "bash: tmux: command not found\n"
+                )
+            }
+            return SSHCommandTestResponse(
+                exitCode: 0,
+                stdout: "tmux 3.4\n",
+                stderr: ""
+            )
+        }
+
+        if self.execMode == .loginPathOnly,
+           trimmed == TmuxExecutableDiscovery.loginPathCommand {
+            return SSHCommandTestResponse(
+                exitCode: 0,
+                stdout: "/home/testuser/.local/bin/tmux\n",
+                stderr: ""
+            )
+        }
+
+        if self.execMode == .loginPathOnly,
+           trimmed == TmuxCommand.probe(executable: "/home/testuser/.local/bin/tmux") {
             return SSHCommandTestResponse(
                 exitCode: 0,
                 stdout: "tmux 3.4\n",
