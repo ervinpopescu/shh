@@ -2122,6 +2122,30 @@ final class AppContainer: ObservableObject {
             return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
         }
 
+        // Mosh already has a live command-capable session and historically
+        // attached tmux directly without a separate SSH PATH probe. Preserve
+        // that path while still validating an explicitly configured binary.
+        if connection is any MoshSessionControlling {
+            let configured = host.tmuxPreferences.executablePath?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if let configured, !configured.isEmpty {
+                guard (try? TmuxControl(executable: configured)) != nil else {
+                    return TmuxResolution(
+                        availability: .unavailable(reason: "Configured tmux executable path is invalid. Use an absolute path without whitespace or shell characters."),
+                        executable: nil
+                    )
+                }
+                return TmuxResolution(
+                    availability: .available(version: "tmux"),
+                    executable: configured
+                )
+            }
+            return TmuxResolution(
+                availability: .available(version: "tmux"),
+                executable: "tmux"
+            )
+        }
+
         if let configured = host.tmuxPreferences.executablePath,
            !configured.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard (try? TmuxControl(executable: configured)) != nil else {
@@ -2159,7 +2183,7 @@ final class AppContainer: ObservableObject {
 
         do {
             let direct = try await executor.executeCommand(
-                TmuxCommand.probe, timeout: 5.0
+                TmuxCommand.probe(), timeout: 5.0
             )
             guard isCurrentConnection() else {
                 return TmuxResolution(availability: .unavailable(reason: "Session disconnected"), executable: nil)
