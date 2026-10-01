@@ -285,6 +285,27 @@ final class MoshDomainTests: XCTestCase {
         await connection.close()
     }
 
+    func testDemoMoshEventsTerminationClosesConnection() async throws {
+        let connection = DemoMoshConnection(
+            sessionInfo: MoshSessionInfo(udpPort: 60002, sessionKey: "demo-secret-key-12345")
+        )
+        let stream = await connection.events()
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            _ = try? await iterator.next()
+            _ = try? await iterator.next()
+        }
+
+        consumer.cancel()
+        _ = await consumer.value
+
+        for _ in 0..<20 where !(await connection.moshState.isDisconnected) {
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        XCTAssertTrue((await connection.moshState).isDisconnected)
+    }
+    }
+
     // MARK: - DemoMoshTransport Tests
 
     func testDemoMoshTransportConnectsWithTrustEvaluator() async throws {
