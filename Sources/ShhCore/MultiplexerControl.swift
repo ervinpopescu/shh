@@ -289,6 +289,11 @@ public struct TmuxControl: MultiplexerControl {
     public let executable: String
     private let executablePath: String
     public init(executable: String = "tmux") throws {
+        guard executable == "tmux"
+            || TmuxExecutableDiscovery.isSafeTmuxExecutablePath(executable)
+        else {
+            throw MultiplexerControlError.invalidIdentifier(executable)
+        }
         _ = try executablePrefix(executable, defaultExecutable: "tmux")
         self.executablePath = executable
         self.executable = executable == "tmux" ? executable : ShellQuoting.quote(executable)

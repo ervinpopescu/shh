@@ -122,13 +122,17 @@ public enum TmuxExecutableDiscovery {
             return nil
         }
         let path = lines[1]
-        return isSafeAbsolutePath(path) ? path : nil
+        return isSafeTmuxExecutablePath(path) ? path : nil
     }
 
     public static func isSafeAbsolutePath(_ path: String) -> Bool {
         guard !path.isEmpty, path.count <= 512, path.hasPrefix("/") else { return false }
-        guard path.split(separator: "/").last.map(String.init) != "herdr" else { return false }
         return !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.properties.isWhitespace })
+    }
+
+    public static func isSafeTmuxExecutablePath(_ path: String) -> Bool {
+        guard isSafeAbsolutePath(path) else { return false }
+        return path.split(separator: "/").last.map(String.init) != "herdr"
     }
 }
 

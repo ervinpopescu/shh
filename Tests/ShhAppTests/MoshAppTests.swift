@@ -353,6 +353,30 @@ final class MoshAppTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
+    func testMoshTmuxAttachmentUsesConfiguredExecutableWithoutProbe() async throws {
+        let mockMosh = ControllableMoshConnection()
+        mockMosh.onExecuteCommand = { _ in
+            SSHCommandResult(exitCode: 0, stdout: "")
+        }
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in mockMosh }
+        let container = makeContainer(moshTransport: moshTransport)
+        let host = try Host(
+            name: "Configured Tmux Mosh Host",
+            hostname: "configured-tmux-mosh.internal",
+            username: "dev",
+            connection: .mosh(MoshOptions()),
+            tmuxPreferences: HostTmuxPreferences(executablePath: "/opt/bin/tmux")
+        )
+
+        await container.connect(to: host)
+        let attached = await container.attachTmuxSession(id: "$0")
+
+        XCTAssertTrue(attached)
+        let terminalOutput = mockMosh.sentData.compactMap { String(data: $0, encoding: .utf8) }.joined()
+        XCTAssertTrue(terminalOutput.contains("env -u TMUX '/opt/bin/tmux' attach-session -d -t '$0'"))
+    }
+
     // MARK: - 5. Fast Session Recovery On Roaming Probe Failure Reattaches Cleanly
 
     func testFastSessionRecoveryReattachesTmuxWithCleanBuffer() async throws {
