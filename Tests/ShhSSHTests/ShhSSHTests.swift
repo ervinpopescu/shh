@@ -285,7 +285,7 @@ final class ShhSSHTests: XCTestCase {
         let events = await connection.events()
 
         let closedExpectation = expectation(description: "Stream received closed")
-        Task {
+        _ = Task {
             for try await event in events {
                 if case .closed = event {
                     closedExpectation.fulfill()

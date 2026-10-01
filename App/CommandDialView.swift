@@ -482,57 +482,7 @@ struct CommandDialSurface: View {
         return Button {
             activate(node)
         } label: {
-            VStack(spacing: 6) {
-                Image(systemName: node.systemImage ?? "circle")
-                    .font(.title3.weight(.semibold))
-                    .frame(height: 24)
-                Text(node.title)
-                    .font(.subheadline.weight(.semibold))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.74)
-            }
-            .foregroundStyle(
-                isHighlighted
-                    ? Color.black : (node.isEnabled ? Color.white : Color.white.opacity(0.48))
-            )
-            .padding(.horizontal, 8)
-            .frame(width: width, height: height)
-            .background(
-                RoundedRectangle(cornerRadius: 23, style: .continuous)
-                    .fill(
-                        isHighlighted
-                            ? accent : Color.black.opacity(contrast == .increased ? 0.96 : 0.82))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 23, style: .continuous)
-                    .stroke(
-                        isHighlighted
-                            ? accent
-                            : (node.isEnabled
-                                ? coolAccent.opacity(0.46) : Color.white.opacity(0.15)),
-                        lineWidth: isHighlighted ? 2 : 1
-                    )
-            )
-            .overlay(alignment: .topTrailing) {
-                if node.availability == .reviewRequired {
-                    Image(systemName: "exclamationmark.shield.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                        .padding(7)
-                } else if !node.children.isEmpty {
-                    Image(systemName: "arrow.up.right")
-                        .font(.caption2.bold())
-                        .foregroundStyle(accent)
-                        .padding(7)
-                }
-            }
-            .shadow(
-                color: isHighlighted ? accent.opacity(0.24) : Color.black.opacity(0.35), radius: 10,
-                y: 5
-            )
-            .scaleEffect(isHighlighted && !reduceMotion ? 1.07 : 1)
-            .contentShape(RoundedRectangle(cornerRadius: 23, style: .continuous))
+            radialNodeButtonContent(node: node, isHighlighted: isHighlighted, width: width, height: height)
         }
         .buttonStyle(.plain)
         .position(point)
@@ -546,6 +496,68 @@ struct CommandDialSurface: View {
         )
         .accessibilityIdentifier(
             "command-dial-node-\(node.id.replacingOccurrences(of: ".", with: "-"))")
+    }
+
+    @ViewBuilder
+    private func radialNodeButtonContent(
+        node: DialNode, isHighlighted: Bool, width: CGFloat, height: CGFloat
+    ) -> some View {
+        VStack(spacing: 6) {
+            Image(systemName: node.systemImage ?? "circle")
+                .font(.title3.weight(.semibold))
+                .frame(height: 24)
+            Text(node.title)
+                .font(.subheadline.weight(.semibold))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .minimumScaleFactor(0.74)
+        }
+        .foregroundStyle(
+            isHighlighted
+                ? Color.black : (node.isEnabled ? Color.white : Color.white.opacity(0.48))
+        )
+        .padding(.horizontal, 8)
+        .frame(width: width, height: height)
+        .background(
+            RoundedRectangle(cornerRadius: 23, style: .continuous)
+                .fill(
+                    isHighlighted
+                        ? accent : Color.black.opacity(contrast == .increased ? 0.96 : 0.82))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 23, style: .continuous)
+                .stroke(
+                    isHighlighted
+                        ? accent
+                        : (node.isEnabled
+                            ? coolAccent.opacity(0.46) : Color.white.opacity(0.15)),
+                    lineWidth: isHighlighted ? 2 : 1
+                )
+        )
+        .overlay(alignment: .topTrailing) {
+            radialNodeBadge(for: node)
+        }
+        .shadow(
+            color: isHighlighted ? accent.opacity(0.24) : Color.black.opacity(0.35), radius: 10,
+            y: 5
+        )
+        .scaleEffect(isHighlighted && !reduceMotion ? 1.07 : 1)
+        .contentShape(RoundedRectangle(cornerRadius: 23, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func radialNodeBadge(for node: DialNode) -> some View {
+        if node.availability == .reviewRequired {
+            Image(systemName: "exclamationmark.shield.fill")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+                .padding(7)
+        } else if !node.children.isEmpty {
+            Image(systemName: "arrow.up.right")
+                .font(.caption2.bold())
+                .foregroundStyle(accent)
+                .padding(7)
+        }
     }
 
     private func radialGesture(layout: DialRadialLayout) -> some Gesture {
