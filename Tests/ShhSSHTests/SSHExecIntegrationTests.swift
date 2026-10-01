@@ -424,7 +424,10 @@ final class SSHExecIntegrationTests: XCTestCase {
         let directProbe = try await connection.executeCommand(TmuxCommand.probe)
         XCTAssertEqual(directProbe.exitCode, 127)
         let loginPath = try await connection.executeCommand(TmuxExecutableDiscovery.loginPathCommand)
-        XCTAssertEqual(loginPath.stdout, "/home/testuser/.local/bin/tmux\n")
+        XCTAssertEqual(
+            loginPath.stdout,
+            "\(TmuxExecutableDiscovery.beginSentinel)\n/home/testuser/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
+        )
         let resolvedProbe = try await connection.executeCommand(
             TmuxCommand.probe(executable: "/home/testuser/.local/bin/tmux")
         )

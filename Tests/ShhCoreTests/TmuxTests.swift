@@ -557,21 +557,58 @@ final class TmuxTests: XCTestCase {
             "'/opt/tools/tmux' has-session -t '$0'"
         )
         XCTAssertEqual(
-            TmuxCommand.attachSession(id: "$0", executable: "/opt/tools/tmux"),
+            try TmuxCommand.attachSession(id: "$0", executable: "/opt/tools/tmux"),
             "env -u TMUX '/opt/tools/tmux' attach-session -d -t '$0'"
         )
     }
 
-    func testTmuxExecutableDiscoveryRejectsProfileNoiseAndUnsafePaths() {
+    func testTmuxExecutableDiscoveryRejectsProfileNoiseMissingExitAndAmbiguity() {
+        let validOutput = "\(TmuxExecutableDiscovery.beginSentinel)\n/Users/demo/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
         XCTAssertEqual(
             TmuxExecutableDiscovery.parseExecutablePath(
-                from: "profile warning\n/Users/demo/.local/bin/tmux\n"
+                result: SSHCommandResult(exitCode: 0, stdout: validOutput)
             ),
             "/Users/demo/.local/bin/tmux"
         )
-        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "tmux not found\n"))
-        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "/tmp/tmux path\n"))
-        XCTAssertNil(TmuxExecutableDiscovery.parseExecutablePath(from: "/tmp/tmux;id\n"))
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "profile warning\n\(validOutput)",
+                    stderr: ""
+                )
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(exitCode: 127, stdout: validOutput)
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(exitCode: 0, stdout: validOutput, stderr: " \n")
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n /tmp/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n/tmp/tmux path\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            )
+        )
+        XCTAssertEqual(
+            TmuxCommand.probe(executable: "/tmp/tmux;id"),
+            "'/tmp/tmux;id' -V"
+        )
     }
 
     // MARK: - Tmux Availability

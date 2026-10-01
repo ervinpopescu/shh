@@ -713,7 +713,7 @@ final class SSHTestServer: @unchecked Sendable {
            trimmed == TmuxExecutableDiscovery.loginPathCommand {
             return SSHCommandTestResponse(
                 exitCode: 0,
-                stdout: "/home/testuser/.local/bin/tmux\n",
+                stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n/home/testuser/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n",
                 stderr: ""
             )
         }
