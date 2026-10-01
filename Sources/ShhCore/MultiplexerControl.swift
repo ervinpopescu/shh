@@ -290,8 +290,10 @@ public struct TmuxControl: MultiplexerControl {
     public let kind: RemoteMultiplexer = .tmux
     public let capabilities: MultiplexerCapabilities = .tmux
     public let executable: String
+    private let executablePath: String
     public init(executable: String = "tmux") throws {
         _ = try executablePrefix(executable)
+        self.executablePath = executable
         self.executable = executable == "tmux" ? executable : ShellQuoting.quote(executable)
     }
 
@@ -331,7 +333,11 @@ public struct TmuxControl: MultiplexerControl {
         if case .tmux(.detachClient(let session, let expectedTTY)) = action, expectedTTY == nil {
             // Resolve from tmux's client table immediately before detaching. In
             // particular, never guess based on list order or detach a session.
-            let identity = try await TmuxClientResolver.resolve(sessionID: session, using: executor)
+            let identity = try await TmuxClientResolver.resolve(
+                sessionID: session,
+                using: executor,
+                executable: executablePath
+            )
             return try await executor.executeCommand(
                 command(for: .tmux(.detachClient(session: session, expectedTTY: identity.tty))))
         }
@@ -412,6 +418,11 @@ public struct TmuxClientIdentity: Hashable, Sendable {
 public enum TmuxClientResolver {
     public static let listCommand = "tmux list-clients -F '#{client_tty}\t#{session_id}'"
 
+    public static func listCommand(executable: String = "tmux") -> String {
+        let token = executable == "tmux" ? executable : ShellQuoting.quote(executable)
+        return "\(token) list-clients -F '#{client_tty}\t#{session_id}'"
+    }
+
     public static func parse(_ output: String) throws -> [TmuxClientIdentity] {
         try output.split(whereSeparator: \.isNewline).map { line in
             let fields = line.split(separator: "\t", omittingEmptySubsequences: false)
@@ -429,9 +440,9 @@ public enum TmuxClientResolver {
     /// unsafe, so ambiguity is always rejected.
     public static func resolve(
         sessionID: TmuxSessionID, expectedTTY: TmuxClientTTY? = nil,
-        using executor: any SSHCommandExecuting
+        using executor: any SSHCommandExecuting, executable: String = "tmux"
     ) async throws -> TmuxClientIdentity {
-        let result = try await executor.executeCommand(listCommand)
+        let result = try await executor.executeCommand(listCommand(executable: executable))
         guard result.isSuccess else { throw MultiplexerControlError.clientNotFound }
         let clients = try parse(result.stdout).filter { $0.sessionID == sessionID }
         if let expectedTTY {

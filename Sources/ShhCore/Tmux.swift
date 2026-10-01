@@ -96,6 +96,39 @@ public enum TmuxAvailability: Equatable, Hashable, Sendable, Codable {
     }
 }
 
+// MARK: - Tmux Executable Discovery
+
+public enum TmuxExecutableDiscovery {
+    /// The login shell is asked to apply its normal PATH rules, but only an
+    /// exact sentinel-delimited response is accepted. Profile output before,
+    /// between, or after the response invalidates discovery.
+    public static let beginSentinel = "__SHH_TMUX_DISCOVERY_BEGIN_7F5A1C__"
+    public static let endSentinel = "__SHH_TMUX_DISCOVERY_END_7F5A1C__"
+    public static let loginPathCommand =
+        "sh -lc 'printf \"%s\\n\" \"\(beginSentinel)\"; command -v tmux; printf \"%s\\n\" \"\(endSentinel)\"'"
+
+    public static func parseExecutablePath(result: SSHCommandResult) -> String? {
+        guard result.exitCode == 0, result.stderr.isEmpty else {
+            return nil
+        }
+        let lines = result.stdout
+            .split(whereSeparator: \.isNewline)
+            .map { String($0) }
+        guard lines.count == 3,
+              lines[0] == beginSentinel,
+              lines[2] == endSentinel else {
+            return nil
+        }
+        let path = lines[1]
+        return isSafeAbsolutePath(path) ? path : nil
+    }
+
+    public static func isSafeAbsolutePath(_ path: String) -> Bool {
+        !path.isEmpty && path.count <= 512 && path.hasPrefix("/") &&
+            !path.unicodeScalars.contains(where: { $0.value < 0x20 || $0.properties.isWhitespace })
+    }
+}
+
 // MARK: - Tmux Session Info
 
 public struct TmuxSessionInfo: Identifiable, Equatable, Hashable, Sendable, Codable {
@@ -448,38 +481,52 @@ public enum TmuxCommand: Sendable {
     /// Printable collision-resistant delimiter format string with explicit shell escaping for list-sessions
     public static let listSessionsFormat: String = "#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}"
 
-    /// Exact list-sessions command template
-    public static let listSessions: String = "tmux list-sessions -F '\(listSessionsFormat)'"
-
-    /// Exact has-session template
-    public static func hasSession(id: String) -> String {
-        "tmux has-session -t \(ShellQuoting.quote(id))"
+    /// An executable is either the default `tmux` lookup or a quoted, resolved
+    /// absolute path. Quoting here keeps discovered PATH content data, not shell syntax.
+    private static func executableToken(_ executable: String) -> String {
+        executable == "tmux" ? executable : ShellQuoting.quote(executable)
     }
 
-    public static func hasSession(id: TmuxSessionID) -> String {
-        "tmux has-session -t \(id.shellArgument)"
+    public static func probe(executable: String = "tmux") -> String {
+        "\(executableToken(executable)) -V"
+    }
+
+    /// Exact list-sessions command template
+    public static let listSessions: String = listSessions()
+
+    public static func listSessions(executable: String = "tmux") -> String {
+        "\(executableToken(executable)) list-sessions -F '\(listSessionsFormat)'"
+    }
+
+    /// Exact has-session template
+    public static func hasSession(id: String, executable: String = "tmux") -> String {
+        "\(executableToken(executable)) has-session -t \(ShellQuoting.quote(id))"
+    }
+
+    public static func hasSession(id: TmuxSessionID, executable: String = "tmux") -> String {
+        hasSession(id: id.value, executable: executable)
     }
 
     /// Exact attach-session takeover template by quoted session ID.
     /// Existing sessions must attach by tmux session ID, never name.
     /// Template: `env -u TMUX tmux attach-session -d -t '<session_id>'`
-    public static func attachSession(id: TmuxSessionID) -> String {
-        "env -u TMUX tmux attach-session -d -t \(id.shellArgument)"
+    public static func attachSession(id: TmuxSessionID, executable: String = "tmux") -> String {
+        "env -u TMUX \(executableToken(executable)) attach-session -d -t \(id.shellArgument)"
     }
 
-    public static func attachSession(id: String) throws -> String {
+    public static func attachSession(id: String, executable: String = "tmux") throws -> String {
         let sessionID = try TmuxSessionID(id)
-        return attachSession(id: sessionID)
+        return attachSession(id: sessionID, executable: executable)
     }
 
     /// Exact new-session template using validated quoted name.
     /// Template: `tmux new-session -A -D -s '<name>'`
-    public static func newSession(name: TmuxSessionName) -> String {
-        "tmux new-session -A -D -s \(name.shellArgument)"
+    public static func newSession(name: TmuxSessionName, executable: String = "tmux") -> String {
+        "\(executableToken(executable)) new-session -A -D -s \(name.shellArgument)"
     }
 
-    public static func newSession(name: String) throws -> String {
+    public static func newSession(name: String, executable: String = "tmux") throws -> String {
         let sessionName = try TmuxSessionName(name)
-        return newSession(name: sessionName)
+        return newSession(name: sessionName, executable: executable)
     }
 }

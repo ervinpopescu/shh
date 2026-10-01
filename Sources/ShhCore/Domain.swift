@@ -410,24 +410,34 @@ public struct HostTmuxPreferences: Codable, Hashable, Sendable {
     // Kept for decoding older catalogs, but no longer persisted for new data.
     public var defaultSession: String?
     public var autoAttach: Bool
+    /// Optional absolute tmux path for hosts whose non-interactive PATH differs
+    /// from the login shell. Invalid values are ignored by command resolution.
+    public var executablePath: String?
 
-    public init(defaultSession: String? = nil, autoAttach: Bool = false) {
+    public init(
+        defaultSession: String? = nil,
+        autoAttach: Bool = false,
+        executablePath: String? = nil
+    ) {
         self.defaultSession = defaultSession
         self.autoAttach = autoAttach
+        self.executablePath = executablePath
     }
 
-    private enum CodingKeys: String, CodingKey { case defaultSession, autoAttach }
+    private enum CodingKeys: String, CodingKey { case defaultSession, autoAttach, executablePath }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         defaultSession = try container.decodeIfPresent(String.self, forKey: .defaultSession)
         autoAttach = try container.decodeIfPresent(Bool.self, forKey: .autoAttach) ?? false
+        executablePath = try container.decodeIfPresent(String.self, forKey: .executablePath)
     }
 
     public func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         // A configured default target is legacy state and must not be emitted.
         try container.encode(autoAttach, forKey: .autoAttach)
+        try container.encodeIfPresent(executablePath, forKey: .executablePath)
     }
 }
 
@@ -500,7 +510,8 @@ public struct Host: Identifiable, Codable, Hashable, Sendable {
         if defaultTmuxSession != nil || autoAttachTmux {
             self.tmuxPreferences = HostTmuxPreferences(
                 defaultSession: defaultTmuxSession ?? tmuxPreferences.defaultSession,
-                autoAttach: autoAttachTmux || tmuxPreferences.autoAttach
+                autoAttach: autoAttachTmux || tmuxPreferences.autoAttach,
+                executablePath: tmuxPreferences.executablePath
             )
         } else {
             self.tmuxPreferences = tmuxPreferences
