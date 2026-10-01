@@ -302,8 +302,8 @@ final class MoshDomainTests: XCTestCase {
         for _ in 0..<20 where !(await connection.moshState.isDisconnected) {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
-        XCTAssertTrue((await connection.moshState).isDisconnected)
-    }
+        let finalState = await connection.moshState
+        XCTAssertTrue(finalState.isDisconnected)
     }
 
     // MARK: - DemoMoshTransport Tests
