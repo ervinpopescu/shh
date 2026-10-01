@@ -267,6 +267,24 @@ final class MoshDomainTests: XCTestCase {
         XCTAssertTrue(keyAfterClose.isZeroized)
     }
 
+    func testDemoMoshStateObserverTerminatesAndCleansUp() async throws {
+        let connection = DemoMoshConnection(
+            sessionInfo: MoshSessionInfo(udpPort: 60002, sessionKey: "state-observer-key", pid: 9999),
+            options: MoshOptions(portRange: MoshPortRange(port: 60002)),
+            remoteHostname: "demo.mosh.internal"
+        )
+
+        await connection.start()
+        let updates = await connection.moshStateUpdates()
+        let consumer = Task {
+            for await _ in updates { }
+        }
+        consumer.cancel()
+        await consumer.value
+
+        await connection.close()
+    }
+
     // MARK: - DemoMoshTransport Tests
 
     func testDemoMoshTransportConnectsWithTrustEvaluator() async throws {
