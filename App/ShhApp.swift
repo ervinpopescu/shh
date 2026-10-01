@@ -1130,7 +1130,7 @@ struct HostEditorView: View {
     static func tmuxExecutablePathValidationMessage(for path: String) -> String? {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        guard trimmed == "tmux" || TmuxExecutableDiscovery.isSafeAbsolutePath(trimmed) else {
+        guard trimmed == "tmux" || TmuxExecutableDiscovery.isSafeTmuxExecutablePath(trimmed) else {
             return "Use a safe absolute tmux executable path, or leave this field blank."
         }
         return nil
