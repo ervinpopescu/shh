@@ -23,6 +23,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private var activeExecChannels: [UUID: Channel] = [:]
     private var activeForwardedChannels: [UUID: Channel] = [:]
     private var redactor: Redactor
+    private var redactorClearRequested = false
 
     public var eventLoop: EventLoop { parentChannel.eventLoop }
     public var group: EventLoopGroup { eventLoopGroup ?? parentChannel.eventLoop }
@@ -133,6 +134,19 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     public func setRedactor(_ redactor: Redactor) {
         lock.withLock {
             self.redactor = redactor
+            redactorClearRequested = false
+        }
+    }
+
+    /// Requests secret cleanup without racing an admitted exec operation's
+    /// final stderr/error redaction. The close barrier performs the same
+    /// cleanup after its write-drain wait.
+    public func clearRedactorAfterOperations() {
+        lock.withLock {
+            redactorClearRequested = true
+            if activeWriteOperations == 0 {
+                redactor = Redactor()
+            }
         }
     }
 
@@ -495,6 +509,10 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             }
 
             isClosed = true
+            redactorClearRequested = true
+            if activeWriteOperations == 0 {
+                redactor = Redactor()
+            }
             keepaliveTask?.cancel()
             keepaliveTask = nil
             let activeContinuations = Array(continuations.values)
@@ -532,9 +550,14 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private func finishClose(snapshot: CloseSnapshot) async {
         let deadline = DispatchTime.now().uptimeNanoseconds &+ Self.closeDrainTimeoutNanoseconds
         let drained = await waitForWriteDrain(until: deadline)
-        if !drained {
-            lock.withLock {
+        lock.withLock {
+            if !drained {
                 didQuarantine = true
+            }
+            // Redaction remains installed until admitted operations have
+            // completed their final stderr/error transformation.
+            if drained && redactorClearRequested {
+                redactor = Redactor()
             }
         }
 
@@ -562,7 +585,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
 
     private func beginWriteOperation() throws {
         let admitted = lock.withLock { () -> Bool in
-            guard !isClosed else { return false }
+            guard !isClosed, !redactorClearRequested else { return false }
             activeWriteOperations += 1
             return true
         }
@@ -574,6 +597,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private func finishWriteOperation() {
         lock.withLock {
             activeWriteOperations = max(0, activeWriteOperations - 1)
+            if activeWriteOperations == 0, redactorClearRequested {
+                redactor = Redactor()
+            }
         }
     }
 

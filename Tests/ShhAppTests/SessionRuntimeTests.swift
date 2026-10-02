@@ -252,6 +252,56 @@ final class SessionRuntimeTests: XCTestCase {
         _ = await pendingSend.value
     }
 
+    func testSessionRuntimeInstallsRedactorOnInitialAndReplacementConnections() async throws {
+        let host = try Host(
+            name: "Installed Redactor",
+            hostname: "installed.invalid",
+            username: "dev"
+        )
+        let initial = RedactorRecordingConnection()
+        let replacement = RedactorRecordingConnection()
+        let initialRedactor = Redactor(secrets: ["initial-secret"])
+        let runtime = SessionRuntime(
+            host: host,
+            session: TerminalSession(hostID: host.id, state: .connecting),
+            connection: initial,
+            terminalController: ShhTerminalController(),
+            redactor: initialRedactor
+        )
+
+        XCTAssertEqual(initial.installedSecrets, ["initial-secret"])
+
+        let replacementRedactor = Redactor(secrets: ["replacement-secret"])
+        let reconnected = await runtime.reconnect(with: replacement, redactor: replacementRedactor)
+
+        XCTAssertTrue(reconnected)
+        XCTAssertEqual(replacement.installedSecrets, ["replacement-secret"])
+        await runtime.disconnect()
+        XCTAssertTrue(
+            replacement.installedSecrets.isEmpty,
+            "Disconnect must clear the installed connection redactor")
+    }
+
+    func testReconnectFailureClearsInstalledConnectionRedactor() async throws {
+        let host = try Host(
+            name: "Reconnect failure redactor",
+            hostname: "reconnect-failure.invalid",
+            username: "dev")
+        let connection = RedactorRecordingConnection()
+        let runtime = SessionRuntime(
+            host: host,
+            session: TerminalSession(hostID: host.id, state: .connected),
+            connection: connection,
+            terminalController: ShhTerminalController(),
+            redactor: Redactor(secrets: ["reconnect-secret"])
+        )
+
+        runtime.markReconnectFailed(reason: "Connection failed.")
+
+        XCTAssertTrue(runtime.redactor.secrets.isEmpty)
+        XCTAssertTrue(connection.installedSecrets.isEmpty)
+    }
+
     func testReplacementOutputUsesRedactorBeforeEventAdmission() async throws {
         let host = try Host(
             name: "Replacement Redactor",
@@ -325,6 +375,37 @@ final class SessionRuntimeTests: XCTestCase {
     private func waitForCallbacks() async {
         await Task.yield()
         try? await Task.sleep(nanoseconds: 20_000_000)
+    }
+}
+
+private final class RedactorRecordingConnection: SSHConnection,
+    SessionRuntimeRedactorInstallingConnection,
+    @unchecked Sendable
+{
+    private let lock = NSLock()
+    private var redactor = Redactor()
+    private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
+
+    var installedSecrets: [String] {
+        lock.withLock { redactor.secrets }
+    }
+
+    func setRedactor(_ redactor: Redactor) {
+        lock.withLock { self.redactor = redactor }
+    }
+
+    func events() async -> AsyncThrowingStream<TerminalEvent, Error> {
+        AsyncThrowingStream { continuation in
+            lock.withLock { streamContinuation = continuation }
+        }
+    }
+
+    func send(_ data: Data) async throws {}
+
+    func resize(_ size: TerminalSize) async throws {}
+
+    func close() async {
+        lock.withLock { streamContinuation?.finish() }
     }
 }
 

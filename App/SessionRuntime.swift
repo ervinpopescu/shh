@@ -3,6 +3,19 @@ import ShhCore
 import ShhSSH
 import ShhTerminal
 
+protocol SessionRuntimeRedactorInstallingConnection: AnyObject {
+    func setRedactor(_ redactor: Redactor)
+    func clearRedactorAfterOperations()
+}
+
+extension SessionRuntimeRedactorInstallingConnection {
+    func clearRedactorAfterOperations() {
+        setRedactor(Redactor())
+    }
+}
+
+extension LiveSSHConnection: SessionRuntimeRedactorInstallingConnection {}
+
 /// Owns the state and callback lifetime for one interactive SSH terminal.
 ///
 /// This is the first migration seam for multi-session support. AppContainer still
@@ -86,6 +99,7 @@ final class SessionRuntime {
         self.connection = connection
         self.terminalController = terminalController
         self.redactor = redactor
+        (connection as? SessionRuntimeRedactorInstallingConnection)?.setRedactor(redactor)
         self.terminalGrid = TerminalGrid(size: session.terminalSize)
         self.ansiParser = ANSIParser()
     }
@@ -104,7 +118,12 @@ final class SessionRuntime {
 
     func setRedactor(_ redactor: Redactor) {
         self.redactor = redactor
-        (connection as? LiveSSHConnection)?.setRedactor(redactor)
+        (connection as? SessionRuntimeRedactorInstallingConnection)?.setRedactor(redactor)
+    }
+
+    private func clearRedactor() {
+        redactor = Redactor()
+        (connection as? SessionRuntimeRedactorInstallingConnection)?.clearRedactorAfterOperations()
     }
 
     /// Activates the current connection and wires callbacks to this runtime.
@@ -130,6 +149,58 @@ final class SessionRuntime {
         session.state = state
     }
 
+    /// Keeps a disconnected runtime retryable without starting recovery itself.
+    /// The owner exposes the existing Retry action when this runtime is selected.
+    func markRetryAvailable(reason: String = "Connection closed.") {
+        guard session.state == .disconnected else { return }
+        reconnectState = .failed(reason: reason)
+    }
+
+    /// Projects coordinator progress onto this runtime before reconnect work
+    /// awaits credential or transport operations. This keeps a runtime truthful
+    /// when selection changes during a slow reconnect.
+    func updateReconnectState(_ state: ReconnectState) {
+        reconnectState = state
+        switch state {
+        case .waiting, .connecting:
+            session.state = .connecting
+        case .connected:
+            session.state = .connected
+        case .cancelled:
+            if session.state == .connecting {
+                session.state = .disconnected
+            }
+        case .exhausted, .failed:
+            // Coordinator terminal states can arrive after a preflight failure
+            // that never reached the transport. Reconcile the runtime owner so
+            // a later retry or foreground recovery is not stranded as connecting.
+            if session.state == .connecting {
+                session.state = .failed
+            }
+        case .idle:
+            break
+        }
+    }
+
+    /// Records a failed reconnect attempt while preserving this runtime as the
+    /// owner of its lifecycle projection. AppContainer may be projecting a
+    /// different session when the transport operation finishes.
+    func markReconnectFailed(reason: String) {
+        session.state = .failed
+        reconnectState = .failed(reason: reason)
+        clearRedactor()
+        _ = invalidateCallbacks()
+    }
+
+    /// Records a cancelled reconnect without allowing a stale operation to
+    /// resurrect this runtime as connecting.
+    func markReconnectCancelled() {
+        session.state = .disconnected
+        reconnectState = .cancelled
+        clearRedactor()
+        _ = invalidateCallbacks()
+    }
+
     /// Replaces only this session's transport. The session identity and terminal
     /// model remain stable, while the generation rejects callbacks from the old
     /// connection even if its event stream races cancellation.
@@ -144,7 +215,7 @@ final class SessionRuntime {
         reconnectGeneration &+= 1
         reconnectState = .connecting(attempt: Int(reconnectGeneration))
         session.state = .connecting
-        redactor = Redactor()
+        clearRedactor()
 
         let deadline = teardownDeadline()
         guard
@@ -160,6 +231,7 @@ final class SessionRuntime {
 
         connection = replacement
         redactor = replacementRedactor
+        (replacement as? SessionRuntimeRedactorInstallingConnection)?.setRedactor(redactor)
         terminalGrid = TerminalGrid(size: session.terminalSize)
         ansiParser = ANSIParser()
         terminalText = ""
@@ -202,7 +274,7 @@ final class SessionRuntime {
         let pending = invalidateCallbacks()
         session.state = .disconnected
         reconnectState = .idle
-        redactor = Redactor()
+        clearRedactor()
         _ = await closeAndAwaitQuiescence(
             activeConnection,
             pending: pending,
@@ -285,7 +357,7 @@ final class SessionRuntime {
                             connection: eventsConnection,
                             token: token,
                             state: .disconnected,
-                            reconnectState: .idle
+                            reconnectState: .failed(reason: "Connection closed.")
                         )
                         await self.onTermination?(.closed)
                         return
@@ -305,7 +377,7 @@ final class SessionRuntime {
                     connection: eventsConnection,
                     token: token,
                     state: .disconnected,
-                    reconnectState: .idle
+                    reconnectState: .failed(reason: "Connection closed.")
                 )
                 await self.onTermination?(.closed)
             } catch {
@@ -330,7 +402,7 @@ final class SessionRuntime {
         guard accepts(token) else { return }
         session.state = state
         self.reconnectState = reconnectState
-        redactor = Redactor()
+        clearRedactor()
         let pending = invalidateCallbacks()
         _ = await closeAndAwaitQuiescence(
             connection,
@@ -456,7 +528,7 @@ final class SessionRuntime {
     private func failTeardown() {
         session.state = .failed
         reconnectState = .failed(reason: "Connection shutdown timed out.")
-        redactor = Redactor()
+        clearRedactor()
         terminalController.onOutput = nil
         terminalController.onResize = nil
     }

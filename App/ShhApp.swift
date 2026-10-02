@@ -387,9 +387,7 @@ struct HostDetailView: View {
                     "Voice input", value: host.isVoiceEnabled ? "Enabled" : "Disabled (Default)")
                 LabeledContent("Environment", value: host.isProduction ? "Production" : "Standard")
             }
-            if let failure = container.lastConnectionFailure,
-                container.activeSession?.hostID == host.id || container.activeHost?.id == host.id
-            {
+            if let failure = container.connectionFailure(for: host.id) {
                 Section {
                     ConnectionFailureCard(
                         failure: failure,
@@ -1438,7 +1436,9 @@ struct SessionView: View {
             }
 
             // Connection Failure Banner (if failed)
-            if let failure = container.lastConnectionFailure,
+            if let sessionID = container.selectedSessionID,
+                let hostID = container.activeSession?.hostID,
+                let failure = container.connectionFailure(for: hostID, sessionID: sessionID),
                 container.activeSession?.state == .failed
             {
                 ConnectionFailureCard(
