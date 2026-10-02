@@ -203,6 +203,9 @@ final class RestorationAndReachabilityTests: XCTestCase {
         let hostID = UUID()
         let mockConnection = MockSSHConnection()
         mockConnection.onExecuteCommand = { command in
+            if command == TmuxCommand.probe() {
+                return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
+            }
             if command.contains("has-session") { return SSHCommandResult(exitCode: 0, stdout: "") }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
