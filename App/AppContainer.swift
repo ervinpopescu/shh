@@ -63,6 +63,53 @@ private final class VoiceInterruptionBridge: @unchecked Sendable {
     }
 }
 
+/// Serializes external operations on a forwarding manager that may be reused
+/// by successive auxiliary owners. A stale owner can only enter the manager
+/// before a newer owner rebinds it; queued stale cleanup is discarded.
+private actor PortForwardingManagerOperationGate {
+    private var generation: UInt64 = 0
+    private var isBusy = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func rebind() -> UInt64 {
+        generation &+= 1
+        return generation
+    }
+
+    func run<T: Sendable>(
+        generation token: UInt64,
+        operation: @Sendable () async throws -> T
+    ) async rethrows -> T? {
+        await acquire()
+        guard generation == token else {
+            release()
+            return nil
+        }
+        defer { release() }
+        return try await operation()
+    }
+
+    private func acquire() async {
+        if !isBusy {
+            isBusy = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+        isBusy = true
+    }
+
+    private func release() {
+        if let waiter = waiters.first {
+            waiters.removeFirst()
+            waiter.resume()
+        } else {
+            isBusy = false
+        }
+    }
+}
+
 public enum SecondaryPaneMode: Equatable, Sendable {
     case none
     case sftp(Host)
@@ -137,7 +184,13 @@ final class AppContainer: ObservableObject {
     @Published var terminalText = ""
     @Published var speechState: SpeechComposerState = .idle
     @Published var pendingTrustChallenge: HostKeyChallenge?
-    @Published public var lastConnectionFailure: ConnectionFailure?
+    /// Connection failures are retained per failed attempt so one host's
+    /// retry cannot erase another host's actionable detail.
+    @Published public private(set) var connectionFailures: [UUID: ConnectionFailure] = [:]
+    /// Compatibility projection for callers that need the most recently
+    /// recorded failure. Views must use `connectionFailure(for:sessionID:)`.
+    @Published public private(set) var lastConnectionFailure: ConnectionFailure?
+    private var connectionFailureOrder: [UUID] = []
     @Published public var catalogUpdateToken: UUID = UUID()
     @Published var reconnectState: ReconnectState = .idle {
         didSet {
@@ -206,6 +259,8 @@ final class AppContainer: ObservableObject {
     @Published public var forwardingSessions: [ForwardingSessionState] = []
     @Published public var forwardingErrorMessage: String? = nil
     private var forwardingStreamTask: Task<Void, Never>?
+    private var forwardingManagerOperationGeneration: UInt64?
+    private var forwardingManagerGates: [ObjectIdentifier: PortForwardingManagerOperationGate] = [:]
 
     public var activeForwardersCount: Int {
         forwardingSessions.filter { $0.status == .active }.count
@@ -221,6 +276,9 @@ final class AppContainer: ObservableObject {
     @Published public var sftpErrorMessage: String? = nil
     @Published public var lastSFTPFailure: ConnectionFailure? = nil
     private var sftpSetupGeneration: Int = 0
+    /// Monotonic list requests are scoped to the single-session auxiliary owner.
+    /// A repository/session match alone cannot order two requests on that owner.
+    private var directoryRequestGenerations: [UUID?: UInt64] = [:]
 
     // Sorting & Filtering
     @Published public var sortField: FileSortField = .type
@@ -238,6 +296,8 @@ final class AppContainer: ObservableObject {
     private var sendImageTask: Task<Void, Never>?
     private var activeSendImageTransferID: UUID?
     private var activeSendImageOperationID: UUID?
+    private var transferQueueGeneration: UInt64 = 0
+    private var sendImageGeneration: UInt64 = 0
 
     // Previews & Editor
     @Published public var previewFile: RemoteFile? = nil
@@ -295,6 +355,16 @@ final class AppContainer: ObservableObject {
     // deciding whether to reconnect, preserving the session with zero delay if it survived.
     private var isSceneInBackground = false
     private var isNetworkRecoveryInProgress = false
+    /// Session that owns the current reconnect coordinator run. Projection
+    /// updates must not be applied to a newly selected session.
+    private var networkRecoverySessionID: UUID?
+    /// TCP interface teardown can finish after selection moved. These owners
+    /// are recovered only when the user selects them again.
+    private var deferredInterfaceRecoverySessionIDs: Set<UUID> = []
+    /// Background cancellation turns an in-flight recovery into a cancelled
+    /// runtime state. Preserve the owner so foreground return can resume it
+    /// without confusing cancellation with an explicit user disconnect.
+    private var pendingForegroundRecoverySessionIDs: Set<UUID> = []
     private(set) var hasObservedTransportError = false
     private var lifecycleGeneration = 0
     private var foregroundRecoveryTask: Task<Void, Never>?
@@ -306,6 +376,63 @@ final class AppContainer: ObservableObject {
     }
     private(set) var sessionRuntimes: [UUID: SessionRuntime] = [:]
     private var sessionOrder: [UUID] = []
+
+    private struct LiveSessionRestorationTarget {
+        let hostID: UUID
+        let target: LastUsedMultiplexerTarget
+    }
+
+    private var restorationTargetsBySessionID: [UUID: LiveSessionRestorationTarget] = [:]
+    /// Serializes restoration writes so an older selection cannot finish after
+    /// a newer selection and overwrite its host or target metadata.
+    private var restorationSaveTask: Task<Void, Never>?
+    private var redactionValidityTokens: [UUID: UUID] = [:]
+    private var selectionGeneration: UInt64 = 0
+    private var auxiliarySetupGeneration: UInt64 = 0
+    private var fileMutationGeneration: UInt64 = 0
+    private var previewOperationGeneration: UInt64 = 0
+    private var editorOperationGeneration: UInt64 = 0
+
+    private struct RestorationWriteContext {
+        let lifecycleGeneration: Int
+        let selectionGeneration: UInt64
+        let sessionID: UUID
+        let hostID: UUID
+        let runtimeIdentity: ObjectIdentifier
+    }
+
+    private enum SFTPOperationScope {
+        case fileMutation
+        case preview
+        case editor
+        case transfer
+    }
+
+    private struct SFTPOperationContext {
+        let sessionID: UUID?
+        let runtimeIdentity: ObjectIdentifier?
+        let hostID: UUID?
+        let repositoryIdentity: ObjectIdentifier
+        let auxiliarySessionID: UUID?
+        let auxiliarySetupGeneration: UInt64
+        let sftpSetupGeneration: Int
+        let transferQueueGeneration: UInt64
+        let lifecycleGeneration: Int
+        let operationGeneration: UInt64
+        let scope: SFTPOperationScope
+    }
+
+    private struct AuxiliaryOwnerContext {
+        let sessionID: UUID
+        let runtimeIdentity: ObjectIdentifier
+        let connectionIdentity: ObjectIdentifier
+        let setupGeneration: UInt64
+    }
+
+    /// Auxiliary adapters remain intentionally single-session-only. This owner
+    /// token prevents a selected-session change from reusing an adapter created
+    /// for another host.
+    private var auxiliarySessionID: UUID?
 
     public var selectedSessionRuntime: SessionRuntime? {
         guard let id = selectedSessionID else { return nil }
@@ -330,8 +457,355 @@ final class AppContainer: ObservableObject {
         sessionRuntimes[sessionID]
     }
 
+    private func beginRedactionValidity(for sessionID: UUID) -> UUID {
+        let token = UUID()
+        redactionValidityTokens[sessionID] = token
+        return token
+    }
+
+    private func invalidateRedactionValidity(for sessionID: UUID) {
+        redactionValidityTokens[sessionID] = UUID()
+    }
+
+    private func isCurrentRedactionValidity(sessionID: UUID, token: UUID) -> Bool {
+        redactionValidityTokens[sessionID] == token
+            && !explicitlyDisconnectedSessionIDs.contains(sessionID)
+            && !isSceneInBackground
+    }
+
+    private func isExplicitDisconnect(for sessionID: UUID) -> Bool {
+        explicitlyDisconnectedSessionIDs.contains(sessionID)
+    }
+
+    private func beginNetworkRecovery(for sessionID: UUID) {
+        networkRecoverySessionID = sessionID
+        isNetworkRecoveryInProgress = true
+    }
+
+    private func finishNetworkRecovery(for sessionID: UUID) {
+        guard networkRecoverySessionID == sessionID else { return }
+        isNetworkRecoveryInProgress = false
+    }
+
+    private func clearNetworkRecovery(for sessionID: UUID) {
+        guard networkRecoverySessionID == sessionID else { return }
+        isNetworkRecoveryInProgress = false
+        networkRecoverySessionID = nil
+    }
+
+    private func auxiliaryOwnerContext(
+        for runtime: SessionRuntime, connection: any SSHConnection
+    ) -> AuxiliaryOwnerContext {
+        AuxiliaryOwnerContext(
+            sessionID: runtime.session.id,
+            runtimeIdentity: ObjectIdentifier(runtime),
+            connectionIdentity: ObjectIdentifier(connection as AnyObject),
+            setupGeneration: auxiliarySetupGeneration
+        )
+    }
+
+    private func isCurrentRuntimeConnection(
+        sessionID: UUID, runtime: SessionRuntime, connection: any SSHConnection
+    ) -> Bool {
+        guard sessionRuntimes[sessionID] === runtime,
+            runtime.session.state == .connected,
+            !isExplicitDisconnect(for: sessionID)
+        else { return false }
+        return ObjectIdentifier(runtime.connection as AnyObject)
+            == ObjectIdentifier(connection as AnyObject)
+    }
+
+    private func isCurrentAuxiliaryOwner(_ context: AuxiliaryOwnerContext) -> Bool {
+        guard auxiliarySetupGeneration == context.setupGeneration,
+            auxiliarySessionID == context.sessionID,
+            selectedSessionID == context.sessionID,
+            sessionRuntimes.count == 1,
+            let runtime = sessionRuntimes[context.sessionID],
+            ObjectIdentifier(runtime) == context.runtimeIdentity,
+            runtime.session.state == .connected,
+            !isExplicitDisconnect(for: context.sessionID)
+        else { return false }
+        return ObjectIdentifier(runtime.connection as AnyObject) == context.connectionIdentity
+    }
+
+    private func abortStaleAuxiliarySetup(
+        sessionID: UUID, runtime: SessionRuntime, connection: any SSHConnection
+    ) async {
+        guard
+            !isCurrentRuntimeConnection(
+                sessionID: sessionID, runtime: runtime, connection: connection)
+        else { return }
+        await connection.close()
+        updateOpenSessions()
+    }
+
+    @discardableResult
+    private func enqueueRestorationSave(
+        _ metadata: SessionRestorationMetadata,
+        context: RestorationWriteContext? = nil
+    ) -> Task<Void, Never> {
+        let previous = restorationSaveTask
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            if let context, !self.isCurrentRestorationWrite(context) { return }
+            try? await self.restorationStore.save(metadata)
+        }
+        restorationSaveTask = task
+        return task
+    }
+
+    private func isCurrentRestorationWrite(_ context: RestorationWriteContext) -> Bool {
+        guard lifecycleGeneration == context.lifecycleGeneration,
+            selectionGeneration == context.selectionGeneration,
+            selectedSessionID == context.sessionID,
+            activeSession?.id == context.sessionID,
+            activeHost?.id == context.hostID,
+            let runtime = sessionRuntimes[context.sessionID],
+            ObjectIdentifier(runtime) == context.runtimeIdentity,
+            !isExplicitDisconnect(for: context.sessionID)
+        else { return false }
+        return true
+    }
+
+    private func restorationWriteContext(
+        session: TerminalSession, host: Host
+    ) -> RestorationWriteContext? {
+        guard selectedSessionID == session.id,
+            activeSession?.id == session.id,
+            activeHost?.id == host.id,
+            let runtime = sessionRuntimes[session.id]
+        else { return nil }
+        return RestorationWriteContext(
+            lifecycleGeneration: lifecycleGeneration,
+            selectionGeneration: selectionGeneration,
+            sessionID: session.id,
+            hostID: host.id,
+            runtimeIdentity: ObjectIdentifier(runtime)
+        )
+    }
+
+    private func saveRestorationMetadata(
+        _ metadata: SessionRestorationMetadata,
+        context: RestorationWriteContext
+    ) async {
+        guard isCurrentRestorationWrite(context) else { return }
+        await enqueueRestorationSave(metadata, context: context).value
+    }
+
+    @discardableResult
+    private func enqueueRestorationClear() -> Task<Void, Never> {
+        let previous = restorationSaveTask
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            try? await self.restorationStore.clear()
+        }
+        restorationSaveTask = task
+        return task
+    }
+
+    private func saveRestorationMetadata(_ metadata: SessionRestorationMetadata) async {
+        await enqueueRestorationSave(metadata).value
+    }
+
+    private func clearRestorationMetadata() async {
+        await enqueueRestorationClear().value
+    }
+
+    private func connectionFailure(
+        for error: Error, host: Host, sessionID: UUID?
+    ) -> ConnectionFailure {
+        var failure = ConnectionFailure.from(error: error, host: host)
+        failure.hostID = host.id
+        failure.sessionID = sessionID
+        return failure
+    }
+
+    private func recordConnectionFailure(_ failure: ConnectionFailure) {
+        connectionFailures[failure.id] = failure
+        connectionFailureOrder.removeAll { $0 == failure.id }
+        connectionFailureOrder.append(failure.id)
+        lastConnectionFailure = failure
+    }
+
+    private func clearConnectionFailures(forHostID hostID: UUID) {
+        let removedIDs = connectionFailureOrder.filter {
+            connectionFailures[$0]?.hostID == hostID
+        }
+        guard !removedIDs.isEmpty else { return }
+        for id in removedIDs {
+            connectionFailures.removeValue(forKey: id)
+        }
+        connectionFailureOrder.removeAll { removedIDs.contains($0) }
+        lastConnectionFailure =
+            connectionFailureOrder.reversed()
+            .compactMap { connectionFailures[$0] }
+            .first
+    }
+
+    private func clearConnectionFailure(forSessionID sessionID: UUID) {
+        let matchingIDs = connectionFailureOrder.filter {
+            connectionFailures[$0]?.sessionID == sessionID
+        }
+        guard !matchingIDs.isEmpty else { return }
+        for id in matchingIDs {
+            connectionFailures.removeValue(forKey: id)
+        }
+        connectionFailureOrder.removeAll { matchingIDs.contains($0) }
+        lastConnectionFailure =
+            connectionFailureOrder.reversed()
+            .compactMap { connectionFailures[$0] }
+            .first
+    }
+
+    func connectionFailure(for hostID: UUID, sessionID: UUID? = nil) -> ConnectionFailure? {
+        connectionFailureOrder.reversed().compactMap { id in
+            guard let failure = connectionFailures[id], failure.hostID == hostID else {
+                return nil
+            }
+            if let sessionID {
+                return failure.sessionID == sessionID ? failure : nil
+            }
+            return failure
+        }.first
+    }
+
+    /// Copies one runtime's state into the selected-session legacy projection.
+    /// The identity checks are required because reconnect work awaits transport
+    /// and credential operations while selection may change.
+    @discardableResult
+    private func synchronizeSelectedSessionProjection(for runtime: SessionRuntime) -> Bool {
+        let sessionID = runtime.session.id
+        guard selectedSessionID == sessionID,
+            let currentRuntime = sessionRuntimes[sessionID], currentRuntime === runtime
+        else { return false }
+        activeSession = runtime.session
+        activeHost = runtime.host
+        terminalText = runtime.terminalText
+        reconnectState = runtime.reconnectState
+        redactor = runtime.redactor
+        updateOpenSessions()
+        syncLiveActivityState()
+        return true
+    }
+
+    /// Synchronizes failure/cancellation state for the owning runtime first,
+    /// then updates selected projections only when that runtime is still current.
+    private func synchronizeReconnectFailure(
+        for runtime: SessionRuntime,
+        sessionID: UUID,
+        reason: String,
+        cancelled: Bool = false
+    ) {
+        guard let currentRuntime = sessionRuntimes[sessionID], currentRuntime === runtime else {
+            return
+        }
+        if runtime.session.state == .connecting {
+            if cancelled {
+                runtime.markReconnectCancelled()
+            } else {
+                runtime.markReconnectFailed(reason: reason)
+            }
+        }
+        updateOpenSessions()
+        finishNetworkRecovery(for: sessionID)
+        guard selectedSessionID == sessionID else { return }
+        _ = synchronizeSelectedSessionProjection(for: runtime)
+        if cancelled {
+            reconnectState = .cancelled
+        } else {
+            reconnectState = .failed(reason: reason)
+        }
+        isForegroundRecoveryInProgress = false
+    }
+
+    private func rememberCurrentRestorationTarget(for sessionID: UUID) {
+        guard selectedSessionID == sessionID,
+            let runtime = sessionRuntimes[sessionID],
+            activeSession?.id == sessionID,
+            activeHost?.id == runtime.host.id
+        else { return }
+        let target =
+            activeTmuxSessionID.flatMap(LastUsedMultiplexerTarget.tmuxTarget)
+            ?? activeHerdrWorkspaceID.flatMap(LastUsedMultiplexerTarget.herdrTarget)
+        guard let target else { return }
+        restorationTargetsBySessionID[sessionID] = LiveSessionRestorationTarget(
+            hostID: runtime.host.id, target: target)
+    }
+
+    private func restorationTarget(for runtime: SessionRuntime) -> LastUsedMultiplexerTarget? {
+        if let stored = restorationTargetsBySessionID[runtime.session.id],
+            stored.hostID == runtime.host.id
+        {
+            return stored.target
+        }
+        guard selectedSessionID == runtime.session.id,
+            activeSession?.id == runtime.session.id,
+            activeHost?.id == runtime.host.id
+        else { return nil }
+        return activeTmuxSessionID.flatMap(LastUsedMultiplexerTarget.tmuxTarget)
+            ?? activeHerdrWorkspaceID.flatMap(LastUsedMultiplexerTarget.herdrTarget)
+    }
+
     func selectSession(id: UUID) {
         guard let runtime = sessionRuntimes[id] else { return }
+        if selectedSessionID != id {
+            selectionGeneration &+= 1
+        }
+        if let previousID = selectedSessionID, previousID != id {
+            rememberCurrentRestorationTarget(for: previousID)
+            transferQueueGeneration &+= 1
+            cancelSendImage()
+            let staleTransferIDs = Set(activeTransferTasks.keys)
+            for taskID in staleTransferIDs {
+                activeTransferTasks[taskID]?.cancel()
+            }
+            activeTransferTasks = activeTransferTasks.filter {
+                !staleTransferIDs.contains($0.key)
+            }
+            transferQueueState = TransferQueueState()
+            auxiliarySetupGeneration &+= 1
+            // Invalidate old-owner projections synchronously. The asynchronous
+            // teardown below must not leave A's forwarding or file state visible
+            // after the UI has selected B.
+            forwardingStreamTask?.cancel()
+            forwardingStreamTask = nil
+            forwardingSessions = []
+            forwardingErrorMessage = nil
+            closePreview()
+            closeEditor()
+            currentDirectoryFiles = []
+            currentPath = RemotePath("/home/dev")
+            isLoadingDirectory = false
+            directoryErrorMessage = nil
+            sftpErrorMessage = nil
+            lastSFTPFailure = nil
+            sftpSetupGeneration += 1
+            directoryRequestGenerations.removeAll()
+            directoryCache.removeAll()
+            if !staleTransferIDs.isEmpty {
+                Task { [weak self] in
+                    guard let self else { return }
+                    for taskID in staleTransferIDs {
+                        await self.transferCoordinator.cancel(id: taskID)
+                        await self.transferCoordinator.remove(id: taskID)
+                    }
+                }
+            }
+        }
+        if sessionRuntimes.count > 1, auxiliarySessionID != nil {
+            let staleTransferIDs = Set(activeTransferTasks.keys)
+            auxiliarySessionID = nil
+            let teardownGeneration = auxiliarySetupGeneration
+            Task { [weak self] in
+                guard let self,
+                    self.auxiliarySetupGeneration == teardownGeneration,
+                    self.auxiliarySessionID == nil
+                else { return }
+                await self.teardownAuxiliaryResources(transferTaskIDs: staleTransferIDs)
+            }
+        }
         if case .sftp(let host) = secondaryPaneMode, host.id != runtime.host.id {
             closeSecondaryPane()
         }
@@ -344,7 +818,28 @@ final class AppContainer: ObservableObject {
         terminalText = runtime.terminalText
         reconnectState = runtime.reconnectState
         redactor = runtime.redactor
+        synchronizeSelectedMoshState(for: runtime)
         syncLiveActivityState()
+
+        // A runtime that was disconnected during an interface transition may
+        // have become retryable while another session was selected. Start its
+        // owner-scoped recovery only after it is selected again.
+        if runtime.session.state == .failed || runtime.session.state == .disconnected,
+            case .failed = runtime.reconnectState,
+            deferredInterfaceRecoverySessionIDs.contains(id),
+            !runtime.reconnectState.isReconnecting,
+            !isExplicitDisconnect(for: id),
+            reachabilityMonitor.isReachable
+        {
+            deferredInterfaceRecoverySessionIDs.remove(id)
+            Task { @MainActor [weak self] in
+                guard let self,
+                    self.selectedSessionID == id,
+                    self.sessionRuntimes[id] === runtime
+                else { return }
+                self.handleConnectionDrop(host: runtime.host, sessionID: id)
+            }
+        }
 
         let targetConnection = runtime.connection
         Task { [weak self] in
@@ -352,20 +847,26 @@ final class AppContainer: ObservableObject {
             _ = await self.synchronizeViewportAndResize(targetConnection, sessionID: id)
         }
 
-        Task { [weak self] in
-            guard let self, let session = self.activeSession, let host = self.activeHost else {
-                return
-            }
-            let metadata = self.restorationMetadata(
-                hostID: host.id, sessionID: session.id, target: nil)
-            try? await self.restorationStore.save(metadata)
-        }
+        guard let currentRuntime = sessionRuntimes[id], currentRuntime === runtime else { return }
+        let target = restorationTarget(for: runtime)
+        let metadata = restorationMetadata(
+            hostID: runtime.host.id, sessionID: runtime.session.id, target: target)
+        _ = enqueueRestorationSave(metadata)
     }
 
     func closeSession(id: UUID) async {
+        if networkRecoverySessionID == id {
+            await reconnectCoordinator.cancel()
+            clearNetworkRecovery(for: id)
+        }
         guard let runtime = sessionRuntimes.removeValue(forKey: id) else { return }
         sessionOrder.removeAll { $0 == id }
         explicitlyDisconnectedSessionIDs.remove(id)
+        pendingForegroundRecoverySessionIDs.remove(id)
+        deferredInterfaceRecoverySessionIDs.remove(id)
+        restorationTargetsBySessionID.removeValue(forKey: id)
+        invalidateRedactionValidity(for: id)
+        clearConnectionFailure(forSessionID: id)
         await runtime.disconnect()
         liveActivityManager.end(sessionID: id)
         updateOpenSessions()
@@ -381,26 +882,34 @@ final class AppContainer: ObservableObject {
             if let nextID = sessionOrder.last {
                 selectSession(id: nextID)
             } else {
+                selectionGeneration &+= 1
                 selectedSessionID = nil
                 activeSession = nil
                 activeHost = nil
                 terminalText = ""
                 reconnectState = .idle
+                redactor = Redactor()
                 fallbackExplicitDisconnect = false
                 liveActivityManager.endAll()
-                try? await restorationStore.clear()
+                await clearRestorationMetadata()
                 await teardownAuxiliaryResources()
             }
         } else if sessionOrder.isEmpty {
+            selectionGeneration &+= 1
             selectedSessionID = nil
             activeSession = nil
             activeHost = nil
             terminalText = ""
             reconnectState = .idle
+            redactor = Redactor()
             fallbackExplicitDisconnect = false
             liveActivityManager.endAll()
-            try? await restorationStore.clear()
+            await clearRestorationMetadata()
             await teardownAuxiliaryResources()
+        }
+
+        if sessionRuntimes.count == 1 {
+            await rebindAuxiliaryResourcesIfNeeded()
         }
     }
 
@@ -711,11 +1220,8 @@ final class AppContainer: ObservableObject {
         self.customPortForwardingManager = portForwardingManager
         if let portForwardingManager {
             self.portForwardingManager = portForwardingManager
-            self.startForwardingMonitoring(manager: portForwardingManager)
         } else if self.transport is DemoSSHTransport {
-            let demoPF = DemoPortForwardingManager()
-            self.portForwardingManager = demoPF
-            self.startForwardingMonitoring(manager: demoPF)
+            self.portForwardingManager = DemoPortForwardingManager()
         } else {
             self.portForwardingManager = nil
         }
@@ -732,12 +1238,24 @@ final class AppContainer: ObservableObject {
                     guard let self,
                         await coordinator.currentGeneration == generation
                     else { return }
-                    self.reconnectState = newState
+                    guard let recoverySessionID = self.networkRecoverySessionID,
+                        let runtime = self.sessionRuntimes[recoverySessionID],
+                        !self.isExplicitDisconnect(for: recoverySessionID)
+                    else { return }
+                    runtime.updateReconnectState(newState)
+                    self.updateOpenSessions()
+                    if self.selectedSessionID == recoverySessionID {
+                        self.reconnectState = newState
+                        // A failed runtime is authoritative for the selected
+                        // projection; coordinator state only adds exhausted or
+                        // retryable status around that runtime state.
+                        self.activeSession = runtime.session
+                        self.redactor = runtime.redactor
+                        self.syncLiveActivityState()
+                    }
                     switch newState {
                     case .idle, .connected, .cancelled, .exhausted, .failed:
-                        if self.activeSession?.state != .connecting {
-                            self.isNetworkRecoveryInProgress = false
-                        }
+                        self.clearNetworkRecovery(for: recoverySessionID)
                     case .waiting, .connecting:
                         break
                     }
@@ -923,6 +1441,8 @@ final class AppContainer: ObservableObject {
         guard !isConnectingSession else { return }
         guard sessionRuntimes.count < Self.maximumConcurrentSessions else {
             let failure = ConnectionFailure(
+                hostID: host.id,
+                sessionID: UUID(),
                 stage: .tcp,
                 reason: "Maximum concurrent sessions reached (\(Self.maximumConcurrentSessions)).",
                 technicalDetail:
@@ -930,20 +1450,26 @@ final class AppContainer: ObservableObject {
                 recoveryAction:
                     "Close an existing session from the switcher before opening a new one."
             )
-            lastConnectionFailure = failure
+            recordConnectionFailure(failure)
             return
         }
 
-        // Close secondary pane before opening a new session to avoid cross-host leak
+        // Close secondary pane and tear down single-session adapters before
+        // opening another host. They must never remain owned by the old host.
         closeSecondaryPane()
+        if let selectedSessionID {
+            rememberCurrentRestorationTarget(for: selectedSessionID)
+        }
+        if !sessionRuntimes.isEmpty {
+            await teardownAuxiliaryResources()
+        }
 
         lifecycleGeneration += 1
         isSceneInBackground = false
         isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
         hasObservedTransportError = false
-        let connectionGeneration = lifecycleGeneration
-        lastConnectionFailure = nil
+        clearConnectionFailures(forHostID: host.id)
         await cancelVoiceRecording()
         resetVoiceState()
         fallbackExplicitDisconnect = false
@@ -992,12 +1518,17 @@ final class AppContainer: ObservableObject {
             directoryCache.removeAll()
             forwardingStreamTask?.cancel()
             forwardingStreamTask = nil
-            await portForwardingManager?.stopAll()
+            forwardingSessions = []
+            forwardingErrorMessage = nil
+            if let manager = portForwardingManager,
+                let managerGeneration = forwardingManagerOperationGeneration
+            {
+                await stopAllForwarding(manager: manager, generation: managerGeneration)
+            }
+            forwardingManagerOperationGeneration = nil
             if !isDemo {
                 portForwardingManager = nil
             }
-            forwardingSessions = []
-            forwardingErrorMessage = nil
             fallbackTerminalController.reset()
         }
 
@@ -1005,6 +1536,7 @@ final class AppContainer: ObservableObject {
         pendingTrustHost = nil
         let newSessionID = sessionID ?? UUID()
         explicitlyDisconnectedSessionIDs.remove(newSessionID)
+        let redactionValidityToken = beginRedactionValidity(for: newSessionID)
         terminalController.synchronizeViewportMeasurement()
         let initialTerminalSize = terminalController.size
 
@@ -1067,36 +1599,45 @@ final class AppContainer: ObservableObject {
             }
             openedConnection = connection
             guard pendingConnectingSession?.id == session.id,
-                lifecycleGeneration == connectionGeneration,
-                !isSceneInBackground
+                isCurrentRedactionValidity(
+                    sessionID: session.id, token: redactionValidityToken)
             else {
                 await connection.close()
                 openedConnection = nil
-                pendingConnectingSession = nil
-                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                let shouldRestorePriorSelection = pendingConnectingSession == nil
+                if pendingConnectingSession?.id == session.id {
+                    pendingConnectingSession = nil
+                }
+                if shouldRestorePriorSelection,
+                    let priorID = priorSelectedSessionID,
+                    sessionRuntimes[priorID] != nil
+                {
                     selectSession(id: priorID)
                 }
                 return
             }
-            if let moshController = connection as? any MoshSessionControlling {
-                let info = await moshController.sessionInfo
-                self.moshSessionInfo = info
-                let st = await moshController.moshState
-                self.moshState = st
-                let roaming = await moshController.roamingState
-                self.networkRoamingState = roaming
-                startMoshMonitoring(for: moshController, session: session)
-            }
-            // Host key is accepted and connection succeeded; load redaction secret if available
-            await loadRedactionSecret(for: host)
+            // Host key is accepted and connection succeeded; load redaction secret if available.
+            // Use the newly opened connection rather than the selected-session projection.
+            let connectionRedactor = await loadRedactionSecret(
+                for: host,
+                connection: connection,
+                sessionID: session.id,
+                validityToken: redactionValidityToken
+            )
             guard pendingConnectingSession?.id == session.id,
-                lifecycleGeneration == connectionGeneration,
-                !isSceneInBackground
+                isCurrentRedactionValidity(
+                    sessionID: session.id, token: redactionValidityToken)
             else {
                 await connection.close()
                 openedConnection = nil
-                pendingConnectingSession = nil
-                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                let shouldRestorePriorSelection = pendingConnectingSession == nil
+                if pendingConnectingSession?.id == session.id {
+                    pendingConnectingSession = nil
+                }
+                if shouldRestorePriorSelection,
+                    let priorID = priorSelectedSessionID,
+                    sessionRuntimes[priorID] != nil
+                {
                     selectSession(id: priorID)
                 }
                 return
@@ -1106,7 +1647,7 @@ final class AppContainer: ObservableObject {
                 session: session,
                 connection: connection,
                 terminalController: runtimeTerminalController,
-                redactor: redactor
+                redactor: connectionRedactor
             )
             createdRuntime = runtime
             configureSessionRuntime(runtime, session: session, host: host)
@@ -1117,16 +1658,47 @@ final class AppContainer: ObservableObject {
             updateOpenSessions()
             selectSession(id: session.id)
             await runtime.activateAndWait()
-            activeSession?.state = .connected
-            updateOpenSessions()
-            syncLiveActivityState()
-            pendingConnectingSession = nil
+            guard
+                isCurrentRuntimeConnection(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
+            // SessionRuntime owns the admitted state. Only project it back to
+            // legacy selected-session properties if selection still points at
+            // this exact runtime after the activation await.
+            _ = synchronizeSelectedSessionProjection(for: runtime)
+            if pendingConnectingSession?.id == session.id {
+                pendingConnectingSession = nil
+            }
+            let auxiliaryContext: AuxiliaryOwnerContext?
+            if sessionRuntimes.count == 1 {
+                auxiliarySessionID = session.id
+                auxiliaryContext = auxiliaryOwnerContext(for: runtime, connection: connection)
+            } else {
+                auxiliaryContext = nil
+            }
 
-            let targetSession = await automaticTmuxTarget(
-                for: host,
-                explicitTarget: restoringTmuxSessionID,
-                allowStoredTarget: restoringTmuxSessionID != nil
-            )
+            let targetSession: String?
+            if sessionRuntimes.count == 1 {
+                targetSession = await automaticTmuxTarget(
+                    for: host,
+                    explicitTarget: restoringTmuxSessionID,
+                    allowStoredTarget: restoringTmuxSessionID != nil
+                )
+            } else {
+                targetSession = nil
+            }
+            guard
+                isCurrentRuntimeConnection(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
 
             // Auto-attach tmux session if requested by host preferences or restored.
             // The attachment boundary performs the final viewport reconciliation
@@ -1137,7 +1709,20 @@ final class AppContainer: ObservableObject {
             } else {
                 _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
             }
+            guard
+                isCurrentRuntimeConnection(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
 
+            if let auxiliaryContext {
+                guard isCurrentAuxiliaryOwner(auxiliaryContext) else {
+                    return
+                }
+            }
             if sessionRuntimes.count == 1 {
                 let pfManager: any PortForwardingManaging
                 if let custom = self.customPortForwardingManager {
@@ -1149,9 +1734,30 @@ final class AppContainer: ObservableObject {
                 } else {
                     pfManager = UnavailablePortForwardingManager()
                 }
+                guard let auxiliaryContext,
+                    isCurrentAuxiliaryOwner(auxiliaryContext)
+                else {
+                    await abortStaleAuxiliarySetup(
+                        sessionID: session.id, runtime: runtime, connection: connection)
+                    return
+                }
                 self.portForwardingManager = pfManager
-                await self.autoStartForwardingRules(for: host, manager: pfManager)
-                self.startForwardingMonitoring(manager: pfManager)
+                guard let managerGeneration = await self.rebindForwardingManager(pfManager),
+                    isCurrentAuxiliaryOwner(auxiliaryContext)
+                else { return }
+                let started = await self.autoStartForwardingRules(
+                    for: host, manager: pfManager, ownerContext: auxiliaryContext,
+                    managerGeneration: managerGeneration)
+                guard isCurrentAuxiliaryOwner(auxiliaryContext),
+                    isCurrentForwardingManager(pfManager)
+                else {
+                    await self.stopAllForwarding(
+                        manager: pfManager, generation: managerGeneration)
+                    return
+                }
+                self.forwardingManagerOperationGeneration = managerGeneration
+                publishForwardingSessions(started)
+                self.startForwardingMonitoring(manager: pfManager, ownerContext: auxiliaryContext)
 
                 Task { [weak self] in
                     await self?.refreshTmuxState()
@@ -1170,10 +1776,14 @@ final class AppContainer: ObservableObject {
                 sessionOrder.removeAll { $0 == session.id }
                 updateOpenSessions()
             }
-            pendingConnectingSession = nil
+            let shouldRestorePriorSelection =
+                pendingConnectingSession == nil || pendingConnectingSession?.id == session.id
+            if pendingConnectingSession?.id == session.id {
+                pendingConnectingSession = nil
+            }
 
-            let failure = ConnectionFailure.from(error: error, host: host)
-            self.lastConnectionFailure = failure
+            let failure = connectionFailure(for: error, host: host, sessionID: session.id)
+            recordConnectionFailure(failure)
             let message = Self.statusMessage(for: error)
             runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
 
@@ -1190,8 +1800,12 @@ final class AppContainer: ObservableObject {
                     activeSession?.state = .failed
                 }
             } else {
-                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                if shouldRestorePriorSelection,
+                    let priorID = priorSelectedSessionID,
+                    sessionRuntimes[priorID] != nil
+                {
                     selectSession(id: priorID)
+                    await rebindAuxiliaryResourcesIfNeeded()
                 }
                 switch error {
                 case .hostKeyApprovalRequired(let challenge):
@@ -1211,10 +1825,14 @@ final class AppContainer: ObservableObject {
                 sessionOrder.removeAll { $0 == session.id }
                 updateOpenSessions()
             }
-            pendingConnectingSession = nil
+            let shouldRestorePriorSelection =
+                pendingConnectingSession == nil || pendingConnectingSession?.id == session.id
+            if pendingConnectingSession?.id == session.id {
+                pendingConnectingSession = nil
+            }
 
-            let failure = ConnectionFailure.from(error: error, host: host)
-            self.lastConnectionFailure = failure
+            let failure = connectionFailure(for: error, host: host, sessionID: session.id)
+            recordConnectionFailure(failure)
             let message = failure.reason
             runtimeTerminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
 
@@ -1222,8 +1840,12 @@ final class AppContainer: ObservableObject {
                 activeSession?.state = .failed
                 terminalText = message
             } else {
-                if let priorID = priorSelectedSessionID, sessionRuntimes[priorID] != nil {
+                if shouldRestorePriorSelection,
+                    let priorID = priorSelectedSessionID,
+                    sessionRuntimes[priorID] != nil
+                {
                     selectSession(id: priorID)
+                    await rebindAuxiliaryResourcesIfNeeded()
                 }
             }
         }
@@ -1257,7 +1879,7 @@ final class AppContainer: ObservableObject {
         host: Host
     ) async {
         guard !explicitlyDisconnectedSessionIDs.contains(session.id) else { return }
-        guard let runtime = sessionRuntimes[session.id] ?? sessionRuntime else { return }
+        guard let runtime = sessionRuntimes[session.id] else { return }
 
         let transportError: TransportError?
         if case .error(let error) = event {
@@ -1298,45 +1920,55 @@ final class AppContainer: ObservableObject {
                 terminalText += "\n" + Self.statusMessage(for: transportError)
             }
             syncLiveActivityState()
-            forwardingStreamTask?.cancel()
-            forwardingStreamTask = nil
-            await portForwardingManager?.stopAll()
-            forwardingSessions = []
-            handleConnectionDrop(host: host)
+            await teardownAuxiliaryResources()
+            handleConnectionDrop(host: host, sessionID: session.id)
         }
     }
 
-    private func handleConnectionDrop(host: Host) {
-        cancelSendImageForLifecycle()
-        guard !isExplicitDisconnect, !isSceneInBackground,
-            !isNetworkRecoveryInProgress,
-            activeHost?.id == host.id
+    private func handleConnectionDrop(host: Host, sessionID: UUID) {
+        guard let runtime = sessionRuntimes[sessionID], runtime.host.id == host.id,
+            !isExplicitDisconnect(for: sessionID),
+            !isSceneInBackground,
+            networkRecoverySessionID == nil || networkRecoverySessionID == sessionID
         else { return }
-        isForegroundRecoveryInProgress = false
+        let isSelected = selectedSessionID == sessionID
+        if isSelected {
+            cancelSendImageForLifecycle()
+            isForegroundRecoveryInProgress = false
+        }
         guard reachabilityMonitor.isReachable else {
             // Preserve an observed transport error while recovery waits for the
-            // network. The error path may transiently expose disconnected before
-            // the terminal close event promotes the session to failed.
-            if activeSession?.state != .failed,
-                !hasObservedTransportError
-            {
-                activeSession?.state = .disconnected
+            // network. Only the selected owner may update the legacy projection.
+            if isSelected {
+                if activeSession?.state != .failed,
+                    !hasObservedTransportError
+                {
+                    activeSession?.state = .disconnected
+                }
+                reconnectState = .failed(reason: "Network unavailable.")
+            } else {
+                runtime.markRetryAvailable(reason: "Network unavailable.")
+                updateOpenSessions()
             }
-            reconnectState = .failed(reason: "Network unavailable.")
             return
         }
-        guard !reconnectState.isReconnecting else { return }
+        guard !runtime.reconnectState.isReconnecting else { return }
 
-        isNetworkRecoveryInProgress = true
+        let recoverySessionID = runtime.session.id
+        pendingForegroundRecoverySessionIDs.remove(recoverySessionID)
+        beginNetworkRecovery(for: recoverySessionID)
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard !self.isExplicitDisconnect,
+            guard self.networkRecoverySessionID == recoverySessionID,
+                !self.isExplicitDisconnect(for: recoverySessionID),
                 !self.isSceneInBackground,
-                self.activeHost?.id == host.id,
+                self.sessionRuntimes[recoverySessionID]?.host.id == host.id,
                 self.reachabilityMonitor.isReachable
             else {
-                self.isNetworkRecoveryInProgress = false
-                self.reconnectState = .failed(reason: "Network unavailable.")
+                self.finishNetworkRecovery(for: recoverySessionID)
+                if self.selectedSessionID == recoverySessionID {
+                    self.reconnectState = .failed(reason: "Network unavailable.")
+                }
                 return
             }
             let recoveryTask = await self.reconnectCoordinator.start { [weak self] attempt in
@@ -1348,53 +1980,97 @@ final class AppContainer: ObservableObject {
     }
 
     func performReconnect(to host: Host, attempt: Int) async throws {
-        guard !isExplicitDisconnect,
-            !isSceneInBackground,
-            activeHost?.id == host.id
+        guard !isSceneInBackground else {
+            throw TransportError.cancelled
+        }
+        let recoverySessionID = networkRecoverySessionID ?? activeSession?.id
+        guard let recoverySessionID,
+            let runtime = sessionRuntimes[recoverySessionID],
+            runtime.host.id == host.id,
+            !isExplicitDisconnect(for: recoverySessionID),
+            networkRecoverySessionID != nil || selectedSessionID == recoverySessionID
         else {
             throw TransportError.cancelled
         }
-        let connectionGeneration = lifecycleGeneration
+        let sessionID = runtime.session.id
+        // Publish owner progress before any credential or transport await. The
+        // selected projection is synchronized only when this owner is selected.
+        runtime.updateReconnectState(.connecting(attempt: attempt))
+        if selectedSessionID == sessionID {
+            reconnectState = runtime.reconnectState
+            activeSession = runtime.session
+            updateOpenSessions()
+        }
         // SessionRuntime invalidates the previous event stream atomically when
         // the replacement transport is admitted.
         // Keep the last selected target independent from transient tmux refreshes
         // while the replacement transport is being established.
-        let recoveryTmuxTarget = activeTmuxSessionID
-        activeTmuxSessionID = nil
+        let ownerTarget = restorationTarget(for: runtime)
+        let recoveryTmuxTarget: String? = {
+            guard let ownerTarget, case .tmux(let target) = ownerTarget else { return nil }
+            return target
+        }()
+        if selectedSessionID == sessionID {
+            activeTmuxSessionID = nil
+        }
         guard reachabilityMonitor.isReachable else {
+            // The coordinator has already marked this attempt as connecting,
+            // but no transport operation ran. Reconcile the owner now so an
+            // exhausted run cannot leave its runtime stranded in connecting.
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: Self.statusMessage(for: TransportError.networkUnavailable)
+            )
             throw TransportError.networkUnavailable
         }
-        tmuxRefreshGeneration += 1
-        herdrRefreshGeneration += 1
-        stopHerdrPolling()
-        isProbingTmux = false
-        isProbingHerdr = false
+        if selectedSessionID == sessionID {
+            tmuxRefreshGeneration += 1
+            herdrRefreshGeneration += 1
+            stopHerdrPolling()
+            isProbingTmux = false
+            isProbingHerdr = false
+        }
 
-        // Cleanly reset terminal emulator buffer and parser to avoid stream corruption
-        terminalController.synchronizeViewportMeasurement()
-        terminalGrid = TerminalGrid()
-        ansiParser = ANSIParser()
-        terminalText = ""
-        redactor = Redactor()
-        terminalController.reset()
+        // Cleanly reset the owner runtime's terminal emulator buffer and parser
+        // without mutating the selected-session projection when selection moved.
+        runtime.terminalController.synchronizeViewportMeasurement()
+        if selectedSessionID == sessionID {
+            terminalGrid = TerminalGrid()
+            ansiParser = ANSIParser()
+            terminalText = ""
+            redactor = Redactor()
+        }
+        runtime.setRedactor(Redactor())
+        runtime.terminalController.reset()
 
-        hasObservedTransportError = false
+        if selectedSessionID == sessionID {
+            hasObservedTransportError = false
+        }
         let session = TerminalSession(
-            id: activeSession?.id ?? UUID(),
+            id: sessionID,
             hostID: host.id,
             state: .connecting,
-            terminalSize: terminalController.size,
+            terminalSize: runtime.terminalController.size,
             capabilities: ["ansi", "resize"]
         )
-        activeSession = session
+        let redactionValidityToken = beginRedactionValidity(for: session.id)
+        runtime.updateSessionState(.connecting)
+        if selectedSessionID == sessionID {
+            activeSession = session
+            reconnectState = .connecting(attempt: attempt)
+        }
+        updateOpenSessions()
         let connection: any SSHConnection
         do {
             let selectedIdentity = try await resolveIdentity(for: host)
             // Identity resolution may yield to SwiftUI layout. Capture the
             // latest measured geometry immediately before PTY initialization.
-            terminalController.synchronizeViewportMeasurement()
-            let initialSize = terminalController.size
-            activeSession?.terminalSize = initialSize
+            runtime.terminalController.synchronizeViewportMeasurement()
+            let initialSize = runtime.terminalController.size
+            if selectedSessionID == sessionID {
+                activeSession?.terminalSize = initialSize
+            }
             if case .mosh = host.connection {
                 connection = try await moshTransport.connect(
                     host: host,
@@ -1411,137 +2087,313 @@ final class AppContainer: ObservableObject {
                 )
             }
         } catch {
-            if activeSession?.id == session.id {
-                activeSession?.state = .disconnected
+            let reason: String
+            if let transportError = error as? TransportError {
+                reason = Self.statusMessage(for: transportError)
+            } else {
+                reason = "Connection unavailable."
             }
+            let cancelled: Bool
+            if let transportError = error as? TransportError {
+                if case .cancelled = transportError {
+                    cancelled = true
+                } else {
+                    cancelled = false
+                }
+            } else {
+                cancelled = false
+            }
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: reason,
+                cancelled: cancelled
+            )
             throw error
         }
 
-        guard activeSession?.id == session.id,
-            lifecycleGeneration == connectionGeneration,
-            !isExplicitDisconnect,
-            !isSceneInBackground
+        guard sessionRuntimes[sessionID] === runtime,
+            isCurrentRedactionValidity(
+                sessionID: session.id, token: redactionValidityToken)
         else {
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: "Connection cancelled.",
+                cancelled: true
+            )
             await connection.close()
             throw TransportError.cancelled
         }
 
-        if let moshController = connection as? any MoshSessionControlling {
-            let info = await moshController.sessionInfo
-            self.moshSessionInfo = info
-            let st = await moshController.moshState
-            self.moshState = st
-            let roaming = await moshController.roamingState
-            self.networkRoamingState = roaming
-            startMoshMonitoring(for: moshController, session: session)
-        }
-
-        guard let runtime = sessionRuntimes[session.id] ?? sessionRuntime else {
+        guard sessionRuntimes[session.id] === runtime else {
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: "Connection cancelled.",
+                cancelled: true
+            )
             await connection.close()
             throw TransportError.cancelled
         }
         configureSessionRuntime(runtime, session: session, host: host)
         let previousConnection = runtime.connection
-        await loadRedactionSecret(for: host)
-        guard activeSession?.id == session.id,
-            activeSession?.state == .connecting,
-            lifecycleGeneration == connectionGeneration,
-            !isExplicitDisconnect,
-            !isSceneInBackground,
-            (sessionRuntimes[session.id] ?? sessionRuntime) === runtime,
+        // Resolve secrets against the replacement connection before installing it
+        // in this runtime. The selected-session projection may refer to another
+        // open session while recovery is in flight.
+        let connectionRedactor = await loadRedactionSecret(
+            for: host,
+            connection: connection,
+            sessionID: session.id,
+            validityToken: redactionValidityToken
+        )
+        guard sessionRuntimes[session.id] === runtime,
+            runtime.session.state == .connecting,
+            isCurrentRedactionValidity(
+                sessionID: session.id, token: redactionValidityToken),
             (runtime.connection as AnyObject) === (previousConnection as AnyObject)
         else {
-            redactor = Redactor()
-            await runtime.disconnect()
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: "Connection cancelled.",
+                cancelled: true
+            )
             await connection.close()
             throw TransportError.cancelled
         }
-        guard await runtime.reconnect(with: connection, redactor: redactor) else {
-            redactor = Redactor()
+        guard await runtime.reconnect(with: connection, redactor: connectionRedactor) else {
+            let reason: String
+            if case .failed(let failureReason) = runtime.reconnectState {
+                reason = failureReason
+            } else {
+                reason = "Connection failed."
+            }
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: reason
+            )
             await connection.close()
             throw TransportError.cancelled
         }
-        guard activeSession?.id == session.id,
-            activeSession?.state == .connecting,
-            lifecycleGeneration == connectionGeneration,
-            !isExplicitDisconnect,
-            !isSceneInBackground,
-            (sessionRuntimes[session.id] ?? sessionRuntime) === runtime,
-            let currentConnection = self.connection,
-            (currentConnection as AnyObject) === (connection as AnyObject)
+        guard sessionRuntimes[session.id] === runtime,
+            isCurrentRedactionValidity(
+                sessionID: session.id, token: redactionValidityToken),
+            (runtime.connection as AnyObject) === (connection as AnyObject)
         else {
-            redactor = Redactor()
             await runtime.disconnect()
+            synchronizeReconnectFailure(
+                for: runtime,
+                sessionID: sessionID,
+                reason: "Connection cancelled.",
+                cancelled: true
+            )
             throw TransportError.cancelled
         }
-        activeSession?.state = .connected
-        reconnectState = .connected
-        updateOpenSessions()
-        syncLiveActivityState()
+        _ = synchronizeSelectedSessionProjection(for: runtime)
+        if selectedSessionID == sessionID {
+            synchronizeSelectedMoshState(for: runtime)
+        } else {
+            updateOpenSessions()
+        }
+        finishNetworkRecovery(for: sessionID)
+        if selectedSessionID == sessionID {
+            reconnectState = .connected
+            syncLiveActivityState()
+        }
+        let auxiliaryContext: AuxiliaryOwnerContext?
+        if sessionRuntimes.count == 1 {
+            auxiliarySessionID = session.id
+            auxiliaryContext = auxiliaryOwnerContext(for: runtime, connection: connection)
+        } else {
+            auxiliaryContext = nil
+        }
 
-        let targetSession = await automaticTmuxTarget(
-            for: host,
-            explicitTarget: recoveryTmuxTarget,
-            allowStoredTarget: true
-        )
+        let targetSession: String?
+        if sessionRuntimes.count == 1 {
+            targetSession = await automaticTmuxTarget(
+                for: host,
+                explicitTarget: recoveryTmuxTarget,
+                allowStoredTarget: true
+            )
+        } else {
+            targetSession = nil
+        }
+        guard
+            isCurrentRuntimeConnection(
+                sessionID: session.id, runtime: runtime, connection: connection)
+        else {
+            await abortStaleAuxiliarySetup(
+                sessionID: session.id, runtime: runtime, connection: connection)
+            return
+        }
         if let target = targetSession {
             _ = await self.handleTmuxTarget(target, on: connection, host: host, session: session)
         } else {
             _ = await synchronizeViewportAndResize(connection, sessionID: session.id)
         }
+        guard
+            isCurrentRuntimeConnection(
+                sessionID: session.id, runtime: runtime, connection: connection)
+        else {
+            await abortStaleAuxiliarySetup(
+                sessionID: session.id, runtime: runtime, connection: connection)
+            return
+        }
 
-        let shouldRestoreHerdr =
-            (try? await restorationStore.load())
-            .flatMap { metadata -> LastUsedMultiplexerTarget? in
+        let persistedTarget: LastUsedMultiplexerTarget? =
+            (try? await restorationStore.load()).flatMap { metadata in
                 guard metadata.hostID == host.id else { return nil }
                 return lastUsedTarget(from: metadata)
             }
-            .map {
-                if case .herdr = $0 { return true }
-                return false
-            } ?? false
-        if herdrAvailability.isAvailable || activeHerdrWorkspaceID != nil || shouldRestoreHerdr {
+        guard
+            isCurrentRuntimeConnection(
+                sessionID: session.id, runtime: runtime, connection: connection)
+        else {
+            await abortStaleAuxiliarySetup(
+                sessionID: session.id, runtime: runtime, connection: connection)
+            return
+        }
+        let herdrTarget: LastUsedMultiplexerTarget? = {
+            if let ownerTarget, case .herdr = ownerTarget { return ownerTarget }
+            return persistedTarget
+        }()
+        let shouldRestoreHerdr: Bool = {
+            guard let herdrTarget, case .herdr = herdrTarget else { return false }
+            return true
+        }()
+        if sessionRuntimes.count == 1, shouldRestoreHerdr {
             await refreshHerdrState()
-            await restoreHerdrTargetIfNeeded(for: host, session: session)
+            guard
+                isCurrentRuntimeConnection(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
+            await restoreHerdrTargetIfNeeded(
+                for: host, session: session, preferredTarget: herdrTarget)
+            guard
+                isCurrentRuntimeConnection(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
         }
 
-        let pfManager: any PortForwardingManaging
-        if let custom = self.customPortForwardingManager {
-            pfManager = custom
-        } else if self.isDemo {
-            pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
-        } else if let live = connection as? LiveSSHConnection {
-            pfManager = PortForwardingManager(connection: live)
-        } else {
-            pfManager = UnavailablePortForwardingManager()
+        if let auxiliaryContext {
+            guard isCurrentAuxiliaryOwner(auxiliaryContext) else {
+                return
+            }
         }
-        self.portForwardingManager = pfManager
-        await self.autoStartForwardingRules(for: host, manager: pfManager)
-        self.startForwardingMonitoring(manager: pfManager)
+        if sessionRuntimes.count == 1 {
+            let pfManager: any PortForwardingManaging
+            if let custom = self.customPortForwardingManager {
+                pfManager = custom
+            } else if self.isDemo {
+                pfManager = self.portForwardingManager ?? DemoPortForwardingManager()
+            } else if let live = connection as? LiveSSHConnection {
+                pfManager = PortForwardingManager(connection: live)
+            } else {
+                pfManager = UnavailablePortForwardingManager()
+            }
+            guard let auxiliaryContext,
+                isCurrentAuxiliaryOwner(auxiliaryContext)
+            else {
+                await abortStaleAuxiliarySetup(
+                    sessionID: session.id, runtime: runtime, connection: connection)
+                return
+            }
+            self.portForwardingManager = pfManager
+            guard let managerGeneration = await self.rebindForwardingManager(pfManager),
+                isCurrentAuxiliaryOwner(auxiliaryContext)
+            else { return }
+            let started = await self.autoStartForwardingRules(
+                for: host, manager: pfManager, ownerContext: auxiliaryContext,
+                managerGeneration: managerGeneration)
+            guard isCurrentAuxiliaryOwner(auxiliaryContext),
+                isCurrentForwardingManager(pfManager)
+            else {
+                await self.stopAllForwarding(
+                    manager: pfManager, generation: managerGeneration)
+                return
+            }
+            self.forwardingManagerOperationGeneration = managerGeneration
+            publishForwardingSessions(started)
+            self.startForwardingMonitoring(manager: pfManager, ownerContext: auxiliaryContext)
+            Task { [weak self] in
+                await self?.refreshTmuxState()
+                await self?.setupSFTPForHost(host)
+            }
+        }
         // Reconnect completion is intentionally published only after the
         // remembered tmux target has been attached successfully.
-        isNetworkRecoveryInProgress = false
-
-        Task { [weak self] in
-            await self?.refreshTmuxState()
-            await self?.setupSFTPForHost(host)
-        }
+        finishNetworkRecovery(for: sessionID)
     }
 
     func cancelReconnect() async {
-        isExplicitDisconnect = true
-        liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
+        // Capture the recovery owner before any await or selected-session side
+        // effect. The user can switch sessions while coordinator cancellation
+        // is suspended.
+        let recoverySessionID = networkRecoverySessionID ?? activeSession?.id
+        let recoveryRuntime = recoverySessionID.flatMap { sessionRuntimes[$0] }
+        let recoveryWasSelected = selectedSessionID == recoverySessionID
+        if let recoverySessionID {
+            pendingForegroundRecoverySessionIDs.remove(recoverySessionID)
+            explicitlyDisconnectedSessionIDs.insert(recoverySessionID)
+            invalidateRedactionValidity(for: recoverySessionID)
+        } else {
+            fallbackExplicitDisconnect = true
+        }
+        if recoveryWasSelected {
+            isExplicitDisconnect = true
+        }
+        liveActivityManager.end(sessionID: recoverySessionID ?? UUID())
         isForegroundRecoveryInProgress = false
         isNetworkRecoveryInProgress = false
         foregroundRecoveryTask?.cancel()
         foregroundRecoveryTask = nil
         lifecycleGeneration += 1
-        tmuxRefreshGeneration += 1
-        herdrRefreshGeneration += 1
-        stopHerdrPolling()
-        isProbingTmux = false
-        isProbingHerdr = false
+        if recoveryWasSelected {
+            tmuxRefreshGeneration += 1
+            herdrRefreshGeneration += 1
+            stopHerdrPolling()
+            isProbingTmux = false
+            isProbingHerdr = false
+        }
         await reconnectCoordinator.cancel()
+
+        // Cancellation suspends at the coordinator hop. The selected runtime
+        // may change while it is suspended, so only tear down the runtime and
+        // recovery session captured before that hop if it still owns the same
+        // session entry afterward.
+        guard let recoverySessionID,
+            let recoveryRuntime,
+            sessionRuntimes[recoverySessionID] === recoveryRuntime
+        else {
+            if recoveryWasSelected, recoveryRuntime == nil {
+                activeSession?.state = .disconnected
+                reconnectState = .cancelled
+            }
+            updateOpenSessions()
+            updateIdleTimerState()
+            return
+        }
+        clearNetworkRecovery(for: recoverySessionID)
+        await recoveryRuntime.disconnect()
+        recoveryRuntime.markReconnectCancelled()
+        updateOpenSessions()
+
+        guard selectedSessionID == recoverySessionID,
+            sessionRuntimes[recoverySessionID] === recoveryRuntime
+        else {
+            updateIdleTimerState()
+            return
+        }
         reconnectState = .cancelled
         moshStateTask?.cancel()
         moshStateTask = nil
@@ -1549,20 +2401,27 @@ final class AppContainer: ObservableObject {
         moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
-        await selectedSessionRuntime?.disconnect()
-        activeSession?.state = .disconnected
-        updateOpenSessions()
+        _ = synchronizeSelectedSessionProjection(for: recoveryRuntime)
+        await teardownAuxiliaryResources()
         updateIdleTimerState()
     }
 
     func retryReconnect() async {
-        guard let host = activeHost else { return }
+        guard let host = activeHost,
+            let sessionID = activeSession?.id,
+            sessionRuntimes[sessionID]?.host.id == host.id
+        else { return }
         guard reachabilityMonitor.isReachable else {
             reconnectState = .failed(reason: "Network unavailable.")
             return
         }
         isExplicitDisconnect = false
-        isNetworkRecoveryInProgress = true
+        explicitlyDisconnectedSessionIDs.remove(sessionID)
+        pendingForegroundRecoverySessionIDs.remove(sessionID)
+        if let runtime = sessionRuntimes[sessionID] {
+            runtime.updateReconnectState(.connecting(attempt: 1))
+        }
+        beginNetworkRecovery(for: sessionID)
         let recoveryTask = await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
@@ -1571,11 +2430,49 @@ final class AppContainer: ObservableObject {
     }
 
     func handleReachabilityChange(_ isReachable: Bool) {
-        guard !isExplicitDisconnect else { return }
+        let selectedID = selectedSessionID
+        let recoverySessionID = networkRecoverySessionID
+        // Reachability belongs to the runtime that owns recovery, not to the
+        // selected-session projection. A selected session may be explicitly
+        // disconnected while another runtime is still progressing.
+        if let recoverySessionID = networkRecoverySessionID {
+            guard let runtime = sessionRuntimes[recoverySessionID],
+                !isExplicitDisconnect(for: recoverySessionID)
+            else { return }
+            if !isReachable, runtime.reconnectState.isReconnecting {
+                runtime.markReconnectFailed(reason: "Network unavailable.")
+                updateOpenSessions()
+                if selectedID == recoverySessionID {
+                    _ = synchronizeSelectedSessionProjection(for: runtime)
+                    reconnectState = .failed(reason: "Network unavailable.")
+                    isNetworkRecoveryInProgress = false
+                }
+                finishNetworkRecovery(for: recoverySessionID)
+                Task { [weak self] in
+                    await self?.reconnectCoordinator.cancel()
+                }
+            } else if isReachable {
+                // The owner coordinator remains authoritative. Do not inspect
+                // or mutate the selected runtime while it is running.
+                if runtime.reconnectState.isReconnecting { return }
+                handleConnectionDrop(host: runtime.host, sessionID: recoverySessionID)
+            }
+            return
+        }
+
+        if let selectedID, isExplicitDisconnect(for: selectedID) { return }
         guard isReachable else {
-            isNetworkRecoveryInProgress = false
-            if reconnectState.isReconnecting {
-                reconnectState = .failed(reason: "Network unavailable.")
+            if reconnectState.isReconnecting, let recoverySessionID,
+                let runtime = sessionRuntimes[recoverySessionID]
+            {
+                runtime.markReconnectFailed(reason: "Network unavailable.")
+                updateOpenSessions()
+                if selectedID == recoverySessionID {
+                    _ = synchronizeSelectedSessionProjection(for: runtime)
+                    reconnectState = .failed(reason: "Network unavailable.")
+                    isNetworkRecoveryInProgress = false
+                }
+                finishNetworkRecovery(for: recoverySessionID)
                 Task { [weak self] in
                     await self?.reconnectCoordinator.cancel()
                 }
@@ -1611,20 +2508,46 @@ final class AppContainer: ObservableObject {
             return
         }
         if activeSession?.state == .failed || activeSession?.state == .disconnected {
-            handleConnectionDrop(host: host)
+            if let sessionID = activeSession?.id {
+                handleConnectionDrop(host: host, sessionID: sessionID)
+            }
         }
     }
 
     // MARK: - Mosh Network Roaming & Fast Session Recovery
 
+    private func isCurrentMoshOwner(
+        sessionID: UUID,
+        runtime: SessionRuntime,
+        controller: any MoshSessionControlling
+    ) -> Bool {
+        sessionRuntimes[sessionID] === runtime
+            && runtime.session.state == .connected
+            && !isExplicitDisconnect(for: sessionID)
+            && (runtime.connection as AnyObject) === (controller as AnyObject)
+    }
+
+    private func isSelectedMoshOwner(
+        sessionID: UUID,
+        runtime: SessionRuntime,
+        controller: any MoshSessionControlling
+    ) -> Bool {
+        selectedSessionID == sessionID
+            && isCurrentMoshOwner(sessionID: sessionID, runtime: runtime, controller: controller)
+    }
+
     private func startMoshMonitoring(
-        for controller: any MoshSessionControlling, session: TerminalSession
+        for controller: any MoshSessionControlling, runtime: SessionRuntime
     ) {
         moshStateTask?.cancel()
+        let sessionID = runtime.session.id
         moshStateTask = Task { @MainActor [weak self] in
             let updates = await controller.moshStateUpdates()
             for await state in updates {
-                guard let self, self.activeSession?.id == session.id else { break }
+                guard let self,
+                    self.isSelectedMoshOwner(
+                        sessionID: sessionID, runtime: runtime, controller: controller)
+                else { break }
                 self.moshState = state
                 if case .roaming(let roaming) = state {
                     self.networkRoamingState = roaming
@@ -1636,52 +2559,151 @@ final class AppContainer: ObservableObject {
     func handleNetworkInterfaceChange(
         _ newInterface: NetworkInterfaceType, roamingState: NetworkRoamingState
     ) async {
-        guard !isExplicitDisconnect else { return }
-        cancelSendImageForLifecycle()
-        self.networkRoamingState = roamingState
+        let ownerSessionID = networkRecoverySessionID ?? selectedSessionID
+        guard let ownerSessionID,
+            let ownerRuntime = sessionRuntimes[ownerSessionID],
+            let ownerHost = sessionRuntimes[ownerSessionID]?.host,
+            ownerHost.id == ownerRuntime.host.id,
+            !isExplicitDisconnect(for: ownerSessionID)
+        else { return }
+        if selectedSessionID == ownerSessionID {
+            cancelSendImageForLifecycle()
+            self.networkRoamingState = roamingState
+        }
 
-        if let moshController = connection as? any MoshSessionControlling {
+        if let ownerController = ownerRuntime.connection as? any MoshSessionControlling {
             do {
-                try await moshController.handleNetworkRoaming(roamingState)
-                self.moshState = await moshController.moshState
+                try await ownerController.handleNetworkRoaming(roamingState)
+                guard
+                    isCurrentMoshOwner(
+                        sessionID: ownerSessionID,
+                        runtime: ownerRuntime,
+                        controller: ownerController
+                    )
+                else { return }
+                let state = await ownerController.moshState
+                guard
+                    isCurrentMoshOwner(
+                        sessionID: ownerSessionID,
+                        runtime: ownerRuntime,
+                        controller: ownerController
+                    )
+                else { return }
+                if selectedSessionID == ownerSessionID {
+                    self.moshState = state
+                }
             } catch {
-                await performFastSessionRecovery()
+                guard
+                    isCurrentMoshOwner(
+                        sessionID: ownerSessionID,
+                        runtime: ownerRuntime,
+                        controller: ownerController
+                    )
+                else { return }
+                await performFastSessionRecovery(
+                    for: ownerSessionID,
+                    runtime: ownerRuntime,
+                    host: ownerHost,
+                    controller: ownerController,
+                    roamingState: roamingState
+                )
             }
-        } else if let host = activeHost,
-            activeSession?.state == .connected
-        {
+        } else if ownerRuntime.session.state == .connected {
             // A path/interface change can leave an established TCP socket
             // half-alive without producing a channel callback. Replace it
             // through the normal reconnect path, but first detach the old
             // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
-            activeSession?.state = .disconnected
-            await sessionRuntime?.disconnect()
+            if selectedSessionID == ownerSessionID {
+                activeSession?.state = .disconnected
+            }
+            await ownerRuntime.disconnect()
+            guard sessionRuntimes[ownerSessionID] === ownerRuntime else { return }
+
+            // Teardown can yield while selection changes. Restrict the global
+            // auxiliary projection to the captured owner and never let a
+            // completed teardown restart or rewrite the newly selected runtime.
+            if selectedSessionID == ownerSessionID {
+                await teardownAuxiliaryResources(
+                    expectedSessionID: ownerSessionID, expectedRuntime: ownerRuntime)
+            }
+            guard sessionRuntimes[ownerSessionID] === ownerRuntime else { return }
             isNetworkRecoveryInProgress = false
-            handleConnectionDrop(host: host)
+            if selectedSessionID == ownerSessionID {
+                handleConnectionDrop(host: ownerHost, sessionID: ownerSessionID)
+            } else {
+                ownerRuntime.markRetryAvailable(reason: "Network changed. Retry connection.")
+                deferredInterfaceRecoverySessionIDs.insert(ownerSessionID)
+                updateOpenSessions()
+            }
         }
     }
 
     func performFastSessionRecovery() async {
-        guard let host = activeHost, !isExplicitDisconnect else { return }
+        guard let sessionID = selectedSessionID,
+            let runtime = sessionRuntimes[sessionID],
+            let host = activeHost,
+            host.id == runtime.host.id
+        else { return }
+        let controller = runtime.connection as? any MoshSessionControlling
+        await performFastSessionRecovery(
+            for: sessionID,
+            runtime: runtime,
+            host: host,
+            controller: controller,
+            roamingState: nil
+        )
+    }
+
+    private func performFastSessionRecovery(
+        for sessionID: UUID,
+        runtime: SessionRuntime,
+        host: Host,
+        controller: (any MoshSessionControlling)?,
+        roamingState: NetworkRoamingState?
+    ) async {
+        guard sessionRuntimes[sessionID] === runtime,
+            runtime.host.id == host.id,
+            runtime.session.state == .connected,
+            !isExplicitDisconnect(for: sessionID)
+        else { return }
 
         if reachabilityMonitor.isReachable,
-            let moshController = connection as? any MoshSessionControlling
+            let moshController = controller ?? (runtime.connection as? any MoshSessionControlling)
         {
             let roaming =
-                networkRoamingState
+                roamingState
+                ?? networkRoamingState
                 ?? NetworkRoamingState(currentInterface: reachabilityMonitor.currentInterfaceType)
             do {
                 try await moshController.handleNetworkRoaming(roaming)
-                self.moshState = await moshController.moshState
+                guard sessionRuntimes[sessionID] === runtime,
+                    runtime.session.state == .connected,
+                    !isExplicitDisconnect(for: sessionID),
+                    (runtime.connection as AnyObject) === (moshController as AnyObject)
+                else { return }
+                let state = await moshController.moshState
+                guard sessionRuntimes[sessionID] === runtime,
+                    runtime.session.state == .connected,
+                    !isExplicitDisconnect(for: sessionID),
+                    (runtime.connection as AnyObject) === (moshController as AnyObject)
+                else { return }
+                if selectedSessionID == sessionID {
+                    self.moshState = state
+                }
                 return
             } catch {
-                // In-place recovery probe failed; fall back to reconnect coordinator
+                // In-place recovery probe failed; fall back to reconnect coordinator.
             }
         }
 
-        guard !reconnectState.isReconnecting else { return }
-        isNetworkRecoveryInProgress = true
+        guard sessionRuntimes[sessionID] === runtime,
+            runtime.session.state == .connected,
+            !isExplicitDisconnect(for: sessionID),
+            !runtime.reconnectState.isReconnecting,
+            networkRecoverySessionID == nil || networkRecoverySessionID == sessionID
+        else { return }
+        beginNetworkRecovery(for: sessionID)
         _ = await reconnectCoordinator.start { [weak self] attempt in
             guard let self else { return }
             try await self.performReconnect(to: host, attempt: attempt)
@@ -1710,10 +2732,27 @@ final class AppContainer: ObservableObject {
             #if canImport(UIKit)
             endCurrentBackgroundTask()
             #endif
+            let recoveryOwnerID = self.networkRecoverySessionID
+            let recoveryOwnerIsActive =
+                recoveryOwnerID.flatMap { ownerID in
+                    self.sessionRuntimes[ownerID].map {
+                        !self.isExplicitDisconnect(for: $0.session.id)
+                    }
+                } ?? false
+            let pendingForegroundRecoveryIsActive =
+                self.pendingForegroundRecoverySessionIDs.contains { sessionID in
+                    guard let runtime = self.sessionRuntimes[sessionID] else { return false }
+                    return !self.isExplicitDisconnect(for: sessionID)
+                        && runtime.session.state != .connected
+                }
             let hasConnectedSessions = self.sessionRuntimes.values.contains {
                 $0.session.state == .connected
+                    && !self.isExplicitDisconnect(for: $0.session.id)
             }
-            guard hasConnectedSessions || !isExplicitDisconnect else { return }
+            guard
+                hasConnectedSessions || recoveryOwnerIsActive
+                    || pendingForegroundRecoveryIsActive
+            else { return }
 
             if wasInBackground {
                 let generation = lifecycleGeneration
@@ -1721,19 +2760,24 @@ final class AppContainer: ObservableObject {
                 let recoveryTask = Task { @MainActor [weak self] in
                     guard let self,
                         self.lifecycleGeneration == generation,
-                        hasConnectedSessions || !self.isExplicitDisconnect
+                        hasConnectedSessions || recoveryOwnerIsActive
+                            || pendingForegroundRecoveryIsActive
                     else { return }
                     // Ensure a reconnect that was invalidated by backgrounding
                     // cannot cancel the new foreground recovery after it starts.
                     // Healthy sessions do not need a coordinator generation bump;
                     // avoiding that actor hop keeps repeated lifecycle probes
                     // ordered as connected -> connecting -> connected.
-                    if self.reconnectState.isReconnecting {
+                    if let recoveryOwnerID,
+                        self.selectedSessionID == recoveryOwnerID,
+                        self.sessionRuntimes[recoveryOwnerID]?.reconnectState.isReconnecting
+                    {
                         await self.reconnectCoordinator.cancel()
                         self.reconnectState = await self.reconnectCoordinator.state
                     }
                     guard self.lifecycleGeneration == generation,
-                        hasConnectedSessions || !self.isExplicitDisconnect
+                        hasConnectedSessions || recoveryOwnerIsActive
+                            || pendingForegroundRecoveryIsActive
                     else {
                         return
                     }
@@ -1743,6 +2787,7 @@ final class AppContainer: ObservableObject {
                     if !self.sessionRuntimes.isEmpty {
                         connectedRuntimes = self.sessionRuntimes.values.filter {
                             $0.session.state == .connected
+                                && !self.isExplicitDisconnect(for: $0.session.id)
                         }
                     } else if let runtime = self.sessionRuntime, runtime.session.state == .connected
                     {
@@ -1791,18 +2836,57 @@ final class AppContainer: ObservableObject {
                                         }
                                         self.updateOpenSessions()
                                     } else {
-                                        await currentRuntime.disconnect()
-                                        self.updateOpenSessions()
+                                        // Capture the probe owner and exact transport before
+                                        // teardown. Selection may change while close awaits.
+                                        let targetRuntime = currentRuntime
+                                        let targetConnection = targetRuntime.connection
+                                        await targetRuntime.disconnect()
 
-                                        if self.selectedSessionID == targetSessionID {
-                                            self.forwardingStreamTask?.cancel()
-                                            self.forwardingStreamTask = nil
-                                            await self.portForwardingManager?.stopAll()
-                                            self.forwardingSessions = []
-                                            self.isForegroundRecoveryInProgress = false
-                                            self.activeSession?.state = .disconnected
-                                            self.handleConnectionDrop(host: targetHost)
+                                        guard self.lifecycleGeneration == generation,
+                                            !self.explicitlyDisconnectedSessionIDs.contains(
+                                                targetSessionID),
+                                            let stillCurrentRuntime = self.sessionRuntimes[
+                                                targetSessionID],
+                                            stillCurrentRuntime === targetRuntime,
+                                            (stillCurrentRuntime.connection as AnyObject)
+                                                === (targetConnection as AnyObject)
+                                        else { return }
+
+                                        guard self.selectedSessionID == targetSessionID else {
+                                            // Keep a background-dropped runtime retryable, but
+                                            // do not start recovery until the user selects it.
+                                            targetRuntime.markRetryAvailable()
+                                            self.updateOpenSessions()
+                                            return
                                         }
+
+                                        await self.teardownAuxiliaryResources(
+                                            expectedSessionID: targetSessionID,
+                                            expectedRuntime: targetRuntime,
+                                            expectedConnection: targetConnection)
+                                        guard self.lifecycleGeneration == generation,
+                                            !self.explicitlyDisconnectedSessionIDs.contains(
+                                                targetSessionID),
+                                            self.selectedSessionID == targetSessionID,
+                                            let stillCurrentRuntime = self.sessionRuntimes[
+                                                targetSessionID],
+                                            stillCurrentRuntime === targetRuntime,
+                                            (stillCurrentRuntime.connection as AnyObject)
+                                                === (targetConnection as AnyObject)
+                                        else {
+                                            if self.selectedSessionID != targetSessionID {
+                                                targetRuntime.markRetryAvailable()
+                                                self.updateOpenSessions()
+                                            }
+                                            return
+                                        }
+
+                                        self.isForegroundRecoveryInProgress = false
+                                        self.activeSession = targetRuntime.session
+                                        self.activeSession?.state = .disconnected
+                                        self.updateOpenSessions()
+                                        self.handleConnectionDrop(
+                                            host: targetHost, sessionID: targetSessionID)
                                     }
                                 }
                             }
@@ -1816,7 +2900,9 @@ final class AppContainer: ObservableObject {
                         // prior coordinator generation. Preserve its backoff
                         // if a newer coordinator is still active.
                         if !self.reconnectState.isReconnecting {
-                            self.handleConnectionDrop(host: host)
+                            if let sessionID = self.activeSession?.id {
+                                self.handleConnectionDrop(host: host, sessionID: sessionID)
+                            }
                         }
                     }
                 }
@@ -1826,8 +2912,11 @@ final class AppContainer: ObservableObject {
             {
                 // An already-running coordinator owns its backoff. Do not
                 // restart it for repeated .active notifications.
-                if !reconnectState.isReconnecting {
-                    handleConnectionDrop(host: host)
+                if !reconnectState.isReconnecting,
+                    let sessionID = activeSession?.id,
+                    !isExplicitDisconnect(for: sessionID)
+                {
+                    handleConnectionDrop(host: host, sessionID: sessionID)
                 }
             }
         default:
@@ -1847,35 +2936,68 @@ final class AppContainer: ObservableObject {
         let backgroundGeneration = lifecycleGeneration
 
         // A reconnect started before backgrounding cannot safely finish while the
-        // scene is inactive. Invalidate it now and let foreground recovery start
-        // one fresh attempt from the resulting disconnected state.
+        // scene is inactive. Invalidate every runtime owner, not only the
+        // selected projection. Non-selected owners remain in a truthful,
+        // retryable state so foreground return does not strand them as connecting.
+        let reconnectingRuntimes = sessionRuntimes.values.filter {
+            $0.reconnectState.isReconnecting || $0.session.state == .connecting
+        }
+        if sessionRuntimes.count == 1 {
+            for runtime in reconnectingRuntimes
+            where !isExplicitDisconnect(for: runtime.session.id) {
+                pendingForegroundRecoverySessionIDs.insert(runtime.session.id)
+            }
+        }
         if reconnectState.isReconnecting || activeSession?.state == .connecting {
             activeSession?.state = .disconnected
             reconnectState = .cancelled
-            Task { [weak self] in
+        }
+        for runtime in reconnectingRuntimes {
+            runtime.markReconnectCancelled()
+            if selectedSessionID == runtime.session.id {
+                _ = synchronizeSelectedSessionProjection(for: runtime)
+                reconnectState = .cancelled
+            }
+        }
+        if let recoveryOwnerID = networkRecoverySessionID {
+            clearNetworkRecovery(for: recoveryOwnerID)
+        }
+        if !reconnectingRuntimes.isEmpty || reconnectState == .cancelled {
+            Task { @MainActor [weak self] in
                 await self?.reconnectCoordinator.cancel()
             }
+            updateOpenSessions()
         }
 
         // Persist intent immediately so that if the app is suspended or terminated
         // by the system, the last active target and host are safely preserved.
-        if let session = activeSession, let host = activeHost {
+        if let session = activeSession, let host = activeHost,
+            let writeContext = restorationWriteContext(session: session, host: host)
+        {
             let activeTarget: LastUsedMultiplexerTarget? =
                 activeTmuxSessionID.flatMap { LastUsedMultiplexerTarget.tmuxTarget($0) }
                 ?? activeHerdrWorkspaceID.flatMap { LastUsedMultiplexerTarget.herdrTarget($0) }
-            Task { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let previous = try? await self.restorationStore.load()
-                let target = activeTarget ?? previous.flatMap { self.lastUsedTarget(from: $0) }
-                guard self.lifecycleGeneration == backgroundGeneration,
-                    !self.isExplicitDisconnect
+                guard self.isCurrentRestorationWrite(writeContext),
+                    self.lifecycleGeneration == backgroundGeneration
                 else { return }
+                let target =
+                    activeTarget
+                    ?? self.sessionRuntimes[session.id].flatMap {
+                        self.restorationTarget(for: $0)
+                    }
+                    ?? previous.flatMap { metadata in
+                        metadata.hostID == host.id ? self.lastUsedTarget(from: metadata) : nil
+                    }
+                guard self.isCurrentRestorationWrite(writeContext) else { return }
                 let metadata = self.restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
                     target: target
                 )
-                try? await self.restorationStore.save(metadata)
+                await self.saveRestorationMetadata(metadata, context: writeContext)
             }
         }
 
@@ -1919,20 +3041,31 @@ final class AppContainer: ObservableObject {
         // keeping the socket open in the kernel, we will probe the existing
         // connection upon returning to the foreground and avoid reconnecting
         // if it survived.
-        if let session = activeSession, let host = activeHost {
+        if let session = activeSession, let host = activeHost,
+            let writeContext = restorationWriteContext(session: session, host: host)
+        {
             let activeTarget: LastUsedMultiplexerTarget? =
                 activeTmuxSessionID.flatMap { LastUsedMultiplexerTarget.tmuxTarget($0) }
                 ?? activeHerdrWorkspaceID.flatMap { LastUsedMultiplexerTarget.herdrTarget($0) }
-            Task { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 let previous = try? await self.restorationStore.load()
-                let target = activeTarget ?? previous.flatMap { self.lastUsedTarget(from: $0) }
+                guard self.isCurrentRestorationWrite(writeContext) else { return }
+                let target =
+                    activeTarget
+                    ?? self.sessionRuntimes[session.id].flatMap {
+                        self.restorationTarget(for: $0)
+                    }
+                    ?? previous.flatMap { metadata in
+                        metadata.hostID == host.id ? self.lastUsedTarget(from: metadata) : nil
+                    }
+                guard self.isCurrentRestorationWrite(writeContext) else { return }
                 let metadata = self.restorationMetadata(
                     hostID: host.id,
                     sessionID: session.id,
                     target: target
                 )
-                try? await self.restorationStore.save(metadata)
+                await self.saveRestorationMetadata(metadata, context: writeContext)
             }
         }
     }
@@ -2002,8 +3135,10 @@ final class AppContainer: ObservableObject {
             await trustStore.trustOnce(challenge)
         }
         pendingTrustChallenge = nil
+        if let hostID = pendingTrustHost?.id {
+            clearConnectionFailures(forHostID: hostID)
+        }
         pendingTrustHost = nil
-        lastConnectionFailure = nil
         lastSFTPFailure = nil
         sftpErrorMessage = nil
         await connect(to: host)
@@ -2011,6 +3146,9 @@ final class AppContainer: ObservableObject {
 
     func rejectPendingHostKey() {
         let rejectedHost = pendingTrustHost
+        if let hostID = rejectedHost?.id {
+            clearConnectionFailures(forHostID: hostID)
+        }
         pendingTrustChallenge = nil
         pendingTrustHost = nil
         if sessionRuntimes.isEmpty || activeHost?.id == rejectedHost?.id {
@@ -2058,72 +3196,331 @@ final class AppContainer: ObservableObject {
         await sendValidatedCommand(command, approved: approved)
     }
 
+    private var canUseSingleSessionAuxiliaryFeatures: Bool {
+        guard sessionRuntimes.count <= 1 else { return false }
+        guard let selectedID = selectedSessionID else { return sessionRuntimes.isEmpty }
+        return auxiliarySessionID == selectedID
+            && activeSession?.id == selectedID
+            && activeSession?.state == .connected
+    }
+
+    private func canUseSingleSessionAuxiliaryFeatures(for host: Host) -> Bool {
+        canUseSingleSessionAuxiliaryFeatures
+            && (sessionRuntimes.isEmpty || activeHost?.id == host.id)
+    }
+
+    private func rebindAuxiliaryResourcesIfNeeded() async {
+        guard sessionRuntimes.count == 1,
+            let selectedID = selectedSessionID,
+            let runtime = sessionRuntimes[selectedID],
+            runtime.session.state == .connected,
+            activeHost?.id == runtime.host.id
+        else { return }
+        guard auxiliarySessionID != selectedID else { return }
+
+        auxiliarySetupGeneration &+= 1
+        let setupGeneration = auxiliarySetupGeneration
+        let ownerRuntime = runtime
+        let ownerConnection = runtime.connection
+        let manager: any PortForwardingManaging
+        if let custom = customPortForwardingManager {
+            manager = custom
+        } else if isDemo {
+            manager = portForwardingManager ?? DemoPortForwardingManager()
+        } else if let live = ownerConnection as? LiveSSHConnection {
+            manager = PortForwardingManager(connection: live)
+        } else {
+            manager = UnavailablePortForwardingManager()
+        }
+        portForwardingManager = manager
+        guard let managerGeneration = await rebindForwardingManager(manager) else { return }
+        let started = await autoStartForwardingRules(
+            for: ownerRuntime.host,
+            manager: manager,
+            ownerContext: AuxiliaryOwnerContext(
+                sessionID: selectedID,
+                runtimeIdentity: ObjectIdentifier(ownerRuntime),
+                connectionIdentity: ObjectIdentifier(ownerConnection as AnyObject),
+                setupGeneration: setupGeneration
+            ),
+            managerGeneration: managerGeneration
+        )
+        guard auxiliarySetupGeneration == setupGeneration,
+            sessionRuntimes.count == 1,
+            selectedSessionID == selectedID,
+            sessionRuntimes[selectedID] === ownerRuntime,
+            ownerRuntime.session.state == .connected,
+            activeHost?.id == ownerRuntime.host.id,
+            (ownerRuntime.connection as AnyObject) === (ownerConnection as AnyObject),
+            isCurrentForwardingManager(manager)
+        else {
+            // The awaited starts belong to an obsolete owner. Stop them before
+            // any newer selection/connect can observe them as active.
+            await stopAllForwarding(manager: manager, generation: managerGeneration)
+            return
+        }
+
+        auxiliarySessionID = selectedID
+        portForwardingManager = manager
+        forwardingManagerOperationGeneration = managerGeneration
+        publishForwardingSessions(started)
+        let ownerContext = auxiliaryOwnerContext(for: ownerRuntime, connection: ownerConnection)
+        startForwardingMonitoring(manager: manager, ownerContext: ownerContext)
+        Task { [weak self] in
+            guard let self,
+                self.auxiliarySetupGeneration == setupGeneration,
+                self.selectedSessionID == selectedID,
+                self.sessionRuntimes[selectedID] === ownerRuntime
+            else { return }
+            await self.refreshTmuxState()
+            await self.setupSFTPForHost(ownerRuntime.host)
+        }
+    }
+
+    private func synchronizeSelectedMoshState(for runtime: SessionRuntime) {
+        moshStateTask?.cancel()
+        moshStateTask = nil
+
+        // Clear the old selected projection before awaiting the new controller.
+        // MoshSessionInfo contains key material, so zeroize it synchronously as
+        // part of the selection boundary rather than leaving A visible while B
+        // is still being queried.
+        moshState = nil
+        moshSessionInfo?.zeroize()
+        moshSessionInfo = nil
+        networkRoamingState = nil
+
+        guard let controller = runtime.connection as? any MoshSessionControlling else {
+            return
+        }
+
+        let sessionID = runtime.session.id
+        moshStateTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let info = await controller.sessionInfo
+            guard
+                self.isSelectedMoshOwner(
+                    sessionID: sessionID, runtime: runtime, controller: controller)
+            else { return }
+            let state = await controller.moshState
+            guard
+                self.isSelectedMoshOwner(
+                    sessionID: sessionID, runtime: runtime, controller: controller)
+            else { return }
+            let roaming = await controller.roamingState
+            guard
+                self.isSelectedMoshOwner(
+                    sessionID: sessionID, runtime: runtime, controller: controller)
+            else { return }
+            self.moshSessionInfo = info
+            self.moshState = state
+            self.networkRoamingState = roaming
+            self.startMoshMonitoring(for: controller, runtime: runtime)
+        }
+    }
+
     func disconnect() async {
         #if canImport(UIKit)
         endCurrentBackgroundTask()
         #endif
-        await cancelVoiceRecording()
+
+        // Capture every owner before the first await. This operation may yield
+        // to a new selection, so no continuation below may infer ownership from
+        // the mutable selected-session projection.
+        let ownerSessionID = selectedSessionID ?? activeSession?.id
+        let ownerRuntime = ownerSessionID.flatMap { sessionRuntimes[$0] }
+        let ownerConnection = ownerRuntime?.connection
+        let ownerWasSelected = ownerSessionID != nil && selectedSessionID == ownerSessionID
+        let ownerLifecycleGeneration = lifecycleGeneration
+        let pendingSessionID = pendingConnectingSession?.id
+        let initialPendingProjection =
+            ownerRuntime == nil
+            && pendingSessionID == ownerSessionID
+            && selectedSessionID == nil
+            && activeSession?.id == pendingSessionID
+        let ownsPendingAdmission =
+            pendingSessionID == ownerSessionID
+            && (ownerWasSelected || initialPendingProjection)
+        let recoveryOwnerID = networkRecoverySessionID
+        let recoveryOwnerRuntime = recoveryOwnerID.flatMap { sessionRuntimes[$0] }
+        pendingForegroundRecoverySessionIDs.remove(ownerSessionID)
+        let ownerHost = ownerWasSelected ? activeHost : nil
+        let ownerSession = ownerWasSelected ? activeSession : nil
+        let ownerTarget: LastUsedMultiplexerTarget? = {
+            guard ownerWasSelected else { return nil }
+            return activeTmuxSessionID.flatMap(LastUsedMultiplexerTarget.tmuxTarget)
+                ?? activeHerdrWorkspaceID.flatMap(LastUsedMultiplexerTarget.herdrTarget)
+        }()
+
+        func ownsCapturedRuntime() -> Bool {
+            guard let ownerSessionID, let ownerRuntime, let ownerConnection,
+                let currentRuntime = sessionRuntimes[ownerSessionID],
+                currentRuntime === ownerRuntime
+            else { return false }
+            return (currentRuntime.connection as AnyObject) === (ownerConnection as AnyObject)
+        }
+
+        func ownsSelectedProjection() -> Bool {
+            // Selection may move away and back while the captured runtime's
+            // teardown awaits. The exact runtime identity is authoritative;
+            // a stale selection generation alone must not reject reconciliation.
+            ownsCapturedRuntime()
+                && ownerWasSelected
+                && selectedSessionID == ownerSessionID
+                && activeSession?.id == ownerSessionID
+        }
+
+        // Invalidate owner-scoped lifecycle work before yielding. Do not write
+        // this generation after an await, because a new connection may advance
+        // it while voice cancellation is suspended.
+        lifecycleGeneration = ownerLifecycleGeneration + 1
+        isSceneInBackground = false
+
         cancelSendImageForLifecycle()
         resetVoiceState()
-        isExplicitDisconnect = true
-        isForegroundRecoveryInProgress = false
-        isNetworkRecoveryInProgress = false
-        foregroundRecoveryTask?.cancel()
-        foregroundRecoveryTask = nil
-        lifecycleGeneration += 1
-        isSceneInBackground = false
-        tmuxRefreshGeneration += 1
-        if let host = activeHost,
-            let session = activeSession,
-            let target = activeTmuxSessionID.flatMap({ LastUsedMultiplexerTarget.tmuxTarget($0) })
-                ?? activeHerdrWorkspaceID.flatMap({ LastUsedMultiplexerTarget.herdrTarget($0) })
-        {
-            try? await restorationStore.save(
-                restorationMetadata(
-                    hostID: host.id,
-                    sessionID: session.id,
-                    target: target
-                ))
-        }
-        activeHost = nil
-        liveActivityManager.end(sessionID: activeSession?.id ?? UUID())
-        await reconnectCoordinator.cancel()
-        reconnectState = .idle
-        await selectedSessionRuntime?.disconnect()
+        await cancelVoiceRecording()
+        // Voice cancellation is global, but all session state remains scoped to
+        // the captured owner after this await.
 
-        activeSession?.state = .disconnected
-        redactor = Redactor()
-        updateOpenSessions()
-        tmuxError = nil
-
-        if sessionRuntimes.count <= 1 {
-            await teardownAuxiliaryResources()
+        if let ownerSessionID {
+            explicitlyDisconnectedSessionIDs.insert(ownerSessionID)
+            invalidateRedactionValidity(for: ownerSessionID)
+            deferredInterfaceRecoverySessionIDs.remove(ownerSessionID)
         } else {
-            closeSecondaryPane()
+            fallbackExplicitDisconnect = true
+        }
+        if let pendingSessionID, ownsPendingAdmission {
+            invalidateRedactionValidity(for: pendingSessionID)
+            // The pending slot is an admission token. Clear it before any
+            // further await so a late transport result cannot clear a newer connection.
+            pendingConnectingSession = nil
+            if ownerRuntime == nil, activeSession?.id == pendingSessionID {
+                activeSession?.state = .disconnected
+                activeHost = nil
+                terminalText = ""
+                reconnectState = .cancelled
+                redactor = Redactor()
+                liveActivityManager.end(sessionID: pendingSessionID)
+            }
+        }
+
+        // Only cancel a coordinator owned by this disconnect. A selection switch
+        // can make another runtime the recovery owner while cancellation waits.
+        let cancelsOwnerRecovery =
+            recoveryOwnerID == ownerSessionID
+            && recoveryOwnerRuntime != nil
+        // The lifecycle generation above invalidates a pre-existing foreground
+        // task without cancelling a task that a newly selected session may have
+        // installed while voice cancellation was suspended.
+        if ownsSelectedProjection() {
+            isForegroundRecoveryInProgress = false
+            isNetworkRecoveryInProgress = false
+        }
+        if ownsSelectedProjection() {
+            tmuxRefreshGeneration += 1
+        }
+
+        if let ownerHost, let ownerSession, let ownerTarget {
+            await saveRestorationMetadata(
+                restorationMetadata(
+                    hostID: ownerHost.id,
+                    sessionID: ownerSession.id,
+                    target: ownerTarget
+                ))
+            guard ownsCapturedRuntime() else { return }
+        }
+
+        if ownsSelectedProjection() {
+            activeHost = nil
+            liveActivityManager.end(sessionID: ownerSessionID ?? UUID())
+        }
+
+        if cancelsOwnerRecovery {
+            await reconnectCoordinator.cancel()
+            guard ownsCapturedRuntime() else { return }
+            if let ownerSessionID, networkRecoverySessionID == ownerSessionID {
+                clearNetworkRecovery(for: ownerSessionID)
+            }
+        }
+        if ownsSelectedProjection() {
+            reconnectState = .idle
+        }
+
+        if let ownerRuntime, ownsCapturedRuntime() {
+            await ownerRuntime.disconnect()
+            guard ownsCapturedRuntime() else { return }
+            if ownsSelectedProjection() {
+                activeSession = ownerRuntime.session
+                activeSession?.state = .disconnected
+                activeHost = ownerRuntime.host
+            }
+        }
+
+        guard ownsCapturedRuntime() else { return }
+        if ownsSelectedProjection() {
+            moshStateTask?.cancel()
+            moshStateTask = nil
+            moshState = nil
+            moshSessionInfo?.zeroize()
+            moshSessionInfo = nil
+            networkRoamingState = nil
+            redactor = Redactor()
+            tmuxError = nil
+        }
+        updateOpenSessions()
+
+        // Auxiliary resources are single-session-only. Never tear down an
+        // adapter after selection moved, because it may now belong to B.
+        if ownsSelectedProjection(), let ownerSessionID, let ownerRuntime {
+            await teardownAuxiliaryResources(
+                expectedSessionID: ownerSessionID,
+                expectedRuntime: ownerRuntime,
+                expectedConnection: ownerConnection)
+            guard ownsCapturedRuntime() else { return }
+        } else if ownerSessionID == nil, selectedSessionID == nil {
+            await teardownAuxiliaryResources()
+            guard ownerSessionID == nil, selectedSessionID == nil else { return }
         }
     }
 
     /// Teardown auxiliary services (port forwarding, SFTP, telemetry, multiplexer)
     /// safely and idempotently when closing or disconnecting single/final sessions.
-    func teardownAuxiliaryResources() async {
+    func teardownAuxiliaryResources(
+        expectedSessionID: UUID? = nil,
+        expectedRuntime: SessionRuntime? = nil,
+        expectedConnection: (any SSHConnection)? = nil,
+        transferTaskIDs: Set<UUID>? = nil
+    ) async {
+        if let expectedSessionID {
+            guard selectedSessionID == expectedSessionID,
+                let expectedRuntime,
+                sessionRuntimes[expectedSessionID] === expectedRuntime,
+                auxiliarySessionID == expectedSessionID
+            else { return }
+            if let expectedConnection {
+                guard
+                    (expectedRuntime.connection as AnyObject) === (expectedConnection as AnyObject)
+                else { return }
+            }
+        }
+        auxiliarySetupGeneration &+= 1
+        let teardownGeneration = auxiliarySetupGeneration
+        auxiliarySessionID = nil
         closeSecondaryPane()
 
+        // Clear every selected-session projection before any asynchronous stop.
+        // A new selection must never observe the old owner's forwarding, SFTP,
+        // editor, or loading state while its teardown is in flight.
         forwardingStreamTask?.cancel()
         forwardingStreamTask = nil
-        await portForwardingManager?.stopAll()
-        if !isDemo {
-            portForwardingManager = nil
-        }
         forwardingSessions = []
         forwardingErrorMessage = nil
-
         activeTmuxSessionID = nil
         tmuxSessions = []
         isTmuxServerRunning = false
         isProbingTmux = false
         tmuxAvailability = .unavailable(reason: "Not connected")
         tmuxError = nil
-
         herdrRefreshGeneration += 1
         stopHerdrPolling()
         herdrWorkspaces = []
@@ -2131,49 +3528,91 @@ final class AppContainer: ObservableObject {
         herdrAvailability = .unavailable(reason: "Not connected")
         herdrError = nil
         activeHerdrWorkspaceID = nil
-
-        // Server Telemetry
-        for poller in telemetryPollers.values {
-            poller.stopPolling()
-        }
+        for poller in telemetryPollers.values { poller.stopPolling() }
         telemetryPollers.removeAll()
-
         moshStateTask?.cancel()
         moshStateTask = nil
         moshState = nil
         moshSessionInfo?.zeroize()
         moshSessionInfo = nil
         networkRoamingState = nil
-
-        // Reset SFTP session, preview, editor, and transfer state
         closePreview()
         closeEditor()
         currentDirectoryFiles = []
         currentPath = RemotePath("/home/dev")
+        isLoadingDirectory = false
         directoryErrorMessage = nil
         sftpErrorMessage = nil
         lastSFTPFailure = nil
         sftpSetupGeneration += 1
-
-        for (_, task) in activeTransferTasks {
-            task.cancel()
+        directoryRequestGenerations.removeAll()
+        transferQueueGeneration &+= 1
+        cancelSendImage()
+        let capturedTransferTaskIDs = transferTaskIDs ?? Set(activeTransferTasks.keys)
+        for taskID in capturedTransferTaskIDs {
+            activeTransferTasks[taskID]?.cancel()
+            activeTransferTasks.removeValue(forKey: taskID)
         }
-        activeTransferTasks.removeAll()
-
         drainPendingConflicts()
-
-        if customSFTPRepository == nil {
-            if let live = sftpRepository as? LiveSFTPRepository {
-                await live.close()
-            }
-            if !isDemo {
-                sftpRepository = nil
-            }
-        }
         directoryCache.removeAll()
         cleanTemporaryTransfersDirectory(removeAll: true)
         fallbackTerminalController.reset()
         updateIdleTimerState()
+
+        let manager = portForwardingManager
+        let managerGeneration = forwardingManagerOperationGeneration
+        let liveSFTP = customSFTPRepository == nil ? sftpRepository as? LiveSFTPRepository : nil
+        if let manager, let managerGeneration {
+            await stopAllForwarding(manager: manager, generation: managerGeneration)
+        }
+        for taskID in capturedTransferTaskIDs {
+            await transferCoordinator.cancel(id: taskID)
+            await transferCoordinator.remove(id: taskID)
+        }
+        // The captured manager belongs to the teardown owner. Revalidate before
+        // closing the second captured resource so a new selection is never
+        // mistaken for the old owner's adapter.
+        let ownsAfterForwardingStop: Bool = {
+            guard auxiliarySetupGeneration == teardownGeneration else { return false }
+            if let expectedSessionID {
+                guard selectedSessionID == expectedSessionID,
+                    let expectedRuntime,
+                    sessionRuntimes[expectedSessionID] === expectedRuntime
+                else { return false }
+                if let expectedConnection {
+                    guard
+                        (expectedRuntime.connection as AnyObject)
+                            === (expectedConnection as AnyObject)
+                    else { return false }
+                }
+            }
+            return true
+        }()
+        await liveSFTP?.close()
+
+        let stillOwner: Bool = {
+            guard ownsAfterForwardingStop,
+                auxiliarySetupGeneration == teardownGeneration
+            else { return false }
+            if let expectedSessionID {
+                guard selectedSessionID == expectedSessionID,
+                    let expectedRuntime,
+                    sessionRuntimes[expectedSessionID] === expectedRuntime
+                else { return false }
+                if let expectedConnection {
+                    guard
+                        (expectedRuntime.connection as AnyObject)
+                            === (expectedConnection as AnyObject)
+                    else { return false }
+                }
+            }
+            return true
+        }()
+        guard stillOwner else { return }
+        transferQueueState = await transferCoordinator.snapshot()
+        forwardingManagerOperationGeneration = nil
+        if !isDemo { portForwardingManager = nil }
+        if customSFTPRepository == nil, !isDemo { sftpRepository = nil }
     }
 
     /// Resolves the exact identity selected by a host without exposing secret
@@ -2192,18 +3631,33 @@ final class AppContainer: ObservableObject {
         return identity
     }
 
-    /// Registers sensitive private key secrets for the host and any intermediate
-    /// ProxyJump bastions with the terminal redactor. All readable credentials are
-    /// protected unconditionally regardless of catalog collision status.
-    func loadRedactionSecret(for host: Host) async {
-        let currentLifecycle = lifecycleGeneration
-        redactor = Redactor()
+    /// Loads sensitive private key and Mosh secrets for one newly opened
+    /// connection. The caller installs the returned redactor on that connection's
+    /// runtime, so opening a session cannot borrow the selected-session projection.
+    /// All readable credentials are protected unconditionally regardless of
+    /// catalog collision status.
+    @discardableResult
+    func loadRedactionSecret(
+        for host: Host,
+        connection: any SSHConnection,
+        sessionID: UUID? = nil,
+        validityToken: UUID? = nil
+    ) async -> Redactor {
         var secrets: [String] = []
         let identities = (try? await catalog.identities()) ?? []
         if let identityID = host.identityID,
             let identity = identities.first(where: { $0.id == identityID }),
             let secret = try? await credentialStore.load(reference: identity.keychainReference),
             let value = String(data: secret, encoding: .utf8), !value.isEmpty
+        {
+            secrets.append(value)
+        }
+        if case .cloudflareAccess(let options) = host.connection,
+            !options.clientSecretKeychainRef.isEmpty,
+            let secret = try? await credentialStore.load(
+                reference: options.clientSecretKeychainRef),
+            let value = String(data: secret, encoding: .utf8),
+            !value.isEmpty
         {
             secrets.append(value)
         }
@@ -2232,23 +3686,19 @@ final class AppContainer: ObservableObject {
             if !key.isEmpty {
                 secrets.append(key)
             }
-        } else if let sessionInfo = self.moshSessionInfo {
-            let key = sessionInfo.sessionKey.base64String
-            if !key.isEmpty {
-                secrets.append(key)
-            }
         }
-        guard lifecycleGeneration == currentLifecycle, !isExplicitDisconnect else {
-            return
+        if let sessionID, let validityToken,
+            !isCurrentRedactionValidity(sessionID: sessionID, token: validityToken)
+        {
+            return Redactor()
         }
-        if !secrets.isEmpty {
-            redactor = Redactor(secrets: secrets)
-        }
+        return Redactor(secrets: secrets)
     }
 
     internal func redacted(_ data: Data) -> Data {
-        guard !redactor.secrets.isEmpty else { return data }
-        return Data(redactor.redact(String(decoding: data, as: UTF8.self)).utf8)
+        let selectedRedactor = selectedSessionRuntime?.redactor ?? redactor
+        guard !selectedRedactor.secrets.isEmpty else { return data }
+        return Data(selectedRedactor.redact(String(decoding: data, as: UTF8.self)).utf8)
     }
 
     // MARK: - Live Tmux Management
@@ -2342,15 +3792,24 @@ final class AppContainer: ObservableObject {
         )
     }
 
-    private func restoreHerdrTargetIfNeeded(for host: Host, session: TerminalSession) async {
-        guard let metadata = try? await restorationStore.load(),
-            metadata.hostID == host.id,
-            let target = lastUsedTarget(from: metadata),
-            case .herdr(let workspaceID) = target
-        else { return }
+    private func restoreHerdrTargetIfNeeded(
+        for host: Host,
+        session: TerminalSession,
+        preferredTarget: LastUsedMultiplexerTarget? = nil
+    ) async {
+        let target: LastUsedMultiplexerTarget?
+        if let preferredTarget {
+            target = preferredTarget
+        } else {
+            target = (try? await restorationStore.load()).flatMap { metadata in
+                guard metadata.hostID == host.id else { return nil }
+                return lastUsedTarget(from: metadata)
+            }
+        }
+        guard let target, case .herdr(let workspaceID) = target else { return }
         guard activeSession?.id == session.id,
             activeSession?.state == .connected,
-            !isExplicitDisconnect
+            !isExplicitDisconnect(for: session.id)
         else { return }
         guard let workspace = herdrWorkspaces.first(where: { $0.id == workspaceID }) else {
             activeHerdrWorkspaceID = nil
@@ -2440,6 +3899,9 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func probeTmux() async -> TmuxAvailability {
+        guard canUseSingleSessionAuxiliaryFeatures else {
+            return .unavailable(reason: "Auxiliary features require one selected session")
+        }
         if connection is any MoshSessionControlling {
             return tmuxAvailability
         }
@@ -2482,7 +3944,8 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func listTmuxSessions(expectedGeneration: Int? = nil) async -> [TmuxSessionInfo] {
-        guard let currentSession = activeSession, currentSession.state == .connected,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let currentSession = activeSession, currentSession.state == .connected,
             let executor = connection as? SSHCommandExecuting
         else {
             tmuxSessions = []
@@ -2526,7 +3989,7 @@ final class AppContainer: ObservableObject {
                                     let target = LastUsedMultiplexerTarget.tmuxTarget(
                                         matched.sessionID)
                                 {
-                                    try? await restorationStore.save(
+                                    await saveRestorationMetadata(
                                         restorationMetadata(
                                             hostID: host.id,
                                             sessionID: sessionID,
@@ -2605,6 +4068,7 @@ final class AppContainer: ObservableObject {
     }
 
     func refreshTmuxState() async {
+        guard canUseSingleSessionAuxiliaryFeatures else { return }
         if connection is any MoshSessionControlling {
             return
         }
@@ -2740,7 +4204,8 @@ final class AppContainer: ObservableObject {
     func executeMultiplexerControl(_ action: MultiplexerControlAction, approved: Bool = false) async
         -> Bool
     {
-        guard activeSession?.state == .connected, let conn = connection,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            activeSession?.state == .connected, let conn = connection,
             let executor = conn as? SSHCommandExecuting
         else { return false }
         let sessionID = activeSession?.id
@@ -2773,7 +4238,10 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func attachTmuxSession(id: String) async -> Bool {
-        guard activeSession?.state == .connected, let conn = connection else {
+        guard canUseSingleSessionAuxiliaryFeatures,
+            activeSession?.state == .connected,
+            let conn = connection
+        else {
             tmuxError = "Not connected."
             return false
         }
@@ -2819,7 +4287,7 @@ final class AppContainer: ObservableObject {
                 guard let target = LastUsedMultiplexerTarget.tmuxTarget(validatedID.value) else {
                     return false
                 }
-                try? await restorationStore.save(
+                await saveRestorationMetadata(
                     restorationMetadata(
                         hostID: host.id,
                         sessionID: session.id,
@@ -2837,7 +4305,10 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func createTmuxSession(name: String) async -> Bool {
-        guard activeSession?.state == .connected, let conn = connection else {
+        guard canUseSingleSessionAuxiliaryFeatures,
+            activeSession?.state == .connected,
+            let conn = connection
+        else {
             tmuxError = "Not connected."
             return false
         }
@@ -2886,7 +4357,7 @@ final class AppContainer: ObservableObject {
                 let targetID = activeTmuxSessionID,
                 let target = LastUsedMultiplexerTarget.tmuxTarget(targetID)
             {
-                try? await restorationStore.save(
+                await saveRestorationMetadata(
                     restorationMetadata(
                         hostID: host.id,
                         sessionID: session.id,
@@ -2906,7 +4377,8 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func probeHerdr() async -> HerdrAvailability {
-        guard let currentSession = activeSession, currentSession.state == .connected,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let currentSession = activeSession, currentSession.state == .connected,
             let executor = connection as? SSHCommandExecuting
         else {
             let avail = HerdrAvailability.unavailable(reason: "Not connected")
@@ -2945,7 +4417,8 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func listHerdrWorkspaces() async -> [HerdrWorkspace] {
-        guard let currentSession = activeSession, currentSession.state == .connected,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let currentSession = activeSession, currentSession.state == .connected,
             let executor = connection as? SSHCommandExecuting
         else {
             herdrWorkspaces = []
@@ -3001,7 +4474,8 @@ final class AppContainer: ObservableObject {
 
     @discardableResult
     func selectHerdrWorkspace(id: String) async -> Bool {
-        guard let target = LastUsedMultiplexerTarget.herdrTarget(id),
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let target = LastUsedMultiplexerTarget.herdrTarget(id),
             activeSession?.state == .connected
         else {
             herdrError = "Not connected."
@@ -3015,7 +4489,7 @@ final class AppContainer: ObservableObject {
         guard let host = activeHost, let session = activeSession else { return false }
         activeHerdrWorkspaceID = workspace.id
         herdrError = nil
-        try? await restorationStore.save(
+        await saveRestorationMetadata(
             restorationMetadata(
                 hostID: host.id,
                 sessionID: session.id,
@@ -3025,6 +4499,7 @@ final class AppContainer: ObservableObject {
     }
 
     func refreshHerdrState() async {
+        guard canUseSingleSessionAuxiliaryFeatures else { return }
         if connection is any MoshSessionControlling {
             return
         }
@@ -3103,6 +4578,9 @@ final class AppContainer: ObservableObject {
     func runHerdrPaneCommand(paneID: String, command: String, approved: Bool = false) async -> (
         success: Bool, error: String?
     ) {
+        guard canUseSingleSessionAuxiliaryFeatures else {
+            return (false, "Auxiliary features require one selected session")
+        }
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             let msg = "Command cannot be empty."
@@ -3167,7 +4645,8 @@ final class AppContainer: ObservableObject {
     func splitHerdrPane(paneID: String, direction: String = "right") async -> (
         success: Bool, error: String?
     ) {
-        guard let currentSession = activeSession, currentSession.state == .connected,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let currentSession = activeSession, currentSession.state == .connected,
             let executor = connection as? SSHCommandExecuting
         else {
             let msg = "Not connected."
@@ -3214,7 +4693,8 @@ final class AppContainer: ObservableObject {
     func readHerdrPaneOutput(paneID: String, source: String = "recent-unwrapped") async throws
         -> String
     {
-        guard let currentSession = activeSession, currentSession.state == .connected,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let currentSession = activeSession, currentSession.state == .connected,
             let executor = connection as? SSHCommandExecuting
         else {
             throw HerdrParseError.emptyOutput
@@ -3237,7 +4717,9 @@ final class AppContainer: ObservableObject {
                 !err.isEmpty ? err : "Read failed with code \(result.exitCode)")
         }
         let unwrapped = HerdrOutputParser.parseRecentUnwrapped(from: result.stdout)
-        return redactor.redact(unwrapped)
+        // Herdr is selected-session-only, but its output must use the owning
+        // runtime in case the legacy projection is awaiting synchronization.
+        return sessionRuntime?.redactor.redact(unwrapped) ?? redactor.redact(unwrapped)
     }
 
     func waitHerdrAgentStatus(
@@ -3274,6 +4756,9 @@ final class AppContainer: ObservableObject {
     func createHerdrWorkspace(label: String, cwd: String = ".") async -> (
         success: Bool, error: String?
     ) {
+        guard canUseSingleSessionAuxiliaryFeatures else {
+            return (false, "Auxiliary features require one selected session")
+        }
         let trimmedLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedLabel.isEmpty else {
             let msg = "Workspace label cannot be empty."
@@ -3595,6 +5080,7 @@ final class AppContainer: ObservableObject {
     // MARK: - Secondary Split Pane Management
 
     public func openSecondarySFTP(for host: Host) {
+        guard canUseSingleSessionAuxiliaryFeatures(for: host) else { return }
         secondaryPaneMode = .sftp(host)
         if sftpRepository == nil || activeHost?.id != host.id {
             Task {
@@ -3614,6 +5100,7 @@ final class AppContainer: ObservableObject {
     // MARK: - SFTP & File Management Methods
 
     func setupSFTPForHost(_ host: Host) async {
+        guard canUseSingleSessionAuxiliaryFeatures(for: host) else { return }
         guard customSFTPRepository == nil else {
             await loadDirectory(at: currentPath)
             return
@@ -3664,7 +5151,7 @@ final class AppContainer: ObservableObject {
     }
 
     public func retrySFTP() async {
-        guard let host = activeHost else { return }
+        guard canUseSingleSessionAuxiliaryFeatures, let host = activeHost else { return }
         self.lastSFTPFailure = nil
         self.sftpErrorMessage = nil
         await setupSFTPForHost(host)
@@ -3677,6 +5164,7 @@ final class AppContainer: ObservableObject {
     /// the existing queue UI and explicit disconnect cancellation remain the
     /// source of truth.
     public func beginSendImage(data: Data) {
+        sendImageGeneration &+= 1
         cancelSendImage()
         let operationID = UUID()
         activeSendImageOperationID = operationID
@@ -3722,7 +5210,8 @@ final class AppContainer: ObservableObject {
         // A cancelled operation may remain queued long enough to start after a
         // replacement upload. Never let that stale task mutate the replacement.
         guard activeSendImageOperationID == operationID else { return }
-        guard let host = activeHost,
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let host = activeHost,
             activeSession?.state == .connected,
             let repo = sftpRepository
         else {
@@ -3735,6 +5224,9 @@ final class AppContainer: ObservableObject {
         let generation = lifecycleGeneration
         let connection = self.connection
         let connectionIdentity = connection.map { ObjectIdentifier($0 as AnyObject) }
+        let transferContext = captureSFTPOperation(
+            repository: repo, operationGeneration: transferQueueGeneration, scope: .transfer)
+        let capturedSendImageGeneration = sendImageGeneration
         var imageRemotePath: RemotePath?
         do {
             let image = try SendImageValidator.validate(data)
@@ -3742,7 +5234,9 @@ final class AppContainer: ObservableObject {
             guard
                 isCurrentSendImage(
                     operationID: operationID, hostID: hostID, sessionID: sessionID,
-                    generation: generation, connectionIdentity: connectionIdentity, repository: repo
+                    generation: generation, connectionIdentity: connectionIdentity,
+                    repository: repo, transferContext: transferContext,
+                    sendImageGeneration: capturedSendImageGeneration
                 )
             else {
                 throw SendImageError.hostChanged
@@ -3772,7 +5266,13 @@ final class AppContainer: ObservableObject {
                 totalBytes: fileSize
             )
             let transferID = transfer.id
-            guard activeSendImageOperationID == operationID else { throw SendImageError.cancelled }
+            guard
+                isCurrentSendImage(
+                    operationID: operationID, hostID: hostID, sessionID: sessionID,
+                    generation: generation, connectionIdentity: connectionIdentity,
+                    repository: repo, transferContext: transferContext,
+                    sendImageGeneration: capturedSendImageGeneration)
+            else { throw SendImageError.cancelled }
             activeSendImageTransferID = transferID
             activeTransferTasks[transferID] = sendImageTask
             await transferCoordinator.registerCancellation(id: transferID) { [weak self] in
@@ -3781,7 +5281,9 @@ final class AppContainer: ObservableObject {
                     self?.sendImageTask?.cancel()
                 }
             }
-            transferQueueState = await transferCoordinator.snapshot()
+            guard await publishTransferQueueState(transferContext) else {
+                throw SendImageError.cancelled
+            }
 
             do {
                 let uploadProgress: @Sendable (TransferProgress) -> Void = { [weak self] progress in
@@ -3793,7 +5295,9 @@ final class AppContainer: ObservableObject {
                             self.isCurrentSendImage(
                                 operationID: operationID, hostID: hostID,
                                 sessionID: sessionID, generation: generation,
-                                connectionIdentity: connectionIdentity, repository: repo)
+                                connectionIdentity: connectionIdentity, repository: repo,
+                                transferContext: transferContext,
+                                sendImageGeneration: capturedSendImageGeneration)
                         else {
                             return
                         }
@@ -3803,7 +5307,14 @@ final class AppContainer: ObservableObject {
                             bytesTransferred: progress.bytesTransferred,
                             totalBytes: progress.totalBytes
                         )
-                        self.transferQueueState = await self.transferCoordinator.snapshot()
+                        guard
+                            self.isCurrentSendImage(
+                                operationID: operationID, hostID: hostID, sessionID: sessionID,
+                                generation: generation, connectionIdentity: connectionIdentity,
+                                repository: repo, transferContext: transferContext,
+                                sendImageGeneration: capturedSendImageGeneration)
+                        else { return }
+                        _ = await self.publishTransferQueueState(transferContext)
                     }
                 }
                 if let restrictedRepo = repo as? any SFTPRestrictedUploader {
@@ -3817,42 +5328,96 @@ final class AppContainer: ObservableObject {
                     isCurrentSendImage(
                         operationID: operationID, hostID: hostID, sessionID: sessionID,
                         generation: generation, connectionIdentity: connectionIdentity,
-                        repository: repo)
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
                 else {
                     throw SendImageError.hostChanged
                 }
                 try Task.checkCancellation()
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
+                else { throw SendImageError.cancelled }
                 await transferCoordinator.markCompleted(id: transferID)
-                guard activeSendImageOperationID == operationID else {
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
+                else { throw SendImageError.cancelled }
+                activeSendImageTransferID = nil
+                guard await publishTransferQueueState(transferContext) else {
                     throw SendImageError.cancelled
                 }
-                activeSendImageTransferID = nil
-                transferQueueState = await transferCoordinator.snapshot()
                 let quotedPath = try SendImageNaming.shellQuote(remotePath.description)
                 guard
                     await sendImageInsertion(
                         quotedPath, operationID: operationID, hostID: hostID,
                         sessionID: sessionID, generation: generation,
-                        connectionIdentity: connectionIdentity, connection: connection)
+                        connectionIdentity: connectionIdentity, connection: connection,
+                        transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
                 else {
                     throw SendImageError.unavailable
                 }
-                guard activeSendImageOperationID == operationID else {
-                    throw SendImageError.cancelled
-                }
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
+                else { throw SendImageError.cancelled }
                 sendImageState = .completed(remotePath)
             } catch {
-                if let imageRemotePath { try? await repo.removeFile(at: imageRemotePath) }
-                guard activeSendImageOperationID == operationID else { return }
+                if isCurrentSendImage(
+                    operationID: operationID, hostID: hostID, sessionID: sessionID,
+                    generation: generation, connectionIdentity: connectionIdentity,
+                    repository: repo, transferContext: transferContext,
+                    sendImageGeneration: capturedSendImageGeneration),
+                    let imageRemotePath
+                {
+                    try? await repo.removeFile(at: imageRemotePath)
+                }
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
+                else { return }
                 if Task.isCancelled || error is CancellationError
                     || error as? SendImageError == .cancelled
                 {
                     await transferCoordinator.cancel(id: transferID)
-                    if activeSendImageOperationID == operationID { sendImageState = .cancelled }
+                    guard
+                        isCurrentSendImage(
+                            operationID: operationID, hostID: hostID, sessionID: sessionID,
+                            generation: generation, connectionIdentity: connectionIdentity,
+                            repository: repo, transferContext: transferContext,
+                            sendImageGeneration: capturedSendImageGeneration)
+                    else { return }
+                    sendImageState = .cancelled
                 } else {
+                    guard
+                        isCurrentSendImage(
+                            operationID: operationID, hostID: hostID, sessionID: sessionID,
+                            generation: generation, connectionIdentity: connectionIdentity,
+                            repository: repo, transferContext: transferContext,
+                            sendImageGeneration: capturedSendImageGeneration)
+                    else { return }
                     await transferCoordinator.markFailed(
                         id: transferID, error: "Image upload failed")
-                    guard activeSendImageOperationID == operationID else { return }
+                    guard
+                        isCurrentSendImage(
+                            operationID: operationID, hostID: hostID, sessionID: sessionID,
+                            generation: generation, connectionIdentity: connectionIdentity,
+                            repository: repo, transferContext: transferContext,
+                            sendImageGeneration: capturedSendImageGeneration)
+                    else { return }
                     if let imageError = error as? SendImageError, imageError == .hostChanged {
                         sendImageState = .cancelled
                     } else {
@@ -3860,14 +5425,32 @@ final class AppContainer: ObservableObject {
                         sendImageState = .failed
                     }
                 }
-                transferQueueState = await transferCoordinator.snapshot()
+                guard
+                    isCurrentSendImage(
+                        operationID: operationID, hostID: hostID, sessionID: sessionID,
+                        generation: generation, connectionIdentity: connectionIdentity,
+                        repository: repo, transferContext: transferContext,
+                        sendImageGeneration: capturedSendImageGeneration)
+                else { return }
+                guard await publishTransferQueueState(transferContext) else { return }
             }
             activeTransferTasks.removeValue(forKey: transferID)
-            if activeSendImageOperationID == operationID {
+            if isCurrentSendImage(
+                operationID: operationID, hostID: hostID, sessionID: sessionID,
+                generation: generation, connectionIdentity: connectionIdentity,
+                repository: repo, transferContext: transferContext,
+                sendImageGeneration: capturedSendImageGeneration)
+            {
                 activeSendImageTransferID = nil
             }
         } catch {
-            guard activeSendImageOperationID == operationID else { return }
+            guard
+                isCurrentSendImage(
+                    operationID: operationID, hostID: hostID, sessionID: sessionID,
+                    generation: generation, connectionIdentity: connectionIdentity,
+                    repository: repo, transferContext: transferContext,
+                    sendImageGeneration: capturedSendImageGeneration)
+            else { return }
             if Task.isCancelled || error is CancellationError
                 || error as? SendImageError == .cancelled
             {
@@ -3886,23 +5469,31 @@ final class AppContainer: ObservableObject {
 
     private func isCurrentSendImage(
         operationID: UUID, hostID: UUID, sessionID: UUID?, generation: Int,
-        connectionIdentity: ObjectIdentifier?, repository: any SFTPRepository
+        connectionIdentity: ObjectIdentifier?, repository: any SFTPRepository,
+        transferContext: SFTPOperationContext, sendImageGeneration: UInt64
     ) -> Bool {
-        activeSendImageOperationID == operationID && activeHost?.id == hostID
-            && activeSession?.id == sessionID && lifecycleGeneration == generation
+        activeSendImageOperationID == operationID
+            && self.sendImageGeneration == sendImageGeneration
+            && activeHost?.id == hostID
+            && activeSession?.id == sessionID
+            && lifecycleGeneration == generation
             && activeSession?.state == .connected
             && connection.map { ObjectIdentifier($0 as AnyObject) } == connectionIdentity
             && sftpRepository.map {
                 ObjectIdentifier($0 as AnyObject) == ObjectIdentifier(repository as AnyObject)
             } == true
+            && isCurrentSFTPOperation(transferContext)
     }
 
     private func sendImageInsertion(
         _ quotedPath: String, operationID: UUID, hostID: UUID, sessionID: UUID?,
         generation: Int, connectionIdentity: ObjectIdentifier?,
-        connection: (any SSHConnection)?
+        connection: (any SSHConnection)?, transferContext: SFTPOperationContext,
+        sendImageGeneration: UInt64
     ) async -> Bool {
         guard activeSendImageOperationID == operationID,
+            self.sendImageGeneration == sendImageGeneration,
+            isCurrentSFTPOperation(transferContext),
             activeHost?.id == hostID,
             activeSession?.id == sessionID,
             activeSession?.state == .connected,
@@ -4004,16 +5595,38 @@ final class AppContainer: ObservableObject {
     }
 
     public func loadDirectory(at path: RemotePath, bypassCache: Bool = false) async {
+        guard canUseSingleSessionAuxiliaryFeatures else { return }
         guard let repo = sftpRepository else {
             directoryErrorMessage = "SFTP repository unavailable."
             return
         }
 
+        let capturedSessionID = selectedSessionID
+        let capturedRuntime = selectedSessionRuntime
+        let capturedHostID = capturedRuntime?.host.id ?? activeHost?.id
+        let capturedAuxiliaryOwnerID = auxiliarySessionID
+        let capturedSetupGeneration = auxiliarySetupGeneration
+        let capturedRepositoryIdentity = ObjectIdentifier(repo as AnyObject)
+        let capturedDirectoryOwnerID =
+            capturedSessionID ?? capturedAuxiliaryOwnerID ?? capturedHostID
+        let capturedRequestToken = nextDirectoryRequestToken(for: capturedDirectoryOwnerID)
+
         if !bypassCache, let cached = directoryCache[path],
+            isCurrentDirectoryLoad(
+                sessionID: capturedSessionID,
+                runtime: capturedRuntime,
+                hostID: capturedHostID,
+                auxiliaryOwnerID: capturedAuxiliaryOwnerID,
+                setupGeneration: capturedSetupGeneration,
+                repositoryIdentity: capturedRepositoryIdentity,
+                requestToken: capturedRequestToken,
+                ownerID: capturedDirectoryOwnerID
+            ),
             Date().timeIntervalSince(cached.timestamp) < directoryCacheTTL
         {
             currentPath = path
             currentDirectoryFiles = cached.files
+            isLoadingDirectory = false
             directoryErrorMessage = nil
             return
         }
@@ -4023,17 +5636,68 @@ final class AppContainer: ObservableObject {
 
         do {
             let files = try await repo.listDirectory(at: path)
+            let isCurrentLoad = isCurrentDirectoryLoad(
+                sessionID: capturedSessionID,
+                runtime: capturedRuntime,
+                hostID: capturedHostID,
+                auxiliaryOwnerID: capturedAuxiliaryOwnerID,
+                setupGeneration: capturedSetupGeneration,
+                repositoryIdentity: capturedRepositoryIdentity,
+                requestToken: capturedRequestToken,
+                ownerID: capturedDirectoryOwnerID
+            )
+            guard isCurrentLoad else { return }
             directoryCache[path] = (files: files, timestamp: Date())
             currentPath = path
             currentDirectoryFiles = files
             isLoadingDirectory = false
         } catch {
+            let isCurrentLoad = isCurrentDirectoryLoad(
+                sessionID: capturedSessionID,
+                runtime: capturedRuntime,
+                hostID: capturedHostID,
+                auxiliaryOwnerID: capturedAuxiliaryOwnerID,
+                setupGeneration: capturedSetupGeneration,
+                repositoryIdentity: capturedRepositoryIdentity,
+                requestToken: capturedRequestToken,
+                ownerID: capturedDirectoryOwnerID
+            )
+            guard isCurrentLoad else { return }
             isLoadingDirectory = false
             directoryErrorMessage = error.localizedDescription
             if path != .root && currentDirectoryFiles.isEmpty {
                 await loadDirectory(at: .root, bypassCache: true)
             }
         }
+    }
+
+    private func nextDirectoryRequestToken(for ownerID: UUID?) -> UInt64 {
+        let next = directoryRequestGenerations[ownerID, default: 0] &+ 1
+        directoryRequestGenerations[ownerID] = next
+        return next
+    }
+
+    private func isCurrentDirectoryLoad(
+        sessionID: UUID?,
+        runtime: SessionRuntime?,
+        hostID: UUID?,
+        auxiliaryOwnerID: UUID?,
+        setupGeneration: UInt64,
+        repositoryIdentity: ObjectIdentifier,
+        requestToken: UInt64,
+        ownerID: UUID?
+    ) -> Bool {
+        guard canUseSingleSessionAuxiliaryFeatures,
+            selectedSessionID == sessionID,
+            selectedSessionRuntime === runtime,
+            activeHost?.id == hostID,
+            auxiliarySessionID == auxiliaryOwnerID,
+            auxiliarySetupGeneration == setupGeneration,
+            directoryRequestGenerations[ownerID] == requestToken,
+            let currentRepository = sftpRepository,
+            ObjectIdentifier(currentRepository as AnyObject) == repositoryIdentity
+        else { return false }
+        return true
     }
 
     public func navigateTo(_ path: RemotePath) async {
@@ -4066,10 +5730,12 @@ final class AppContainer: ObservableObject {
         destinationURL: URL? = nil,
         overwrite: Bool? = nil
     ) async -> TransferTask? {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             directoryErrorMessage = "SFTP repository unavailable."
             return nil
         }
+        let transferContext = captureSFTPOperation(
+            repository: repo, operationGeneration: 0, scope: .transfer)
 
         let safeFileName = (file.name as NSString).lastPathComponent
         guard !safeFileName.isEmpty && safeFileName != "." && safeFileName != ".." else {
@@ -4112,6 +5778,7 @@ final class AppContainer: ObservableObject {
 
         // Atomic safety: Do NOT remove targetURL up front.
         // The SFTP repository downloads to a temporary file and atomically replaces destination on success.
+        guard isCurrentSFTPOperation(transferContext) else { return nil }
 
         let task = await transferCoordinator.enqueue(
             direction: .download,
@@ -4119,38 +5786,78 @@ final class AppContainer: ObservableObject {
             localURL: targetURL,
             totalBytes: file.size
         )
-        self.transferQueueState = await transferCoordinator.snapshot()
+        guard isCurrentSFTPOperation(transferContext) else {
+            await transferCoordinator.cancel(id: task.id)
+            await transferCoordinator.remove(id: task.id)
+            return nil
+        }
+        guard await publishTransferQueueState(transferContext) else {
+            await transferCoordinator.cancel(id: task.id)
+            await transferCoordinator.remove(id: task.id)
+            return nil
+        }
 
         let taskID = task.id
         let executionTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.isCurrentSFTPOperation(transferContext) else {
+                await self.transferCoordinator.cancel(id: taskID)
+                return
+            }
             do {
                 await self.transferCoordinator.registerCancellation(id: taskID) { [weak self] in
                     Task { @MainActor [weak self] in
                         self?.activeTransferTasks[taskID]?.cancel()
                     }
                 }
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 try await repo.download(from: file.path, to: targetURL) { [weak self] progress in
                     Task { @MainActor [weak self] in
-                        guard let self else { return }
+                        guard let self,
+                            self.isCurrentSFTPOperation(transferContext)
+                        else { return }
                         await self.transferCoordinator.updateProgress(
                             id: taskID,
                             bytesTransferred: progress.bytesTransferred,
                             totalBytes: progress.totalBytes
                         )
-                        self.transferQueueState = await self.transferCoordinator.snapshot()
+                        guard await self.publishTransferQueueState(transferContext) else { return }
                     }
                 }
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 await self.transferCoordinator.markCompleted(id: taskID)
-                self.transferQueueState = await self.transferCoordinator.snapshot()
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
+                guard await self.publishTransferQueueState(transferContext) else {
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
             } catch {
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
                     await self.transferCoordinator.cancel(id: taskID)
                 } else {
                     await self.transferCoordinator.markFailed(
                         id: taskID, error: error.localizedDescription)
                 }
-                self.transferQueueState = await self.transferCoordinator.snapshot()
+                guard await self.publishTransferQueueState(transferContext) else {
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
             }
             self.activeTransferTasks.removeValue(forKey: taskID)
         }
@@ -4164,10 +5871,12 @@ final class AppContainer: ObservableObject {
         destinationDirectory: RemotePath? = nil,
         overwrite: Bool? = nil
     ) async -> TransferTask? {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             directoryErrorMessage = "SFTP repository unavailable."
             return nil
         }
+        let transferContext = captureSFTPOperation(
+            repository: repo, operationGeneration: 0, scope: .transfer)
 
         let dir = destinationDirectory ?? currentPath
         let fileName = localURL.lastPathComponent
@@ -4209,48 +5918,89 @@ final class AppContainer: ObservableObject {
             (try? FileManager.default.attributesOfItem(atPath: localURL.path)[.size] as? NSNumber)?
             .int64Value ?? 0
 
+        guard isCurrentSFTPOperation(transferContext) else { return nil }
         let task = await transferCoordinator.enqueue(
             direction: .upload,
             remotePath: remotePath,
             localURL: localURL,
             totalBytes: fileSize
         )
-        self.transferQueueState = await transferCoordinator.snapshot()
+        guard isCurrentSFTPOperation(transferContext) else {
+            await transferCoordinator.cancel(id: task.id)
+            await transferCoordinator.remove(id: task.id)
+            return nil
+        }
+        guard await publishTransferQueueState(transferContext) else {
+            await transferCoordinator.cancel(id: task.id)
+            await transferCoordinator.remove(id: task.id)
+            return nil
+        }
 
         let taskID = task.id
         let executionTask = Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.isCurrentSFTPOperation(transferContext) else {
+                await self.transferCoordinator.cancel(id: taskID)
+                return
+            }
             do {
                 await self.transferCoordinator.registerCancellation(id: taskID) { [weak self] in
                     Task { @MainActor [weak self] in
                         self?.activeTransferTasks[taskID]?.cancel()
                     }
                 }
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 try await repo.upload(from: localURL, to: remotePath) { [weak self] progress in
                     Task { @MainActor [weak self] in
-                        guard let self else { return }
+                        guard let self,
+                            self.isCurrentSFTPOperation(transferContext)
+                        else { return }
                         await self.transferCoordinator.updateProgress(
                             id: taskID,
                             bytesTransferred: progress.bytesTransferred,
                             totalBytes: progress.totalBytes
                         )
-                        self.transferQueueState = await self.transferCoordinator.snapshot()
+                        guard await self.publishTransferQueueState(transferContext) else { return }
                     }
                 }
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 await self.transferCoordinator.markCompleted(id: taskID)
-                self.transferQueueState = await self.transferCoordinator.snapshot()
+                guard await self.publishTransferQueueState(transferContext) else {
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 self.invalidateDirectoryCache(at: dir)
                 if self.currentPath == dir {
+                    guard self.isCurrentSFTPOperation(transferContext) else {
+                        self.activeTransferTasks.removeValue(forKey: taskID)
+                        return
+                    }
                     await self.refreshCurrentDirectory()
                 }
             } catch {
+                guard self.isCurrentSFTPOperation(transferContext) else {
+                    await self.transferCoordinator.cancel(id: taskID)
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
                 if Task.isCancelled || (error as? SFTPRepositoryError) == .cancelled {
                     await self.transferCoordinator.cancel(id: taskID)
                 } else {
                     await self.transferCoordinator.markFailed(
                         id: taskID, error: error.localizedDescription)
                 }
-                self.transferQueueState = await self.transferCoordinator.snapshot()
+                guard await self.publishTransferQueueState(transferContext) else {
+                    self.activeTransferTasks.removeValue(forKey: taskID)
+                    return
+                }
             }
             self.activeTransferTasks.removeValue(forKey: taskID)
         }
@@ -4259,10 +6009,15 @@ final class AppContainer: ObservableObject {
     }
 
     public func cancelTransfer(id: UUID) async {
+        let transferContext = sftpRepository.map {
+            captureSFTPOperation(repository: $0, operationGeneration: 0, scope: .transfer)
+        }
         activeTransferTasks[id]?.cancel()
         activeTransferTasks.removeValue(forKey: id)
         await transferCoordinator.cancel(id: id)
-        transferQueueState = await transferCoordinator.snapshot()
+        if let transferContext {
+            _ = await publishTransferQueueState(transferContext)
+        }
     }
 
     public func retryTransfer(id: UUID) async {
@@ -4375,21 +6130,86 @@ final class AppContainer: ObservableObject {
 
     // MARK: - File Actions (Delete, Rename, Move, Create)
 
+    private func nextSFTPOperationGeneration() -> UInt64 {
+        fileMutationGeneration &+= 1
+        return fileMutationGeneration
+    }
+
+    private func captureSFTPOperation(
+        repository: any SFTPRepository,
+        operationGeneration: UInt64,
+        scope: SFTPOperationScope = .fileMutation
+    ) -> SFTPOperationContext {
+        let runtime = selectedSessionRuntime
+        return SFTPOperationContext(
+            sessionID: selectedSessionID,
+            runtimeIdentity: runtime.map { ObjectIdentifier($0) },
+            hostID: runtime?.host.id ?? activeHost?.id,
+            repositoryIdentity: ObjectIdentifier(repository as AnyObject),
+            auxiliarySessionID: auxiliarySessionID,
+            auxiliarySetupGeneration: auxiliarySetupGeneration,
+            sftpSetupGeneration: sftpSetupGeneration,
+            transferQueueGeneration: transferQueueGeneration,
+            lifecycleGeneration: lifecycleGeneration,
+            operationGeneration: operationGeneration,
+            scope: scope
+        )
+    }
+
+    private func isCurrentSFTPOperation(_ context: SFTPOperationContext) -> Bool {
+        guard canUseSingleSessionAuxiliaryFeatures,
+            selectedSessionID == context.sessionID,
+            selectedSessionRuntime.map { ObjectIdentifier($0) } == context.runtimeIdentity,
+            activeHost?.id == context.hostID,
+            auxiliarySessionID == context.auxiliarySessionID,
+            auxiliarySetupGeneration == context.auxiliarySetupGeneration,
+            sftpSetupGeneration == context.sftpSetupGeneration,
+            transferQueueGeneration == context.transferQueueGeneration,
+            lifecycleGeneration == context.lifecycleGeneration,
+            operationGeneration(for: context.scope) == context.operationGeneration,
+            let repository = sftpRepository,
+            ObjectIdentifier(repository as AnyObject) == context.repositoryIdentity
+        else { return false }
+        return true
+    }
+
+    private func operationGeneration(for scope: SFTPOperationScope) -> UInt64 {
+        switch scope {
+        case .fileMutation: return fileMutationGeneration
+        case .preview: return previewOperationGeneration
+        case .editor: return editorOperationGeneration
+        case .transfer: return 0
+        }
+    }
+
+    private func publishTransferQueueState(_ context: SFTPOperationContext) async -> Bool {
+        guard isCurrentSFTPOperation(context) else { return false }
+        let snapshot = await transferCoordinator.snapshot()
+        guard isCurrentSFTPOperation(context) else { return false }
+        transferQueueState = snapshot
+        return true
+    }
+
     public func deleteFile(_ file: RemoteFile) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: nextSFTPOperationGeneration())
         if file.isDirectory {
             try await repo.removeDirectory(at: file.path)
         } else {
             try await repo.removeFile(at: file.path)
         }
+        guard isCurrentSFTPOperation(context) else { return }
         invalidateDirectoryCache(at: file.path.parent)
+        guard isCurrentSFTPOperation(context) else { return }
         await refreshCurrentDirectory()
+        guard isCurrentSFTPOperation(context) else { return }
     }
 
     public func renameFile(_ file: RemoteFile, to newName: String) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4397,13 +6217,18 @@ final class AppContainer: ObservableObject {
             throw SFTPRepositoryError.invalidPath("Invalid file name: '\(newName)'")
         }
         let newPath = try file.path.parent.appendingSafely(trimmed)
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: nextSFTPOperationGeneration())
         try await repo.rename(from: file.path, to: newPath)
+        guard isCurrentSFTPOperation(context) else { return }
         invalidateDirectoryCache(at: file.path.parent)
+        guard isCurrentSFTPOperation(context) else { return }
         await refreshCurrentDirectory()
+        guard isCurrentSFTPOperation(context) else { return }
     }
 
     public func moveFile(_ file: RemoteFile, to destinationDirectory: RemotePath) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
         if file.isDirectory && destinationDirectory.isDescendantOrEqual(to: file.path) {
@@ -4412,77 +6237,110 @@ final class AppContainer: ObservableObject {
             )
         }
         let targetPath = try destinationDirectory.appendingSafely(file.name)
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: nextSFTPOperationGeneration())
         try await repo.rename(from: file.path, to: targetPath)
+        guard isCurrentSFTPOperation(context) else { return }
         invalidateDirectoryCache(at: file.path.parent)
         invalidateDirectoryCache(at: destinationDirectory)
+        guard isCurrentSFTPOperation(context) else { return }
         await refreshCurrentDirectory()
+        guard isCurrentSFTPOperation(context) else { return }
     }
 
     public func createDirectory(named name: String) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty && !trimmed.contains("/") && trimmed != ".." && trimmed != "." else {
             throw SFTPRepositoryError.invalidPath("Invalid directory name: '\(name)'")
         }
-        let targetPath = try currentPath.appendingSafely(trimmed)
+        let directory = currentPath
+        let targetPath = try directory.appendingSafely(trimmed)
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: nextSFTPOperationGeneration())
         try await repo.createDirectory(at: targetPath)
-        invalidateDirectoryCache(at: currentPath)
+        guard isCurrentSFTPOperation(context) else { return }
+        invalidateDirectoryCache(at: directory)
+        guard isCurrentSFTPOperation(context) else { return }
         await refreshCurrentDirectory()
+        guard isCurrentSFTPOperation(context) else { return }
     }
 
     public func createFile(named name: String, content: Data = Data()) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty && !trimmed.contains("/") && trimmed != ".." && trimmed != "." else {
             throw SFTPRepositoryError.invalidPath("Invalid file name: '\(name)'")
         }
-        let targetPath = try currentPath.appendingSafely(trimmed)
+        let directory = currentPath
+        let targetPath = try directory.appendingSafely(trimmed)
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: nextSFTPOperationGeneration())
         try await repo.writeFile(data: content, at: targetPath, progress: nil)
-        invalidateDirectoryCache(at: currentPath)
+        guard isCurrentSFTPOperation(context) else { return }
+        invalidateDirectoryCache(at: directory)
+        guard isCurrentSFTPOperation(context) else { return }
         await refreshCurrentDirectory()
+        guard isCurrentSFTPOperation(context) else { return }
     }
 
     // MARK: - Previews & In-App Text Editor
 
     public func openItem(_ file: RemoteFile) async {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else { return }
+        previewOperationGeneration &+= 1
+        let context = captureSFTPOperation(
+            repository: repo,
+            operationGeneration: previewOperationGeneration,
+            scope: .preview)
         if file.isDirectory {
+            guard isCurrentSFTPOperation(context) else { return }
             await navigateTo(file.path)
             return
         }
         if file.isSymlink {
-            if let attrs = try? await sftpRepository?.fetchAttributes(at: file.path),
-                attrs.isDirectory
-            {
-                await navigateTo(file.path)
-                return
+            if let attrs = try? await repo.fetchAttributes(at: file.path) {
+                guard isCurrentSFTPOperation(context) else { return }
+                if attrs.isDirectory {
+                    await navigateTo(file.path)
+                    return
+                }
             }
             if let targetStr = file.symlinkTarget {
                 let resolvedPath =
                     targetStr.hasPrefix("/")
                     ? RemotePath(targetStr) : file.path.parent.appending(targetStr)
-                if let attrs = try? await sftpRepository?.fetchAttributes(at: resolvedPath),
-                    attrs.isDirectory
-                {
-                    await navigateTo(file.path)
-                    return
+                if let attrs = try? await repo.fetchAttributes(at: resolvedPath) {
+                    guard isCurrentSFTPOperation(context) else { return }
+                    if attrs.isDirectory {
+                        await navigateTo(file.path)
+                        return
+                    }
                 }
             }
         }
+        guard isCurrentSFTPOperation(context) else { return }
         await loadPreview(for: file)
     }
 
     public func loadPreview(for file: RemoteFile) async {
-        guard let repo = sftpRepository else { return }
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else { return }
+        previewOperationGeneration &+= 1
+        let generation = previewOperationGeneration
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: generation, scope: .preview)
+        guard isCurrentSFTPOperation(context) else { return }
         previewFile = file
         previewData = nil
         previewErrorMessage = nil
 
         let maxPreviewSize: Int64 = 5 * 1024 * 1024  // 5 MB
         if file.size > maxPreviewSize {
+            guard isCurrentSFTPOperation(context) else { return }
             previewErrorMessage =
                 "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 5 MB preview limit. Please download to view."
             isPreviewLoading = false
@@ -4492,15 +6350,18 @@ final class AppContainer: ObservableObject {
         isPreviewLoading = true
         do {
             let data = try await repo.readFile(at: file.path)
+            guard isCurrentSFTPOperation(context) else { return }
             previewData = data
             isPreviewLoading = false
         } catch {
+            guard isCurrentSFTPOperation(context) else { return }
             isPreviewLoading = false
             previewErrorMessage = error.localizedDescription
         }
     }
 
     public func closePreview() {
+        previewOperationGeneration &+= 1
         previewFile = nil
         previewData = nil
         previewErrorMessage = nil
@@ -4508,14 +6369,19 @@ final class AppContainer: ObservableObject {
     }
 
     public func openEditor(for file: RemoteFile) async throws {
-        guard let repo = sftpRepository else {
+        guard canUseSingleSessionAuxiliaryFeatures, let repo = sftpRepository else {
             throw SFTPRepositoryError.connectionClosed
         }
+        editorOperationGeneration &+= 1
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: editorOperationGeneration, scope: .editor)
+        guard isCurrentSFTPOperation(context) else { return }
         isSavingFile = false
         editorErrorMessage = nil
 
         let maxEditorSize: Int64 = 2 * 1024 * 1024  // 2 MB
         if file.size > maxEditorSize {
+            guard isCurrentSFTPOperation(context) else { return }
             let err = SFTPRepositoryError.remoteFailure(
                 "File size (\(ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file))) exceeds 2 MB editor limit. Please download to view."
             )
@@ -4525,22 +6391,27 @@ final class AppContainer: ObservableObject {
 
         do {
             let data = try await repo.readFile(at: file.path)
+            guard isCurrentSFTPOperation(context) else { return }
             guard let text = String(data: data, encoding: .utf8) else {
                 let err = SFTPRepositoryError.remoteFailure(
                     "Cannot edit '\(file.name)': File contains non-UTF-8 or binary data.")
+                guard isCurrentSFTPOperation(context) else { return }
                 editorErrorMessage = err.localizedDescription
                 throw err
             }
+            guard isCurrentSFTPOperation(context) else { return }
             editingFileContent = text
             activeEditingFile = file
             activeEditingHostID = activeHost?.id
         } catch {
+            guard isCurrentSFTPOperation(context) else { return }
             editorErrorMessage = error.localizedDescription
             throw error
         }
     }
 
     public func closeEditor() {
+        editorOperationGeneration &+= 1
         activeEditingFile = nil
         editingFileContent = ""
         isSavingFile = false
@@ -4549,24 +6420,34 @@ final class AppContainer: ObservableObject {
     }
 
     public func saveEditedFile() async throws {
-        guard let repo = sftpRepository, let file = activeEditingFile else {
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let repo = sftpRepository, let file = activeEditingFile
+        else {
             throw SFTPRepositoryError.connectionClosed
         }
         guard activeHost?.id == activeEditingHostID else {
             throw SFTPRepositoryError.remoteFailure(
                 "Host mismatch: File editor session belongs to a different host.")
         }
+        editorOperationGeneration &+= 1
+        let context = captureSFTPOperation(
+            repository: repo, operationGeneration: editorOperationGeneration, scope: .editor)
+        guard isCurrentSFTPOperation(context) else { return }
         isSavingFile = true
         editorErrorMessage = nil
         do {
             let data = Data(editingFileContent.utf8)
             try await repo.writeFile(data: data, at: file.path, progress: nil)
+            guard isCurrentSFTPOperation(context) else { return }
             invalidateDirectoryCache(at: file.path.parent)
             if currentPath == file.path.parent {
+                guard isCurrentSFTPOperation(context) else { return }
                 await refreshCurrentDirectory()
+                guard isCurrentSFTPOperation(context) else { return }
             }
             isSavingFile = false
         } catch {
+            guard isCurrentSFTPOperation(context) else { return }
             isSavingFile = false
             editorErrorMessage = error.localizedDescription
             throw error
@@ -4575,83 +6456,214 @@ final class AppContainer: ObservableObject {
 
     // MARK: - Port Forwarding Management
 
-    private func startForwardingMonitoring(manager: any PortForwardingManaging) {
-        forwardingStreamTask?.cancel()
-        forwardingStreamTask = Task { @MainActor [weak self] in
-            let stream = await manager.sessionStatesStream()
-            for await states in stream {
-                guard let self, !Task.isCancelled else { return }
-                self.forwardingSessions = states
-            }
-        }
+    private func forwardingManagerGate(
+        for manager: any PortForwardingManaging
+    ) -> PortForwardingManagerOperationGate {
+        let identity = ObjectIdentifier(manager as AnyObject)
+        if let gate = forwardingManagerGates[identity] { return gate }
+        let gate = PortForwardingManagerOperationGate()
+        forwardingManagerGates[identity] = gate
+        return gate
     }
 
-    private func autoStartForwardingRules(for host: Host, manager: any PortForwardingManaging) async
-    {
-        var started: [ForwardingSessionState] = []
-        for rule in host.forwardingRules where rule.enabled {
-            if rule.requiresNonLoopbackApproval {
-                let message = "\(rule.name) requires approval to bind to \(rule.localHost)."
-                forwardingErrorMessage = message
-                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
-                continue
-            }
-            do {
-                let session = try await manager.startForwarding(rule: rule)
-                started.append(session)
-            } catch {
-                let message = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
-                forwardingErrorMessage = message
-                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
-            }
-        }
-        if !started.isEmpty {
-            for session in started {
-                if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == session.ruleID }) {
-                    forwardingSessions[idx] = session
-                } else {
-                    forwardingSessions.append(session)
-                }
-            }
-        }
-    }
-
-    @discardableResult
-    public func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState {
-        guard let manager = portForwardingManager else {
-            throw TransportError.unsupported
-        }
-        forwardingErrorMessage = nil
+    private func rebindForwardingManager(
+        _ manager: any PortForwardingManaging
+    ) async -> UInt64? {
+        let gate = forwardingManagerGate(for: manager)
+        let token = await gate.rebind()
         do {
-            let session = try await manager.startForwarding(rule: rule)
+            guard await gate.run(generation: token, operation: { await manager.stopAll() }) != nil
+            else { return nil }
+        } catch {
+            return nil
+        }
+        return token
+    }
+
+    private func stopAllForwarding(
+        manager: any PortForwardingManaging, generation token: UInt64
+    ) async {
+        let gate = forwardingManagerGate(for: manager)
+        _ = try? await gate.run(generation: token, operation: { await manager.stopAll() })
+    }
+
+    private func stopForwarding(
+        ruleID: UUID, manager: any PortForwardingManaging, generation token: UInt64
+    ) async throws {
+        let gate = forwardingManagerGate(for: manager)
+        guard
+            try await gate.run(
+                generation: token,
+                operation: { try await manager.stopForwarding(ruleID: ruleID) }
+            ) != nil
+        else {
+            throw TransportError.cancelled
+        }
+    }
+
+    private func isCurrentForwardingManager(_ manager: any PortForwardingManaging) -> Bool {
+        guard let currentManager = portForwardingManager else { return false }
+        return ObjectIdentifier(currentManager as AnyObject)
+            == ObjectIdentifier(manager as AnyObject)
+    }
+
+    private func isCurrentForwardingOperation(
+        _ ownerContext: AuxiliaryOwnerContext,
+        manager: any PortForwardingManaging
+    ) -> Bool {
+        isCurrentAuxiliaryOwner(ownerContext) && isCurrentForwardingManager(manager)
+    }
+
+    private func publishForwardingSessions(_ sessions: [ForwardingSessionState]) {
+        for session in sessions {
             if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == session.ruleID }) {
                 forwardingSessions[idx] = session
             } else {
                 forwardingSessions.append(session)
             }
+        }
+    }
+
+    private func startForwardingMonitoring(
+        manager: any PortForwardingManaging,
+        ownerContext: AuxiliaryOwnerContext
+    ) {
+        forwardingStreamTask?.cancel()
+        forwardingStreamTask = Task { @MainActor [weak self] in
+            let stream = await manager.sessionStatesStream()
+            guard let self, !Task.isCancelled,
+                self.isCurrentForwardingOperation(ownerContext, manager: manager)
+            else { return }
+            for await states in stream {
+                guard !Task.isCancelled,
+                    self.isCurrentForwardingOperation(ownerContext, manager: manager)
+                else { return }
+                self.forwardingSessions = states
+            }
+        }
+    }
+
+    private func autoStartForwardingRules(
+        for host: Host,
+        manager: any PortForwardingManaging,
+        ownerContext: AuxiliaryOwnerContext,
+        managerGeneration: UInt64
+    ) async -> [ForwardingSessionState] {
+        var started: [ForwardingSessionState] = []
+        for rule in host.forwardingRules where rule.enabled {
+            guard isCurrentForwardingOperation(ownerContext, manager: manager) else { break }
+            if rule.requiresNonLoopbackApproval {
+                let message = "\(rule.name) requires approval to bind to \(rule.localHost)."
+                guard isCurrentForwardingOperation(ownerContext, manager: manager) else { break }
+                forwardingErrorMessage = message
+                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
+                continue
+            }
+            do {
+                guard
+                    let session = try await forwardingManagerGate(for: manager).run(
+                        generation: managerGeneration,
+                        operation: { try await manager.startForwarding(rule: rule) }
+                    )
+                else { break }
+                guard isCurrentForwardingOperation(ownerContext, manager: manager) else {
+                    // A non-cooperative manager may complete after selection
+                    // moved. The generation gate prevents stale cleanup from
+                    // touching a newer owner of the reused manager.
+                    await stopForwarding(
+                        ruleID: rule.id, manager: manager, generation: managerGeneration)
+                    continue
+                }
+                started.append(session)
+            } catch {
+                guard isCurrentForwardingOperation(ownerContext, manager: manager) else {
+                    continue
+                }
+                let message = "Failed to auto-start \(rule.name): \(error.localizedDescription)"
+                forwardingErrorMessage = message
+                terminalController.feed("\r\n\u{1b}[33m[\(message)]\u{1b}[0m\r\n")
+            }
+        }
+        return started
+    }
+
+    @discardableResult
+    public func startForwarding(rule: PortForwardingRule) async throws -> ForwardingSessionState {
+        guard canUseSingleSessionAuxiliaryFeatures, let manager = portForwardingManager,
+            let runtime = selectedSessionRuntime,
+            auxiliarySessionID == runtime.session.id
+        else {
+            throw TransportError.unsupported
+        }
+        let connection = runtime.connection
+        let ownerContext = auxiliaryOwnerContext(for: runtime, connection: connection)
+        guard isCurrentForwardingOperation(ownerContext, manager: manager),
+            let managerGeneration = forwardingManagerOperationGeneration
+        else {
+            throw TransportError.cancelled
+        }
+        forwardingErrorMessage = nil
+        do {
+            guard
+                let session = try await forwardingManagerGate(for: manager).run(
+                    generation: managerGeneration,
+                    operation: { try await manager.startForwarding(rule: rule) }
+                )
+            else { throw TransportError.cancelled }
+            guard isCurrentForwardingOperation(ownerContext, manager: manager) else {
+                await stopForwarding(
+                    ruleID: rule.id, manager: manager, generation: managerGeneration)
+                throw TransportError.cancelled
+            }
+            publishForwardingSessions([session])
             return session
         } catch {
+            guard isCurrentForwardingOperation(ownerContext, manager: manager) else {
+                throw error
+            }
             forwardingErrorMessage = error.localizedDescription
             throw error
         }
     }
 
     public func stopForwarding(ruleID: UUID) async {
-        guard let manager = portForwardingManager else { return }
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let manager = portForwardingManager,
+            let runtime = selectedSessionRuntime,
+            auxiliarySessionID == runtime.session.id
+        else { return }
+        let connection = runtime.connection
+        let ownerContext = auxiliaryOwnerContext(for: runtime, connection: connection)
+        guard isCurrentForwardingOperation(ownerContext, manager: manager),
+            let managerGeneration = forwardingManagerOperationGeneration
+        else { return }
         do {
-            try await manager.stopForwarding(ruleID: ruleID)
+            try await stopForwarding(
+                ruleID: ruleID, manager: manager, generation: managerGeneration)
+            guard isCurrentForwardingOperation(ownerContext, manager: manager) else { return }
             if let idx = forwardingSessions.firstIndex(where: { $0.ruleID == ruleID }) {
                 forwardingSessions[idx].status = .stopped
                 forwardingSessions[idx].activeConnectionsCount = 0
             }
         } catch {
+            guard isCurrentForwardingOperation(ownerContext, manager: manager) else { return }
             forwardingErrorMessage = error.localizedDescription
         }
     }
 
     public func stopAllForwarding() async {
-        guard let manager = portForwardingManager else { return }
-        await manager.stopAll()
+        guard canUseSingleSessionAuxiliaryFeatures,
+            let manager = portForwardingManager,
+            let runtime = selectedSessionRuntime,
+            auxiliarySessionID == runtime.session.id
+        else { return }
+        let connection = runtime.connection
+        let ownerContext = auxiliaryOwnerContext(for: runtime, connection: connection)
+        guard isCurrentForwardingOperation(ownerContext, manager: manager),
+            let managerGeneration = forwardingManagerOperationGeneration
+        else { return }
+        await stopAllForwarding(manager: manager, generation: managerGeneration)
+        guard isCurrentForwardingOperation(ownerContext, manager: manager) else { return }
         for idx in forwardingSessions.indices {
             forwardingSessions[idx].status = .stopped
             forwardingSessions[idx].activeConnectionsCount = 0

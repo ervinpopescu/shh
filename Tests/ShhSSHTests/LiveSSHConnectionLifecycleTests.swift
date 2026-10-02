@@ -40,6 +40,29 @@ final class LiveSSHConnectionLifecycleTests: XCTestCase {
         try await group.shutdownGracefully()
     }
 
+    func testRedactorCleanupClosesAdmissionBarrierAtomically() async throws {
+        let (connection, blocker, group, peerSocket, _) = try await makeConnection()
+        connection.setRedactor(Redactor(secrets: ["cleanup-secret"]))
+        let admittedSend = Task {
+            try await connection.send(Data("admitted-before-cleanup".utf8))
+        }
+        await blocker.waitForPendingWrite()
+
+        connection.clearRedactorAfterOperations()
+        do {
+            try await connection.send(Data("must-not-admit".utf8))
+            XCTFail("writes admitted after redactor cleanup would race secret clearing")
+        } catch {
+            XCTAssertTrue(error is TransportError)
+        }
+
+        blocker.completePendingWrite()
+        try await admittedSend.value
+        await connection.close()
+        Darwin.close(peerSocket)
+        try await group.shutdownGracefully()
+    }
+
     func testCloseQuarantinesUncooperativeWriteAfterDeadline() async throws {
         let (connection, blocker, group, peerSocket, _) = try await makeConnection()
         let pendingSend = Task {
