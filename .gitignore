@@ -10,3 +10,4 @@ Shh.xcodeproj/
 *.xcworkspace/xcuserdata/
 .swiftpm/
 Package.resolved
+/.cycle-deploy.json
