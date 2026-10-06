@@ -93,7 +93,10 @@ struct CommandDialSurface: View {
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
-    @State private var drag = CommandDialDrag()
+    @State private var highlightedNodeID: String?
+    @State private var lastHighlightedNodeID: String?
+    @State private var gesturePreviousLocation: CGPoint?
+    @State private var gestureChangedLevel = false
 
     private let accent = Color(red: 0.43, green: 0.95, blue: 0.69)
     private let coolAccent = Color(red: 0.44, green: 0.62, blue: 0.96)
@@ -130,22 +133,15 @@ struct CommandDialSurface: View {
         return nodes
     }
 
-    private var currentNode: DialNode? {
-        guard !navigation.path.isEmpty else { return nil }
+    private var currentTitle: String {
+        guard let currentID = navigation.path.last else { return "Command Center" }
         var nodes = model.roots
-        var result: DialNode?
         for id in navigation.path {
-            result = nodes.first(where: { $0.id == id })
-            guard let result else { return nil }
-            nodes = result.children
+            guard let node = nodes.first(where: { $0.id == id }) else { return "Command Center" }
+            if id == currentID { return node.title }
+            nodes = node.children
         }
-        return result
-    }
-
-    private var currentTitle: String { currentNode?.title ?? "Command Center" }
-
-    private var highlightedNode: DialNode? {
-        currentNodes.first(where: { $0.id == drag.parentID ?? navigation.selectedNodeID })
+        return "Command Center"
     }
 
     private var breadcrumb: String {
@@ -164,7 +160,7 @@ struct CommandDialSurface: View {
             let layout = radialLayout(in: proxy)
             ZStack {
                 Color(red: 0.035, green: 0.05, blue: 0.06)
-                    .opacity(contrast == .increased ? 0.96 : 0.88)
+                    .opacity(contrast == .increased ? 0.34 : 0.12)
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
                     .onTapGesture { onDismiss() }
@@ -179,7 +175,12 @@ struct CommandDialSurface: View {
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-                if dynamicTypeSize.isAccessibilitySize || Self.usesListLayout(height: proxy.size.height) {
+                if Self.usesListLayout(
+                    dynamicTypeSize: dynamicTypeSize,
+                    size: size,
+                    containerSize: proxy.size,
+                    safeAreaInsets: proxy.safeAreaInsets
+                ) {
                     accessibilityLayout(proxy: proxy)
                         .zIndex(3)
                 } else {
@@ -206,10 +207,20 @@ struct CommandDialSurface: View {
                 value: navigation.path
             )
             .onChange(of: triggerDrag) { _, event in
-                guard let event, !Self.usesListLayout(height: proxy.size.height) else { return }
+                guard let event,
+                    !Self.usesListLayout(
+                        dynamicTypeSize: dynamicTypeSize,
+                        size: size,
+                        containerSize: proxy.size,
+                        safeAreaInsets: proxy.safeAreaInsets
+                    )
+                else {
+                    return
+                }
                 let frame = proxy.frame(in: .global)
-                let point = CGPoint(x: event.location.x - frame.minX, y: event.location.y - frame.minY)
-                handleDrag(at: point, ended: event.ended, outer: layout)
+                let point = CGPoint(
+                    x: event.location.x - frame.minX, y: event.location.y - frame.minY)
+                handlePointer(at: point, ended: event.ended, layout: layout)
             }
         }
         .accessibilityElement(children: .contain)
@@ -219,7 +230,27 @@ struct CommandDialSurface: View {
         }
     }
 
-    static func usesListLayout(height: CGFloat) -> Bool { height < 620 }
+    static func usesListLayout(
+        dynamicTypeSize: DynamicTypeSize,
+        size: CommandDialSize = .compact,
+        containerSize: CGSize? = nil,
+        safeAreaInsets: EdgeInsets = EdgeInsets()
+    ) -> Bool {
+        guard !dynamicTypeSize.isAccessibilitySize, let containerSize else {
+            return dynamicTypeSize.isAccessibilitySize
+        }
+
+        let cardHalfHeight: CGFloat = size == .compact ? 39 : 44
+        let centerY = containerSize.height - safeAreaInsets.bottom - cardHalfHeight - 20
+        let headerReserve: CGFloat = size == .compact ? 178 : 192
+        let heightLimit = centerY - safeAreaInsets.top - headerReserve - cardHalfHeight
+
+        // A clamped radius of 132 points is not enough to keep a card inside a
+        // short keyboard-reduced viewport. Use the scrollable list before the
+        // radial layout reaches that clamp, while retaining the radial dial at
+        // normal phone and tablet heights.
+        return heightLimit < 132
+    }
 
     private func radialLayout(in proxy: GeometryProxy) -> DialRadialLayout {
         Self.computeRadialLayout(
@@ -250,7 +281,9 @@ struct CommandDialSurface: View {
             ? containerSize.width - centerX - safeAreaInsets.trailing - cardHalfWidth - 14
             : centerX - safeAreaInsets.leading - cardHalfWidth - 14
         let widthLimit = max(132, availableWidth)
-        let headerReserve: CGFloat = 120
+        // Keep compact phones from placing the uppermost card into the
+        // header when the terminal viewport is reduced by the keyboard.
+        let headerReserve: CGFloat = size == .compact ? 178 : 192
         let heightLimit = max(
             132, centerY - safeAreaInsets.top - headerReserve - cardHalfHeight)
         let preferred: CGFloat = size == .compact ? 254 : 330
@@ -259,6 +292,7 @@ struct CommandDialSurface: View {
             center: CGPoint(x: centerX, y: centerY),
             radius: radius,
             itemRadius: itemRadius,
+            itemSize: CGSize(width: cardHalfWidth * 2, height: cardHalfHeight * 2),
             count: max(nodeCount, 1),
             placement: placement
         )
@@ -290,9 +324,8 @@ struct CommandDialSurface: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.8)
 
-            if !navigation.path.isEmpty || drag.parentID != nil {
-                Text(drag.parentID.flatMap { id in currentNodes.first { $0.id == id }?.title }
-                    ?? currentTitle)
+            if !navigation.path.isEmpty {
+                Text(currentTitle)
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(coolAccent)
                     .lineLimit(1)
@@ -407,31 +440,11 @@ struct CommandDialSurface: View {
             "command-dial-node-\(node.id.replacingOccurrences(of: ".", with: "-"))")
     }
 
-    private func innerLayout(for outer: DialRadialLayout) -> DialRadialLayout {
-        DialRadialLayout.corner(
-            center: outer.center, radius: outer.orbitRadius * 0.69,
-            itemRadius: outer.itemRadius, count: currentNodes.count, placement: placement)
-    }
-
     private func wheel(layout: DialRadialLayout) -> some View {
-        let inner = innerLayout(for: layout)
-        return ZStack {
-            if highlightedNode?.children.isEmpty != false {
-                ForEach(Array(currentNodes.enumerated()), id: \.element.id) { index, node in
-                    if let point = inner.point(at: index) {
-                        radialNodeButton(node, point: point, highlighted: drag.parentID == node.id)
-                    }
-                }
-            }
-            if let parent = highlightedNode, !parent.children.isEmpty {
-                let outer = DialRadialLayout.corner(
-                    center: layout.center, radius: layout.orbitRadius,
-                    itemRadius: layout.itemRadius, count: parent.children.count,
-                    placement: placement)
-                ForEach(Array(parent.children.enumerated()), id: \.element.id) { index, child in
-                    if let point = outer.point(at: index) {
-                        radialNodeButton(child, point: point, highlighted: drag.childID == child.id)
-                    }
+        ZStack {
+            ForEach(Array(currentNodes.enumerated()), id: \.element.id) { index, node in
+                if let point = layout.point(at: index) {
+                    radialNodeButton(node, point: point)
                 }
             }
             centralPuck.position(layout.center)
@@ -439,6 +452,9 @@ struct CommandDialSurface: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .highPriorityGesture(radialGesture(layout: layout))
         .accessibilityAddTraits(.isModal)
+        .accessibilityHint(
+            "Swipe outward through a group to open it, inward toward the center to go back. Lift on an action to choose it."
+        )
     }
 
     private var centralPuck: some View {
@@ -448,7 +464,7 @@ struct CommandDialSurface: View {
                 onDismiss()
             } else {
                 navigation.back()
-                drag = CommandDialDrag()
+                highlightedNodeID = nil
                 haptics.emit(.selection)
             }
         } label: {
@@ -473,10 +489,8 @@ struct CommandDialSurface: View {
         .accessibilityIdentifier("command-dial-home")
     }
 
-    private func radialNodeButton(
-        _ node: DialNode, point: CGPoint, highlighted: Bool
-    ) -> some View {
-        let isHighlighted = highlighted || navigation.selectedNodeID == node.id
+    private func radialNodeButton(_ node: DialNode, point: CGPoint) -> some View {
+        let isHighlighted = highlightedNodeID == node.id || navigation.selectedNodeID == node.id
         let width: CGFloat = size == .compact ? 112 : 128
         let height: CGFloat = size == .compact ? 74 : 84
         return Button {
@@ -562,34 +576,89 @@ struct CommandDialSurface: View {
 
     private func radialGesture(layout: DialRadialLayout) -> some Gesture {
         DragGesture(minimumDistance: 8)
-            .onChanged { value in handleDrag(at: value.location, ended: false, outer: layout) }
-            .onEnded { value in handleDrag(at: value.location, ended: true, outer: layout) }
+            .onChanged { value in
+                handlePointer(at: value.location, ended: false, layout: layout)
+            }
+            .onEnded { value in
+                handlePointer(at: value.location, ended: true, layout: layout)
+            }
     }
 
-    private func handleDrag(at point: CGPoint, ended: Bool, outer outerLayout: DialRadialLayout) {
-        let inner = innerLayout(for: outerLayout)
-        let parent = currentNodes.first { $0.id == drag.parentID }
-        let outer = DialRadialLayout.corner(
-            center: outerLayout.center, radius: outerLayout.orbitRadius,
-            itemRadius: outerLayout.itemRadius, count: parent?.children.count ?? 0,
-            placement: placement)
-        let previous = drag
-        drag.update(at: point, inner: inner, outer: outer, nodes: currentNodes)
-        if drag.parentID != previous.parentID || drag.childID != previous.childID {
-            haptics.emit(.selection)
-        }
-        guard ended else { return }
-        defer { drag = CommandDialDrag() }
-        if drag.returnedToCenter {
-            if !navigation.path.isEmpty {
-                navigation.back()
-                haptics.emit(.selection)
+    private func handlePointer(at point: CGPoint, ended: Bool, layout: DialRadialLayout) {
+        let previous = gesturePreviousLocation ?? point
+        gesturePreviousLocation = point
+        let activeLayout = DialRadialLayout.corner(
+            center: layout.center,
+            radius: layout.orbitRadius,
+            itemRadius: layout.itemRadius,
+            itemSize: layout.itemSize,
+            count: currentNodes.count,
+            placement: placement
+        )
+        let selectedGroup = currentNodes.first { $0.id == highlightedNodeID }
+        switch activeLayout.levelTransition(
+            from: previous,
+            to: point,
+            selectedGroup: selectedGroup?.isEnabled == true
+                && selectedGroup?.children.isEmpty == false,
+            hasParent: !navigation.path.isEmpty
+        ) {
+        case .enter:
+            if let selectedGroup {
+                navigation.enter(selectedGroup)
+                gestureChangedLevel = true
+                highlightedNodeID = nil
+                lastHighlightedNodeID = nil
+                haptics.emit(.commit)
             }
+            if ended { resetGesture() }
             return
+        case .back:
+            navigation.back()
+            gestureChangedLevel = true
+            highlightedNodeID = nil
+            lastHighlightedNodeID = nil
+            haptics.emit(.selection)
+            if ended { resetGesture() }
+            return
+        case nil:
+            break
         }
-        if let node = drag.releasedNode(at: point, inner: inner, outer: outer, nodes: currentNodes) {
-            activate(node)
+
+        if let index = activeLayout.index(at: point), currentNodes.indices.contains(index) {
+            let node = currentNodes[index]
+            if node.isEnabled {
+                highlightedNodeID = node.id
+                gestureChangedLevel = false
+                if lastHighlightedNodeID != node.id {
+                    haptics.emit(.selection)
+                    lastHighlightedNodeID = node.id
+                }
+            } else {
+                highlightedNodeID = nil
+                if lastHighlightedNodeID != node.id {
+                    haptics.emit(.boundary)
+                    lastHighlightedNodeID = node.id
+                }
+            }
+        } else {
+            highlightedNodeID = nil
         }
+
+        guard ended else { return }
+        defer { resetGesture() }
+        guard !gestureChangedLevel,
+            let index = activeLayout.index(at: point), currentNodes.indices.contains(index),
+            highlightedNodeID == currentNodes[index].id
+        else { return }
+        activate(currentNodes[index])
+    }
+
+    private func resetGesture() {
+        highlightedNodeID = nil
+        lastHighlightedNodeID = nil
+        gesturePreviousLocation = nil
+        gestureChangedLevel = false
     }
 
     private func activate(_ node: DialNode) {
@@ -597,7 +666,7 @@ struct CommandDialSurface: View {
         case .ignored:
             haptics.emit(.boundary)
         case .navigated:
-            drag = CommandDialDrag()
+            highlightedNodeID = nil
             haptics.emit(.commit)
         case .dispatch(let action):
             haptics.emit(.commit)
