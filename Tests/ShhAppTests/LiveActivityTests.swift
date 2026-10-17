@@ -6,6 +6,65 @@ import XCTest
 
 @testable import Shh
 
+private actor ProbeGate {
+  private var isOpen = false
+  private var hasStarted = false
+  private var openWaiters: [CheckedContinuation<Void, Never>] = []
+  private var startWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func markStarted() {
+    hasStarted = true
+    startWaiters.forEach { $0.resume() }
+    startWaiters.removeAll()
+  }
+
+  func waitUntilStarted() async {
+    if hasStarted { return }
+    await withCheckedContinuation { continuation in
+      startWaiters.append(continuation)
+    }
+  }
+
+  func waitUntilOpen() async {
+    if isOpen { return }
+    await withCheckedContinuation { continuation in
+      openWaiters.append(continuation)
+    }
+  }
+
+  func open() {
+    isOpen = true
+    openWaiters.forEach { $0.resume() }
+    openWaiters.removeAll()
+  }
+}
+
+private actor ProbeConnectionSequence {
+  private var connections: [any SSHConnection]
+  private var connectionCount = 0
+  private var countWaiters: [(Int, CheckedContinuation<Void, Never>)] = []
+
+  init(_ connections: [any SSHConnection]) {
+    self.connections = connections
+  }
+
+  func next() -> any SSHConnection {
+    let connection = connections.removeFirst()
+    connectionCount += 1
+    let ready = countWaiters.filter { $0.0 <= connectionCount }
+    countWaiters.removeAll { $0.0 <= connectionCount }
+    ready.forEach { $0.1.resume() }
+    return connection
+  }
+
+  func waitForCount(_ expected: Int) async {
+    if connectionCount >= expected { return }
+    await withCheckedContinuation { continuation in
+      countWaiters.append((expected, continuation))
+    }
+  }
+}
+
 final class LiveActivityTests: XCTestCase {
 
   @MainActor
@@ -448,6 +507,49 @@ final class LiveActivityTests: XCTestCase {
     await activity.end(nil, dismissalPolicy: .immediate)
   }
 
+  func testConnectedActivityStaleDateUsesStateTimestamp() {
+    let confirmedAt = Date(timeIntervalSince1970: 1_700_000_000)
+    let state = ShhSSHSessionActivityAttributes.ContentState(
+      status: .connected,
+      updatedAt: confirmedAt
+    )
+    // ActivityKit may execute the request after the state was created.
+    let staleDate = SSHSessionLiveActivityManager.staleDate(for: state)
+
+    XCTAssertEqual(
+      staleDate,
+      confirmedAt.addingTimeInterval(SSHSessionLiveActivityManager.connectedStatusFreshness)
+    )
+    XCTAssertEqual(
+      staleDate.timeIntervalSince(confirmedAt),
+      SSHSessionLiveActivityManager.connectedStatusFreshness
+    )
+    XCTAssertEqual(state.displayName(isStale: false), "Connected")
+    XCTAssertEqual(state.displayName(isStale: true), "Status unverified")
+    XCTAssertEqual(state.lastConfirmedLabel, "Last confirmed")
+  }
+
+  @MainActor
+  func testLiveActivityCardRendersStatusUnverifiedWhenStale() {
+    let renderer = ImageRenderer(
+      content: ShhLiveActivityCardView(
+        displayName: "bastion",
+        hostLabel: "bastion.internal:22",
+        state: ShhSSHSessionActivityAttributes.ContentState(
+          status: .connected,
+          updatedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        ),
+        isStale: true
+      )
+      .frame(width: 360, height: 180)
+    )
+    renderer.scale = 1
+
+    let image = renderer.uiImage
+    XCTAssertEqual(image?.size, CGSize(width: 360, height: 180))
+    XCTAssertNotNil(image?.pngData())
+  }
+
   func testStatusDisplayNamesDescribeEveryLifecycleState() {
     XCTAssertEqual(
       ShhSSHSessionActivityAttributes.ContentState.Status.connected.displayName,
@@ -624,6 +726,92 @@ final class LiveActivityTests: XCTestCase {
     for _ in 0..<10 {
       await Task.yield()
     }
+  }
+
+  @MainActor
+  func testForegroundProbeStopsClaimingConnectedUntilTransportConfirms() async throws {
+    let connection = MockSSHConnection()
+    connection.onTestResponsiveness = { _ in
+      try? await Task.sleep(nanoseconds: 200_000_000)
+      return true
+    }
+    let transport = ControllableTransport()
+    transport.onConnect = { _ in connection }
+    let container = AppContainer(
+      transport: transport,
+      reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+      reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+    )
+    let host = try Host(name: "Foreground Host", hostname: "foreground.invalid", username: "dev")
+
+    await container.connect(to: host)
+    let sessionID = try XCTUnwrap(container.activeSession?.id)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+
+    container.handleScenePhaseChange(.background)
+    container.handleScenePhaseChange(.active)
+
+    try await waitForLiveActivityState(sessionID: sessionID, status: .disconnected)
+    XCTAssertEqual(container.activeSession?.state, .connecting)
+
+    try await Task.sleep(nanoseconds: 250_000_000)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+    XCTAssertEqual(container.activeSession?.state, .connected)
+    await container.disconnect()
+  }
+
+  @MainActor
+  func testForegroundProbeResultIsIgnoredAfterTransportDropAndReplacementStarts() async throws {
+    let firstConnection = MockSSHConnection()
+    let replacementConnection = MockSSHConnection()
+    let probeGate = ProbeGate()
+    let replacementGate = ProbeGate()
+    firstConnection.onTestResponsiveness = { _ in
+      await probeGate.markStarted()
+      await probeGate.waitUntilOpen()
+      return true
+    }
+    let sequence = ProbeConnectionSequence([firstConnection, replacementConnection])
+    let transport = ControllableTransport()
+    transport.onConnect = { _ in
+      let connection = await sequence.next()
+      if ObjectIdentifier(connection as AnyObject) == ObjectIdentifier(replacementConnection) {
+        await replacementGate.waitUntilOpen()
+      }
+      return connection
+    }
+    let container = AppContainer(
+      transport: transport,
+      reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+      reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+    )
+    let host = try Host(name: "Probe Race Host", hostname: "probe-race.invalid", username: "dev")
+
+    await container.connect(to: host)
+    let sessionID = try XCTUnwrap(container.activeSession?.id)
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+
+    container.handleScenePhaseChange(.background)
+    container.handleScenePhaseChange(.active)
+    await probeGate.waitUntilStarted()
+
+    firstConnection.emit(.closed)
+    await sequence.waitForCount(2)
+    await probeGate.open()
+    try await Task.sleep(nanoseconds: 100_000_000)
+
+    XCTAssertEqual(container.activeSession?.state, .connecting)
+    XCTAssertNotEqual(
+      Activity<ShhSSHSessionActivityAttributes>.activities.first(where: {
+        $0.attributes.sessionID == sessionID
+      })?.content.state.status,
+      .connected
+    )
+
+    await replacementGate.open()
+    try await waitForLiveActivityState(sessionID: sessionID, status: .connected)
+    XCTAssertEqual(container.activeSession?.state, .connected)
+    await container.disconnect()
   }
 
   @MainActor
