@@ -13,17 +13,20 @@ public struct DialRadialLayout: Equatable, Sendable {
     public let center: CGPoint
     public let orbitRadius: CGFloat
     public let itemRadius: CGFloat
+    public let itemSize: CGSize
     public let startAngle: CGFloat
     public let endAngle: CGFloat
     public let count: Int
 
     public init(
         center: CGPoint, orbitRadius: CGFloat, itemRadius: CGFloat,
+        itemSize: CGSize? = nil,
         startAngle: CGFloat, endAngle: CGFloat, count: Int
     ) {
         self.center = center
         self.orbitRadius = max(0, orbitRadius)
         self.itemRadius = max(1, itemRadius)
+        self.itemSize = itemSize ?? CGSize(width: itemRadius * 2, height: itemRadius * 2)
         self.startAngle = startAngle
         self.endAngle = endAngle
         self.count = max(0, count)
@@ -41,38 +44,29 @@ public struct DialRadialLayout: Equatable, Sendable {
         return positions[index]
     }
 
-    /// Returns the item under a touch only when it is in the annulus around
-    /// the orbit and within the configured arc. The center puck and the space
-    /// outside the orbit are intentionally not selectable by polar gestures.
+    /// Returns the item under a touch using the visible card bounds, with a
+    /// small touch slop. Cards are not circles, so hit testing their actual
+    /// rectangles keeps drag release and button taps aligned with what is seen.
     public func index(at point: CGPoint) -> Int? {
         guard count > 0 else { return nil }
-        let dx = point.x - center.x
-        let dy = point.y - center.y
-        let distance = hypot(dx, dy)
-        let minimumDistance = max(itemRadius * 0.85, orbitRadius * 0.36, 30)
-        let maximumDistance = orbitRadius + max(itemRadius * 1.45, 34)
-        guard distance >= minimumDistance, distance <= maximumDistance else { return nil }
-
-        guard count > 1 else {
-            return angularDistance(from: atan2(dy, dx), to: (startAngle + endAngle) / 2) <= .pi / 2
-                ? 0 : nil
-        }
-
-        let span = endAngle - startAngle
-        guard span != 0 else { return 0 }
-        let angle = unwrap(angle: atan2(dy, dx), around: startAngle)
-        let progress = (angle - startAngle) / span
-        let step = 1 / CGFloat(count - 1)
-        let index = Int((progress / step).rounded())
-        guard index >= 0, index < count else { return nil }
-        let nearestProgress = CGFloat(index) * step
-        guard abs(progress - nearestProgress) <= step / 2 else { return nil }
-        return index
+        let halfWidth = itemSize.width / 2 + 10
+        let halfHeight = itemSize.height / 2 + 10
+        return positions.enumerated()
+            .filter { _, position in
+                abs(point.x - position.x) <= halfWidth
+                    && abs(point.y - position.y) <= halfHeight
+            }
+            .min { lhs, rhs in
+                let left = positions[lhs.offset]
+                let right = positions[rhs.offset]
+                return distanceSquared(from: point, to: left)
+                    < distanceSquared(from: point, to: right)
+            }?.offset
     }
 
     public static func corner(
         center: CGPoint, radius: CGFloat, itemRadius: CGFloat,
-        count: Int, placement: CommandDialPlacement
+        itemSize: CGSize? = nil, count: Int, placement: CommandDialPlacement
     ) -> Self {
         let start: CGFloat
         let end: CGFloat
@@ -96,6 +90,7 @@ public struct DialRadialLayout: Equatable, Sendable {
         let span = end - start
         return Self(
             center: center, orbitRadius: radius, itemRadius: itemRadius,
+            itemSize: itemSize,
             startAngle: start + span * insetFraction,
             endAngle: end - span * insetFraction, count: count)
     }
@@ -128,14 +123,10 @@ public struct DialRadialLayout: Equatable, Sendable {
             y: center.y + sin(angle) * orbitRadius)
     }
 
-    private func unwrap(angle: CGFloat, around reference: CGFloat) -> CGFloat {
-        var result = angle
-        while result - reference > .pi { result -= 2 * .pi }
-        while result - reference < -.pi { result += 2 * .pi }
-        return result
+    private func distanceSquared(from lhs: CGPoint, to rhs: CGPoint) -> CGFloat {
+        let dx = lhs.x - rhs.x
+        let dy = lhs.y - rhs.y
+        return dx * dx + dy * dy
     }
 
-    private func angularDistance(from lhs: CGFloat, to rhs: CGFloat) -> CGFloat {
-        abs(unwrap(angle: lhs, around: rhs) - rhs)
-    }
 }

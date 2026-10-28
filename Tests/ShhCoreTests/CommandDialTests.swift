@@ -177,6 +177,23 @@ final class CommandDialTests: XCTestCase {
         XCTAssertTrue(navigation.isOpen)
     }
 
+    func testNestedGroupActivationKeepsParentBeforeSiblingNavigation() throws {
+        let model = CommandDialModel()
+        var navigation = CommandDialNavigation(isOpen: true)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        let keyboard = try XCTUnwrap(input.children.first { $0.id == "input.keyboard" })
+
+        XCTAssertEqual(navigation.activate(input), .navigated(nodeID: input.id))
+        XCTAssertEqual(navigation.activate(navigate), .navigated(nodeID: navigate.id))
+        XCTAssertEqual(navigation.path, [input.id, navigate.id])
+
+        navigation.back()
+        XCTAssertEqual(navigation.path, [input.id])
+        XCTAssertEqual(navigation.activate(keyboard), .dispatch(.keyboard))
+        XCTAssertEqual(navigation.path, [input.id])
+    }
+
     func testCornerGeometryMirrorsPlacementAndInsetsSparsePages() throws {
         let leading = DialRadialLayout.corner(
             center: CGPoint(x: 70, y: 700), radius: 240, itemRadius: 38,
@@ -340,6 +357,63 @@ final class CommandDialTests: XCTestCase {
 
         let haptics = NoopDialHaptics()
         haptics.emit(.open)
+    }
+
+    func testRadialHitTestingMatchesVisibleCardExtents() throws {
+        let layout = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: CGSize(width: 112, height: 74),
+            count: 3,
+            placement: .trailing
+        )
+        let card = try XCTUnwrap(layout.point(at: 1))
+        XCTAssertEqual(layout.index(at: CGPoint(x: card.x + 54, y: card.y + 32)), 1)
+        XCTAssertNil(layout.index(at: CGPoint(x: card.x + 70, y: card.y + 50)))
+    }
+
+    func testLeadingDragUsesTheSameChildArcAsTheVisibleLayout() throws {
+        let model = CommandDialModel(connected: true)
+        let inner = DialRadialLayout.corner(
+            center: CGPoint(x: 72, y: 700), radius: 145, itemRadius: 38,
+            count: model.roots.count, placement: .leading)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let outer = DialRadialLayout.corner(
+            center: inner.center, radius: 245, itemRadius: 38,
+            count: input.children.count, placement: .leading)
+        var drag = CommandDialDrag()
+        drag.update(
+            at: try XCTUnwrap(inner.point(at: 0)), inner: inner, outer: outer, nodes: model.roots)
+        let childPoint = try XCTUnwrap(outer.point(at: 1))
+        drag.update(at: childPoint, inner: inner, outer: outer, nodes: model.roots)
+        XCTAssertEqual(drag.childID, "input.keyboard")
+        XCTAssertEqual(
+            drag.releasedNode(at: childPoint, inner: inner, outer: outer, nodes: model.roots)?.id,
+            "input.keyboard")
+    }
+
+    func testRadialLayoutDefaultsAndCornerCardSize() {
+        let defaultSize = DialRadialLayout(
+            center: .zero,
+            orbitRadius: 50,
+            itemRadius: 10,
+            startAngle: 0,
+            endAngle: .pi,
+            count: 1
+        )
+        XCTAssertEqual(defaultSize.itemSize, CGSize(width: 20, height: 20))
+
+        let customSize = CGSize(width: 112, height: 74)
+        let corner = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: customSize,
+            count: 3,
+            placement: .trailing
+        )
+        XCTAssertEqual(corner.itemSize, customSize)
     }
 
     func testRadialLayoutEdgeCases() {
