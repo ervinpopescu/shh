@@ -267,7 +267,7 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
 
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         let result: SSHCommandResult
-        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+        if trimmed == TmuxCommand.probe() || trimmed == "tmux -V" {
             result = SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n", stderr: "")
         } else if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
             let sample = "$0|demo-main|1|1700000000|1700000000|1\n"
