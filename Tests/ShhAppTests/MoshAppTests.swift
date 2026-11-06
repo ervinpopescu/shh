@@ -18,6 +18,7 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
     private var streamContinuation: AsyncThrowingStream<TerminalEvent, Error>.Continuation?
     private var stateContinuations: [UUID: AsyncStream<MoshState>.Continuation] = [:]
     var onHandleNetworkRoaming: (@Sendable (NetworkRoamingState) async throws -> Void)?
+    var onStateUpdates: (@Sendable () async -> Void)?
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
 
     init(
@@ -43,7 +44,10 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
     }
 
     func moshStateUpdates() async -> AsyncStream<MoshState> {
-        AsyncStream { continuation in
+        if let onStateUpdates {
+            await onStateUpdates()
+        }
+        return AsyncStream { continuation in
             let id = UUID()
             self.lock.withLock {
                 self.stateContinuations[id] = continuation
@@ -262,6 +266,76 @@ final class MoshAppTests: XCTestCase {
         XCTAssertNil(container.networkRoamingState)
         XCTAssertTrue(mockMosh.isClosed)
         XCTAssertTrue(mockMosh.sessionInfo.sessionKey.isZeroized)
+    }
+
+    func testOldMoshMonitorCannotPublishAfterSameSessionReplacement() async throws {
+        let gate = MoshStateUpdatesGate()
+        let oldConnection = ControllableMoshConnection(
+            sessionInfo: MoshSessionInfo(udpPort: 60021, sessionKey: "old-mosh-key", pid: 42101))
+        oldConnection.onStateUpdates = { await gate.wait() }
+        oldConnection.onHandleNetworkRoaming = { _ in throw TransportError.connectionRefused }
+        let replacement = ControllableMoshConnection(
+            sessionInfo: MoshSessionInfo(udpPort: 60022, sessionKey: "replacement-mosh-key", pid: 42102))
+        let connects = CounterBox()
+        let transport = ControllableMoshTransport()
+        transport.onConnect = { _ in
+            connects.increment() == 1 ? oldConnection : replacement
+        }
+        let container = makeContainer(moshTransport: transport)
+        let host = try Host(
+            name: "Mosh replacement", hostname: "replacement.invalid", username: "dev",
+            connection: .mosh(MoshOptions()))
+
+        await container.connect(to: host)
+        await gate.waitForStart()
+
+        await container.handleNetworkInterfaceChange(
+            .cellular,
+            roamingState: NetworkRoamingState(currentInterface: .cellular))
+        try await eventually {
+            container.moshSessionPort == 60022 && container.moshState == .connected
+        }
+
+        await gate.open()
+        try await Task.sleep(nanoseconds: 30_000_000)
+        XCTAssertEqual(container.moshSessionPort, 60022)
+        XCTAssertEqual(container.moshState, .connected)
+    }
+
+    func testMoshStatusFollowsSelectedSessionAcrossMultiSessionSwitching() async throws {
+        let mockMosh = ControllableMoshConnection()
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { _ in mockMosh }
+        let regularConnection = MockSSHConnection()
+        let regularTransport = ControllableTransport()
+        regularTransport.onConnect = { _ in regularConnection }
+        let container = AppContainer(
+            transport: regularTransport,
+            moshTransport: moshTransport,
+            sftpRepository: DemoSFTPRepository(seedDemoData: true),
+            portForwardingManager: DemoPortForwardingManager()
+        )
+        let moshHost = try Host(
+            name: "Mosh A", hostname: "mosh-a.invalid", username: "dev",
+            connection: .mosh(MoshOptions()))
+        let regularHost = try Host(name: "SSH B", hostname: "ssh-b.invalid", username: "dev")
+
+        await container.connect(to: moshHost)
+        let moshSessionID = try XCTUnwrap(container.selectedSessionID)
+        XCTAssertEqual(container.moshState, .connected)
+
+        await container.connect(to: regularHost)
+        let regularSessionID = try XCTUnwrap(container.selectedSessionID)
+        XCTAssertNotEqual(moshSessionID, regularSessionID)
+        XCTAssertNil(container.moshState)
+        XCTAssertNil(container.moshSessionInfo)
+        XCTAssertNil(container.networkRoamingState)
+
+        await container.closeSession(id: regularSessionID)
+        try await eventually {
+            container.selectedSessionID == moshSessionID && container.moshState == .connected
+        }
+        XCTAssertEqual(container.activeHost?.id, moshHost.id)
     }
 
     // MARK: - 3. Network Interface Change Detection (Wi-Fi <-> Cellular)
@@ -749,6 +823,34 @@ final class MoshAppTests: XCTestCase {
         // Stale result must be discarded and must not overwrite recovered target $0
         XCTAssertTrue(staleResult.isEmpty, "Stale generation results must be discarded")
         XCTAssertEqual(container.activeTmuxSessionID, "$0", "Active tmux session ID must not be wiped by stale generation")
+    }
+}
+
+private actor MoshStateUpdatesGate {
+    private var isOpen = false
+    private var started = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        started = true
+        if isOpen { return }
+        await withCheckedContinuation { continuation in
+            continuations.append(continuation)
+        }
+    }
+
+    func waitForStart() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func open() {
+        isOpen = true
+        for continuation in continuations {
+            continuation.resume()
+        }
+        continuations.removeAll()
     }
 }
 

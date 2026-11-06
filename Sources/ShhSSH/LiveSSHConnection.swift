@@ -4,6 +4,7 @@ import NIOCore
 import ShhCore
 
 public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
+    private static let closeDrainTimeoutNanoseconds: UInt64 = 1_000_000_000
     private let childChannel: Channel
     private let parentChannel: Channel
     private let hopChannels: [Channel]
@@ -11,7 +12,10 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private let ownsGroup: Bool
     private let inboundRouter: InboundChildChannelRouter?
     private let lock = NSLock()
-    private var isClosed = false
+    private(set) var isClosed = false
+    private var closeTask: Task<Void, Never>?
+    private var activeWriteOperations = 0
+    private(set) var didQuarantine = false
     private var keepaliveTask: Task<Void, Never>?
     private var pendingTerminalError: TransportError?
     private var bufferedData: [Data] = []
@@ -19,6 +23,7 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     private var activeExecChannels: [UUID: Channel] = [:]
     private var activeForwardedChannels: [UUID: Channel] = [:]
     private var redactor: Redactor
+    private var redactorClearRequested = false
 
     public var eventLoop: EventLoop { parentChannel.eventLoop }
     public var group: EventLoopGroup { eventLoopGroup ?? parentChannel.eventLoop }
@@ -79,17 +84,20 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     private func sendKeepaliveProbe(timeout: TimeInterval) async throws {
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
+
         let eventLoop = parentChannel.eventLoop
+        let requestPromise = eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
         let requestFuture = eventLoop.flatSubmit {
             self.parentChannel.pipeline.handler(type: NIOSSHHandler.self).flatMap { handler in
-                let promise = eventLoop.makePromise(of: GlobalRequest.TCPForwardingResponse?.self)
                 // cancel-tcpip-forward never creates a listener. It is a
                 // harmless global request that receives a protocol response.
                 handler.sendTCPForwardingRequest(
                     .cancel(host: "127.0.0.1", port: 0),
-                    promise: promise
+                    promise: requestPromise
                 )
-                return promise.futureResult.map { _ in () }
+                return requestPromise.futureResult.map { _ in () }
             }
         }
 
@@ -100,12 +108,24 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         // foreground recovery path a deterministic bound even on a black-holed
         // socket.
         let responsePromise = eventLoop.makePromise(of: Void.self)
+        var responseCompleted = false
+        let completeResponse: (Result<Void, Error>) -> Void = { result in
+            guard !responseCompleted else { return }
+            responseCompleted = true
+            responsePromise.completeWith(result)
+        }
         let timeoutTask = eventLoop.scheduleTask(in: .milliseconds(Int64(max(0.1, timeout) * 1_000))) {
+            guard !responseCompleted else { return }
+            responseCompleted = true
             responsePromise.fail(TransportError.timeout)
+            // Let NIOSSH fail its own request promise from handlerRemoved;
+            // closing the parent is the cancellation path for the protocol
+            // request and avoids completing that promise twice.
+            self.parentChannel.close(promise: nil)
         }
         requestFuture.whenComplete { result in
             timeoutTask.cancel()
-            responsePromise.completeWith(result.map { _ in () })
+            completeResponse(result.map { _ in () })
         }
 
         try await responsePromise.futureResult.get()
@@ -114,6 +134,19 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     public func setRedactor(_ redactor: Redactor) {
         lock.withLock {
             self.redactor = redactor
+            redactorClearRequested = false
+        }
+    }
+
+    /// Requests secret cleanup without racing an admitted exec operation's
+    /// final stderr/error redaction. The close barrier performs the same
+    /// cleanup after its write-drain wait.
+    public func clearRedactorAfterOperations() {
+        lock.withLock {
+            redactorClearRequested = true
+            if activeWriteOperations == 0 {
+                redactor = Redactor()
+            }
         }
     }
 
@@ -178,10 +211,8 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     public func send(_ data: Data) async throws {
-        let closed: Bool = lock.withLock { isClosed }
-        guard !closed else {
-            throw TransportError.remoteFailure("SSH connection is closed")
-        }
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
 
         var buffer = childChannel.allocator.buffer(capacity: data.count)
         buffer.writeBytes(data)
@@ -195,10 +226,8 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     public func resize(_ size: TerminalSize) async throws {
-        let closed: Bool = lock.withLock { isClosed }
-        guard !closed else {
-            throw TransportError.remoteFailure("SSH connection is closed")
-        }
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
 
         let request = SSHChannelRequestEvent.WindowChangeRequest(
             terminalCharacterWidth: size.columns,
@@ -223,6 +252,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         timeout: TimeInterval?,
         maxOutputBytes: Int?
     ) async throws -> SSHCommandResult {
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
+
         let effectiveTimeout = timeout ?? 15.0
         let effectiveMaxBytes = maxOutputBytes ?? 1_048_576
 
@@ -301,22 +333,18 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
             throw TransportError.remoteFailure(activeRedactor.redact("Failed to send exec request: \(error.localizedDescription)"))
         }
 
+        let timeoutTask = effectiveTimeout > 0
+            ? execChannel.eventLoop.scheduleTask(
+                in: .milliseconds(Int64(effectiveTimeout * 1_000))
+            ) {
+                execHandler.failAndClose(TransportError.timeout)
+            }
+            : nil
+        defer { timeoutTask?.cancel() }
+
         do {
             let result = try await withTaskCancellationHandler {
-                try await withThrowingTaskGroup(of: SSHCommandResult.self) { group in
-                    group.addTask {
-                        try await promise.futureResult.get()
-                    }
-                    if effectiveTimeout > 0 {
-                        group.addTask {
-                            try await Task.sleep(nanoseconds: UInt64(effectiveTimeout * 1_000_000_000))
-                            throw TransportError.timeout
-                        }
-                    }
-                    let first = try await group.next()!
-                    group.cancelAll()
-                    return first
-                }
+                try await promise.futureResult.get()
             } onCancel: {
                 execHandler.failAndClose(TransportError.cancelled)
             }
@@ -351,6 +379,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         targetPort: Int,
         originatorAddress: SocketAddress? = nil
     ) async throws -> Channel {
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
+
         let closed: Bool = lock.withLock { isClosed }
         guard !closed else {
             throw TransportError.remoteFailure("SSH connection is closed")
@@ -378,8 +409,14 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         }.get()
 
         let id = UUID()
-        lock.withLock {
+        let registered = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
             self.activeForwardedChannels[id] = channel
+            return true
+        }
+        guard registered else {
+            channel.close(promise: nil)
+            throw TransportError.remoteFailure("SSH connection is closed")
         }
         channel.closeFuture.whenComplete { [weak self] _ in
             self?.lock.withLock {
@@ -393,6 +430,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         bindHost: String,
         bindPort: Int
     ) async throws -> Int? {
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
+
         let closed: Bool = lock.withLock { isClosed }
         guard !closed else {
             throw TransportError.remoteFailure("SSH connection is closed")
@@ -413,6 +453,9 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         bindHost: String,
         bindPort: Int
     ) async throws {
+        try beginWriteOperation()
+        defer { finishWriteOperation() }
+
         let closed: Bool = lock.withLock { isClosed }
         guard !closed else { return }
 
@@ -431,10 +474,16 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
         inboundRouter?.register(handler)
     }
 
-    func trackForwardedChannel(_ channel: Channel) -> UUID {
+    func trackForwardedChannel(_ channel: Channel) -> UUID? {
         let id = UUID()
-        lock.withLock {
+        let registered = lock.withLock { () -> Bool in
+            guard !isClosed else { return false }
             self.activeForwardedChannels[id] = channel
+            return true
+        }
+        guard registered else {
+            channel.close(promise: nil)
+            return nil
         }
         channel.closeFuture.whenComplete { [weak self] _ in
             self?.lock.withLock {
@@ -445,50 +494,123 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     public func close() async {
-        keepaliveTask?.cancel()
-        keepaliveTask = nil
-        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
-            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
-            [Channel],
-            [Channel],
-            Bool
-        ) = lock.withLock {
-            guard !isClosed else { return ([], [], [], false) }
+        await startClose().value
+    }
+
+    private struct CloseSnapshot {
+        let activeChannels: [Channel]
+        let forwardedChannels: [Channel]
+    }
+
+    private func startClose(error: TransportError? = nil) -> Task<Void, Never> {
+        let start: (Task<Void, Never>, [AsyncThrowingStream<TerminalEvent, Error>.Continuation]) = lock.withLock {
+            if let closeTask {
+                return (closeTask, [])
+            }
+
             isClosed = true
-            let list = Array(continuations.values)
+            redactorClearRequested = true
+            if activeWriteOperations == 0 {
+                redactor = Redactor()
+            }
+            keepaliveTask?.cancel()
+            keepaliveTask = nil
+            let activeContinuations = Array(continuations.values)
             continuations.removeAll()
             bufferedData.removeAll()
-            let execs = Array(activeExecChannels.values)
+            if activeContinuations.isEmpty, let error {
+                pendingTerminalError = error
+            }
+            let snapshot = CloseSnapshot(
+                activeChannels: Array(activeExecChannels.values),
+                forwardedChannels: Array(activeForwardedChannels.values)
+            )
             activeExecChannels.removeAll()
-            let fwds = Array(activeForwardedChannels.values)
             activeForwardedChannels.removeAll()
-            return (list, execs, fwds, true)
+            let task: Task<Void, Never> = Task { [weak self] in
+                guard let self else { return }
+                await self.finishClose(snapshot: snapshot)
+            }
+            closeTask = task
+            return (task, activeContinuations)
         }
 
-        for continuation in activeContinuations {
-            continuation.yield(.closed)
-            continuation.finish()
+        for continuation in start.1 {
+            if let error {
+                continuation.yield(.error(error))
+                continuation.finish(throwing: error)
+            } else {
+                continuation.yield(.closed)
+                continuation.finish()
+            }
+        }
+        return start.0
+    }
+
+    private func finishClose(snapshot: CloseSnapshot) async {
+        let deadline = DispatchTime.now().uptimeNanoseconds &+ Self.closeDrainTimeoutNanoseconds
+        let drained = await waitForWriteDrain(until: deadline)
+        lock.withLock {
+            if !drained {
+                didQuarantine = true
+            }
+            // Redaction remains installed until admitted operations have
+            // completed their final stderr/error transformation.
+            if drained && redactorClearRequested {
+                redactor = Redactor()
+            }
         }
 
-        for execChannel in activeChannels {
-            _ = try? await execChannel.close().get()
+        // NIO close futures are not cancellation-aware. Initiate every close
+        // without awaiting the future; when drain times out, this is a
+        // quarantine path rather than proof that in-flight writes stopped.
+        for channel in snapshot.activeChannels {
+            channel.close(promise: nil)
+        }
+        for channel in snapshot.forwardedChannels {
+            channel.close(promise: nil)
+        }
+        childChannel.close(promise: nil)
+        parentChannel.close(promise: nil)
+        for channel in hopChannels.reversed() {
+            channel.close(promise: nil)
         }
 
-        for forwardedChannel in forwardedChannels {
-            _ = try? await forwardedChannel.close().get()
-        }
-
-        guard shouldClose else { return }
-
-        _ = try? await childChannel.close().get()
-        _ = try? await parentChannel.close().get()
-
-        for hopChannel in hopChannels.reversed() {
-            _ = try? await hopChannel.close().get()
-        }
-
-        if ownsGroup, let group = eventLoopGroup {
+        guard ownsGroup, let group = eventLoopGroup else { return }
+        // Do not let a group shutdown future extend the bounded quarantine.
+        Task {
             try? await group.shutdownGracefully()
+        }
+    }
+
+    private func beginWriteOperation() throws {
+        let admitted = lock.withLock { () -> Bool in
+            guard !isClosed, !redactorClearRequested else { return false }
+            activeWriteOperations += 1
+            return true
+        }
+        guard admitted else {
+            throw TransportError.remoteFailure("SSH connection is closed")
+        }
+    }
+
+    private func finishWriteOperation() {
+        lock.withLock {
+            activeWriteOperations = max(0, activeWriteOperations - 1)
+            if activeWriteOperations == 0, redactorClearRequested {
+                redactor = Redactor()
+            }
+        }
+    }
+
+    private func waitForWriteDrain(until deadline: UInt64) async -> Bool {
+        while true {
+            if lock.withLock({ activeWriteOperations == 0 }) {
+                return true
+            }
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard deadline > now else { return false }
+            try? await Task.sleep(nanoseconds: min(deadline - now, 1_000_000))
         }
     }
 
@@ -508,102 +630,13 @@ public final class LiveSSHConnection: SSHConnection, SSHCommandExecuting, @unche
     }
 
     func handleChannelClosed() {
-        keepaliveTask?.cancel()
-        keepaliveTask = nil
-        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
-            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
-            [Channel],
-            [Channel],
-            Bool
-        ) = lock.withLock {
-            guard !isClosed else { return ([], [], [], false) }
-            isClosed = true
-            let list = Array(continuations.values)
-            continuations.removeAll()
-            bufferedData.removeAll()
-            let execs = Array(activeExecChannels.values)
-            activeExecChannels.removeAll()
-            let fwds = Array(activeForwardedChannels.values)
-            activeForwardedChannels.removeAll()
-            return (list, execs, fwds, true)
-        }
-
-        for continuation in activeContinuations {
-            continuation.yield(.closed)
-            continuation.finish()
-        }
-
-        for execChannel in activeChannels {
-            execChannel.close(promise: nil)
-        }
-
-        for forwardedChannel in forwardedChannels {
-            forwardedChannel.close(promise: nil)
-        }
-
-        guard shouldClose else { return }
-
-        let hops = hopChannels
-        Task {
-            _ = try? await self.parentChannel.close().get()
-            for hop in hops.reversed() {
-                _ = try? await hop.close().get()
-            }
-            if self.ownsGroup, let group = self.eventLoopGroup {
-                try? await group.shutdownGracefully()
-            }
-        }
+        _ = startClose()
     }
 
     func handleChannelError(_ error: Error) {
-        keepaliveTask?.cancel()
-        keepaliveTask = nil
-        let transportError = (error as? TransportError) ?? TransportError.remoteFailure(error.localizedDescription)
-        let (activeContinuations, activeChannels, forwardedChannels, shouldClose): (
-            [AsyncThrowingStream<TerminalEvent, Error>.Continuation],
-            [Channel],
-            [Channel],
-            Bool
-        ) = lock.withLock {
-            guard !isClosed else { return ([], [], [], false) }
-            isClosed = true
-            let list = Array(continuations.values)
-            continuations.removeAll()
-            pendingTerminalError = list.isEmpty ? transportError : nil
-            bufferedData.removeAll()
-            let execs = Array(activeExecChannels.values)
-            activeExecChannels.removeAll()
-            let fwds = Array(activeForwardedChannels.values)
-            activeForwardedChannels.removeAll()
-            return (list, execs, fwds, true)
-        }
-
-        for execChannel in activeChannels {
-            execChannel.close(promise: nil)
-        }
-
-        for forwardedChannel in forwardedChannels {
-            forwardedChannel.close(promise: nil)
-        }
-
-        for continuation in activeContinuations {
-            continuation.yield(.error(transportError))
-            continuation.finish(throwing: transportError)
-        }
-
-        guard shouldClose else { return }
-
-        let hops = hopChannels
-        Task {
-            _ = try? await self.childChannel.close().get()
-            _ = try? await self.parentChannel.close().get()
-            for hop in hops.reversed() {
-                _ = try? await hop.close().get()
-            }
-            if self.ownsGroup, let group = self.eventLoopGroup {
-                try? await group.shutdownGracefully()
-            }
-        }
+        let transportError =
+            (error as? TransportError) ?? TransportError.remoteFailure(error.localizedDescription)
+        _ = startClose(error: transportError)
     }
 
     private func removeContinuation(id: UUID) {

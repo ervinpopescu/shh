@@ -11,10 +11,14 @@ final class SSHExecIntegrationTests: XCTestCase {
         server: SSHTestServer,
         redactor: Redactor = Redactor(),
         keepaliveInterval: TimeInterval = 30.0,
-        keepaliveTimeout: TimeInterval = 8.0
+        keepaliveTimeout: TimeInterval = 8.0,
+        cloudflareSecret: String? = nil
     ) async throws -> (LiveSSHTransport, LiveSSHConnection) {
         let credStore = InMemoryCredentialStore()
         try await credStore.save(Data("testpassword".utf8), reference: "ref-pass")
+        if let cloudflareSecret {
+            try await credStore.save(Data(cloudflareSecret.utf8), reference: "ref-cf-secret")
+        }
         let identity = try IdentityDescriptor(name: "Test Pass", kind: .password, keychainReference: "ref-pass")
 
         let trustStore = InMemoryTrustStore()
@@ -31,13 +35,24 @@ final class SSHExecIntegrationTests: XCTestCase {
             keepaliveInterval: keepaliveInterval,
             keepaliveTimeout: keepaliveTimeout
         )
+        let profile: HostConnectionType
+        if cloudflareSecret != nil {
+            profile = .cloudflareAccess(
+                CloudflareAccessOptions(
+                    clientID: "test-client-id",
+                    clientSecretKeychainRef: "ref-cf-secret",
+                    tunnelDomain: "127.0.0.1"))
+        } else {
+            profile = .ssh(
+                SSHOptions(connectTimeoutSeconds: 5, strictHostKeyChecking: .trustedOnly))
+        }
         let host = try ShhCore.Host(
             name: "Localhost",
             hostname: "127.0.0.1",
             port: server.port,
             username: "testuser",
             identityID: identity.id,
-            connection: .ssh(SSHOptions(connectTimeoutSeconds: 5, strictHostKeyChecking: .trustedOnly))
+            connection: profile
         )
 
         let rawConnection = try await transport.connect(host: host, identity: identity, trustEvaluator: trustStore)
@@ -45,7 +60,9 @@ final class SSHExecIntegrationTests: XCTestCase {
             XCTFail("Expected LiveSSHConnection")
             throw TransportError.remoteFailure("Cast failed")
         }
-        connection.setRedactor(redactor)
+        if !redactor.secrets.isEmpty {
+            connection.setRedactor(redactor)
+        }
         return (transport, connection)
     }
 
@@ -357,6 +374,28 @@ final class SSHExecIntegrationTests: XCTestCase {
 
     // MARK: - 10. Redacted Errors
 
+    func testCloudflareClientSecretIsRedactedFromExecOutput() async throws {
+        let server = SSHTestServer()
+        _ = try await server.start()
+        addTeardownBlock { try await server.stop() }
+
+        let secret = "cloudflare-exec-secret-0123456789"
+        let (_, connection) = try await makeConnectedClient(
+            server: server,
+            cloudflareSecret: secret)
+        addTeardownBlock { await connection.close() }
+        server.execHandler = { _ in
+            SSHCommandTestResponse(
+                exitCode: 1,
+                stdout: "",
+                stderr: "cloudflare client secret: \(secret)\\n")
+        }
+
+        let result = try await connection.executeCommand("print-secret")
+        XCTAssertFalse(result.stderr.contains(secret))
+        XCTAssertTrue(result.stderr.contains("[REDACTED]"))
+    }
+
     func testRedactedErrors() async throws {
         let server = SSHTestServer()
         _ = try await server.start()
@@ -364,8 +403,12 @@ final class SSHExecIntegrationTests: XCTestCase {
 
         let secretToken = "super-secret-password-xyz"
         let redactor = Redactor(secrets: [secretToken])
-        let (_, connection) = try await makeConnectedClient(server: server, redactor: redactor)
+        let (_, connection) = try await makeConnectedClient(server: server)
         addTeardownBlock { await connection.close() }
+
+        // SessionRuntime uses this existing installation path after loading the
+        // session-scoped secret from the credential store.
+        connection.setRedactor(redactor)
 
         // Configure server to emit an error mentioning the secret
         server.execHandler = { cmd in
