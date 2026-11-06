@@ -564,6 +564,7 @@ struct HostEditorView: View {
     @State private var ruleToEdit: PortForwardingRule? = nil
     @State private var allHosts: [Host] = []
     @State private var autoAttachTmux: Bool
+    @State private var tmuxExecutablePath: String
     @State private var enableVoice: Bool
     @State private var allowShellCommand: Bool
     @State private var allowAgentMessage: Bool
@@ -685,6 +686,7 @@ struct HostEditorView: View {
         _sendImageDestination = State(initialValue: existing?.sendImageDestination ?? "")
 
         _autoAttachTmux = State(initialValue: existing?.autoAttachTmux ?? false)
+        _tmuxExecutablePath = State(initialValue: existing?.tmuxPreferences.executablePath ?? "")
         _enableVoice = State(initialValue: existing?.isVoiceEnabled ?? false)
         let allowed = existing?.voicePolicy.allowedModes ?? Set(VoiceInputMode.allCases)
         _allowShellCommand = State(initialValue: allowed.contains(.shellCommand))
@@ -1009,6 +1011,20 @@ struct HostEditorView: View {
                 Section("Tmux preferences") {
                     Toggle("Auto-attach last used tmux session", isOn: $autoAttachTmux)
                         .accessibilityIdentifier("host-editor-auto-attach-toggle")
+                    TextField("Absolute tmux executable path (optional)", text: $tmuxExecutablePath)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                        .accessibilityIdentifier("host-editor-tmux-executable-path")
+                    if let tmuxPathValidationMessage {
+                        Text(tmuxPathValidationMessage)
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("host-editor-tmux-executable-path-error")
+                    } else {
+                        Text("Leave blank to discover tmux from the SSH command PATH, then the remote login PATH.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Section("Image transfer") {
                     TextField("Private remote directory (optional)", text: $sendImageDestination)
@@ -1075,7 +1091,7 @@ struct HostEditorView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") { save() }
-                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid)
+                        .disabled(name.isEmpty || hostname.isEmpty || username.isEmpty || (connectionType == .proxyJump && bastionHops.isEmpty) || !isMoshPortRangeValid || tmuxPathValidationMessage != nil)
                         .accessibilityIdentifier("host-editor-save-button")
                 }
                 ToolbarItemGroup(placement: .keyboard) {
@@ -1107,8 +1123,23 @@ struct HostEditorView: View {
         return true
     }
 
+    private var tmuxPathValidationMessage: String? {
+        Self.tmuxExecutablePathValidationMessage(for: tmuxExecutablePath)
+    }
+
+    static func tmuxExecutablePathValidationMessage(for path: String) -> String? {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard trimmed == "tmux" || TmuxExecutableDiscovery.isSafeTmuxExecutablePath(trimmed) else {
+            return "Use a safe absolute tmux executable path, or leave this field blank."
+        }
+        return nil
+    }
+
     func buildHost(secretRef: String? = nil) -> Host? {
         guard isMoshPortRangeValid else { return nil }
+        let trimmedTmuxPath = tmuxExecutablePath.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard Self.tmuxExecutablePathValidationMessage(for: trimmedTmuxPath) == nil else { return nil }
         if connectionType == .proxyJump && bastionHops.isEmpty { return nil }
         var allowedModes: Set<VoiceInputMode> = []
         if allowShellCommand { allowedModes.insert(.shellCommand) }
@@ -1194,7 +1225,10 @@ struct HostEditorView: View {
             username: username,
             identityID: identityID,
             connection: profile,
-            autoAttachTmux: autoAttachTmux,
+            tmuxPreferences: HostTmuxPreferences(
+                autoAttach: autoAttachTmux,
+                executablePath: trimmedTmuxPath.isEmpty ? nil : trimmedTmuxPath
+            ),
             voicePolicy: voicePolicy,
             isProduction: isProductionHost,
             forwardingRules: forwardingRules,

@@ -244,6 +244,8 @@ final class MultiplexerControlTests: XCTestCase {
         XCTAssertEqual(herdrControl.executable, "'/opt/bin/herdr'")
 
         XCTAssertThrowsError(try TmuxControl(executable: "custom-mux"))
+        XCTAssertThrowsError(try TmuxControl(executable: "herdr"))
+        XCTAssertThrowsError(try TmuxControl(executable: "/opt/bin/herdr"))
         XCTAssertThrowsError(try TmuxControl(executable: "/bin/tmux\n"))
     }
 

@@ -123,7 +123,7 @@ final class HetznerConnectionIntegrationTests: XCTestCase {
             return
         }
 
-        let versionRes = try await executor.executeCommand(TmuxCommand.probe)
+        let versionRes = try await executor.executeCommand(TmuxCommand.probe())
         XCTAssertEqual(versionRes.exitCode, 0)
         let availability = TmuxAvailability.parse(result: versionRes)
         XCTAssertTrue(availability.isAvailable)
