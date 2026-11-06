@@ -12,24 +12,26 @@ public enum DialCategory: String, CaseIterable, Codable, Hashable, Sendable, Ide
     case sendImage = "send-image"
 
     public var id: String { rawValue }
+
     public var title: String {
         switch self {
-        case .commonKeys: return "Navigation"
-        case .snippets: return "Saved Commands"
-        case .voice: return "Dictate"
+        case .commonKeys: return "Input"
+        case .snippets: return "Saved"
+        case .voice: return "Voice"
         case .keyboard: return "Keyboard"
         case .multiplexer: return "Session"
-        case .sendImage: return "Share Image"
+        case .sendImage: return "Share"
         }
     }
+
     public var systemImage: String {
         switch self {
-        case .commonKeys: return "command"
+        case .commonKeys: return "terminal"
         case .snippets: return "text.book.closed"
         case .voice: return "waveform"
         case .keyboard: return "keyboard"
         case .multiplexer: return "rectangle.3.group"
-        case .sendImage: return "photo"
+        case .sendImage: return "square.and.arrow.up"
         }
     }
 }
@@ -46,6 +48,7 @@ public enum DialCommonKey: String, CaseIterable, Codable, Hashable, Sendable, Id
     case enter
 
     public var id: String { rawValue }
+
     public var title: String {
         switch self {
         case .escape: return "Esc"
@@ -57,9 +60,10 @@ public enum DialCommonKey: String, CaseIterable, Codable, Hashable, Sendable, Id
         case .arrowRight: return "Right"
         case .controlC: return "Ctrl-C"
         case .controlD: return "Ctrl-D"
-        case .enter: return "Enter"
+        case .enter: return "Return"
         }
     }
+
     public var systemImage: String? {
         switch self {
         case .arrowUp: return "arrow.up"
@@ -100,12 +104,8 @@ public struct DialNode: Identifiable, Hashable, Sendable {
     public let availability: DialActionAvailability
 
     public init(
-        id: String,
-        title: String,
-        subtitle: String? = nil,
-        systemImage: String? = nil,
-        action: DialActionIdentifier,
-        children: [DialNode] = [],
+        id: String, title: String, subtitle: String? = nil, systemImage: String? = nil,
+        action: DialActionIdentifier, children: [DialNode] = [],
         availability: DialActionAvailability = .available
     ) {
         self.id = id
@@ -142,7 +142,8 @@ public struct DialSnippetDescriptor: Hashable, Sendable {
     public let availability: DialActionAvailability
 
     public init(
-        id: UUID, name: String, preview: String, availability: DialActionAvailability = .available
+        id: UUID, name: String, preview: String,
+        availability: DialActionAvailability = .available
     ) {
         self.id = id
         self.name = name
@@ -160,28 +161,88 @@ public struct CommandDialModel: Sendable {
         pinnedCategories: [DialCategory] = DialCategory.allCases,
         multiplexerChildren: [DialNode] = []
     ) {
-        let pinned = Set(pinnedCategories)
-        let connectionAvailability: DialActionAvailability =
+        let availability: DialActionAvailability =
             connected
-            ? .available
-            : .unavailable(reason: "Connect to a host")
+            ? .available : .unavailable(reason: "Connect to a host")
+        roots = Self.makeRoots(
+            pinnedLiterals: pinnedLiterals,
+            snippets: snippets,
+            categories: Set(pinnedCategories),
+            availability: availability,
+            connected: connected,
+            multiplexerChildren: multiplexerChildren
+        )
+    }
 
-        let keys = Dictionary(
-            uniqueKeysWithValues: DialCommonKey.allCases.map { key in
-                (
-                    key,
-                    DialNode(
-                        id: "key.\(key.id)", title: key.title, systemImage: key.systemImage,
-                        action: .commonKey(key), availability: connectionAvailability)
-                )
-            })
-        func nodes(for values: [DialCommonKey]) -> [DialNode] {
-            values.compactMap { keys[$0] }
+    private static func makeRoots(
+        pinnedLiterals: [String], snippets: [DialSnippetDescriptor],
+        categories: Set<DialCategory>, availability: DialActionAvailability,
+        connected: Bool, multiplexerChildren: [DialNode]
+    ) -> [DialNode] {
+        let input = inputNodes(categories: categories, availability: availability)
+        let literals = literalNodes(
+            values: pinnedLiterals, connected: connected, availability: availability)
+        let saved = savedNodes(
+            snippets: snippets, literals: literals, categories: categories,
+            availability: availability)
+        var roots: [DialNode] = []
+
+        if !input.isEmpty {
+            roots.append(
+                DialNode(
+                    id: "root.input", title: "Input", subtitle: "Type, dictate, or navigate",
+                    systemImage: DialCategory.commonKeys.systemImage,
+                    action: .category(.commonKeys), children: input,
+                    availability: input.contains(where: \.isEnabled) ? .available : availability))
         }
+        if categories.contains(.multiplexer) {
+            roots.append(sessionRoot(children: multiplexerChildren, availability: availability))
+        }
+        if categories.contains(.snippets) || !literals.isEmpty {
+            roots.append(
+                DialNode(
+                    id: "root.saved", title: "Saved", subtitle: "Snippets and quick text",
+                    systemImage: DialCategory.snippets.systemImage, action: .category(.snippets),
+                    children: saved,
+                    availability: saved.contains(where: \.isEnabled)
+                        ? .available
+                        : (saved.isEmpty
+                            ? .unavailable(reason: "No saved commands") : availability)))
+        }
+        if categories.contains(.sendImage) {
+            roots.append(
+                DialNode(
+                    id: "root.share", title: "Share", subtitle: "Send an image to this host",
+                    systemImage: DialCategory.sendImage.systemImage, action: .category(.sendImage),
+                    children: [
+                        DialNode(
+                            id: "share.image", title: "Image",
+                            subtitle: "Send a file to the terminal",
+                            systemImage: "photo", action: .sendImage, availability: availability
+                        )
+                    ], availability: availability))
+        }
+        return roots
+    }
 
-        var inputChildren: [DialNode] = []
-        if pinned.contains(.commonKeys) {
-            inputChildren.append(
+    private static func inputNodes(
+        categories: Set<DialCategory>, availability: DialActionAvailability
+    ) -> [DialNode] {
+        var nodes: [DialNode] = []
+        if categories.contains(.commonKeys) {
+            let keys = Dictionary(
+                uniqueKeysWithValues: DialCommonKey.allCases.map { key in
+                    (
+                        key,
+                        DialNode(
+                            id: "key.\(key.id)", title: key.title, systemImage: key.systemImage,
+                            action: .commonKey(key), availability: availability)
+                    )
+                })
+            func keyNodes(_ values: [DialCommonKey]) -> [DialNode] {
+                values.compactMap { keys[$0] }
+            }
+            nodes.append(
                 DialNode(
                     id: "input.navigate", title: "Navigate",
                     subtitle: "Move, complete, and control terminal input",
@@ -189,140 +250,108 @@ public struct CommandDialModel: Sendable {
                     action: .category(.commonKeys),
                     children: [
                         DialNode(
-                            id: "input.navigate.cursor", title: "Move Cursor",
-                            systemImage: "cursorarrow.motionlines",
-                            action: .category(.commonKeys),
-                            children: nodes(for: [.arrowUp, .arrowRight, .arrowDown, .arrowLeft]),
-                            availability: connectionAvailability),
+                            id: "input.navigate.cursor", title: "Cursor",
+                            systemImage: "cursorarrow.motionlines", action: .category(.commonKeys),
+                            children: keyNodes([.arrowUp, .arrowRight, .arrowDown, .arrowLeft]),
+                            availability: availability),
                         DialNode(
                             id: "input.navigate.complete", title: "Complete",
                             systemImage: "arrow.right.to.line.compact",
                             action: .category(.commonKeys),
-                            children: nodes(for: [.tab, .shiftTab]),
-                            availability: connectionAvailability),
+                            children: keyNodes([.tab, .shiftTab]), availability: availability),
                         DialNode(
-                            id: "input.navigate.control", title: "Control Process",
-                            systemImage: "terminal",
-                            action: .category(.commonKeys),
-                            children: nodes(for: [.enter, .escape, .controlC, .controlD]),
-                            availability: connectionAvailability),
-                    ],
-                    availability: connectionAvailability
-                )
-            )
+                            id: "input.navigate.control", title: "Control",
+                            systemImage: "terminal", action: .category(.commonKeys),
+                            children: keyNodes([.enter, .escape, .controlC, .controlD]),
+                            availability: availability),
+                    ], availability: availability))
         }
-        if pinned.contains(.keyboard) {
-            inputChildren.append(
+        if categories.contains(.keyboard) {
+            nodes.append(
                 DialNode(
-                    id: "input.keyboard", title: "Show Keyboard", subtitle: "Return to typing",
+                    id: "input.keyboard", title: "Keyboard", subtitle: "Return to typing",
                     systemImage: DialCategory.keyboard.systemImage, action: .keyboard))
         }
-        if pinned.contains(.voice) {
-            inputChildren.append(
+        if categories.contains(.voice) {
+            nodes.append(
                 DialNode(
-                    id: "input.dictate", title: "Dictate", subtitle: "Compose with your voice",
+                    id: "input.dictate", title: "Voice", subtitle: "Compose with your voice",
                     systemImage: DialCategory.voice.systemImage, action: .voice,
-                    availability: connectionAvailability))
+                    availability: availability))
         }
+        return nodes
+    }
 
-        let literals = Self.validPinnedLiterals(pinnedLiterals).map { literal in
-            let availability: DialActionAvailability
+    private static func literalNodes(
+        values: [String], connected: Bool, availability: DialActionAvailability
+    ) -> [DialNode] {
+        validPinnedLiterals(values).map { literal in
+            let nodeAvailability: DialActionAvailability
             switch CommandPolicy().classify(literal) {
-            case .safe: availability = connectionAvailability
+            case .safe: nodeAvailability = availability
             case .reviewRequired:
-                availability = connected ? .reviewRequired : connectionAvailability
-            case .blocked: availability = .blocked(reason: "Safety policy")
+                nodeAvailability = connected ? .reviewRequired : availability
+            case .blocked: nodeAvailability = .blocked(reason: "Safety policy")
             }
             return DialNode(
                 id: "literal.\(literal)", title: literal, subtitle: "Insert without running",
                 systemImage: "text.cursor", action: .pinnedLiteral(literal),
-                availability: availability)
+                availability: nodeAvailability)
         }
+    }
+
+    private static func savedNodes(
+        snippets: [DialSnippetDescriptor], literals: [DialNode], categories: Set<DialCategory>,
+        availability: DialActionAvailability
+    ) -> [DialNode] {
         let snippetNodes = snippets.map { snippet in
             DialNode(
                 id: "snippet.\(snippet.id.uuidString)", title: snippet.name,
-                subtitle: snippet.preview,
-                systemImage: "text.quote", action: .snippet(snippet.id),
+                subtitle: snippet.preview, systemImage: "text.quote", action: .snippet(snippet.id),
                 availability: snippet.availability)
         }
-        var runChildren: [DialNode] = []
-        if pinned.contains(.snippets), !snippetNodes.isEmpty {
-            runChildren.append(
+        var nodes: [DialNode] = []
+        if categories.contains(.snippets), !snippetNodes.isEmpty {
+            nodes.append(
                 DialNode(
-                    id: "run.saved", title: "Saved Commands", subtitle: "Run a trusted snippet",
+                    id: "saved.snippets", title: "Snippets", subtitle: "Insert a saved command",
                     systemImage: DialCategory.snippets.systemImage, action: .category(.snippets),
-                    children: Self.pagedNodes(
-                        snippetNodes, prefix: "run.saved", moreTitle: "More Commands"),
-                    availability: connectionAvailability)
-            )
+                    children: pagedNodes(
+                        snippetNodes, prefix: "saved.snippets", moreTitle: "More Snippets"),
+                    availability: availability))
         }
-        if pinned.contains(.commonKeys), !literals.isEmpty {
-            runChildren.append(
+        if categories.contains(.commonKeys), !literals.isEmpty {
+            nodes.append(
                 DialNode(
-                    id: "run.quick-text", title: "Quick Text", subtitle: "Insert a pinned phrase",
+                    id: "saved.quick-text", title: "Quick Text", subtitle: "Insert a pinned phrase",
                     systemImage: "text.cursor", action: .category(.commonKeys),
-                    children: Self.pagedNodes(
-                        literals, prefix: "run.quick-text", moreTitle: "More Quick Text"),
-                    availability: connectionAvailability)
-            )
+                    children: pagedNodes(
+                        literals, prefix: "saved.quick-text", moreTitle: "More Quick Text"),
+                    availability: availability))
         }
+        return nodes
+    }
 
-        let multiplexerGroups = Self.groupedMultiplexerNodes(multiplexerChildren)
-        var roots: [DialNode] = []
-        if !inputChildren.isEmpty {
-            roots.append(
+    private static func sessionRoot(
+        children: [DialNode], availability: DialActionAvailability
+    ) -> DialNode {
+        let groups = groupedMultiplexerNodes(children)
+        var sessionChildren = [DialNode](
+            arrayLiteral: DialNode(
+                id: "session.browser", title: "Browse Sessions",
+                subtitle: "Attach or switch workspace", systemImage: "rectangle.stack",
+                action: .multiplexer, availability: availability))
+        if !groups.isEmpty {
+            sessionChildren.append(
                 DialNode(
-                    id: "root.input", title: "Input", subtitle: "Type, dictate, or navigate",
-                    systemImage: "terminal", action: .category(.commonKeys),
-                    children: inputChildren,
-                    availability: inputChildren.contains(where: \.isEnabled)
-                        ? .available : connectionAvailability)
-            )
+                    id: "session.current", title: "tmux", subtitle: "Windows, panes, and layout",
+                    systemImage: "rectangle.3.group", action: .category(.multiplexer),
+                    children: groups, availability: availability))
         }
-        if !runChildren.isEmpty {
-            roots.append(
-                DialNode(
-                    id: "root.run", title: "Run", subtitle: "Saved commands and quick text",
-                    systemImage: "play.fill", action: .category(.snippets), children: runChildren,
-                    availability: runChildren.contains(where: \.isEnabled)
-                        ? .available : connectionAvailability)
-            )
-        }
-        if pinned.contains(.multiplexer) {
-            var sessionChildren = [
-                DialNode(
-                    id: "session.browser", title: "Browse Sessions",
-                    subtitle: "Attach or switch workspace",
-                    systemImage: "rectangle.stack", action: .multiplexer,
-                    availability: connectionAvailability)
-            ]
-            if !multiplexerGroups.isEmpty {
-                sessionChildren.append(
-                    DialNode(
-                        id: "session.current", title: "Current Session",
-                        subtitle: "Windows, panes, and layout",
-                        systemImage: "rectangle.3.group", action: .category(.multiplexer),
-                        children: multiplexerGroups, availability: connectionAvailability)
-                )
-            }
-            roots.append(
-                DialNode(
-                    id: "root.session", title: "Session",
-                    subtitle: "Switch and arrange your workspace",
-                    systemImage: DialCategory.multiplexer.systemImage,
-                    action: .category(.multiplexer),
-                    children: sessionChildren, availability: connectionAvailability)
-            )
-        }
-        if pinned.contains(.sendImage) {
-            roots.append(
-                DialNode(
-                    id: "root.share", title: "Share", subtitle: "Send an image to this host",
-                    systemImage: "square.and.arrow.up", action: .sendImage,
-                    availability: connectionAvailability)
-            )
-        }
-        self.roots = roots
+        return DialNode(
+            id: "root.session", title: "Session", subtitle: "Switch and arrange your workspace",
+            systemImage: DialCategory.multiplexer.systemImage, action: .category(.multiplexer),
+            children: sessionChildren, availability: availability)
     }
 
     private static func pagedNodes(
@@ -336,25 +365,31 @@ public struct CommandDialModel: Sendable {
             id: "\(prefix).more.\(page)", title: moreTitle,
             subtitle: "\(remaining.count) more", systemImage: "ellipsis",
             action: .category(.snippets),
-            children: pagedNodes(remaining, prefix: prefix, moreTitle: moreTitle, page: page + 1)
-        )
+            children: pagedNodes(remaining, prefix: prefix, moreTitle: moreTitle, page: page + 1))
         return visible + [more]
     }
 
+    private struct MultiplexerGroup {
+        let id: String
+        let title: String
+        let icon: String
+        let matches: (DialNode) -> Bool
+    }
+
     private static func groupedMultiplexerNodes(_ nodes: [DialNode]) -> [DialNode] {
-        let groups: [(id: String, title: String, icon: String, matches: (DialNode) -> Bool)] = [
-            ("windows", "Switch Window", "rectangle.2.swap", { $0.id.contains("window") }),
-            (
-                "focus", "Choose Pane", "arrow.up.and.down.and.arrow.left.and.right",
-                { $0.id.contains(".focus.") }
-            ),
-            (
-                "layout", "Arrange Panes", "rectangle.3.group",
-                {
-                    $0.id.contains(".split.") || $0.id.hasSuffix(".zoom")
-                }
-            ),
-            ("actions", "Pane Actions", "ellipsis.circle", { _ in true }),
+        let groups = [
+            MultiplexerGroup(
+                id: "windows", title: "Switch Window", icon: "rectangle.2.swap",
+                matches: { $0.id.contains("window") }),
+            MultiplexerGroup(
+                id: "focus", title: "Focus", icon: "arrow.up.and.down.and.arrow.left.and.right",
+                matches: { $0.id.contains(".focus.") }),
+            MultiplexerGroup(
+                id: "layout", title: "Arrange Panes", icon: "rectangle.3.group",
+                matches: { $0.id.contains(".split.") || $0.id.hasSuffix(".zoom") }),
+            MultiplexerGroup(
+                id: "actions", title: "Pane Actions", icon: "ellipsis.circle",
+                matches: { _ in true }),
         ]
         var remaining = nodes
         return groups.compactMap { group in
@@ -365,8 +400,7 @@ public struct CommandDialModel: Sendable {
                 id: "session.current.\(group.id)", title: group.title,
                 systemImage: group.icon, action: .category(.multiplexer),
                 children: pagedNodes(
-                    matches, prefix: "session.current.\(group.id)",
-                    moreTitle: "More Actions"))
+                    matches, prefix: "session.current.\(group.id)", moreTitle: "More Actions"))
         }
     }
 
@@ -381,8 +415,8 @@ public struct CommandDialModel: Sendable {
         }.prefix(12).map { $0 }
     }
 
-    /// Pinned values are terminal insertion text, never commands. In particular,
-    /// a persisted value may not contain a line ending or any control byte.
+    /// Pinned values are terminal insertion text, never commands. A persisted
+    /// value may not contain a line ending or any control byte.
     public static func isInsertOnlyTerminalText(_ value: String) -> Bool {
         !value.isEmpty && value.utf8.count <= 64
             && !value.unicodeScalars.contains { $0.value < 0x20 || $0.value == 0x7f }
@@ -408,11 +442,13 @@ public struct CommandDialNavigation: Equatable, Sendable {
         isOpen = true
         selectedNodeID = nil
     }
+
     public mutating func dismiss() {
         isOpen = false
         path.removeAll()
         selectedNodeID = nil
     }
+
     public mutating func clearSelection() { selectedNodeID = nil }
     public mutating func highlight(_ id: String?) { selectedNodeID = id }
 
@@ -427,9 +463,8 @@ public struct CommandDialNavigation: Equatable, Sendable {
         selectedNodeID = nil
     }
 
-    /// Converts a selected node into either navigation or a typed action. The
-    /// view and non-visual clients share this path so category taps can never
-    /// accidentally dispatch their placeholder action.
+    /// Converts a selected node into navigation or a typed action. Category
+    /// taps can never accidentally dispatch their placeholder action.
     @discardableResult
     public mutating func activate(_ node: DialNode) -> DialActivation {
         guard node.isEnabled else { return .ignored }
@@ -449,7 +484,11 @@ public struct CommandDialNavigation: Equatable, Sendable {
 public enum DialHapticEvent: Equatable, Sendable {
     case open, selection, commit, boundary, confirmation, success, failure
 }
-public protocol DialHaptics: Sendable { func emit(_ event: DialHapticEvent) }
+
+public protocol DialHaptics: Sendable {
+    func emit(_ event: DialHapticEvent)
+}
+
 public struct NoopDialHaptics: DialHaptics {
     public init() {}
     public func emit(_ event: DialHapticEvent) {}
@@ -460,17 +499,20 @@ public enum CommandDialPlacement: String, CaseIterable, Codable, Sendable, Ident
     public var id: String { rawValue }
     public var title: String { rawValue.capitalized }
 }
+
 public enum CommandDialSize: String, CaseIterable, Codable, Sendable, Identifiable {
     case compact, regular
     public var id: String { rawValue }
     public var title: String { rawValue.capitalized }
 }
+
 public struct CommandDialPreferences: Codable, Equatable, Sendable {
     public var placement: CommandDialPlacement
     public var size: CommandDialSize
     public var hapticsEnabled: Bool
     public var pinnedCategories: [DialCategory]
     public var pinnedLiterals: [String]
+
     public init(
         placement: CommandDialPlacement = .trailing, size: CommandDialSize = .compact,
         hapticsEnabled: Bool = true, pinnedCategories: [DialCategory] = DialCategory.allCases,
