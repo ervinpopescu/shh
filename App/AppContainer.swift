@@ -269,6 +269,8 @@ final class AppContainer: ObservableObject {
     private(set) var connection: (any SSHConnection)?
     private var eventTask: Task<Void, Never>?
     private var eventMonitoringGeneration = 0
+    /// Invalidates foreground probes when a drop or replacement transport starts.
+    private var transportRecoveryEpoch: UInt64 = 0
     private var outboundTask: Task<Void, Never>?
     private var terminalResizeTask: Task<Bool, Never>?
     private var terminalGrid = TerminalGrid()
@@ -979,6 +981,7 @@ final class AppContainer: ObservableObject {
             default:
                 activeSession?.state = .failed
             }
+            syncLiveActivityState()
         } catch {
             guard activeSession?.id == session.id, activeSession?.state == .connecting else { return }
             detachCallbacks()
@@ -986,6 +989,7 @@ final class AppContainer: ObservableObject {
             self.lastConnectionFailure = failure
             let message = failure.reason
             activeSession?.state = .failed
+            syncLiveActivityState()
             terminalText = message
             terminalController.feed("\r\n\u{1b}[31m[" + message + "]\u{1b}[0m\r\n")
         }
@@ -997,6 +1001,7 @@ final class AppContainer: ObservableObject {
         session: TerminalSession,
         host: Host
     ) {
+        transportRecoveryEpoch &+= 1
         eventMonitoringGeneration &+= 1
         let monitoringGeneration = eventMonitoringGeneration
         eventTask?.cancel()
@@ -1022,6 +1027,7 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
+                        self.transportRecoveryEpoch &+= 1
                         // Closing is the terminal event for a clean drop. If a
                         // transport error was already observed for this session,
                         // retain failed so the actionable error remains visible.
@@ -1031,6 +1037,7 @@ final class AppContainer: ObservableObject {
                         } else {
                             self.activeSession?.state = .failed
                         }
+                        self.syncLiveActivityState()
                         self.detachCallbacks()
                         self.terminalController.feed("\r\n\u{1b}[90m[Connection closed]\u{1b}[0m\r\n")
                         self.redactor = Redactor()
@@ -1053,6 +1060,7 @@ final class AppContainer: ObservableObject {
                         self.stopHerdrPolling()
                         self.isProbingTmux = false
                         self.isProbingHerdr = false
+                        self.transportRecoveryEpoch &+= 1
                         self.hasObservedTransportError = true
                         if error == .networkUnavailable,
                            !self.reachabilityMonitor.isReachable {
@@ -1063,6 +1071,7 @@ final class AppContainer: ObservableObject {
                         } else {
                             self.activeSession?.state = .failed
                         }
+                        self.syncLiveActivityState()
                         self.detachCallbacks()
                         let message = Self.statusMessage(for: error)
                         self.terminalText += "\n" + message
@@ -1090,8 +1099,10 @@ final class AppContainer: ObservableObject {
                 self.stopHerdrPolling()
                 self.isProbingTmux = false
                 self.isProbingHerdr = false
+                self.transportRecoveryEpoch &+= 1
                 self.hasObservedTransportError = true
                 self.activeSession?.state = .failed
+                self.syncLiveActivityState()
                 self.detachCallbacks()
                 let message = Self.statusMessage(for: error)
                 self.terminalText += "\n" + message
@@ -1122,6 +1133,7 @@ final class AppContainer: ObservableObject {
             if activeSession?.state != .failed,
                !hasObservedTransportError {
                 activeSession?.state = .disconnected
+                syncLiveActivityState()
             }
             reconnectState = .failed(reason: "Network unavailable.")
             return
@@ -1153,6 +1165,7 @@ final class AppContainer: ObservableObject {
               activeHost?.id == host.id else {
             throw TransportError.cancelled
         }
+        transportRecoveryEpoch &+= 1
         let connectionGeneration = lifecycleGeneration
         // Invalidate the previous stream before replacing the transport. A late
         // event from that stream must not change the new session's Live Activity.
@@ -1391,6 +1404,7 @@ final class AppContainer: ObservableObject {
                 if activeSession?.state != .failed,
                    !hasObservedTransportError {
                     activeSession?.state = .disconnected
+                    syncLiveActivityState()
                 }
                 reconnectState = .failed(reason: "Network unavailable.")
             }
@@ -1449,7 +1463,9 @@ final class AppContainer: ObservableObject {
             // through the normal reconnect path, but first detach the old
             // stream so its close event cannot start a second coordinator.
             isNetworkRecoveryInProgress = true
+            transportRecoveryEpoch &+= 1
             activeSession?.state = .disconnected
+            syncLiveActivityState()
             detachCallbacks()
             eventTask?.cancel()
             eventTask = nil
@@ -1525,18 +1541,24 @@ final class AppContainer: ObservableObject {
                     guard self.lifecycleGeneration == generation, !self.isExplicitDisconnect else { return }
 
                     if let session = self.activeSession, session.state == .connected, let conn = self.connection {
+                        let probeConnectionID = ObjectIdentifier(conn as AnyObject)
+                        let probeRecoveryEpoch = self.transportRecoveryEpoch
                         // A process may have been suspended after the finite
                         // background grace period. Report the session as
                         // connecting while the bounded transport probe runs so
                         // the UI never claims a dead socket is ready.
                         self.isForegroundRecoveryInProgress = true
                         self.activeSession?.state = .connecting
+                        self.syncLiveActivityState()
                         let isResponsive = await conn.testResponsiveness(timeout: 2.5)
                         guard self.lifecycleGeneration == generation,
+                              self.transportRecoveryEpoch == probeRecoveryEpoch,
                               !self.isExplicitDisconnect,
                               self.activeSession?.id == session.id,
                               self.activeSession?.state == .connecting,
-                              self.connection != nil else { return }
+                              self.connection.map({ ObjectIdentifier($0 as AnyObject) }) == probeConnectionID else {
+                            return
+                        }
 
                         if isResponsive {
                             self.isForegroundRecoveryInProgress = false
@@ -1560,6 +1582,7 @@ final class AppContainer: ObservableObject {
                             await deadConn?.close()
                             self.isForegroundRecoveryInProgress = false
                             self.activeSession?.state = .disconnected
+                            self.syncLiveActivityState()
                             if let host = self.activeHost {
                                 self.handleConnectionDrop(host: host)
                             }

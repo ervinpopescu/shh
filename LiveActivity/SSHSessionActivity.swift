@@ -34,6 +34,15 @@ public struct ShhSSHSessionActivityAttributes: ActivityAttributes {
       self.updatedAt = updatedAt
       self.reconnectAttempt = reconnectAttempt
     }
+
+    /// A stale ActivityKit snapshot no longer proves that the SSH transport is connected.
+    public func displayName(isStale: Bool) -> String {
+      isStale ? "Status unverified" : status.displayName
+    }
+
+    public var lastConfirmedLabel: String {
+      "Last confirmed"
+    }
   }
 
   public let sessionID: UUID
@@ -52,15 +61,18 @@ public struct ShhLiveActivityCardView: View {
   public let displayName: String
   public let hostLabel: String
   public let state: ShhSSHSessionActivityAttributes.ContentState
+  public let isStale: Bool
 
   public init(
     displayName: String,
     hostLabel: String,
-    state: ShhSSHSessionActivityAttributes.ContentState
+    state: ShhSSHSessionActivityAttributes.ContentState,
+    isStale: Bool = false
   ) {
     self.displayName = displayName
     self.hostLabel = hostLabel
     self.state = state
+    self.isStale = isStale
   }
 
   public var body: some View {
@@ -79,7 +91,7 @@ public struct ShhLiveActivityCardView: View {
             .lineLimit(1)
         }
         Spacer(minLength: 8)
-        Text(state.status.displayName)
+        Text(state.displayName(isStale: isStale))
           .font(.subheadline.weight(.semibold))
           .foregroundStyle(statusColor(state.status))
       }
@@ -92,7 +104,7 @@ public struct ShhLiveActivityCardView: View {
       .fixedSize(horizontal: false, vertical: true)
     }
     .accessibilityElement(children: .combine)
-    .accessibilityLabel("SSH session at \(displayName), \(state.status.displayName)")
+    .accessibilityLabel("SSH session at \(displayName), \(state.displayName(isStale: isStale))")
     .accessibilityHint(
       "Displays connection status only. Does not extend background socket execution and never exposes commands or credentials."
     )
@@ -109,24 +121,31 @@ public struct ShhLiveActivityCardView: View {
         ProgressView(value: Double(attempt), total: 8)
           .tint(statusColor(state.status))
           .accessibilityLabel("Reconnect attempt \(attempt) of 8")
-        Text(state.updatedAt, style: .relative)
-          .font(.caption2)
-          .foregroundStyle(.white.opacity(0.7))
-          .accessibilityLabel("Updated \(state.updatedAt.formatted())")
+        timestampView
         Spacer(minLength: 0)
       }
     } else {
       HStack(spacing: 8) {
-        Text(state.updatedAt, style: .relative)
-          .font(.caption2)
-          .foregroundStyle(.white.opacity(0.7))
-          .accessibilityLabel("Updated \(state.updatedAt.formatted())")
+        timestampView
         Spacer(minLength: 0)
       }
     }
   }
 
+  private var timestampView: some View {
+    HStack(spacing: 4) {
+      if isStale {
+        Text(state.lastConfirmedLabel)
+      }
+      Text(state.updatedAt, style: .relative)
+        .accessibilityLabel("\(isStale ? state.lastConfirmedLabel : "Updated") \(state.updatedAt.formatted())")
+    }
+    .font(.caption2)
+    .foregroundStyle(.white.opacity(0.7))
+  }
+
   private func statusColor(_ status: ShhSSHSessionActivityAttributes.ContentState.Status) -> Color {
+    if isStale { return .yellow }
     switch status {
     case .connected: return .green
     case .reconnecting: return .orange
