@@ -1,125 +1,128 @@
+<div align="center">
+
 # Shh
 
-Shh is a native SwiftUI iPhone/iPad SSH client targeting iOS/iPadOS 17+.
+### A native, privacy-first SSH workspace for iPhone and iPad
 
-## Overview
+[![CI](https://github.com/ervinpopescu/shh/actions/workflows/ci.yml/badge.svg)](https://github.com/ervinpopescu/shh/actions/workflows/ci.yml)
+[![iOS 17+](https://img.shields.io/badge/iOS%2FiPadOS-17%2B-0A7EA4)](https://developer.apple.com/ios/)
+[![Swift 5.10](https://img.shields.io/badge/Swift-5.10-F05138)](https://www.swift.org/)
 
-Shh provides an adaptive terminal client, multiplexer integration,
-on-device voice transcription, multi-hop port forwarding, Herdr agent
-management, Mosh roaming recovery, native iOS Files app integration
-via a File Provider extension, and zero-knowledge encrypted vault
-backups.
+Connect to hosts, work in a real terminal, move files, and keep common
+operations within thumb reach. Shh keeps credentials in the platform
+Keychain, verifies host keys before authentication, and does not require a
+Shh cloud service.
 
-## Documentation
+</div>
 
-- [`AGENTS.md`](AGENTS.md) - Repository map, architecture seams, setup,
-  commands, security contracts, testing, CI, and troubleshooting for coding
-  agents.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - Layer and target boundaries.
-- [`docs/PRODUCT.md`](docs/PRODUCT.md) - Implemented behavior and release
-  limitations.
-- [`docs/SECURITY.md`](docs/SECURITY.md) - Credential, transport, backup,
-  privacy, and entitlement guarantees.
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) - Completed and future milestones.
+## What Shh does
 
-## Capabilities
+- **Terminal-first SSH** - SwiftNIO SSH, PTY sessions, SwiftTerm rendering,
+  TOFU host-key verification, reconnect support, and ProxyJump bastions.
+- **Files and tunnels** - In-app SFTP, iOS Files integration, local/remote/
+  SOCKS5 forwarding, and Bonjour discovery for `_ssh._tcp` services.
+- **Focused workflows** - Tmux controls, Herdr workspaces, a one-handed
+  Command Dial, terminal image insertion, and Live Activity session status.
+- **Local voice input** - WhisperKit and Apple Speech providers with editable
+  previews. Transcripts are never sent automatically.
+- **Encrypted portability** - `.shhbackup` vault files use AES-256-GCM and
+  PBKDF2-HMAC-SHA256. Keychain credential bytes and private keys stay out of
+  backups.
+- **Privacy by design** - No analytics or tracking service. The privacy
+  manifest declares no collected data types; network and microphone access are
+  used only by their corresponding features.
 
-- **Terminal & Transport:** Live SwiftNIO SSH transport with PTY,
-  TOFU host-key verification, and SwiftTerm rendering with alternate
-  screen buffers and debounced resize handling. Citadel is isolated to
-  the SFTP subsystem.
-- **Lifecycle & Keepalive:** Finite iOS background grace period
-  keepalives for active SSH, Mosh, and forwarding sessions without
-  background audio modes, with zero-delay foreground resumption via
-  transport probing.
-- **Multiplexing:** First-class Tmux integration supporting session
-  listing, creation, attach, and command approval.
-- **On-Device Voice AI:** WhisperKit and Apple Speech local transcribers
-  with push-to-talk recording, editable preview drawers, and strict
-  manual send safety policies.
-- **Local Network Discovery:** Bonjour discovery (`_ssh._tcp`) detecting
-  local SSH servers with advertised mDNS hostname and port resolution.
-- **Tunneling & Bastions:** Multi-hop ProxyJump pipeline and port
-  forwarding (local, remote, and dynamic SOCKS5).
-- **Network Profiles:** Cloudflare Access tunnel resolution with optional
-  Keychain-backed client secrets and Tailscale hostname resolution with
-  configurable host-key policy. External service interoperability is not part
-  of CI.
-- **Herdr Supervision:** Workspace and pane management with structured
-  agent state monitoring and output inspection.
-- **Mosh Roaming:** UDP datagram transport with automatic network
-  roaming recovery and session resumption. Full Mosh State
-  Synchronization Protocol (SSP) payload encryption and speculative echo
-  remain pending.
-- **File Provider Extension:** Exposes remote SFTP directories directly
-  in the iOS Files app via an `NSFileProviderReplicatedExtension`.
-  Atomic synchronization of catalog snapshot and trusted host keys.
-  Mosh-only hosts are rejected as unsupported.
-- **Encrypted Vault Backup:** Zero-knowledge `.shhbackup` export and
-  import encrypted with AES-256-GCM and PBKDF2-HMAC-SHA256 (600,000
-  rounds). Includes preview of record counts before restore, explicit
-  replace versus merge restore choices, wrong-passphrase and tamper
-  detection, and security-scoped staging. Keychain credential bytes and
-  private keys are strictly excluded.
-- **Privacy & Safety:** Privacy manifest declaring required-reason APIs
-  (`UserDefaults`, file timestamps, disk space). Zero tracking, zero
-  analytics, and zero collected data.
+## How it works
 
-## Getting Started
+1. Add a host with endpoint metadata and an opaque identity reference.
+2. Approve the host key when Shh encounters an unknown fingerprint. Changed
+   host keys are rejected.
+3. Shh resolves the selected credential only after trust approval, then opens
+   the terminal or an isolated SFTP, exec, or forwarding channel.
+4. Use the terminal directly, or open the Command Dial for saved commands,
+   multiplexer controls, voice composition, and image transfer.
 
-On macOS, install [XcodeGen](https://github.com/yonaskolb/XcodeGen) and
-`just`, then generate the ignored Xcode project:
+## Quick start
+
+Shh targets iOS and iPadOS 17 or newer. The repository currently provides the
+source and simulator development workflow rather than a TestFlight or App
+Store release.
+
+On macOS, install [Xcode](https://developer.apple.com/xcode/),
+[XcodeGen](https://github.com/yonaskolb/XcodeGen), and [`just`](https://github.com/casey/just):
 
 ```sh
+just doctor device=iphone
 just generate
 open Shh.xcodeproj
 ```
 
-For the repeatable development lifecycle, install `just` and run `just --list`.
-The default full-Xcode toolchain is `/Applications/Xcode.app/Contents/Developer`;
-override it with `DEVELOPER_DIR=...`. Dedicated simulator presets are selected
-without erasing simulator state:
+For a repeatable local check:
 
 ```sh
 just check
-just build device=iphone
-just test device=ipad
-just deploy iphone
-just deploy-device <simulator-or-device-udid>
-just launch ipad
-just logs iphone seconds=30
-just screenshot ipad
-just stop iphone
-just ci
+just test iphone
 ```
 
-`IPHONE_UDID`, `IPAD_UDID`, and `DERIVED_DATA_PATH` override the presets and
-build location. Simulator builds use ad-hoc signing by default
-(`SIGNING_IDENTITY=-`, `SIGNING_REQUIRED=NO`). Physical-device builds use
-automatic development signing with team `B7D575CY5M` by default; override it
-with `DEVELOPMENT_TEAM=<team-id>` when needed. They never pass the simulator
-ad-hoc identity or disable required signing. An unavailable simulator is
-reported as such instead of being treated as a physical device. `just clean`
-removes only the selected DerivedData directory. Test results, logs, and
-screenshots are written to timestamped paths under `tmp/e2e/`.
+Use `DEVELOPER_DIR` to select a different Xcode installation. Simulator
+builds use the local ad-hoc defaults; physical-device builds require your own
+Apple Developer provisioning and signing team.
 
-The Foundation-only core is also a Swift package:
+## Development commands
+
+```sh
+just --list             # Show all recipes
+just format-check       # Check Swift formatting
+just lint               # Swift and shell checks
+just unit               # Host-runnable Swift package tests
+just build iphone       # Build the generated app for an iPhone simulator
+just test ipad          # Run app tests on an iPad simulator
+just ci                 # Run the CI-equivalent local flow
+```
+
+The reusable package targets can also be tested directly:
 
 ```sh
 swift package dump-package
 swift test
 ```
 
-## Platform Status & Limitations
+Generated `Shh.xcodeproj` output and build products are local artifacts. The
+canonical project description is [`project.yml`](project.yml).
 
-The implementation is covered by package tests, app tests, generated unsigned
-builds, and iPhone/iPad simulator tests where applicable. Optional live-host
-integration tests require a configured simulator snapshot and remote host;
-Cloudflare and Tailscale tests cover target resolution rather than external
-service login.
+## Product status and boundaries
 
-Physical-device App Group/File Provider provisioning, hardware microphone and
-Files app validation, full Mosh SSP encryption, independent security review,
-broad interoperability testing, and TestFlight/App Store distribution remain
-unverified or incomplete. See [`docs/PRODUCT.md`](docs/PRODUCT.md) and
-[`docs/ROADMAP.md`](docs/ROADMAP.md) for the evidence boundary.
+Shh is an active implementation project with substantial automated coverage:
+package tests, app tests, generated unsigned builds, and simulator tests. An
+optional live-host simulator path is available when its host snapshot,
+credentials, and trust state are configured. Cloudflare Access and Tailscale
+coverage validates target resolution, not an external login or network.
+
+The following remain outside the repository's release evidence:
+
+- physical-device provisioning, Keychain/App Group behavior, Files app
+  execution, and hardware microphone validation;
+- complete Mosh SSP cryptography, packet authentication, server-compatible
+  negotiation, and speculative echo;
+- broad SSH server, roaming, Cloudflare, Tailscale, and hardware
+  interoperability testing;
+- an independent cryptographic or privacy audit; and
+- TestFlight, App Store distribution, export-compliance submission, and
+  release signing.
+
+Demo mode and the Docker OpenSSH fixture are development aids, not proof of
+production interoperability. See [`docs/PRODUCT.md`](docs/PRODUCT.md) for the
+implementation evidence boundary and [`docs/SECURITY.md`](docs/SECURITY.md)
+for the threat model and credential guarantees.
+
+## Documentation
+
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) - module boundaries and
+  integration seams.
+- [`docs/PRODUCT.md`](docs/PRODUCT.md) - implemented features and validation
+  limits.
+- [`docs/SECURITY.md`](docs/SECURITY.md) - trust, credential, backup, and
+  privacy contracts.
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) - completed milestones and future work.
+- [`AGENTS.md`](AGENTS.md) - local setup, testing, CI, and contribution
+  guidance.
