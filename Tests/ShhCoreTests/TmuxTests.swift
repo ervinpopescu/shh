@@ -507,7 +507,7 @@ final class TmuxTests: XCTestCase {
 
     func testVerifiedCommandTemplates() throws {
         // 1. Probe template: tmux -V
-        XCTAssertEqual(TmuxCommand.probe, "tmux -V")
+        XCTAssertEqual(TmuxCommand.probe(), "tmux -V")
 
         // 2. Delimited list-sessions fields
         XCTAssertEqual(
@@ -547,6 +547,71 @@ final class TmuxTests: XCTestCase {
         XCTAssertEqual(adapter.command(for: .list), TmuxCommand.listSessions)
         XCTAssertEqual(adapter.command(for: .attach(name: "$0")), "env -u TMUX tmux attach-session -d -t '$0'")
         XCTAssertEqual(adapter.command(for: .create(name: "work")), "tmux new-session -A -D -s 'work'")
+
+        XCTAssertEqual(
+            TmuxCommand.listSessions(executable: "/opt/tools/tmux"),
+            "'/opt/tools/tmux' list-sessions -F '#{session_id}|#{q:session_name}|#{session_windows}|#{session_created}|#{session_activity}|#{session_attached}'"
+        )
+        XCTAssertEqual(
+            TmuxCommand.hasSession(id: "$0", executable: "/opt/tools/tmux"),
+            "'/opt/tools/tmux' has-session -t '$0'"
+        )
+        XCTAssertEqual(
+            try TmuxCommand.attachSession(id: "$0", executable: "/opt/tools/tmux"),
+            "env -u TMUX '/opt/tools/tmux' attach-session -d -t '$0'"
+        )
+    }
+
+    func testTmuxExecutableDiscoveryUsesRemoteLoginShellAndRejectsProfileNoise() {
+        XCTAssertTrue(TmuxExecutableDiscovery.loginPathCommand.hasPrefix("\"${SHELL:-/bin/sh}\" -lc "))
+        XCTAssertFalse(TmuxExecutableDiscovery.loginPathCommand.hasPrefix("sh -lc "))
+
+        let validOutput = "\(TmuxExecutableDiscovery.beginSentinel)\n/Users/demo/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
+        XCTAssertEqual(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(exitCode: 0, stdout: validOutput)
+            ),
+            "/Users/demo/.local/bin/tmux"
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "profile warning\n\(validOutput)",
+                    stderr: ""
+                )
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(exitCode: 127, stdout: validOutput)
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(exitCode: 0, stdout: validOutput, stderr: " \n")
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n /tmp/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            )
+        )
+        XCTAssertNil(
+            TmuxExecutableDiscovery.parseExecutablePath(
+                result: SSHCommandResult(
+                    exitCode: 0,
+                    stdout: "\(TmuxExecutableDiscovery.beginSentinel)\n/tmp/tmux path\n\(TmuxExecutableDiscovery.endSentinel)\n"
+                )
+            )
+        )
+        XCTAssertEqual(
+            TmuxCommand.probe(executable: "/tmp/tmux;id"),
+            "'/tmp/tmux;id' -V"
+        )
     }
 
     // MARK: - Tmux Availability

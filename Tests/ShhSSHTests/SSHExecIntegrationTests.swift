@@ -418,6 +418,29 @@ final class SSHExecIntegrationTests: XCTestCase {
         XCTAssertEqual(has99.exitCode, 1)
         XCTAssertTrue(has99.stderr.contains("can't find session"))
 
+        // A tmux binary available only after login-PATH initialization must be
+        // discoverable and reusable through its absolute path.
+        server.execMode = .loginPathOnly
+        let directProbe = try await connection.executeCommand(TmuxCommand.probe())
+        XCTAssertEqual(directProbe.exitCode, 127)
+        let loginPath = try await connection.executeCommand(TmuxExecutableDiscovery.loginPathCommand)
+        XCTAssertEqual(
+            loginPath.stdout,
+            "\(TmuxExecutableDiscovery.beginSentinel)\n/home/testuser/.local/bin/tmux\n\(TmuxExecutableDiscovery.endSentinel)\n"
+        )
+        let resolvedProbe = try await connection.executeCommand(
+            TmuxCommand.probe(executable: "/home/testuser/.local/bin/tmux")
+        )
+        XCTAssertTrue(resolvedProbe.isSuccess)
+        let resolvedList = try await connection.executeCommand(
+            TmuxCommand.listSessions(executable: "/home/testuser/.local/bin/tmux")
+        )
+        XCTAssertTrue(resolvedList.isSuccess)
+        XCTAssertTrue(
+            TmuxCommand.listSessions(executable: "/home/testuser/.local/bin/tmux")
+                .contains("'/home/testuser/.local/bin/tmux' list-sessions")
+        )
+
         // not-installed mode
         server.execMode = .notInstalled
         let notInstalledResult = try await connection.executeCommand("tmux -V")
@@ -453,7 +476,7 @@ final class SSHExecIntegrationTests: XCTestCase {
         let demo = DemoSSHConnection()
 
         // Probe
-        let probeResult = try await demo.executeCommand(TmuxCommand.probe)
+        let probeResult = try await demo.executeCommand(TmuxCommand.probe())
         XCTAssertTrue(probeResult.isSuccess)
         XCTAssertEqual(probeResult.stdout, "tmux 3.4\n")
 

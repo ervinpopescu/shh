@@ -1452,7 +1452,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
             return try await onExecuteCommand(command)
         }
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed == TmuxCommand.probe || trimmed == "tmux -V" {
+        if trimmed == TmuxCommand.probe() || trimmed == "tmux -V" {
             return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n", stderr: "")
         }
         if trimmed == TmuxCommand.listSessions || trimmed.contains("list-sessions") {
