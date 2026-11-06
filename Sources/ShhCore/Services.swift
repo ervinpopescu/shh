@@ -112,10 +112,26 @@ public protocol HostTrustEvaluator: Sendable {
     func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision
 }
 public enum TerminalEvent: Sendable, Equatable { case bytes(Data); case closed; case error(TransportError) }
+/// A terminal transport with linearized admission and shutdown semantics.
+///
+/// `send` and `resize` atomically admit work before touching the transport.
+/// Once `close()` begins, new calls fail and already-admitted calls are drained
+/// before the implementation finishes its close barrier. `events()` called
+/// after close returns a finished stream. Implementations may quarantine an
+/// admitted operation when the underlying transport cannot prove completion by
+/// its finite shutdown deadline; callers must not treat that path as proof that
+/// the peer or an in-flight NIO operation stopped immediately.
 public protocol SSHConnection: Sendable {
+    /// Returns a stream whose terminal event is `.closed` or `.error` exactly
+    /// once. Calling this after shutdown returns an already-finished stream.
     func events() async -> AsyncThrowingStream<TerminalEvent, Error>
+    /// Fails if shutdown has started; admitted writes are drained by `close`.
     func send(_ data: Data) async throws
+    /// Fails if shutdown has started; admitted writes are drained by `close`.
     func resize(_ size: TerminalSize) async throws
+    /// Linearizes shutdown and is idempotent. Concurrent callers await the same
+    /// close barrier. A non-cooperative underlying transport is quarantined at
+    /// the implementation's finite deadline rather than awaited forever.
     func close() async
     /// Probes the connection to determine whether it is active and responsive.
     func testResponsiveness(timeout: TimeInterval) async -> Bool

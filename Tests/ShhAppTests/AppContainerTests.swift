@@ -29,6 +29,46 @@ final class CountingCredentialStore: CredentialStore, @unchecked Sendable {
     }
 }
 
+final class BlockingCredentialStore: CredentialStore, @unchecked Sendable {
+    private let inner = InMemoryCredentialStore()
+    private let lock = NSLock()
+    private var blockNext = false
+    private let started = Gate()
+    private let release = Gate()
+
+    func blockNextLoad() {
+        lock.withLock { blockNext = true }
+    }
+
+    func waitForBlockedLoad() async {
+        await started.wait()
+    }
+
+    func releaseBlockedLoad() async {
+        await release.open()
+    }
+
+    func save(_ secret: Data, reference: String) async throws {
+        try await inner.save(secret, reference: reference)
+    }
+
+    func load(reference: String) async throws -> Data {
+        let shouldBlock = lock.withLock {
+            defer { blockNext = false }
+            return blockNext
+        }
+        if shouldBlock {
+            await started.open()
+            await release.wait()
+        }
+        return try await inner.load(reference: reference)
+    }
+
+    func delete(reference: String) async throws {
+        try await inner.delete(reference: reference)
+    }
+}
+
 @MainActor
 final class AppContainerTests: XCTestCase {
 
@@ -721,6 +761,310 @@ final class AppContainerTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.hostID, hostB.id)
     }
 
+    func testSessionRuntimeRoutesEventsAndOwnsReconnectTeardown() async throws {
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let host = try Host(name: "Runtime Host", hostname: "runtime.invalid", username: "user")
+        await container.connect(to: host)
+
+        firstConnection.emit(.bytes(Data("first-output\\n".utf8)))
+        try await waitUntil { container.terminalText.contains("first-output") }
+        XCTAssertTrue(container.terminalController.onOutput != nil)
+        XCTAssertTrue(container.terminalController.onResize != nil)
+
+        container.terminalController.handleResize(columns: 111, rows: 37)
+        container.terminalController.flushResize()
+        try await waitUntil { firstConnection.resizeCalls.last == TerminalSize(columns: 111, rows: 37) }
+        XCTAssertEqual(container.activeSession?.terminalSize, TerminalSize(columns: 111, rows: 37))
+
+        try await container.performReconnect(to: host, attempt: 1)
+        XCTAssertTrue(firstConnection.isClosed)
+        replacementConnection.emit(.bytes(Data("replacement-output\\n".utf8)))
+        try await waitUntil { container.terminalText.contains("replacement-output") }
+        XCTAssertFalse(container.terminalText.contains("first-output"))
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        await container.disconnect()
+        XCTAssertTrue(replacementConnection.isClosed)
+        XCTAssertNil(container.terminalController.onOutput)
+        XCTAssertNil(container.terminalController.onResize)
+    }
+
+    func testReconnectSynchronizesSelectedRedactorForAppOutputPath() async throws {
+        let credentialStore = InMemoryCredentialStore()
+        let secret = "reconnect-app-output-secret"
+        try await credentialStore.save(Data(secret.utf8), reference: "reconnect-output-ref")
+        let identity = try IdentityDescriptor(
+            name: "Reconnect output identity", kind: .password,
+            keychainReference: "reconnect-output-ref")
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await connections.next() }
+        let container = AppContainer(credentialStore: credentialStore, transport: transport)
+        try await container.catalog.save(identity)
+        let host = try Host(
+            name: "Reconnect output host", hostname: "reconnect-output.invalid", username: "dev",
+            identityID: identity.id)
+
+        await container.connect(to: host)
+        XCTAssertEqual(container.redactor.secrets, [secret])
+
+        try await container.performReconnect(to: host, attempt: 1)
+
+        let runtime = try XCTUnwrap(container.selectedSessionRuntime)
+        XCTAssertEqual(runtime.redactor.secrets, [secret])
+        XCTAssertEqual(container.redactor.secrets, [secret])
+        let output = String(
+            decoding: container.redacted(Data("stdout: \(secret)".utf8)), as: UTF8.self)
+        XCTAssertFalse(output.contains(secret))
+        XCTAssertTrue(output.contains("[REDACTED]"))
+
+        await container.disconnect()
+    }
+
+    func testReconnectFailureProjectsFailedStateAndPreservesHealthySession() async throws {
+        let closeGate = Gate()
+        let failedOriginal = MockSSHConnection()
+        failedOriginal.onClose = { await closeGate.wait() }
+        let failedReplacement = MockSSHConnection()
+        let healthyConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let failedConnections = ConnectionSequence([failedOriginal, failedReplacement])
+        transport.onConnect = { host in
+            host.hostname == "failed-reconnect.invalid"
+                ? await failedConnections.next()
+                : healthyConnection
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true))
+        let failedHost = try Host(
+            name: "Failed reconnect", hostname: "failed-reconnect.invalid", username: "dev")
+        let healthyHost = try Host(
+            name: "Healthy session", hostname: "healthy-reconnect.invalid", username: "dev")
+
+        await container.connect(to: failedHost)
+        let failedSessionID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: healthyHost)
+        let healthySessionID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: failedSessionID)
+
+        do {
+            try await container.performReconnect(to: failedHost, attempt: 1)
+            XCTFail("Reconnect teardown timeout should fail")
+        } catch let error as TransportError {
+            guard case .cancelled = error else {
+                XCTFail("Expected cancellation after teardown timeout, got \(error)")
+                return
+            }
+        }
+
+        XCTAssertEqual(container.selectedSessionID, failedSessionID)
+        XCTAssertEqual(container.activeSession?.state, .failed)
+        XCTAssertEqual(
+            container.openSessions.first(where: { $0.id == failedSessionID })?.state,
+            .failed)
+        XCTAssertEqual(container.reconnectState, .failed(reason: "Connection shutdown timed out."))
+        XCTAssertFalse(container.reconnectState.isReconnecting)
+
+        container.selectSession(id: healthySessionID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertEqual(container.runtime(for: failedSessionID)?.session.state, .failed)
+        XCTAssertFalse(healthyConnection.isClosed)
+
+        await closeGate.open()
+        try await waitUntil { failedOriginal.isClosed }
+        await container.disconnect()
+    }
+
+    func testReconnectCoordinatorFailureProjectsFailedRuntimeAndLeavesRetryAvailable()
+        async throws
+    {
+        let original = MockSSHConnection()
+        let replacement = MockSSHConnection()
+        let outcomes = ReconnectOutcomeSequence([
+            .success(original),
+            .failure(.timeout),
+            .success(replacement),
+        ])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in try await outcomes.next() }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                maxAttempts: 1,
+                clock: { _ in },
+                jitter: ReconnectCoordinator.zeroJitter
+            )
+        )
+        let host = try Host(
+            name: "Coordinator failure", hostname: "coordinator-failure.invalid", username: "dev")
+
+        await container.connect(to: host)
+        let sessionID = try XCTUnwrap(container.selectedSessionID)
+        original.emit(.error(.timeout))
+
+        try await waitUntil {
+            container.activeSession?.state == .failed
+                && container.reconnectState == .exhausted(attempts: 1)
+        }
+        XCTAssertEqual(container.openSessions.first(where: { $0.id == sessionID })?.state, .failed)
+        XCTAssertFalse(container.reconnectState.isReconnecting)
+
+        await container.retryReconnect()
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue((container.connection as AnyObject) === (replacement as AnyObject))
+        await container.disconnect()
+    }
+
+    func testUnavailableReconnectPreflightExhaustionReconcilesRuntimeAndRetry()
+        async throws
+    {
+        let reachability = SilentReachabilityMonitor(isReachable: true)
+        reachability.flipOnNextCoordinatorClock = true
+        let original = MockSSHConnection()
+        let replacement = MockSSHConnection()
+        let connections = ConnectionSequence([original, replacement])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await connections.next() }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: reachability,
+            reconnectCoordinator: ReconnectCoordinator(
+                maxAttempts: 1,
+                clock: { _ in
+                    if reachability.consumeClockFlip() {
+                        reachability.isReachable = false
+                    }
+                },
+                jitter: ReconnectCoordinator.zeroJitter
+            )
+        )
+        let host = try Host(
+            name: "Unavailable reconnect",
+            hostname: "unavailable-reconnect.invalid",
+            username: "dev"
+        )
+
+        await container.connect(to: host)
+        let sessionID = try XCTUnwrap(container.selectedSessionID)
+        original.emit(.closed)
+
+        try await waitUntil {
+            container.runtime(for: sessionID)?.session.state == .failed
+                && container.runtime(for: sessionID)?.reconnectState == .exhausted(attempts: 1)
+        }
+        XCTAssertFalse(container.runtime(for: sessionID)?.reconnectState.isReconnecting == true)
+
+        reachability.isReachable = true
+        await container.retryReconnect()
+        XCTAssertEqual(container.runtime(for: sessionID)?.session.state, .connected)
+        XCTAssertTrue((container.connection as AnyObject) === (replacement as AnyObject))
+    }
+
+    func testDisconnectDuringReconnectSecretLoadCannotPublishReplacement() async throws {
+        let credentialStore = BlockingCredentialStore()
+        try await credentialStore.save(Data("secret-value".utf8), reference: "blocked-secret")
+        let identity = try IdentityDescriptor(
+            name: "Blocked Secret", kind: .password, keychainReference: "blocked-secret")
+        let firstConnection = MockSSHConnection()
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(credentialStore: credentialStore, transport: transport)
+        try await container.catalog.save(identity)
+        let host = try Host(
+            name: "Blocked Runtime Host",
+            hostname: "blocked-runtime.invalid",
+            username: "user",
+            identityID: identity.id
+        )
+        await container.connect(to: host)
+        credentialStore.blockNextLoad()
+
+        let reconnectTask = Task { @MainActor in
+            try? await container.performReconnect(to: host, attempt: 1)
+        }
+        await credentialStore.waitForBlockedLoad()
+        await container.disconnect()
+        await credentialStore.releaseBlockedLoad()
+        await reconnectTask.value
+
+        XCTAssertEqual(container.activeSession?.state, .disconnected)
+        XCTAssertNil(container.connection)
+        XCTAssertTrue(replacementConnection.isClosed)
+        XCTAssertTrue(container.redactor.secrets.isEmpty)
+    }
+
+    func testReconnectClosesReplacementWhenRuntimeTeardownTimesOut() async throws {
+        let closeGate = Gate()
+        let firstConnection = MockSSHConnection()
+        firstConnection.onClose = {
+            await closeGate.wait()
+        }
+        let replacementConnection = MockSSHConnection()
+        let transport = ControllableTransport()
+        let connections = ConnectionSequence([firstConnection, replacementConnection])
+        transport.onConnect = { _ in await connections.next() }
+
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let host = try Host(name: "Timeout Host", hostname: "timeout.invalid", username: "user")
+        await container.connect(to: host)
+
+        do {
+            try await container.performReconnect(to: host, attempt: 1)
+            XCTFail("performReconnect should have thrown TransportError.cancelled")
+        } catch let error as TransportError {
+            guard case .cancelled = error else {
+                XCTFail("Expected TransportError.cancelled, got \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        XCTAssertTrue(
+            replacementConnection.isClosed,
+            "Replacement connection must be closed when runtime teardown fails"
+        )
+        XCTAssertEqual(replacementConnection.closeCallCount, 1)
+        XCTAssertEqual(firstConnection.closeCallCount, 1)
+        XCTAssertFalse(firstConnection.isClosed)
+
+        // Release the uncooperative connection teardown so background tasks quiesce
+        await closeGate.open()
+        try await waitUntil { firstConnection.isClosed }
+        XCTAssertTrue(firstConnection.isClosed)
+
+        await container.disconnect()
+        XCTAssertEqual(
+            firstConnection.closeCallCount,
+            1,
+            "Timed-out connection must retain close ownership and not be closed again"
+        )
+        XCTAssertEqual(
+            replacementConnection.closeCallCount,
+            1,
+            "Replacement connection must not be closed a second time during disconnect"
+        )
+    }
+
     func testRedactionBeforeFeedInProductionSurface() async throws {
         let credStore = InMemoryCredentialStore()
         let secretValue = "super-secret-ssh-token-42"
@@ -1140,6 +1484,37 @@ final class AppContainerTests: XCTestCase {
         XCTAssertNil(updatedHost?.identityID)
     }
 
+    func testCloudflareClientSecretRedactsTerminalOutput() async throws {
+        let secret = "cloudflare-client-secret-0123456789"
+        let credentialStore = InMemoryCredentialStore()
+        try await credentialStore.save(Data(secret.utf8), reference: "cf-secret")
+        let connection = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in connection }
+        let container = AppContainer(
+            credentialStore: credentialStore,
+            transport: transport,
+            sftpRepository: DemoSFTPRepository(seedDemoData: true),
+            portForwardingManager: DemoPortForwardingManager())
+        let options = CloudflareAccessOptions(
+            clientID: "client-id",
+            clientSecretKeychainRef: "cf-secret",
+            tunnelDomain: "tunnel.example.com")
+        let host = try Host(
+            name: "Cloudflare host",
+            hostname: "origin.example.com",
+            username: "dev",
+            connection: .cloudflareAccess(options))
+
+        await container.connect(to: host)
+        connection.emit(.bytes(Data("terminal: \(secret)\\r\\n".utf8)))
+        try await Task.sleep(nanoseconds: 30_000_000)
+
+        XCTAssertEqual(container.selectedSessionRuntime?.redactor.secrets, [secret])
+        XCTAssertFalse(container.terminalText.contains(secret))
+        XCTAssertTrue(container.terminalText.contains("[REDACTED]"))
+    }
+
     func testRedactionIncludesSecretEvenForCollidingIdentities() async throws {
         let container = AppContainer.demo()
         let ref = "colliding-ref"
@@ -1154,10 +1529,12 @@ final class AppContainerTests: XCTestCase {
         let host = try Host(name: "Target", hostname: "server.local", username: "admin", identityID: first.id)
         try await container.saveHost(host)
 
-        await container.loadRedactionSecret(for: host)
+        let redactor = await container.loadRedactionSecret(
+            for: host, connection: MockSSHConnection())
 
         let sampleOutput = Data("output containing super-secret-key-material here".utf8)
-        let redactedData = container.redacted(sampleOutput)
+        let redactedData = Data(
+            redactor.redact(String(decoding: sampleOutput, as: UTF8.self)).utf8)
         let redactedString = String(decoding: redactedData, as: UTF8.self)
         XCTAssertFalse(redactedString.contains(secretText))
         XCTAssertTrue(redactedString.contains("[REDACTED]"))
@@ -1387,6 +1764,7 @@ private actor Gate {
 final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var isClosed = false
+    private(set) var closeCallCount = 0
     var isResponsive: Bool = true
     var onTestResponsiveness: (@Sendable (TimeInterval) async -> Bool)?
     private(set) var sentData: [Data] = []
@@ -1395,6 +1773,7 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     var onExecuteCommand: (@Sendable (String) async throws -> SSHCommandResult)?
     var onResize: (@Sendable (TerminalSize) async throws -> Void)?
     var onSend: (@Sendable (Data) async throws -> Void)?
+    var onClose: (@Sendable () async -> Void)?
 
     func testResponsiveness(timeout: TimeInterval = 3.0) async -> Bool {
         if let onTestResponsiveness {
@@ -1431,6 +1810,12 @@ final class MockSSHConnection: SSHConnection, SSHCommandExecuting, @unchecked Se
     }
 
     func close() async {
+        lock.withLock {
+            closeCallCount += 1
+        }
+        if let onClose {
+            await onClose()
+        }
         lock.withLock {
             isClosed = true
             streamContinuation?.finish()
@@ -1475,6 +1860,75 @@ final class ControllableTransport: SSHTransport, @unchecked Sendable {
             return try await onConnect(host)
         }
         return MockSSHConnection()
+    }
+}
+
+final class SilentReachabilityMonitor: ReachabilityMonitoring, @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isReachable: Bool
+    private var _flipOnNextCoordinatorClock = false
+    private var _onReachabilityChange: (@Sendable (Bool) -> Void)?
+    private var _onInterfaceChange:
+        (@Sendable (NetworkInterfaceType, NetworkRoamingState) -> Void)?
+
+    init(isReachable: Bool) {
+        _isReachable = isReachable
+    }
+
+    var isReachable: Bool {
+        get { lock.withLock { _isReachable } }
+        set { lock.withLock { _isReachable = newValue } }
+    }
+
+    var currentInterfaceType: NetworkInterfaceType { .wifi }
+
+    var onReachabilityChange: (@Sendable (Bool) -> Void)? {
+        get { lock.withLock { _onReachabilityChange } }
+        set { lock.withLock { _onReachabilityChange = newValue } }
+    }
+
+    var onInterfaceChange: (@Sendable (NetworkInterfaceType, NetworkRoamingState) -> Void)? {
+        get { lock.withLock { _onInterfaceChange } }
+        set { lock.withLock { _onInterfaceChange = newValue } }
+    }
+
+    var flipOnNextCoordinatorClock: Bool {
+        get { lock.withLock { _flipOnNextCoordinatorClock } }
+        set { lock.withLock { _flipOnNextCoordinatorClock = newValue } }
+    }
+
+    func consumeClockFlip() -> Bool {
+        lock.withLock {
+            guard _flipOnNextCoordinatorClock else { return false }
+            _flipOnNextCoordinatorClock = false
+            return true
+        }
+    }
+
+    func start() {}
+    func stop() {}
+}
+
+actor ReconnectOutcomeSequence {
+    enum Outcome {
+        case success(MockSSHConnection)
+        case failure(TransportError)
+    }
+
+    private var outcomes: [Outcome]
+
+    init(_ outcomes: [Outcome]) {
+        self.outcomes = outcomes
+    }
+
+    func next() throws -> MockSSHConnection {
+        precondition(!outcomes.isEmpty, "No reconnect outcomes remain")
+        switch outcomes.removeFirst() {
+        case .success(let connection):
+            return connection
+        case .failure(let error):
+            throw error
+        }
     }
 }
 
