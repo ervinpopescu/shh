@@ -909,6 +909,8 @@ public enum ConnectionStage: String, Codable, Sendable, CaseIterable {
 
 public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
+    public var hostID: UUID?
+    public var sessionID: UUID?
     public var stage: ConnectionStage
     public var reason: String
     public var technicalDetail: String
@@ -917,6 +919,8 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
 
     public init(
         id: UUID = UUID(),
+        hostID: UUID? = nil,
+        sessionID: UUID? = nil,
         stage: ConnectionStage,
         reason: String,
         technicalDetail: String,
@@ -924,6 +928,8 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
         timestamp: Date = Date()
     ) {
         self.id = id
+        self.hostID = hostID
+        self.sessionID = sessionID
         self.stage = stage
         self.reason = reason
         self.technicalDetail = technicalDetail
