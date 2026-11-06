@@ -16,6 +16,7 @@ struct ShhLiveActivityWidget: Widget {
       DynamicIsland {
         DynamicIslandExpandedRegion(.leading) {
           Image(systemName: "terminal")
+            .foregroundStyle(statusColor(context.state.status, isStale: context.isStale))
             .accessibilityLabel("SSH session")
         }
         DynamicIslandExpandedRegion(.center) {
@@ -23,23 +24,31 @@ struct ShhLiveActivityWidget: Widget {
             Text(context.attributes.displayName)
               .font(.headline)
               .lineLimit(1)
-            Text(context.state.status.displayName)
+            Text(context.state.displayName(isStale: context.isStale))
               .font(.caption)
-              .foregroundStyle(statusColor(context.state.status))
+              .foregroundStyle(statusColor(context.state.status, isStale: context.isStale))
           }
           .accessibilityElement(children: .combine)
           .accessibilityLabel(
-            "SSH session at \(context.attributes.displayName), \(context.state.status.displayName)"
+            "SSH session at \(context.attributes.displayName), \(context.state.displayName(isStale: context.isStale))"
           )
           .accessibilityHint(
             "Displays connection status only. Does not extend background socket execution and never exposes commands or credentials."
           )
         }
         DynamicIslandExpandedRegion(.trailing) {
-          Text(context.state.updatedAt, style: .relative)
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-            .accessibilityLabel("Updated \(context.state.updatedAt.formatted())")
+          VStack(alignment: .trailing, spacing: 1) {
+            if context.isStale {
+              Text(context.state.lastConfirmedLabel)
+                .font(.caption2)
+            }
+            Text(context.state.updatedAt, style: .relative)
+              .font(.caption2)
+          }
+          .foregroundStyle(.secondary)
+          .accessibilityLabel(
+            "\(context.isStale ? context.state.lastConfirmedLabel : "Updated") \(context.state.updatedAt.formatted())"
+          )
         }
         DynamicIslandExpandedRegion(.bottom) {
           VStack(alignment: .leading, spacing: 4) {
@@ -57,16 +66,16 @@ struct ShhLiveActivityWidget: Widget {
         }
       } compactLeading: {
         Image(systemName: "terminal")
-          .foregroundStyle(statusColor(context.state.status))
+          .foregroundStyle(statusColor(context.state.status, isStale: context.isStale))
           .accessibilityLabel("SSH session")
       } compactTrailing: {
-        Image(systemName: statusSymbol(context.state.status))
-          .foregroundStyle(statusColor(context.state.status))
-          .accessibilityLabel(context.state.status.displayName)
+        Image(systemName: statusSymbol(context.state.status, isStale: context.isStale))
+          .foregroundStyle(statusColor(context.state.status, isStale: context.isStale))
+          .accessibilityLabel(context.state.displayName(isStale: context.isStale))
       } minimal: {
-        Image(systemName: statusSymbol(context.state.status))
-          .foregroundStyle(statusColor(context.state.status))
-          .accessibilityLabel("SSH session: \(context.state.status.displayName)")
+        Image(systemName: statusSymbol(context.state.status, isStale: context.isStale))
+          .foregroundStyle(statusColor(context.state.status, isStale: context.isStale))
+          .accessibilityLabel("SSH session: \(context.state.displayName(isStale: context.isStale))")
       }
       .widgetURL(
         URL(string: "shh://session/\(context.attributes.sessionID.uuidString)")!
@@ -82,7 +91,8 @@ private struct ShhLiveActivityLockScreenView: View {
     ShhLiveActivityCardView(
       displayName: context.attributes.displayName,
       hostLabel: context.attributes.hostLabel,
-      state: context.state
+      state: context.state,
+      isStale: context.isStale
     )
     .padding(.vertical, 4)
   }
@@ -101,7 +111,7 @@ private struct ShhLiveActivityStatusView: View {
           let attempt = context.state.reconnectAttempt
         {
           ProgressView(value: Double(attempt), total: 8)
-            .tint(statusColor(context.state.status))
+            .tint(statusColor(context.state.status, isStale: context.isStale))
             .accessibilityLabel("Reconnect attempt \(attempt) of 8")
         }
         if showsTimestamp {
@@ -116,7 +126,11 @@ private struct ShhLiveActivityStatusView: View {
   }
 }
 
-private func statusSymbol(_ status: ShhSSHSessionActivityAttributes.ContentState.Status) -> String {
+private func statusSymbol(
+  _ status: ShhSSHSessionActivityAttributes.ContentState.Status,
+  isStale: Bool
+) -> String {
+  if isStale { return "questionmark.circle.fill" }
   switch status {
   case .connected: return "checkmark.circle.fill"
   case .reconnecting: return "arrow.clockwise.circle.fill"
@@ -125,7 +139,11 @@ private func statusSymbol(_ status: ShhSSHSessionActivityAttributes.ContentState
   }
 }
 
-private func statusColor(_ status: ShhSSHSessionActivityAttributes.ContentState.Status) -> Color {
+private func statusColor(
+  _ status: ShhSSHSessionActivityAttributes.ContentState.Status,
+  isStale: Bool
+) -> Color {
+  if isStale { return .yellow }
   switch status {
   case .connected: return .green
   case .reconnecting: return .orange
