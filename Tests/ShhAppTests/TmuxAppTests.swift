@@ -1,9 +1,51 @@
+// swiftlint:disable file_length line_length
+
 import ShhCore
 import ShhTerminal
 import SwiftUI
 import XCTest
 
 @testable import Shh
+
+private struct CommandDialNativeTestSurface: View {
+    let model: CommandDialModel
+    @State private var navigation: CommandDialNavigation
+    let placement: CommandDialPlacement
+    let onNavigationChange: (CommandDialNavigation) -> Void
+
+    init(
+        model: CommandDialModel,
+        navigation: CommandDialNavigation,
+        placement: CommandDialPlacement,
+        onNavigationChange: @escaping (CommandDialNavigation) -> Void
+    ) {
+        self.model = model
+        _navigation = State(initialValue: navigation)
+        self.placement = placement
+        self.onNavigationChange = onNavigationChange
+    }
+
+    var body: some View {
+        let navigationBinding = Binding(
+            get: { navigation },
+            set: { value in
+                navigation = value
+                onNavigationChange(value)
+            })
+        CommandDialSurface(
+            model: model,
+            navigation: navigationBinding,
+            placement: placement,
+            size: .compact,
+            hostLabel: "Native Review Host",
+            paneLabel: "Terminal",
+            connectionStatus: "Connected",
+            onAction: { _ in },
+            onDismiss: {}
+        )
+        .environment(\.accessibilityReduceMotion, true)
+    }
+}
 
 private final class LockedString: @unchecked Sendable {
     private let lock = NSLock()
@@ -20,6 +62,7 @@ private final class LockedString: @unchecked Sendable {
 }
 
 @MainActor
+// swiftlint:disable:next type_body_length
 final class TmuxAppTests: XCTestCase {
 
     // MARK: - 1. Probe Tmux
@@ -156,9 +199,25 @@ final class TmuxAppTests: XCTestCase {
         _ = state
     }
 
-    func testCommandDialKeyboardVisibleUsesScrollableActions() {
-        XCTAssertTrue(CommandDialSurface.usesListLayout(height: 500))
-        XCTAssertFalse(CommandDialSurface.usesListLayout(height: 852))
+    func testCommandDialCompactKeyboardViewportStaysRadial() {
+        XCTAssertFalse(CommandDialSurface.usesListLayout(dynamicTypeSize: .large))
+        XCTAssertTrue(CommandDialSurface.usesListLayout(dynamicTypeSize: .accessibility3))
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: CGSize(width: 568, height: 212),
+                safeAreaInsets: EdgeInsets()
+            )
+        )
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: CGSize(width: 568, height: 500),
+                safeAreaInsets: EdgeInsets()
+            )
+        )
         var navigation = CommandDialNavigation(isOpen: true)
         let model = CommandDialModel(connected: true)
         let surface = CommandDialSurface(
@@ -184,21 +243,327 @@ final class TmuxAppTests: XCTestCase {
         // Attach the rendered action list independent of the test runner foreground app.
         hosting.view.frame = CGRect(
             x: 0, y: 0, width: window.bounds.width, height: min(500, window.bounds.height * 0.62))
+        hosting.view.setNeedsLayout()
         hosting.view.layoutIfNeeded()
+        // Resize-driven SwiftUI layout must settle before inspecting or rendering the
+        // native controls. A direct drawHierarchy immediately after changing the
+        // hosting-controller frame can export Canvas connectors while omitting the
+        // newly positioned Button layers.
+        RunLoop.current.run(until: Date().addingTimeInterval(0.7))
+        hosting.view.window?.layoutIfNeeded()
+        logNativeViewFrames(in: hosting.view)
+        let safeAreaInsets = hosting.view.safeAreaInsets
+        let viewport = hosting.view.bounds.size
+        let layout = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .trailing,
+            nodeCount: model.roots.count,
+            containerSize: viewport,
+            safeAreaInsets: EdgeInsets(
+                top: safeAreaInsets.top,
+                leading: safeAreaInsets.left,
+                bottom: safeAreaInsets.bottom,
+                trailing: safeAreaInsets.right))
+        let headerBottom = CommandDialSurface.headerBottomForLayout(
+            safeAreaTop: safeAreaInsets.top)
+        let cardFrames = layout.positions.compactMap { point in
+            CGRect(
+                x: point.x - layout.itemSize.width / 2,
+                y: point.y - layout.itemSize.height / 2,
+                width: layout.itemSize.width,
+                height: layout.itemSize.height)
+        }
+        let hubFrame = CGRect(
+            x: layout.center.x - 35, y: layout.center.y - 35, width: 70, height: 70)
+        print(
+            "command-dial measured viewport=\(viewport) safeArea=\(safeAreaInsets) "
+                + "headerBottom=\(headerBottom) hub=\(hubFrame) cards=\(cardFrames)")
+        let measuredInsets = DialLayoutInsets(
+            top: headerBottom,
+            leading: safeAreaInsets.left,
+            bottom: safeAreaInsets.bottom,
+            trailing: safeAreaInsets.right)
+        XCTAssertTrue(layout.fits(in: viewport, safeAreaInsets: measuredInsets, hubRadius: 35))
+        XCTAssertEqual(cardFrames.count, model.roots.count)
+        XCTAssertTrue(cardFrames.allSatisfy { $0.intersects(hosting.view.bounds) })
+        XCTAssertTrue(hubFrame.intersects(hosting.view.bounds))
+
         let renderer = UIGraphicsImageRenderer(bounds: hosting.view.bounds)
         let image = renderer.image { _ in
             hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
         }
         let attachment = XCTAttachment(image: image)
-        attachment.name = "command-dial-keyboard-viewport"
+        attachment.name = "command-dial-keyboard-viewport-radial-stabilized"
         attachment.lifetime = .keepAlways
         add(attachment)
+
+        let layerImage = renderer.image { context in
+            hosting.view.layer.render(in: context.cgContext)
+        }
+        let layerAttachment = XCTAttachment(image: layerImage)
+        layerAttachment.name = "command-dial-keyboard-viewport-layer-render"
+        layerAttachment.lifetime = .keepAlways
+        add(layerAttachment)
         _ = navigation
     }
 
-    func testCommandDialLeadingPlacementRadiusMatchesTrailing() {
+    private func logNativeViewFrames(in hostingView: UIView) {
+        let nativeViews = hostingView.subviews.flatMap { descendants(of: $0) }
+        for view in nativeViews {
+            let frame = view.convert(view.bounds, to: hostingView)
+            guard frame.width > 0, frame.height > 0 else { continue }
+            let identifier = view.accessibilityIdentifier ?? "-"
+            print(
+                "command-dial native \(String(describing: type(of: view))) "
+                    + "identifier=\(identifier) frame=\(frame)")
+        }
+    }
+
+    private func descendants(of view: UIView) -> [UIView] {
+        view.subviews + view.subviews.flatMap { descendants(of: $0) }
+    }
+
+    func testCommandDialCompactKeyboardViewportKeepsCardsBelowHeader() throws {
+        let compactViewport = CGSize(width: 568, height: 212)
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: compactViewport,
+                safeAreaInsets: EdgeInsets()
+            )
+        )
+
+        let normalViewport = CGSize(width: 393, height: 500)
+        XCTAssertFalse(
+            CommandDialSurface.usesListLayout(
+                dynamicTypeSize: .large,
+                size: .compact,
+                containerSize: normalViewport,
+                safeAreaInsets: EdgeInsets()
+            )
+        )
+        let layout = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .trailing,
+            nodeCount: 4,
+            containerSize: normalViewport,
+            safeAreaInsets: EdgeInsets()
+        )
+        let topCard =
+            try XCTUnwrap(layout.positions.map { $0.y }.min()) - layout.itemSize.height / 2
+        let bottomCard =
+            try XCTUnwrap(layout.positions.map { $0.y }.max()) + layout.itemSize.height / 2
+        let normalInsets = DialLayoutInsets(
+            top: CommandDialSurface.headerBottomForLayout(safeAreaTop: 0))
+        XCTAssertTrue(
+            layout.fits(
+                in: normalViewport, safeAreaInsets: normalInsets, hubRadius: 35),
+            "normal viewport geometry must clear the native header and hub")
+        XCTAssertTrue(layout.hasSeparatedTargets(hubRadius: 35))
+        XCTAssertGreaterThanOrEqual(
+            layout.itemSize.width, DialRadialLayout.minimumTargetDimension)
+        XCTAssertGreaterThanOrEqual(
+            layout.itemSize.height, DialRadialLayout.minimumTargetDimension)
+        let targetRects = try layout.positions.indices.map {
+            try XCTUnwrap(layout.targetRect(at: $0))
+        }
+        XCTAssertTrue(
+            targetRects.allSatisfy { rect in
+                rect.minY >= normalInsets.top
+                    && rect.maxY <= normalViewport.height
+                    && rect.minX >= normalInsets.leading
+                    && rect.maxX <= normalViewport.width - normalInsets.trailing
+            },
+            "visible card bounds must remain inside the measured native viewport")
+        XCTAssertGreaterThanOrEqual(topCard, normalInsets.top)
+        XCTAssertLessThanOrEqual(bottomCard, normalViewport.height)
+
+        let compactLayout = CommandDialSurface.computeRadialLayout(
+            size: .compact,
+            placement: .trailing,
+            nodeCount: 4,
+            containerSize: compactViewport,
+            safeAreaInsets: EdgeInsets()
+        )
+        let compactTopCard =
+            try XCTUnwrap(compactLayout.positions.map { $0.y }.min())
+            - compactLayout.itemSize.height / 2
+        let compactBottomCard =
+            try XCTUnwrap(compactLayout.positions.map { $0.y }.max())
+            + compactLayout.itemSize.height / 2
+        XCTAssertGreaterThanOrEqual(
+            compactTopCard, CommandDialSurface.headerBottomForLayout(safeAreaTop: 0))
+        XCTAssertLessThanOrEqual(compactBottomCard, compactViewport.height)
+    }
+
+    func testCommandDialRadialGeometrySeparatesTargetsAndPreservesAnchors() throws {
+        let cases: [(CGSize, EdgeInsets)] = [
+            (CGSize(width: 393, height: 500), EdgeInsets()),
+            (
+                CGSize(width: 393, height: 500),
+                EdgeInsets(top: 59, leading: 0, bottom: 0, trailing: 0)
+            ),
+            (CGSize(width: 568, height: 212), EdgeInsets()),
+        ]
+        for (viewport, insets) in cases {
+            let root = CommandDialSurface.computeRadialLayout(
+                size: .compact, placement: .trailing, nodeCount: 4,
+                containerSize: viewport, safeAreaInsets: insets)
+            let layoutInsets = DialLayoutInsets(
+                top: CommandDialSurface.headerBottomForLayout(safeAreaTop: insets.top),
+                leading: insets.leading, bottom: insets.bottom, trailing: insets.trailing)
+            XCTAssertTrue(
+                root.fits(in: viewport, safeAreaInsets: layoutInsets, hubRadius: 35),
+                "root geometry does not fit \(viewport) with insets \(insets)")
+            XCTAssertTrue(root.hasSeparatedTargets(hubRadius: 35))
+            for (index, point) in root.positions.enumerated() {
+                XCTAssertEqual(root.index(at: point), index)
+            }
+            for first in root.positions.indices {
+                for second in root.positions.indices where second > first {
+                    let firstRect = try XCTUnwrap(root.targetRect(at: first))
+                    let secondRect = try XCTUnwrap(root.targetRect(at: second))
+                    XCTAssertFalse(firstRect.intersects(secondRect))
+                }
+            }
+
+            let parent = try XCTUnwrap(root.point(at: 0))
+            let child = CommandDialSurface.computeChildRadialLayout(
+                size: .compact, placement: .trailing, nodeCount: 4, center: parent,
+                containerSize: viewport, safeAreaInsets: insets)
+            XCTAssertEqual(child.center, parent)
+            XCTAssertTrue(
+                child.fits(in: viewport, safeAreaInsets: layoutInsets, hubRadius: 35),
+                "child geometry does not fit \(viewport) with insets \(insets), center \(parent), "
+                    + "size \(child.itemSize)"
+            )
+            XCTAssertEqual(child.index(at: try XCTUnwrap(child.point(at: 0))), 0)
+            XCTAssertNil(child.index(at: child.center))
+        }
+    }
+
+    func testCommandDialCurrentAncestorAnchorFollowsKeyboardRotationAndResize() throws {
+        let model = CommandDialModel(connected: true)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        let cases: [(CGSize, EdgeInsets)] = [
+            (
+                CGSize(width: 393, height: 852),
+                EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0)
+            ),
+            (
+                CGSize(width: 393, height: 500),
+                EdgeInsets(top: 59, leading: 0, bottom: 8, trailing: 0)
+            ),
+            (
+                CGSize(width: 852, height: 393),
+                EdgeInsets(top: 0, leading: 0, bottom: 21, trailing: 0)
+            ),
+            (CGSize(width: 568, height: 212), EdgeInsets()),
+        ]
+
+        for (viewport, insets) in cases {
+            let root = CommandDialSurface.computeRadialLayout(
+                size: .compact, placement: .trailing, nodeCount: model.roots.count,
+                containerSize: viewport, safeAreaInsets: insets)
+            let rootIndex = try XCTUnwrap(model.roots.firstIndex(of: input))
+            let rootAnchor = try XCTUnwrap(root.point(at: rootIndex))
+            XCTAssertEqual(
+                CommandDialSurface.computeCurrentAncestorCenter(
+                    model: model, path: [], size: .compact, placement: .trailing,
+                    containerSize: viewport, safeAreaInsets: insets), root.center,
+                "root anchor must follow the current viewport")
+            XCTAssertEqual(
+                CommandDialSurface.computeCurrentAncestorCenter(
+                    model: model, path: [input.id], size: .compact, placement: .trailing,
+                    containerSize: viewport, safeAreaInsets: insets), rootAnchor,
+                "child center must use the current root layout for \(viewport)")
+
+            let inputLayout = CommandDialSurface.computeChildRadialLayout(
+                size: .compact, placement: .trailing, nodeCount: input.children.count,
+                center: rootAnchor, containerSize: viewport, safeAreaInsets: insets)
+            let navigateIndex = try XCTUnwrap(input.children.firstIndex(of: navigate))
+            let nestedAnchor = try XCTUnwrap(inputLayout.point(at: navigateIndex))
+            XCTAssertEqual(
+                CommandDialSurface.computeCurrentAncestorCenter(
+                    model: model, path: [input.id, navigate.id], size: .compact,
+                    placement: .trailing, containerSize: viewport, safeAreaInsets: insets),
+                nestedAnchor,
+                "nested child center must use current ancestor geometry for \(viewport)")
+
+            // Accessibility activation has no drag point. It must resolve to the
+            // same current anchor as ordinary radial button activation.
+            var navigation = CommandDialNavigation(isOpen: true)
+            navigation.enter(input)
+            XCTAssertEqual(
+                CommandDialSurface.computeCurrentAncestorCenter(
+                    model: model, path: navigation.path, size: .compact,
+                    placement: .trailing, containerSize: viewport, safeAreaInsets: insets),
+                rootAnchor)
+            navigation.enter(navigate)
+            XCTAssertEqual(
+                CommandDialSurface.computeCurrentAncestorCenter(
+                    model: model, path: navigation.path, size: .compact,
+                    placement: .trailing, containerSize: viewport, safeAreaInsets: insets),
+                nestedAnchor)
+        }
+    }
+
+    func testCommandDialNativeResizeAndRotationEvidence() throws {
+        var navigation = CommandDialNavigation(isOpen: true)
+        let model = CommandDialModel(connected: true)
+        func surface() -> CommandDialSurface {
+            CommandDialSurface(
+                model: model,
+                navigation: Binding(get: { navigation }, set: { navigation = $0 }),
+                placement: .trailing,
+                size: .compact,
+                hostLabel: "Resize Host",
+                paneLabel: "Terminal",
+                connectionStatus: "Connected",
+                onAction: { _ in }, onDismiss: {}
+            )
+        }
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        let hosting = UIHostingController(rootView: surface())
+        window.rootViewController = hosting
+        window.makeKeyAndVisible()
+        defer { window.isHidden = true }
+
+        func capture(_ name: String, frame: CGRect) {
+            hosting.view.frame = frame
+            hosting.view.layoutIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.25))
+            let renderer = UIGraphicsImageRenderer(bounds: hosting.view.bounds)
+            let image = renderer.image { _ in
+                hosting.view.drawHierarchy(in: hosting.view.bounds, afterScreenUpdates: true)
+            }
+            let attachment = XCTAttachment(image: image)
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+
+        capture("dial-native-root", frame: CGRect(x: 0, y: 0, width: 393, height: 852))
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        navigation.enter(input)
+        hosting.rootView = surface()
+        capture(
+            "dial-native-input-keyboard-resize",
+            frame: CGRect(x: 0, y: 0, width: 393, height: 500))
+
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        navigation.enter(navigate)
+        hosting.rootView = surface()
+        capture("dial-native-nested-rotation", frame: CGRect(x: 0, y: 0, width: 852, height: 393))
+        XCTAssertEqual(navigation.path, [input.id, navigate.id])
+    }
+
+    func testCommandDialLeadingPlacementRadiusMatchesTrailing() throws {
         let insets = EdgeInsets(top: 59, leading: 0, bottom: 34, trailing: 0)
         let phoneSize = CGSize(width: 393, height: 852)
+        let pointTolerance: CGFloat = 1e-9
 
         let leadingPhone = CommandDialSurface.computeRadialLayout(
             size: .compact,
@@ -215,7 +580,12 @@ final class TmuxAppTests: XCTestCase {
             safeAreaInsets: insets
         )
 
-        XCTAssertEqual(leadingPhone.orbitRadius, trailingPhone.orbitRadius)
+        try assertMirrored(
+            leading: leadingPhone, trailing: trailingPhone, width: phoneSize.width,
+            tolerance: pointTolerance)
+        XCTAssertEqual(
+            leadingPhone.orbitRadius, trailingPhone.orbitRadius, accuracy: pointTolerance,
+            "mirror arithmetic may differ by a few floating-point ULPs, far below one point")
         XCTAssertGreaterThan(leadingPhone.orbitRadius, 132)
 
         let ipadSize = CGSize(width: 1024, height: 1366)
@@ -236,8 +606,47 @@ final class TmuxAppTests: XCTestCase {
             safeAreaInsets: ipadInsets
         )
 
-        XCTAssertEqual(leadingIPad.orbitRadius, trailingIPad.orbitRadius)
-        XCTAssertEqual(leadingIPad.orbitRadius, 330)
+        try assertMirrored(
+            leading: leadingIPad, trailing: trailingIPad, width: ipadSize.width,
+            tolerance: pointTolerance)
+        XCTAssertEqual(
+            leadingIPad.orbitRadius, trailingIPad.orbitRadius, accuracy: pointTolerance)
+        XCTAssertGreaterThan(
+            leadingIPad.orbitRadius, 330,
+            "non-uniform regular fans report their actual outermost point distance")
+
+        let asymmetricTrailing = CommandDialSurface.computeRadialLayout(
+            size: .regular,
+            placement: .trailing,
+            nodeCount: 3,
+            containerSize: ipadSize,
+            safeAreaInsets: ipadInsets
+        )
+        XCTAssertGreaterThan(
+            abs(asymmetricTrailing.orbitRadius - trailingIPad.orbitRadius), 1,
+            "a material count/radius perturbation must not be hidden by the point tolerance")
+    }
+
+    private func assertMirrored(
+        leading: DialRadialLayout, trailing: DialRadialLayout,
+        width: CGFloat, tolerance: CGFloat
+    ) throws {
+        XCTAssertEqual(leading.center.x + trailing.center.x, width, accuracy: tolerance)
+        XCTAssertEqual(leading.center.y, trailing.center.y, accuracy: tolerance)
+        XCTAssertEqual(leading.itemSize, trailing.itemSize)
+        XCTAssertEqual(leading.positions.count, trailing.positions.count)
+        for (leadingPoint, trailingPoint) in zip(leading.positions, trailing.positions) {
+            XCTAssertEqual(leadingPoint.x + trailingPoint.x, width, accuracy: tolerance)
+            XCTAssertEqual(leadingPoint.y, trailingPoint.y, accuracy: tolerance)
+        }
+        for index in leading.positions.indices {
+            let leadingFrame = try XCTUnwrap(leading.targetRect(at: index))
+            let trailingFrame = try XCTUnwrap(trailing.targetRect(at: index))
+            XCTAssertEqual(leadingFrame.width, trailingFrame.width, accuracy: tolerance)
+            XCTAssertEqual(leadingFrame.height, trailingFrame.height, accuracy: tolerance)
+            XCTAssertEqual(leadingFrame.minX + trailingFrame.maxX, width, accuracy: tolerance)
+            XCTAssertEqual(leadingFrame.minY, trailingFrame.minY, accuracy: tolerance)
+        }
     }
 
     func testCommandDialHierarchyVisualEvidence() throws {
@@ -285,6 +694,170 @@ final class TmuxAppTests: XCTestCase {
         capture("dial-navigate")
         navigation.back()
         XCTAssertEqual(navigation.path, ["root.input"])
+    }
+
+    func testCommandDialNativeHostedViewportAccessibilityPathsAndReducedMotion() throws {
+        let model = CommandDialModel(
+            pinnedLiterals: ["echo ready"], connected: true)
+        let viewports = [
+            CGSize(width: 393, height: 500), CGSize(width: 568, height: 212),
+        ]
+
+        for placement in CommandDialPlacement.allCases {
+            for viewport in viewports {
+                var navigation = CommandDialNavigation(isOpen: true)
+                let surface = CommandDialNativeTestSurface(
+                    model: model,
+                    navigation: navigation,
+                    placement: placement,
+                    onNavigationChange: { navigation = $0 })
+                let window = UIWindow(frame: UIScreen.main.bounds)
+                let hosting = UIHostingController(rootView: surface)
+                hosting.loadViewIfNeeded()
+                hosting.view.frame = CGRect(origin: .zero, size: viewport)
+                window.rootViewController = hosting
+                window.makeKeyAndVisible()
+                hosting.beginAppearanceTransition(true, animated: false)
+                hosting.endAppearanceTransition()
+                defer {
+                    hosting.beginAppearanceTransition(false, animated: false)
+                    hosting.endAppearanceTransition()
+                    window.endEditing(true)
+                    window.resignKey()
+                    window.isHidden = true
+                    window.rootViewController = nil
+                }
+                hosting.view.setNeedsLayout()
+                hosting.view.layoutIfNeeded()
+                _ = RunLoop.main.run(mode: .common, before: Date())
+                XCTAssertTrue(hosting.view.window === window)
+
+                func activate(_ identifier: String) throws {
+                    let target = try XCTUnwrap(
+                        nativeActionTarget(identifier: identifier, in: hosting.view),
+                        "missing native accessibility control \(identifier)")
+                    assertNativeAccessibilityFrame(target, in: hosting.view)
+                    if let view = target as? UIView {
+                        XCTAssertTrue(
+                            view.accessibilityActivate(),
+                            "VoiceOver activation must use the real control path for \(identifier)")
+                    } else {
+                        let selector = NSSelectorFromString("accessibilityActivate")
+                        let implementation = target.method(for: selector)
+                        typealias AccessibilityActivate =
+                            @convention(c) (AnyObject, Selector) -> Bool
+                        let activate = unsafeBitCast(implementation, to: AccessibilityActivate.self)
+                        let activated = activate(target, selector)
+                        XCTAssertTrue(
+                            activated,
+                            "VoiceOver activation must use the real accessibility path "
+                                + "for \(identifier)")
+                    }
+                    hosting.view.setNeedsLayout()
+                    hosting.view.layoutIfNeeded()
+                    _ = RunLoop.main.run(mode: .common, before: Date())
+                    XCTAssertTrue(hosting.view.window === window)
+                }
+
+                func walk(_ nodes: [DialNode], path: [String]) throws {
+                    for node in nodes where node.isEnabled {
+                        try activate(nodeAccessibilityID(node))
+                        if node.children.isEmpty {
+                            XCTAssertEqual(navigation.path, path)
+                        } else {
+                            let childPath = path + [node.id]
+                            XCTAssertEqual(navigation.path, childPath)
+                            try walk(node.children, path: childPath)
+                            try activate("command-dial-home")
+                            XCTAssertEqual(navigation.path, path)
+                            try activate(nodeAccessibilityID(node))
+                            XCTAssertEqual(navigation.path, childPath)
+                            try activate("command-dial-home")
+                            XCTAssertEqual(navigation.path, path)
+                        }
+                    }
+                }
+
+                let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+                let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+                try activate(nodeAccessibilityID(input))
+                try activate(nodeAccessibilityID(navigate))
+                let nestedPath = navigation.path
+                hosting.view.frame = CGRect(
+                    x: 0, y: 0, width: viewport.width, height: min(viewport.height, 500))
+                hosting.view.setNeedsLayout()
+                hosting.view.layoutIfNeeded()
+                XCTAssertEqual(navigation.path, nestedPath)
+                try activate("command-dial-home")
+                XCTAssertEqual(navigation.path, [input.id])
+                try activate("command-dial-home")
+                XCTAssertTrue(navigation.path.isEmpty)
+
+                try walk(model.roots, path: [])
+            }
+        }
+    }
+
+    private func nodeAccessibilityID(_ node: DialNode) -> String {
+        "command-dial-node-\(node.id.replacingOccurrences(of: ".", with: "-"))"
+    }
+
+    private func nativeActionTarget(identifier: String, in root: UIView) -> NSObject? {
+        let views = ([root] + descendants(of: root)).filter {
+            $0.accessibilityIdentifier == identifier
+        }
+        if let view = views.max(by: {
+            ($0.bounds.width * $0.bounds.height) < ($1.bounds.width * $1.bounds.height)
+        }) {
+            return view
+        }
+
+        for container in [root] + descendants(of: root) {
+            guard let elements = container.accessibilityElements as? [NSObject] else { continue }
+            if let element = findAccessibilityTarget(
+                identifier: identifier, in: elements)
+            {
+                return element
+            }
+        }
+        return nil
+    }
+
+    private func findAccessibilityTarget(
+        identifier: String, in elements: [NSObject]) -> NSObject?
+    {
+        for element in elements {
+            let elementIdentifier = element.value(forKey: "accessibilityIdentifier") as? String
+            if elementIdentifier == identifier {
+                return element
+            }
+            let childKeys = ["accessibilityElements", "accessibilityChildren", "children"]
+            for key in childKeys where element.responds(to: NSSelectorFromString(key)) {
+                let value = element.value(forKey: key)
+                if let children = value as? [NSObject],
+                    let match = findAccessibilityTarget(identifier: identifier, in: children)
+                {
+                    return match
+                }
+            }
+        }
+        return nil
+    }
+
+    private func assertNativeAccessibilityFrame(_ target: NSObject, in root: UIView) {
+        let renderedFrame: CGRect
+        let voiceOverFrame: CGRect
+        if let view = target as? UIView {
+            renderedFrame = view.convert(view.bounds, to: root)
+            voiceOverFrame = view.accessibilityFrame
+        } else {
+            renderedFrame = (target.value(forKey: "accessibilityFrame") as? NSValue)?.cgRectValue ?? .zero
+            voiceOverFrame = renderedFrame
+        }
+        XCTAssertGreaterThanOrEqual(renderedFrame.width + 0.001, 44)
+        XCTAssertGreaterThanOrEqual(renderedFrame.height + 0.001, 44)
+        XCTAssertGreaterThanOrEqual(voiceOverFrame.width + 0.001, 44)
+        XCTAssertGreaterThanOrEqual(voiceOverFrame.height + 0.001, 44)
     }
 
     func testCommandDialSubmenusAndMultiplexerArtifacts() throws {
