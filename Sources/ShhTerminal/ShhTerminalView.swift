@@ -3,6 +3,7 @@ import SwiftUI
 import UIKit
 import SwiftTerm
 import ShhCore
+import os.lock
 
 private extension UIColor {
     convenience init(terminalColor: TerminalColor) {
@@ -134,6 +135,30 @@ public struct ShhTerminalView: UIViewRepresentable {
     }
 }
 
+private struct TerminalInteractionState: Sendable {
+    var mouseReporting = false
+    var alternateScreen = false
+}
+
+private final class TerminalInteractionStateBox: Sendable {
+    private let lock = OSAllocatedUnfairLock(initialState: TerminalInteractionState())
+
+    func snapshot() -> TerminalInteractionState {
+        lock.withLock { $0 }
+    }
+
+    func update(mouseReporting: Bool? = nil, alternateScreen: Bool? = nil) {
+        lock.withLock { state in
+            if let mouseReporting {
+                state.mouseReporting = mouseReporting
+            }
+            if let alternateScreen {
+                state.alternateScreen = alternateScreen
+            }
+        }
+    }
+}
+
 public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBridge, TerminalFirstResponderBridge, UIGestureRecognizerDelegate {
     weak var controller: ShhTerminalController?
     private var lastAppliedBoundsSize: CGSize = .zero
@@ -143,9 +168,7 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     private var scrollReducerState = TerminalScrollIntentReducer.State()
     private var suspendedMouseReporting = false
     private var previousAllowMouseReporting = true
-    private let terminalInteractionStateLock = NSLock()
-    private var terminalMouseReporting = false
-    private var terminalAlternateScreen = false
+    private nonisolated let terminalInteractionStateBox = TerminalInteractionStateBox()
 
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
@@ -159,23 +182,17 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         fatalError("init(coder:) has not been implemented")
     }
 
-    private var terminalInteractionState: (mouseReporting: Bool, alternateScreen: Bool) {
-        terminalInteractionStateLock.lock()
-        defer { terminalInteractionStateLock.unlock() }
-        return (terminalMouseReporting, terminalAlternateScreen)
+    private var terminalInteractionState: TerminalInteractionState {
+        terminalInteractionStateBox.snapshot()
     }
 
     public nonisolated override func mouseModeChanged(source: Terminal) {
-        terminalInteractionStateLock.lock()
-        terminalMouseReporting = source.mouseMode != .off
-        terminalInteractionStateLock.unlock()
+        terminalInteractionStateBox.update(mouseReporting: source.mouseMode != .off)
         super.mouseModeChanged(source: source)
     }
 
     public nonisolated override func bufferActivated(source: Terminal) {
-        terminalInteractionStateLock.lock()
-        terminalAlternateScreen = source.isCurrentBufferAlternate
-        terminalInteractionStateLock.unlock()
+        terminalInteractionStateBox.update(alternateScreen: source.isCurrentBufferAlternate)
         super.bufferActivated(source: source)
     }
 
