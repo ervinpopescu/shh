@@ -103,6 +103,7 @@ struct CommandDialSurface: View {
     let onAction: (DialActionIdentifier) -> Void
     let onDismiss: () -> Void
     let haptics: any DialHaptics
+    let surfaceLocalSafeAreaInsets: EdgeInsets
 
     @Environment(\.colorSchemeContrast) private var contrast
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -117,13 +118,17 @@ struct CommandDialSurface: View {
             ? ShhDialPalette.blue : ShhDialPalette.lavender
     }
 
+    /// The parent supplies `surfaceLocalSafeAreaInsets` in this surface's coordinate space.
+    /// Standalone and preview callers use zero when their bounds already exclude parent
+    /// safe-area or occlusion constraints.
     init(
         model: CommandDialModel, navigation: Binding<CommandDialNavigation>,
         triggerDrag: DialPointerEvent? = nil, placement: CommandDialPlacement,
         size: CommandDialSize, hostLabel: String, paneLabel: String,
         connectionStatus: String = "Disconnected",
         onAction: @escaping (DialActionIdentifier) -> Void,
-        onDismiss: @escaping () -> Void, haptics: any DialHaptics = NoopDialHaptics()
+        onDismiss: @escaping () -> Void, haptics: any DialHaptics = NoopDialHaptics(),
+        surfaceLocalSafeAreaInsets: EdgeInsets = EdgeInsets()
     ) {
         self.model = model
         self._navigation = navigation
@@ -136,6 +141,7 @@ struct CommandDialSurface: View {
         self.onAction = onAction
         self.onDismiss = onDismiss
         self.haptics = haptics
+        self.surfaceLocalSafeAreaInsets = surfaceLocalSafeAreaInsets
     }
 
     private var currentNodes: [DialNode] {
@@ -161,10 +167,15 @@ struct CommandDialSurface: View {
 
     var body: some View {
         GeometryReader { proxy in
+            // The parent owns the coordinate-space conversion. This value is already
+            // local to the dial surface and is shared by every geometry calculation.
+            let surfaceSafeAreaInsets = surfaceLocalSafeAreaInsets
             let center = Self.baseCenter(
                 size: size, placement: placement,
-                containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets)
-            let layout = radialLayout(center: center, proxy: proxy)
+                containerSize: proxy.size, safeAreaInsets: surfaceSafeAreaInsets)
+            let layout = radialLayout(
+                center: center, containerSize: proxy.size,
+                safeAreaInsets: surfaceSafeAreaInsets)
             ZStack {
                 ShhDialPalette.mantle
                     .opacity(contrast == .increased ? 0.88 : 0.72)
@@ -175,7 +186,7 @@ struct CommandDialSurface: View {
 
                 dialHeader(proxy: proxy)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-                    .padding(.top, max(proxy.safeAreaInsets.top, 8) + 8)
+                    .padding(.top, max(surfaceSafeAreaInsets.top, 8) + 8)
                     .padding(.horizontal, 14)
                     .zIndex(3)
 
@@ -185,9 +196,10 @@ struct CommandDialSurface: View {
 
                 if Self.usesListLayout(
                     dynamicTypeSize: dynamicTypeSize, size: size,
-                    containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets
+                    containerSize: proxy.size, safeAreaInsets: surfaceSafeAreaInsets
                 ) {
-                    accessibilityLayout(proxy: proxy).zIndex(4)
+                    accessibilityLayout(safeAreaInsets: surfaceSafeAreaInsets)
+                        .zIndex(4)
                 } else {
                     wheel(layout: layout, baseCenter: center).zIndex(2)
                 }
@@ -204,7 +216,7 @@ struct CommandDialSurface: View {
                 guard let event,
                     !Self.usesListLayout(
                         dynamicTypeSize: dynamicTypeSize, size: size,
-                        containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets
+                        containerSize: proxy.size, safeAreaInsets: surfaceSafeAreaInsets
                     )
                 else { return }
                 let frame = proxy.frame(in: .global)
@@ -300,6 +312,7 @@ extension CommandDialSurface {
         let baseSize = standardItemSize(for: size)
         let insets = layoutInsets(for: safeAreaInsets)
         let candidates = size == .compact ? compactItemSizes(base: baseSize) : [baseSize]
+        var firstFittingCandidate: DialRadialLayout?
         for itemSize in candidates {
             let candidate = DialRadialLayout.cornerFitting(
                 center: center,
@@ -308,10 +321,12 @@ extension CommandDialSurface {
                 itemRadius: itemRadius, itemSize: itemSize, count: nodeCount,
                 placement: placement, bounds: containerSize, safeAreaInsets: insets,
                 requireSeparatedTargets: true)
-            if candidate.fits(in: containerSize, safeAreaInsets: insets, hubRadius: itemRadius) {
-                return candidate
-            }
+            guard candidate.fits(in: containerSize, safeAreaInsets: insets, hubRadius: itemRadius)
+            else { continue }
+            firstFittingCandidate = firstFittingCandidate ?? candidate
+            if isAngularLayout(candidate) { return candidate }
         }
+        if let firstFittingCandidate { return firstFittingCandidate }
         return DialRadialLayout.cornerFitting(
             center: center,
             preferredRadius: preferredRadius(size: size, height: containerSize.height),
@@ -362,16 +377,25 @@ extension CommandDialSurface {
         let baseSize = standardItemSize(for: size)
         let insets = layoutInsets(for: safeAreaInsets)
         let candidates = size == .compact ? compactItemSizes(base: baseSize) : [baseSize]
+        var firstFittingCandidate: DialRadialLayout?
         for itemSize in candidates {
             let candidate = DialRadialLayout.inwardFan(
                 center: center, preferredRadius: min(142, max(78, containerSize.height * 0.2)),
                 itemRadius: itemRadius, itemSize: itemSize, count: nodeCount,
                 placement: placement, bounds: containerSize, safeAreaInsets: insets,
                 requireSeparatedTargets: true)
-            if candidate.fits(in: containerSize, safeAreaInsets: insets, hubRadius: itemRadius) {
-                return candidate
-            }
+            guard candidate.fits(in: containerSize, safeAreaInsets: insets, hubRadius: itemRadius)
+            else { continue }
+            firstFittingCandidate = firstFittingCandidate ?? candidate
+            if isAngularLayout(candidate) { return candidate }
         }
+        if let angularFallback = inwardAngularFallback(
+            center: center, itemSizes: candidates, itemRadius: itemRadius, count: nodeCount,
+            placement: placement, containerSize: containerSize, safeAreaInsets: insets)
+        {
+            return angularFallback
+        }
+        if let firstFittingCandidate { return firstFittingCandidate }
         return DialRadialLayout.inwardFan(
             center: center, preferredRadius: min(142, max(78, containerSize.height * 0.2)),
             itemRadius: itemRadius, itemSize: candidates.last ?? baseSize, count: nodeCount,
@@ -379,18 +403,197 @@ extension CommandDialSurface {
             requireSeparatedTargets: true)
     }
 
-    private func radialLayout(center: CGPoint, proxy: GeometryProxy) -> DialRadialLayout {
+    /// Finds a bounded uniform-polar fan when Core's fitting fallback is nonangular.
+    /// Candidate headings point toward the usable interior or its inward axes; the fan
+    /// midpoint, not every ray, is inward so broad existing Core spans remain available.
+    private static func inwardAngularFallback(
+        center: CGPoint, itemSizes: [CGSize], itemRadius: CGFloat, count: Int,
+        placement: CommandDialPlacement, containerSize: CGSize,
+        safeAreaInsets: DialLayoutInsets
+    ) -> DialRadialLayout? {
+        guard count > 0, containerSize.width.isFinite, containerSize.height.isFinite,
+            containerSize.width > 0, containerSize.height > 0,
+            center.x.isFinite, center.y.isFinite, itemRadius.isFinite, itemRadius > 0,
+            safeAreaInsets.leading.isFinite, safeAreaInsets.trailing.isFinite,
+            safeAreaInsets.top.isFinite, safeAreaInsets.bottom.isFinite,
+            safeAreaInsets.leading >= 0, safeAreaInsets.trailing >= 0,
+            safeAreaInsets.top >= 0, safeAreaInsets.bottom >= 0
+        else { return nil }
+        let usableCenter = CGPoint(
+            x: (safeAreaInsets.leading + containerSize.width - safeAreaInsets.trailing) / 2,
+            y: (safeAreaInsets.top + containerSize.height - safeAreaInsets.bottom) / 2)
+        let dx = usableCenter.x - center.x
+        let dy = usableCenter.y - center.y
+        guard usableCenter.x.isFinite, usableCenter.y.isFinite else { return nil }
+        let epsilon: CGFloat = 0.001
+        var headings: [CGFloat] = []
+        if hypot(dx, dy) >= epsilon {
+            headings.append(atan2(dy, dx))
+        }
+        if abs(dx) >= epsilon { headings.append(dx > 0 ? 0 : .pi) }
+        if abs(dy) >= epsilon { headings.append(dy > 0 ? .pi / 2 : -.pi / 2) }
+        if headings.isEmpty {
+            headings.append(placement == .leading ? 0 : .pi)
+        }
+        var uniqueHeadings: [CGFloat] = []
+        for heading in headings where heading.isFinite {
+            if !uniqueHeadings.contains(where: {
+                abs(atan2(sin(heading - $0), cos(heading - $0))) < epsilon
+            }) {
+                uniqueHeadings.append(heading)
+            }
+        }
+        guard !uniqueHeadings.isEmpty else { return nil }
+
+        var seenSizes: [CGSize] = []
+        for requestedSize in itemSizes {
+            guard requestedSize.width.isFinite, requestedSize.height.isFinite,
+                requestedSize.width > 0, requestedSize.height > 0
+            else { continue }
+            let itemSize = CGSize(
+                width: max(DialRadialLayout.minimumTargetDimension, requestedSize.width),
+                height: max(DialRadialLayout.minimumTargetDimension, requestedSize.height))
+            guard !seenSizes.contains(itemSize) else { continue }
+            seenSizes.append(itemSize)
+            let baseSpan = min(1.45, max(0.68, CGFloat(count - 1) * 0.34))
+            let spans: [CGFloat] = [baseSpan, max(baseSpan, 1.9), 2.5, .pi]
+            for heading in uniqueHeadings {
+                for span in spans {
+                    let start = heading - span / 2
+                    let end = heading + span / 2
+                    guard
+                        let minimumRadius = requiredInwardOrbitRadius(
+                            center: center, itemSize: itemSize, itemRadius: itemRadius,
+                            startAngle: start, endAngle: end, count: count),
+                        let maximumRadius = maximumInwardOrbitRadius(
+                            center: center, itemSize: itemSize, itemRadius: itemRadius,
+                            startAngle: start, endAngle: end, count: count,
+                            bounds: containerSize, safeAreaInsets: safeAreaInsets),
+                        minimumRadius <= maximumRadius
+                    else { continue }
+                    // Use the interior of a real feasible interval to avoid relying on
+                    // floating-point contact at either containment/separation boundary.
+                    let orbitRadius =
+                        maximumRadius > minimumRadius
+                        ? minimumRadius + (maximumRadius - minimumRadius) / 2
+                        : minimumRadius
+                    let candidate = DialRadialLayout(
+                        center: center, orbitRadius: orbitRadius, itemRadius: itemRadius,
+                        itemSize: itemSize, startAngle: start, endAngle: end, count: count)
+                    guard
+                        candidate.fits(
+                            in: containerSize, safeAreaInsets: safeAreaInsets,
+                            hubRadius: itemRadius),
+                        candidate.itemSize.width >= DialRadialLayout.minimumTargetDimension,
+                        candidate.itemSize.height >= DialRadialLayout.minimumTargetDimension
+                    else { continue }
+                    return candidate
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func requiredInwardOrbitRadius(
+        center: CGPoint, itemSize: CGSize, itemRadius: CGFloat,
+        startAngle: CGFloat, endAngle: CGFloat, count: Int
+    ) -> CGFloat? {
+        guard count > 0, startAngle.isFinite, endAngle.isFinite else { return nil }
+        var required = itemRadius + hypot(itemSize.width / 2, itemSize.height / 2)
+        let angles = (0..<count).map { index in
+            count > 1
+                ? startAngle + CGFloat(index) * (endAngle - startAngle) / CGFloat(count - 1)
+                : (startAngle + endAngle) / 2
+        }
+        for first in angles.indices {
+            for second in angles.indices where second > first {
+                let dx = cos(angles[second]) - cos(angles[first])
+                let dy = sin(angles[second]) - sin(angles[first])
+                let xRadius = abs(dx) > 0.000001 ? itemSize.width / abs(dx) : .infinity
+                let yRadius = abs(dy) > 0.000001 ? itemSize.height / abs(dy) : .infinity
+                required = max(required, min(xRadius, yRadius))
+            }
+        }
+        return required.isFinite ? required : nil
+    }
+
+    private static func maximumInwardOrbitRadius(
+        center: CGPoint, itemSize: CGSize, itemRadius: CGFloat,
+        startAngle: CGFloat, endAngle: CGFloat, count: Int, bounds: CGSize,
+        safeAreaInsets: DialLayoutInsets
+    ) -> CGFloat? {
+        let minimumX = max(
+            safeAreaInsets.leading + itemSize.width / 2,
+            safeAreaInsets.leading + itemRadius)
+        let maximumX = min(
+            bounds.width - safeAreaInsets.trailing - itemSize.width / 2,
+            bounds.width - safeAreaInsets.trailing - itemRadius)
+        let minimumY = max(
+            safeAreaInsets.top + itemSize.height / 2,
+            safeAreaInsets.top + itemRadius)
+        let maximumY = min(
+            bounds.height - safeAreaInsets.bottom - itemSize.height / 2,
+            bounds.height - safeAreaInsets.bottom - itemRadius)
+        guard center.x >= safeAreaInsets.leading + itemRadius,
+            center.x <= bounds.width - safeAreaInsets.trailing - itemRadius,
+            center.y >= safeAreaInsets.top + itemRadius,
+            center.y <= bounds.height - safeAreaInsets.bottom - itemRadius,
+            minimumX <= maximumX, minimumY <= maximumY
+        else { return nil }
+        var maximumRadius = CGFloat.greatestFiniteMagnitude
+        for index in 0..<count {
+            let angle =
+                count > 1
+                ? startAngle + CGFloat(index) * (endAngle - startAngle) / CGFloat(count - 1)
+                : (startAngle + endAngle) / 2
+            let xDirection = cos(angle)
+            let yDirection = sin(angle)
+            if xDirection > 0.000001 {
+                maximumRadius = min(maximumRadius, (maximumX - center.x) / xDirection)
+            } else if xDirection < -0.000001 {
+                maximumRadius = min(maximumRadius, (minimumX - center.x) / xDirection)
+            }
+            if yDirection > 0.000001 {
+                maximumRadius = min(maximumRadius, (maximumY - center.y) / yDirection)
+            } else if yDirection < -0.000001 {
+                maximumRadius = min(maximumRadius, (minimumY - center.y) / yDirection)
+            }
+        }
+        guard maximumRadius.isFinite else { return nil }
+        return max(0, maximumRadius)
+    }
+
+    /// Identifies the current Core angularFan and mirrored angular producers without
+    /// expanding Core's policy API. This private check intentionally relies on their
+    /// uniform polar representation and matching metadata; a future nonuniform producer
+    /// must receive a local test/update rather than silently changing candidate choice.
+    private static func isAngularLayout(_ layout: DialRadialLayout) -> Bool {
+        guard layout.count > 1 else { return true }
+        let step = (layout.endAngle - layout.startAngle) / CGFloat(layout.count - 1)
+        let tolerance = CGFloat.ulpOfOne * max(1, abs(layout.orbitRadius)) * 64
+        return layout.positions.enumerated().allSatisfy { index, position in
+            let angle = layout.startAngle + CGFloat(index) * step
+            let expected = CGPoint(
+                x: layout.center.x + cos(angle) * layout.orbitRadius,
+                y: layout.center.y + sin(angle) * layout.orbitRadius)
+            return hypot(position.x - expected.x, position.y - expected.y) <= tolerance
+        }
+    }
+
+    private func radialLayout(
+        center: CGPoint, containerSize: CGSize, safeAreaInsets: EdgeInsets
+    ) -> DialRadialLayout {
         if navigation.path.isEmpty {
             return Self.computeRadialLayout(
                 size: size, placement: placement, nodeCount: currentNodes.count,
-                containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets)
+                containerSize: containerSize, safeAreaInsets: safeAreaInsets)
         }
         let activeCenter = Self.computeCurrentAncestorCenter(
             model: model, path: navigation.path, size: size, placement: placement,
-            containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets)
+            containerSize: containerSize, safeAreaInsets: safeAreaInsets)
         return Self.computeChildRadialLayout(
             size: size, placement: placement, nodeCount: currentNodes.count,
-            center: activeCenter, containerSize: proxy.size, safeAreaInsets: proxy.safeAreaInsets)
+            center: activeCenter, containerSize: containerSize, safeAreaInsets: safeAreaInsets)
     }
 
     private func dialHeader(proxy: GeometryProxy) -> some View {
@@ -439,9 +642,9 @@ extension CommandDialSurface {
         }
     }
 
-    private func accessibilityLayout(proxy: GeometryProxy) -> some View {
+    private func accessibilityLayout(safeAreaInsets: EdgeInsets) -> some View {
         VStack(spacing: 12) {
-            Spacer().frame(height: max(proxy.safeAreaInsets.top, 8) + 45)
+            Spacer().frame(height: max(safeAreaInsets.top, 8) + 45)
             ScrollView {
                 LazyVStack(spacing: 10) {
                     ForEach(currentNodes) { node in accessibilityNodeButton(node) }
@@ -451,7 +654,7 @@ extension CommandDialSurface {
             }
             backButton
                 .padding(.horizontal, 14)
-                .padding(.bottom, max(proxy.safeAreaInsets.bottom, 12))
+                .padding(.bottom, max(safeAreaInsets.bottom, 12))
         }
     }
 
@@ -590,11 +793,10 @@ extension CommandDialSurface {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(
+                    .strokeBorder(
                         highlighted ? accent : accent.opacity(0.42), lineWidth: highlighted ? 2 : 1)
             )
             .shadow(color: .black.opacity(0.32), radius: 8, y: 4)
-            .scaleEffect(highlighted && !reduceMotion ? 1.05 : 1)
             .contentShape(RoundedRectangle(cornerRadius: 20))
         }
         .buttonStyle(.plain)

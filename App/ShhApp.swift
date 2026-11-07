@@ -394,9 +394,19 @@ struct HostDetailView: View {
         }
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if let session = container.activeSession, session.hostID == host.id {
-                NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding()
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    NavigationLink("Open session", destination: SessionView())
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color(uiColor: .systemBackground))
+                .overlay(alignment: .top) { Divider() }
             }
         }
     }
@@ -1252,6 +1262,17 @@ struct PendingCommand: Identifiable {
     let command: String
 }
 
+private struct SessionNavigationChromeModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content
+            .toolbarColorScheme(colorScheme, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
+    }
+}
+
 // swiftlint:disable:next type_body_length
 struct SessionView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -1389,7 +1410,11 @@ struct SessionView: View {
                         onAction: handleDialAction,
                         onDismiss: dismissCommandDial,
                         haptics: container.commandDialPreferences.hapticsEnabled
-                            ? SystemDialHaptics() : NoopDialHaptics()
+                            ? SystemDialHaptics() : NoopDialHaptics(),
+                        // This ZStack is inside SessionView's safe-area-respecting VStack,
+                        // above the accessory bar and drawer, so its parent-local occlusion
+                        // contract is zero rather than a second window-safe-area reservation.
+                        surfaceLocalSafeAreaInsets: EdgeInsets()
                     )
                 } else {
                     CommandDialTrigger(
@@ -1415,6 +1440,7 @@ struct SessionView: View {
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .navigationBarTitleDisplayMode(.inline)
+        .modifier(SessionNavigationChromeModifier())
         .toolbar(isZenMode ? .hidden : .visible, for: .navigationBar)
         .navigationBarHidden(isZenMode)
         .toolbar {
