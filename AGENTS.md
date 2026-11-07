@@ -77,6 +77,17 @@ just --list
 just doctor device=iphone
 ```
 
+The four session-navigation chrome acceptance scenarios are isolated runs, not one scheme-wide batch: invoke each exact test identifier below separately on its own newly created disposable iPhone simulator, with fresh System/Mocha defaults for the first scenario. A whole-target batch does not satisfy the per-scenario fresh-device or fresh-System-preference requirement.
+
+```sh
+xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeFreshSystemMocha -resultBundlePath tmp/e2e/session-chrome-system-mocha.xcresult -skipPackagePluginValidation -collect-test-diagnostics never
+xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeDarkAppMochaTerminal -resultBundlePath tmp/e2e/session-chrome-dark-mocha.xcresult -skipPackagePluginValidation -collect-test-diagnostics never
+xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeLightAppMochaTerminal -resultBundlePath tmp/e2e/session-chrome-light-mocha.xcresult -skipPackagePluginValidation -collect-test-diagnostics never
+xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeLightAppLatteTerminal -resultBundlePath tmp/e2e/session-chrome-light-latte.xcresult -skipPackagePluginValidation -collect-test-diagnostics never
+```
+
+The chrome tests supply `--demo` and `SHH_DEMO_MODE=1` themselves; set OS appearance to light with official `simctl ui` before each run and clean up only the simulator created for that run. The original native dial test also asserts the production HostDetailView `Open session` control has an actual hittable frame of at least 44 points before near-edge activation; see the [`docs/PRODUCT.md` validation boundary](docs/PRODUCT.md#validation-boundary) for the exact isolated invocation.
+
 `just doctor` checks Xcode, XcodeGen, Swift, Python, and the selected simulator.
 The default developer directory is
 `/Applications/Xcode.app/Contents/Developer`; set `DEVELOPER_DIR` to another
@@ -97,6 +108,7 @@ installation.
 | Run all app tests on iPhone | `just test iphone` | Uses the selected available iPhone simulator and writes an `.xcresult` under `tmp/e2e/`. |
 | Run all app tests on iPad | `just test ipad` | Same flow for the selected iPad simulator. |
 | Run focused app tests | `just test-focused test=ShhAppTests/AppContainerTests device=iphone` | The `test` value can name a test class or method. |
+| Run the native Command Dial UI test | `xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/CommandDialSystemUITests/testCommandDialProductionAccessibilityPath -resultBundlePath tmp/e2e/command-dial.xcresult -skipPackagePluginValidation -collect-test-diagnostics never` | Run this exact test on one fresh disposable iPhone simulator; the test supplies `--demo` and `SHH_DEMO_MODE=1`, so inspect kept screenshots and hierarchy attachments, then terminate and delete that exact simulator. This scheme is intentionally outside `just test` and `just ci`. |
 | Build the app | `just build iphone` | Generates the project and builds for a simulator or explicit device UDID. |
 | Inspect simulator/device readiness | `just doctor device=ipad` | Pass `udid=<id>` to inspect a specific target. |
 | List simulators and connected devices | `just devices` | Read-only inventory of simulator states and connected physical devices. |
@@ -169,6 +181,7 @@ and result bundles are timestamped under `tmp/e2e/` and should not be committed.
 | `Tests/ShhTerminalTests/` | Headless terminal, key encoding, resize, and input coordinator tests. |
 | `Tests/ShhVoiceTests/` | Audio format/recording, transcriber, provider, and Whisper model tests. |
 | `Tests/ShhAppTests/` | App-container, SwiftUI behavior, lifecycle, File Provider, restoration, and feature integration tests. |
+| `Tests/ShhCommandDialUITests/` | Dedicated native XCUIApplication acceptance path for the production Command Dial demo flow; excluded from the default app-test scheme. |
 | `Tests/verify-*.sh` | CI checks for App Group entitlements, compiled/source icons, and Bonjour Info.plist declarations. |
 | `fixtures/docker-sshd/` | Optional Alpine OpenSSH server for manual interoperability checks. |
 | `.github/workflows/ci.yml` | Documentation-only classification, package tests, generated-project builds, icon/App Group checks, and simulator matrix. |
@@ -310,7 +323,10 @@ UDIDs, signing material, or secrets to source.
    `Tests/<Target>Tests` directory. Name tests after the behavior or source
    seam they protect.
 3. For UI behavior, prefer existing accessibility identifiers and app tests;
-   use `just test-focused` before the full simulator matrix when iterating.
+   use `just test-focused` before the full simulator matrix when iterating. The
+   production Command Dial path must be validated through
+   `ShhCommandDialUITests` and `XCUIApplication`; do not treat the hosted
+   `ShhAppTests` accessibility-tree traversal as equivalent native-app proof.
 4. Run `just format-check`, `just lint`, and the narrowest relevant tests. Run
    `just check` before handoff when dependencies and host tooling are available.
 5. Run `just generate` and a build after changing `project.yml`, entitlements,

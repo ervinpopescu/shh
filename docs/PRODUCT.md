@@ -91,7 +91,9 @@ requires Apple provisioning and physical-device validation for release use.
   active SSH, Mosh, and forwarding work when iOS permits it. Foreground return
   probes the existing transport and reconnects/restores the last tmux or Herdr
   target if the socket did not survive. Indefinite background TCP execution is
-  not promised.
+  not promised. The open Command Dial and its current submenu path are preserved
+  across a brief background/return to the same live session, not across process
+  death, session replacement, explicit dismissal, or leaving the session.
 
 Evidence is in `Tests/ShhSSHTests/PortForwardingTests.swift`,
 `Tests/ShhCoreTests/PortForwardingModelTests.swift`,
@@ -158,6 +160,34 @@ The standard automated coverage is:
   components, in-process SSH integration, terminal behavior, and voice logic.
 - `just test iphone` and `just test ipad` for the generated app test scheme on
   available simulators.
+- The dedicated `ShhCommandDialUITests` XCUITest bundle drives the real demo app
+  through `XCUIApplication`, including the production host/trust/session path,
+  required Input -> Navigate -> Cursor activation, parent restoration, close,
+  reopen, and native target frames of at least 44 points. The setup path also
+  asserts the production HostDetailView `Open session` control's actual native
+  frame is at least 44 points, then activates it near its lower edge. Run the
+  original dial acceptance directly on one fresh disposable iPhone simulator
+  with this exact test selection:
+  `xcodebuild test -project Shh.xcodeproj -scheme ShhCommandDialUITests -destination 'platform=iOS Simulator,id=<fresh-udid>' -only-testing:ShhCommandDialUITests/CommandDialSystemUITests/testCommandDialProductionAccessibilityPath -resultBundlePath tmp/e2e/command-dial.xcresult -skipPackagePluginValidation -collect-test-diagnostics never`.
+  The test supplies `--demo` and `SHH_DEMO_MODE=1`; this scheme is intentionally
+  not part of the default `just test` or `just ci` matrix.
+- Session-navigation chrome acceptance is four separate-only invocations, each
+  on its own newly created disposable iPhone simulator, rather than a whole
+  `ShhCommandDialUITests` batch. Use the exact identifiers
+  `-only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeFreshSystemMocha`,
+  `-only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeDarkAppMochaTerminal`,
+  `-only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeLightAppMochaTerminal`,
+  and `-only-testing:ShhCommandDialUITests/SessionNavigationChromeUITests/testSessionNavigationChromeLightAppLatteTerminal`.
+  Set OS appearance to light with official `simctl ui` before each run; the
+  first scenario additionally requires untouched System/Mocha defaults. A
+  whole-target batch does not satisfy these fresh-device and fresh-System
+  preconditions. The chrome tests supply `--demo` and `SHH_DEMO_MODE=1`.
+- The hosted `ShhAppTests` Command Dial coverage remains responsible for
+  deterministic model navigation, leading/trailing placement, compact 393x500
+  and 568x212 layout/lifecycle geometry, resize path preservation, and the
+  existing largest Dynamic Type host check. Hosted accessibility activation is
+  not equivalent to the native XCUIApplication proof and is intentionally not
+  duplicated there.
 - `just ci` for package tests, generated unsigned app and extension builds,
   icon and entitlement checks, and both simulator test passes.
 - GitHub CodeQL for the manually built Swift targets.
