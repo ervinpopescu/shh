@@ -143,6 +143,9 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     private var scrollReducerState = TerminalScrollIntentReducer.State()
     private var suspendedMouseReporting = false
     private var previousAllowMouseReporting = true
+    private let terminalInteractionStateLock = NSLock()
+    private var terminalMouseReporting = false
+    private var terminalAlternateScreen = false
 
     init(frame: CGRect, options: TerminalOptions, controller: ShhTerminalController) {
         self.controller = controller
@@ -154,6 +157,26 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    private var terminalInteractionState: (mouseReporting: Bool, alternateScreen: Bool) {
+        terminalInteractionStateLock.lock()
+        defer { terminalInteractionStateLock.unlock() }
+        return (terminalMouseReporting, terminalAlternateScreen)
+    }
+
+    public nonisolated override func mouseModeChanged(source: Terminal) {
+        terminalInteractionStateLock.lock()
+        terminalMouseReporting = source.mouseMode != .off
+        terminalInteractionStateLock.unlock()
+        super.mouseModeChanged(source: source)
+    }
+
+    public nonisolated override func bufferActivated(source: Terminal) {
+        terminalInteractionStateLock.lock()
+        terminalAlternateScreen = source.isCurrentBufferAlternate
+        terminalInteractionStateLock.unlock()
+        super.bufferActivated(source: source)
     }
 
     private func setupContextAwareScrollGesture() {
@@ -192,13 +215,13 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         _ gestureRecognizer: UIGestureRecognizer
     ) -> Bool {
         guard gestureRecognizer === scrollGesture else { return true }
-        let terminal = getTerminal()
+        let state = terminalInteractionState
         guard !hasActiveSelection else { return false }
         // Mouse reporting is application input. This is also required for a
         // primary-screen tmux session: its wheel binding, not SwiftTerm's local
         // scroll view, owns the session scrollback. With reporting disabled,
         // primary-screen scrolling falls through to the native scroll view.
-        return terminal.mouseMode != .off || terminal.isCurrentBufferAlternate
+        return state.mouseReporting || state.alternateScreen
     }
 
     @objc private func handleScroll(_ recognizer: UIPanGestureRecognizer) {
@@ -228,25 +251,26 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         velocityY: Double = 0,
         location: CGPoint = .zero
     ) {
-        let terminal = getTerminal()
-        let mouseReporting = terminal.mouseMode != .off
+        let dimensions = terminalDimensions
+        let state = terminalInteractionState
+        let mouseReporting = state.mouseReporting
         // Mouse wheel ticks represent touch movement through a stable viewport
         // grid, rather than every rendered glyph row. Without this normalization
         // a large phone/iPad terminal emits multiple wheel packets for one touch
         // update merely because its font creates more visible rows.
-        let referenceRows = max(1, min(terminal.rows, 24))
+        let referenceRows = max(1, min(dimensions.rows, 24))
         let rowHeight =
             mouseReporting
             ? max(1, bounds.height / CGFloat(referenceRows))
-            : max(1, bounds.height / CGFloat(max(1, terminal.rows)))
+            : max(1, bounds.height / CGFloat(max(1, dimensions.rows)))
         let context = TerminalScrollContext(
-            surface: terminal.isCurrentBufferAlternate ? .alternate : .primary,
+            surface: state.alternateScreen ? .alternate : .primary,
             mouseReporting: mouseReporting,
             rowHeight: rowHeight,
-            rowCount: terminal.rows,
+            rowCount: dimensions.rows,
             copyModeFallbackAvailable: controller?.isCopyModeFallbackAvailable ?? false
         )
-        if phase == .began && terminal.mouseMode != .off {
+        if phase == .began && mouseReporting {
             previousAllowMouseReporting = allowMouseReporting
             allowMouseReporting = false
             suspendedMouseReporting = true
@@ -258,7 +282,7 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
         )
         let intents = scrollReducer.reduce(event, context: context, state: &scrollReducerState)
         for intent in intents {
-            applyScrollIntent(intent, terminal: terminal, at: location)
+            applyScrollIntent(intent, at: location)
         }
         if phase == .ended || phase == .cancelled {
             if suspendedMouseReporting {
@@ -270,46 +294,29 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
 
     internal func applyScrollIntent(
         _ intent: TerminalScrollIntent,
-        terminal: SwiftTerm.Terminal,
         at point: CGPoint
     ) {
         switch intent {
         case .native:
             break
         case .mouseWheel(let direction):
-            let columnWidth = max(1, bounds.width / CGFloat(max(1, terminal.cols)))
-            let rowHeight = max(1, bounds.height / CGFloat(max(1, terminal.rows)))
-            let column = max(0, min(terminal.cols - 1, Int(floor(point.x / columnWidth))))
-            let row = max(0, min(terminal.rows - 1, Int(floor(point.y / rowHeight))))
+            let dimensions = terminalDimensions
+            let columnWidth = max(1, bounds.width / CGFloat(max(1, dimensions.cols)))
+            let rowHeight = max(1, bounds.height / CGFloat(max(1, dimensions.rows)))
+            let column = max(0, min(dimensions.cols - 1, Int(floor(point.x / columnWidth))))
+            let row = max(0, min(dimensions.rows - 1, Int(floor(point.y / rowHeight))))
             // Use SwiftTerm's encoder rather than constructing CSI bytes here.
             // It selects SGR, UTF-8, URXVT, or legacy encoding negotiated by the
             // application, while keeping wheel buttons 4 and 5 (64 and 65).
             let button = direction == .up ? 4 : 5
-            let buttonFlags = terminal.encodeButton(
-                button: button,
-                release: false,
-                shift: false,
-                meta: false,
-                control: false
-            )
-            terminal.sendEvent(buttonFlags: buttonFlags, x: column, y: row)
+            sendMouseEvent(button: button, release: false, col: column, row: row)
         case .key(let key):
-            let bytes: [UInt8]
             switch key {
-            case .up:
-                bytes =
-                    terminal.applicationCursor
-                    ? EscapeSequences.moveUpApp
-                    : EscapeSequences.moveUpNormal
-            case .down:
-                bytes =
-                    terminal.applicationCursor
-                    ? EscapeSequences.moveDownApp
-                    : EscapeSequences.moveDownNormal
-            case .pageUp: bytes = EscapeSequences.cmdPageUp
-            case .pageDown: bytes = EscapeSequences.cmdPageDown
+            case .up: sendKeyUp()
+            case .down: sendKeyDown()
+            case .pageUp: send(data: EscapeSequences.cmdPageUp[...])
+            case .pageDown: send(data: EscapeSequences.cmdPageDown[...])
             }
-            insertText(String(decoding: bytes, as: UTF8.self))
         case .copyModeFallback:
             controller?.requestCopyModeFallback()
         }
@@ -458,15 +465,16 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     // MARK: - TerminalEngineBridge
 
     var bracketedPasteMode: Bool {
-        getTerminal().bracketedPasteMode
+        terminalStateSnapshot().bracketedPasteMode
     }
 
     var isAlternateScreenActive: Bool {
-        getTerminal().isCurrentBufferAlternate
+        terminalInteractionState.alternateScreen
     }
 
     var currentSize: TerminalSize {
-        TerminalSize(columns: getTerminal().cols, rows: getTerminal().rows)
+        let dimensions = terminalDimensions
+        return TerminalSize(columns: dimensions.cols, rows: dimensions.rows)
     }
 
     func feed(data: Data) {
@@ -475,11 +483,11 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
     }
 
     func resize(size: TerminalSize) {
-        getTerminal().resize(cols: size.columns, rows: size.rows)
+        super.resize(cols: size.columns, rows: size.rows)
     }
 
     func changeScrollback(_ limit: Int) {
-        getTerminal().changeScrollback(limit)
+        super.changeScrollback(limit)
     }
 
     func setTheme(_ theme: TerminalThemePreset) {
@@ -527,14 +535,8 @@ public final class ShhInternalTerminalHostView: TerminalView, TerminalEngineBrid
             let lines = pageContent.components(separatedBy: "\n")
             return lines.suffix(limit).joined(separator: "\n")
         }
-        let terminal = getTerminal()
-        let dims = terminal.getDims()
-        var lines: [String] = []
-        for r in 0..<dims.rows {
-            if let line = terminal.getLine(row: r) {
-                lines.append(line.translateToString(trimRight: true))
-            }
-        }
+        let dimensions = terminalDimensions
+        var lines = visibleRowsText(0..<dimensions.rows)
         while lines.last?.isEmpty == true {
             lines.removeLast()
         }

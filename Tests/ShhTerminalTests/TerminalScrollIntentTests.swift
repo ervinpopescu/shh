@@ -254,6 +254,31 @@ extension TerminalScrollIntentTests {
     }
 
     @MainActor
+    func testHostViewBridgeReadsCopiedSwiftTermState() {
+        let controller = ShhTerminalController()
+        let hostView = ShhInternalTerminalHostView(
+            frame: .zero,
+            options: .default,
+            controller: controller
+        )
+        hostView.terminalDelegate = ShhTerminalView.Coordinator(controller: controller)
+        controller.attachEngine(hostView, firstResponder: hostView)
+
+        XCTAssertEqual(hostView.currentSize.columns, 80)
+        XCTAssertEqual(hostView.currentSize.rows, 24)
+        XCTAssertFalse(hostView.bracketedPasteMode)
+        XCTAssertFalse(hostView.isAlternateScreenActive)
+
+        hostView.feed(text: "\u{1b}[?2004h\u{1b}[?1049h")
+
+        XCTAssertTrue(hostView.bracketedPasteMode)
+        XCTAssertTrue(hostView.isAlternateScreenActive)
+
+        hostView.feed(text: "\u{1b}[?1049l")
+        XCTAssertFalse(hostView.isAlternateScreenActive)
+    }
+
+    @MainActor
     func testHostViewMouseModeTranslatesSwipesToWheelEvents() async {
         let controller = ShhTerminalController()
         let hostView = ShhInternalTerminalHostView(
@@ -297,9 +322,9 @@ extension TerminalScrollIntentTests {
         await fulfillment(of: [wheelUp], timeout: 1)
         output.expectation = nil
 
-        let terminal = hostView.getTerminal()
-        let columnWidth = max(1, hostView.bounds.width / CGFloat(max(1, terminal.cols)))
-        let rowHeight = max(1, hostView.bounds.height / CGFloat(max(1, terminal.rows)))
+        let dimensions = hostView.terminalDimensions
+        let columnWidth = max(1, hostView.bounds.width / CGFloat(max(1, dimensions.cols)))
+        let rowHeight = max(1, hostView.bounds.height / CGFloat(max(1, dimensions.rows)))
         let column = Int(floor(100 / columnWidth)) + 1
         let row = Int(floor(100 / rowHeight)) + 1
         XCTAssertEqual(
