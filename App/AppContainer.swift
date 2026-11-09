@@ -3004,6 +3004,10 @@ final class AppContainer: ObservableObject {
                             !self.reconnectState.isReconnecting
                         {
                             self.pendingForegroundRecoverySessionIDs.remove(sessionID)
+                            // The fresh admission is itself the foreground
+                            // recovery task. Do not let connect() cancel its
+                            // owning lifecycle task during first-session reset.
+                            self.foregroundRecoveryTask = nil
                             let recoveryTask = await self.reconnectCoordinator.start {
                                 [weak self] _ in
                                 guard let self else { throw TransportError.cancelled }
