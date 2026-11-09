@@ -234,6 +234,7 @@ final class SessionRuntime {
     ) async -> Bool {
         let previous = connection
         let pending = invalidateCallbacks()
+        clearMoshProjection()
         transportGeneration &+= 1
         reconnectGeneration &+= 1
         reconnectState = .connecting(attempt: Int(reconnectGeneration))

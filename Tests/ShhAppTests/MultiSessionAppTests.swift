@@ -192,6 +192,8 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertNil(container.previewData)
         XCTAssertNil(container.previewErrorMessage)
 
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        await container.closeSession(id: sessionBID)
         container.selectSession(id: sessionAID)
         await repository.delayRead(failing: true)
         let editor = Task { @MainActor in try? await container.openEditor(for: file) }
@@ -401,7 +403,11 @@ final class MultiSessionAppTests: XCTestCase {
         let sessionAID = try XCTUnwrap(container.selectedSessionID)
         await container.connect(to: hostB)
         let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
         container.selectSession(id: sessionAID)
+        // Force the selection path to query the delayed controller instead of
+        // reusing the projection captured during B's initial connection.
+        runtimeB.clearMoshProjection()
         delayedB.delayReads()
 
         container.selectSession(id: sessionBID)

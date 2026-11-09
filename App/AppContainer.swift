@@ -1963,11 +1963,13 @@ final class AppContainer: ObservableObject {
         guard !runtime.reconnectState.isReconnecting else { return }
 
         let recoverySessionID = runtime.session.id
+        let recoveryLifecycleGeneration = lifecycleGeneration
         pendingForegroundRecoverySessionIDs.remove(recoverySessionID)
         beginNetworkRecovery(for: recoverySessionID)
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard self.networkRecoverySessionID == recoverySessionID,
+            guard self.lifecycleGeneration == recoveryLifecycleGeneration,
+                self.networkRecoverySessionID == recoverySessionID,
                 !self.isExplicitDisconnect(for: recoverySessionID),
                 !self.isSceneInBackground,
                 self.sessionRuntimes[recoverySessionID]?.host.id == host.id,
@@ -1991,11 +1993,13 @@ final class AppContainer: ObservableObject {
         guard !isSceneInBackground else {
             throw TransportError.cancelled
         }
+        let reconnectLifecycleGeneration = lifecycleGeneration
         let recoverySessionID = networkRecoverySessionID ?? activeSession?.id
         guard let recoverySessionID,
             let runtime = sessionRuntimes[recoverySessionID],
             runtime.host.id == host.id,
             !isExplicitDisconnect(for: recoverySessionID),
+            lifecycleGeneration == reconnectLifecycleGeneration,
             networkRecoverySessionID != nil || selectedSessionID == recoverySessionID
         else {
             throw TransportError.cancelled
@@ -2072,6 +2076,12 @@ final class AppContainer: ObservableObject {
         let connection: any SSHConnection
         do {
             let selectedIdentity = try await resolveIdentity(for: host)
+            guard lifecycleGeneration == reconnectLifecycleGeneration,
+                !isSceneInBackground,
+                !isExplicitDisconnect(for: sessionID)
+            else {
+                throw TransportError.cancelled
+            }
             // Identity resolution may yield to SwiftUI layout. Capture the
             // latest measured geometry immediately before PTY initialization.
             runtime.terminalController.synchronizeViewportMeasurement()
@@ -2093,6 +2103,13 @@ final class AppContainer: ObservableObject {
                     trustEvaluator: trustStore,
                     initialSize: initialSize
                 )
+            }
+            guard lifecycleGeneration == reconnectLifecycleGeneration,
+                !isSceneInBackground,
+                !isExplicitDisconnect(for: sessionID)
+            else {
+                await connection.close()
+                throw TransportError.cancelled
             }
         } catch {
             let reason: String
@@ -2155,7 +2172,10 @@ final class AppContainer: ObservableObject {
             sessionID: session.id,
             validityToken: redactionValidityToken
         )
-        guard sessionRuntimes[session.id] === runtime,
+        guard lifecycleGeneration == reconnectLifecycleGeneration,
+            !isSceneInBackground,
+            !isExplicitDisconnect(for: sessionID),
+            sessionRuntimes[session.id] === runtime,
             runtime.session.state == .connecting,
             isCurrentRedactionValidity(
                 sessionID: session.id, token: redactionValidityToken),
@@ -2978,6 +2998,7 @@ final class AppContainer: ObservableObject {
             reconnectState = .cancelled
         }
         for runtime in reconnectingRuntimes {
+            invalidateRedactionValidity(for: runtime.session.id)
             runtime.markReconnectCancelled()
             if selectedSessionID == runtime.session.id {
                 _ = synchronizeSelectedSessionProjection(for: runtime)
