@@ -372,7 +372,10 @@ final class AppContainer: ObservableObject {
     /// Legacy projection of the selected transport. SessionRuntime owns the
     /// connection and all terminal lifecycle callbacks.
     var connection: (any SSHConnection)? {
-        sessionRuntime?.connection
+        guard let runtime = sessionRuntime, runtime.session.state == .connected else {
+            return nil
+        }
+        return runtime.connection
     }
     private(set) var sessionRuntimes: [UUID: SessionRuntime] = [:]
     private var sessionOrder: [UUID] = []
@@ -1434,7 +1437,32 @@ final class AppContainer: ObservableObject {
         restoringTmuxSessionID: String? = nil,
         sessionID: UUID? = nil
     ) async {
+        if isConnectingSession {
+            guard let selectedSessionID,
+                let runtime = sessionRuntimes[selectedSessionID],
+                runtime.host.id == host.id,
+                runtime.reconnectState.isReconnecting
+            else { return }
+            await cancelReconnect()
+        }
         guard !isConnectingSession else { return }
+        if sessionID == nil,
+            let selectedSessionID,
+            let selectedRuntime = sessionRuntimes[selectedSessionID],
+            selectedRuntime.host.id == host.id,
+            selectedRuntime.session.state != .connected,
+            selectedRuntime.session.state != .connecting
+        {
+            sessionRuntimes.removeValue(forKey: selectedSessionID)
+            sessionOrder.removeAll { $0 == selectedSessionID }
+            explicitlyDisconnectedSessionIDs.remove(selectedSessionID)
+            pendingForegroundRecoverySessionIDs.remove(selectedSessionID)
+            deferredInterfaceRecoverySessionIDs.remove(selectedSessionID)
+            self.selectedSessionID = nil
+            activeSession = nil
+            activeHost = nil
+            updateOpenSessions()
+        }
         guard sessionRuntimes.count < Self.maximumConcurrentSessions else {
             let failure = ConnectionFailure(
                 hostID: host.id,
@@ -1638,6 +1666,12 @@ final class AppContainer: ObservableObject {
                 }
                 return
             }
+            if terminalController.hasMeasuredViewport {
+                let measuredSize = terminalController.size
+                runtimeTerminalController.handleResize(
+                    columns: measuredSize.columns, rows: measuredSize.rows)
+                runtimeTerminalController.flushResize()
+            }
             let runtime = SessionRuntime(
                 host: host,
                 session: session,
@@ -1784,6 +1818,9 @@ final class AppContainer: ObservableObject {
                 sessionOrder.removeAll { $0 == session.id }
                 updateOpenSessions()
             }
+            guard isCurrentRedactionValidity(
+                sessionID: session.id, token: redactionValidityToken)
+            else { return }
             let shouldRestorePriorSelection =
                 pendingConnectingSession == nil || pendingConnectingSession?.id == session.id
             if pendingConnectingSession?.id == session.id {
@@ -1833,6 +1870,9 @@ final class AppContainer: ObservableObject {
                 sessionOrder.removeAll { $0 == session.id }
                 updateOpenSessions()
             }
+            guard isCurrentRedactionValidity(
+                sessionID: session.id, token: redactionValidityToken)
+            else { return }
             let shouldRestorePriorSelection =
                 pendingConnectingSession == nil || pendingConnectingSession?.id == session.id
             if pendingConnectingSession?.id == session.id {
@@ -2409,10 +2449,13 @@ final class AppContainer: ObservableObject {
             let recoveryRuntime,
             sessionRuntimes[recoverySessionID] === recoveryRuntime
         else {
+            // A failed initial connection can remove its runtime before the
+            // reconnect banner is cancelled. The coordinator still needs to
+            // publish the user's explicit cancellation in that state.
             if recoveryWasSelected, recoveryRuntime == nil {
                 activeSession?.state = .disconnected
-                reconnectState = .cancelled
             }
+            reconnectState = .cancelled
             updateOpenSessions()
             updateIdleTimerState()
             return

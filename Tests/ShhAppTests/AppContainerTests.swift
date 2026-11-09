@@ -293,7 +293,11 @@ final class AppContainerTests: XCTestCase {
         let transport = ControllableTransport()
         transport.onConnect = { _ in mockConnection }
 
-        let container = AppContainer(credentialStore: credStore, transport: transport)
+        let container = AppContainer(
+            credentialStore: credStore,
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: false)
+        )
         try await container.catalog.save(identity)
         let host = try Host(name: "Host", hostname: "host.invalid", username: "user", identityID: identity.id)
 
