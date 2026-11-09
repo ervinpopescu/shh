@@ -368,6 +368,7 @@ final class AppContainer: ObservableObject {
     private(set) var hasObservedTransportError = false
     private var lifecycleGeneration = 0
     private var foregroundRecoveryTask: Task<Void, Never>?
+    private var isForegroundAdmissionInProgress = false
     private(set) var pendingTrustHost: Host?
     /// Legacy projection of the selected transport. SessionRuntime owns the
     /// connection and all terminal lifecycle callbacks.
@@ -1507,8 +1508,10 @@ final class AppContainer: ObservableObject {
 
         if isFirstSession {
             liveActivityManager.endAll()
-            foregroundRecoveryTask?.cancel()
-            foregroundRecoveryTask = nil
+            if !isForegroundAdmissionInProgress {
+                foregroundRecoveryTask?.cancel()
+                foregroundRecoveryTask = nil
+            }
             tmuxRefreshGeneration += 1
             herdrRefreshGeneration += 1
             stopHerdrPolling()
@@ -1529,7 +1532,9 @@ final class AppContainer: ObservableObject {
             moshSessionInfo = nil
             networkRoamingState = nil
             activeHerdrWorkspaceID = nil
-            await reconnectCoordinator.cancel()
+            if !isForegroundAdmissionInProgress {
+                await reconnectCoordinator.cancel()
+            }
             reconnectState = .idle
             cancelSendImageForLifecycle()
             closePreview()
@@ -3008,10 +3013,14 @@ final class AppContainer: ObservableObject {
                             // recovery task. Do not let connect() cancel its
                             // owning lifecycle task during first-session reset.
                             self.foregroundRecoveryTask = nil
+                            self.isForegroundAdmissionInProgress = true
                             let recoveryTask = await self.reconnectCoordinator.start {
                                 [weak self] _ in
                                 guard let self else { throw TransportError.cancelled }
                                 await self.connect(to: host, sessionID: sessionID)
+                                await MainActor.run {
+                                    self.isForegroundAdmissionInProgress = false
+                                }
                             }
                             await recoveryTask.value
                         } else if !self.reconnectState.isReconnecting {
