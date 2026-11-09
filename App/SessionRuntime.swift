@@ -56,6 +56,7 @@ final class SessionRuntime {
 
     private var callbackGeneration: UInt64 = 0
     private var transportGeneration: UInt64 = 0
+    private var acceptsForegroundProbeEvents = false
     private var eventReadyWaiters: [CheckedContinuation<Void, Never>] = []
     /// Marks a transport before invoking close so timeout paths cannot invoke
     /// a second close on the same object during later teardown attempts.
@@ -116,7 +117,19 @@ final class SessionRuntime {
     }
 
     func accepts(_ token: CallbackToken) -> Bool {
-        token == callbackToken && session.state == .connected
+        token == callbackToken
+            && (session.state == .connected || acceptsForegroundProbeEvents)
+    }
+
+    /// Keeps the existing event stream admitted while a foreground probe marks
+    /// the session as connecting in the selected projection. A real transport
+    /// replacement still invalidates callbacks before installing its runtime.
+    func beginForegroundProbe() {
+        acceptsForegroundProbeEvents = true
+    }
+
+    func endForegroundProbe() {
+        acceptsForegroundProbeEvents = false
     }
 
     func setRedactor(_ redactor: Redactor) {

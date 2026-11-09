@@ -851,10 +851,14 @@ final class AppContainer: ObservableObject {
         }
 
         guard let currentRuntime = sessionRuntimes[id], currentRuntime === runtime else { return }
-        let target = restorationTarget(for: runtime)
-        let metadata = restorationMetadata(
-            hostID: runtime.host.id, sessionID: runtime.session.id, target: target)
-        _ = enqueueRestorationSave(metadata)
+        // A newly admitted runtime may still be resolving its restoration
+        // target. Do not persist an empty target from the selection boundary
+        // over the stored last-used target before that resolution completes.
+        if runtime.session.state == .connected, let target = restorationTarget(for: runtime) {
+            let metadata = restorationMetadata(
+                hostID: runtime.host.id, sessionID: runtime.session.id, target: target)
+            _ = enqueueRestorationSave(metadata)
+        }
     }
 
     func closeSession(id: UUID) async {
@@ -1737,6 +1741,10 @@ final class AppContainer: ObservableObject {
                 return
             }
 
+            // Refresh before restoration so a successful listing cannot clear
+            // an explicit missing-session error reported by the target handler.
+            await refreshTmuxState()
+
             // Auto-attach tmux session if requested by host preferences or restored.
             // The attachment boundary performs the final viewport reconciliation
             // after any awaited target validation. Without a target, still resize
@@ -1796,9 +1804,6 @@ final class AppContainer: ObservableObject {
                 publishForwardingSessions(started)
                 self.startForwardingMonitoring(manager: pfManager, ownerContext: auxiliaryContext)
 
-                Task { [weak self] in
-                    await self?.refreshTmuxState()
-                }
                 if customSFTPRepository is DemoSFTPRepository {
                     await setupSFTPForHost(host)
                 } else {
@@ -2829,9 +2834,12 @@ final class AppContainer: ObservableObject {
                 } ?? false
             let pendingForegroundRecoveryIsActive =
                 self.pendingForegroundRecoverySessionIDs.contains { sessionID in
-                    guard let runtime = self.sessionRuntimes[sessionID] else { return false }
-                    return !self.isExplicitDisconnect(for: sessionID)
-                        && runtime.session.state != .connected
+                    if let runtime = self.sessionRuntimes[sessionID] {
+                        return !self.isExplicitDisconnect(for: sessionID)
+                            && runtime.session.state != .connected
+                    }
+                    return self.pendingConnectingSession?.id == sessionID
+                        || self.activeSession?.id == sessionID
                 }
             let hasConnectedSessions = self.sessionRuntimes.values.contains {
                 $0.session.state == .connected
@@ -2887,6 +2895,7 @@ final class AppContainer: ObservableObject {
                     if !connectedRuntimes.isEmpty {
                         // Mark active/probed sessions as connecting during probe
                         for runtime in connectedRuntimes {
+                            runtime.beginForegroundProbe()
                             runtime.updateSessionState(.connecting)
                             if runtime.session.id == self.selectedSessionID {
                                 self.isForegroundRecoveryInProgress = true
@@ -2904,6 +2913,7 @@ final class AppContainer: ObservableObject {
                                     guard let self else { return }
                                     let isResponsive = await targetConnection.testResponsiveness(
                                         timeout: 2.5)
+                                    runtime.endForegroundProbe()
 
                                     // Stale-generation guards: ensure state was not superseded
                                     guard self.lifecycleGeneration == generation,
@@ -2984,10 +2994,19 @@ final class AppContainer: ObservableObject {
                             || self.activeSession?.state == .disconnected
                     {
                         self.isForegroundRecoveryInProgress = false
-                        // The foreground transition already invalidated any
-                        // prior coordinator generation. Preserve its backoff
-                        // if a newer coordinator is still active.
-                        if !self.reconnectState.isReconnecting {
+                        // An initial connect can finish after backgrounding and
+                        // be discarded before a runtime is admitted. Reuse its
+                        // session admission token for one fresh foreground connect.
+                        if let sessionID = self.pendingForegroundRecoverySessionIDs.first,
+                            self.sessionRuntimes[sessionID] == nil,
+                            !self.reconnectState.isReconnecting
+                        {
+                            self.pendingForegroundRecoverySessionIDs.remove(sessionID)
+                            await self.connect(to: host, sessionID: sessionID)
+                        } else if !self.reconnectState.isReconnecting {
+                            // The foreground transition already invalidated any
+                            // prior coordinator generation. Preserve its backoff
+                            // if a newer coordinator is still active.
                             if let sessionID = self.activeSession?.id {
                                 self.handleConnectionDrop(host: host, sessionID: sessionID)
                             }
@@ -3029,6 +3048,11 @@ final class AppContainer: ObservableObject {
         // retryable state so foreground return does not strand them as connecting.
         let reconnectingRuntimes = sessionRuntimes.values.filter {
             $0.reconnectState.isReconnecting || $0.session.state == .connecting
+        }
+        if let pendingSessionID = pendingConnectingSession?.id,
+            !isExplicitDisconnect(for: pendingSessionID)
+        {
+            pendingForegroundRecoverySessionIDs.insert(pendingSessionID)
         }
         if sessionRuntimes.count == 1 {
             for runtime in reconnectingRuntimes
@@ -3536,8 +3560,8 @@ final class AppContainer: ObservableObject {
         isSceneInBackground = false
 
         cancelSendImageForLifecycle()
-        resetVoiceState()
         await cancelVoiceRecording()
+        resetVoiceState()
         // Voice cancellation is global, but all session state remains scoped to
         // the captured owner after this await.
 
@@ -3615,7 +3639,9 @@ final class AppContainer: ObservableObject {
             }
         }
 
-        guard ownsCapturedRuntime() else { return }
+        if ownerSessionID != nil {
+            guard ownsCapturedRuntime() else { return }
+        }
         if ownsSelectedProjection() {
             moshStateTask?.cancel()
             moshStateTask = nil
