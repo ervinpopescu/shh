@@ -1743,7 +1743,9 @@ final class AppContainer: ObservableObject {
 
             // Refresh before restoration so a successful listing cannot clear
             // an explicit missing-session error reported by the target handler.
-            await refreshTmuxState()
+            if targetSession != nil {
+                await refreshTmuxState()
+            }
 
             // Auto-attach tmux session if requested by host preferences or restored.
             // The attachment boundary performs the final viewport reconciliation
@@ -3002,7 +3004,12 @@ final class AppContainer: ObservableObject {
                             !self.reconnectState.isReconnecting
                         {
                             self.pendingForegroundRecoverySessionIDs.remove(sessionID)
-                            await self.connect(to: host, sessionID: sessionID)
+                            let recoveryTask = await self.reconnectCoordinator.start {
+                                [weak self] _ in
+                                guard let self else { throw TransportError.cancelled }
+                                await self.connect(to: host, sessionID: sessionID)
+                            }
+                            await recoveryTask.value
                         } else if !self.reconnectState.isReconnecting {
                             // The foreground transition already invalidated any
                             // prior coordinator generation. Preserve its backoff
