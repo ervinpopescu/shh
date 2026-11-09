@@ -129,6 +129,11 @@ extensions.
   strictly as an ambient status surface; does not alter or extend
   background socket lifetime, and never ingests or displays command
   buffers, credentials, or terminal contents.
+- **Freshness boundary:** Connected snapshots expire after 60 seconds. A
+  stale snapshot is rendered as `Status unverified` with `Last confirmed`
+  timing rather than claiming the SSH socket is still connected. No continuous
+  heartbeat is used because iOS suspension cannot make one reliable; foreground
+  probes and transport events refresh the state when the app is running.
 
 ## CI Workflow Architecture
 
