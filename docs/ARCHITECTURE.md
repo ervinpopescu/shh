@@ -132,7 +132,12 @@ extensions.
 
 ## CI Workflow Architecture
 
-GitHub Actions runs on `macos-14` runners with:
+GitHub Actions runs on `macos-26` with Xcode 26 or newer and Swift 6.2 or
+newer. SwiftTerm 1.99 requires SwiftPM tools-version 6.2; the root package's
+tools-version remains 5.10 because it is independently accepted by this
+newer toolchain. The iOS deployment target remains 17.0. The `macos-26`
+runner provides iOS 26 simulators for its iPhone and iPad simulator tests.
+
 - Automated package resolution and test verification (`swift test`).
 - Project generation via cached XcodeGen (`xcodegen generate`).
 - Scoped warning settings verification enforcing warnings-as-errors on
