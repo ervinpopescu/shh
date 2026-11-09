@@ -18,7 +18,7 @@ permissions:
 jobs:
   fast-lane:
     name: Fast Lane Validation
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 10
     outputs:
       run_full_suite: ${{ steps.classify.outputs.run_full_suite }}
@@ -133,7 +133,7 @@ jobs:
     name: Build and Core Tests
     needs: fast-lane
     if: needs.fast-lane.outputs.run_full_suite == 'true'
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:
@@ -149,17 +149,16 @@ jobs:
             brew install xcodegen
           fi
 
-      - name: Select Xcode 16
+      - name: Select Xcode 26
         run: |
-          selected_xcode=""
-          for xcode in /Applications/Xcode_16*.app; do
+          set -euo pipefail
+          selected_xcode=$(for xcode in /Applications/Xcode_26*.app; do
             if [ -d "$xcode" ]; then
-              selected_xcode="$xcode"
-              break
+              printf '%s\n' "$xcode"
             fi
-          done
+          done | sort -V | tail -n 1)
           if [ -z "$selected_xcode" ]; then
-            echo "Error: no Xcode 16 installation found" >&2
+            echo "Error: no Xcode 26 installation found" >&2
             exit 1
           fi
           developer_dir="$selected_xcode/Contents/Developer"
@@ -326,7 +325,7 @@ jobs:
     name: ${{ matrix.name }}
     needs: fast-lane
     if: needs.fast-lane.outputs.run_full_suite == 'true'
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -356,17 +355,16 @@ jobs:
             brew install xcodegen
           fi
 
-      - name: Select Xcode 16
+      - name: Select Xcode 26
         run: |
-          selected_xcode=""
-          for xcode in /Applications/Xcode_16*.app; do
+          set -euo pipefail
+          selected_xcode=$(for xcode in /Applications/Xcode_26*.app; do
             if [ -d "$xcode" ]; then
-              selected_xcode="$xcode"
-              break
+              printf '%s\n' "$xcode"
             fi
-          done
+          done | sort -V | tail -n 1)
           if [ -z "$selected_xcode" ]; then
-            echo "Error: no Xcode 16 installation found" >&2
+            echo "Error: no Xcode 26 installation found" >&2
             exit 1
           fi
           developer_dir="$selected_xcode/Contents/Developer"
