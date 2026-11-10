@@ -290,20 +290,26 @@ final class MoshDomainTests: XCTestCase {
             sessionInfo: MoshSessionInfo(udpPort: 60002, sessionKey: "demo-secret-key-12345")
         )
         let stream = await connection.events()
+        let stateUpdates = await connection.moshStateUpdates()
+        var stateIterator = stateUpdates.makeAsyncIterator()
+        let initialState = await stateIterator.next()
+        XCTAssertEqual(initialState, .connected)
+
+        let (consumerStarted, consumerStartedContinuation) = AsyncStream<Void>.makeStream()
         let consumer = Task {
             var iterator = stream.makeAsyncIterator()
             _ = try? await iterator.next()
+            consumerStartedContinuation.yield(())
             _ = try? await iterator.next()
         }
 
+        var consumerStartedIterator = consumerStarted.makeAsyncIterator()
+        _ = await consumerStartedIterator.next()
         consumer.cancel()
         _ = await consumer.value
 
-        for _ in 0..<20 where !(await connection.moshState.isDisconnected) {
-            try await Task.sleep(nanoseconds: 1_000_000)
-        }
-        let finalState = await connection.moshState
-        XCTAssertTrue(finalState.isDisconnected)
+        let finalState = await stateIterator.next()
+        XCTAssertEqual(finalState, .disconnected(reason: "Closed"))
     }
 
     // MARK: - DemoMoshTransport Tests
