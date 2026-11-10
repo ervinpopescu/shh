@@ -39,7 +39,10 @@ jobs:
               printf '%s\t%s\n' "$version" "$xcode"
             fi
           done |
-            awk -F '\t' '{ split($1, parts, "."); printf "%03d%03d%03d\t%s\n", parts[1], parts[2], parts[3], $2 }' |
+            awk -F '\t' '{
+              split($1, parts, ".")
+              printf "%03d%03d%03d\t%s\n", parts[1], parts[2], parts[3], $2
+            }' |
             LC_ALL=C sort |
             tail -n 1 |
             cut -f2)
