@@ -1948,6 +1948,12 @@ final class AppContainer: ObservableObject {
             transportError = nil
         }
 
+        // A network-unavailable event means the established session has been
+        // disconnected, while the reconnect remains deferred until reachability
+        // returns. Preserve failed only for actionable transport failures.
+        if transportError == .networkUnavailable, !reachabilityMonitor.isReachable {
+            runtime.updateSessionState(.disconnected)
+        }
         updateOpenSessions()
 
         if let transportError {
