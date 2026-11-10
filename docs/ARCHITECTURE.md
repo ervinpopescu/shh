@@ -132,7 +132,7 @@ extensions.
 
 ## CI Workflow Architecture
 
-GitHub Actions runs on `macos-26` runners with Xcode 26 or newer. The iOS
+GitHub Actions runs on `macos-26` runners with Xcode 26. The iOS
 deployment target remains 17.0, and the runner provides iOS 26 simulators for
 its iPhone and iPad simulator tests. Workflows select the newest installed
 Xcode 26 application.
