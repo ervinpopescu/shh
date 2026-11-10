@@ -1987,6 +1987,12 @@ final class AppContainer: ObservableObject {
             }
             syncLiveActivityState()
             await teardownAuxiliaryResources()
+            // A clean close is already fully represented as disconnected. Leave
+            // recovery admission to reachability or the next foreground probe so
+            // auxiliary teardown cannot race a replacement transport projection.
+            if case .closed = event {
+                return
+            }
             handleConnectionDrop(host: host, sessionID: session.id)
         }
     }
