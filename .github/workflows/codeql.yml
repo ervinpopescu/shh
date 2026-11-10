@@ -17,7 +17,7 @@ permissions:
 jobs:
   analyze:
     name: Analyze Swift
-    runs-on: macos-14
+    runs-on: macos-26
     timeout-minutes: 60
     permissions:
       actions: read
@@ -29,17 +29,25 @@ jobs:
         # v4.2.2
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
-      - name: Select Xcode 16
+      - name: Select Xcode 26
         run: |
-          selected_xcode=""
-          for xcode in /Applications/Xcode_16*.app; do
+          set -euo pipefail
+          selected_xcode=$(for xcode in /Applications/Xcode_26*.app; do
             if [ -d "$xcode" ]; then
-              selected_xcode="$xcode"
-              break
+              version=${xcode##*/Xcode_}
+              version=${version%.app}
+              printf '%s\t%s\n' "$version" "$xcode"
             fi
-          done
+          done |
+            awk -F '\t' '{
+              split($1, parts, ".")
+              printf "%03d%03d%03d\t%s\n", parts[1], parts[2], parts[3], $2
+            }' |
+            LC_ALL=C sort |
+            tail -n 1 |
+            cut -f2)
           if [ -z "$selected_xcode" ]; then
-            echo "Error: no Xcode 16 installation found" >&2
+            echo "Error: no Xcode 26 installation found" >&2
             exit 1
           fi
           developer_dir="$selected_xcode/Contents/Developer"

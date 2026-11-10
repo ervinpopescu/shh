@@ -24,8 +24,9 @@ The repository has two build surfaces:
   and ignored by Git; do not edit it by hand.
 
 The normal development host is macOS with Xcode, because the app and extension
-are iOS targets. CI runs on `macos-14`, selects an installed Xcode 16, and
-builds unsigned generic iOS targets plus iPhone and iPad simulator tests.
+are iOS targets. CI runs on `macos-26`, selects the newest installed Xcode 26,
+and builds unsigned generic iOS targets plus iPhone and iPad simulator tests.
+The app deployment target remains iOS 17.
 `project.yml` records an Xcode 15.4 project-generation preference, so use the
 installed Xcode selected by `DEVELOPER_DIR` for the actual build.
 
@@ -79,7 +80,7 @@ just doctor device=iphone
 `just doctor` checks Xcode, XcodeGen, Swift, Python, and the selected simulator.
 The default developer directory is
 `/Applications/Xcode.app/Contents/Developer`; set `DEVELOPER_DIR` to another
-Xcode installation when necessary. CI sets it to the selected Xcode 16
+Xcode installation when necessary. CI sets it to the selected Xcode 26
 installation.
 
 ### Generate, format, lint, and test
