@@ -1,3 +1,4 @@
+<!-- markdownlint-disable MD001 MD033 MD041 -->
 <div align="center">
 
 # Shh
@@ -14,6 +15,7 @@ Keychain, verifies host keys before authentication, and does not require a
 Shh cloud service.
 
 </div>
+<!-- markdownlint-enable MD001 MD033 MD041 -->
 
 ## What Shh does
 
