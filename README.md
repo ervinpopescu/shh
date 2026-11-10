@@ -49,7 +49,11 @@ source and simulator development workflow rather than a TestFlight or App
 Store release.
 
 On macOS, install [Xcode](https://developer.apple.com/xcode/),
-[XcodeGen](https://github.com/yonaskolb/XcodeGen), and [`just`](https://github.com/casey/just):
+[XcodeGen](https://github.com/yonaskolb/XcodeGen), [`just`](https://github.com/casey/just),
+Python 3, `swift-format`, and `shellcheck`. Make the dedicated
+`Shh Review iPhone` and `Shh Review iPad` simulators available, or set
+`IPHONE_UDID` and `IPAD_UDID` to available simulator UDIDs before running
+these commands:
 
 ```sh
 just doctor device=iphone
@@ -95,8 +99,9 @@ canonical project description is [`project.yml`](project.yml).
 Shh is an active implementation project with substantial automated coverage:
 package tests, app tests, generated unsigned builds, and simulator tests. An
 optional live-host simulator path is available when its host snapshot,
-credentials, and trust state are configured. Cloudflare Access and Tailscale
-coverage validates target resolution, not an external login or network.
+credentials, trust state, and remote environment are configured.
+Cloudflare Access and Tailscale coverage validates target resolution, not an
+external login or network.
 
 The following remain outside the repository's release evidence:
 
