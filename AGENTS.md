@@ -46,13 +46,20 @@ installed Xcode selected by `DEVELOPER_DIR` for the actual build.
    pre-existing changes. Never overwrite unrelated edits. Build products and
    local evidence normally live in ignored `build/`, `.build/`, or `tmp/`
    paths, but still do not add them to a change.
-3. Read the relevant design and security documentation before changing a
+3. `SESSION.md` is a shared local notes file at the primary repository checkout
+   root, not a per-worktree file. Consult it before work and keep only concise,
+   nonblocking gotchas or deferred issues there, never accomplishments. Locate
+   the primary checkout portably from `git worktree list`, or for a normal
+   non-bare checkout resolve the common Git directory from
+   `git rev-parse --git-common-dir` and its checkout parent. Do not create a
+   worktree-local copy.
+4. Read the relevant design and security documentation before changing a
    behavior:
    - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
    - [`docs/PRODUCT.md`](docs/PRODUCT.md)
    - [`docs/SECURITY.md`](docs/SECURITY.md)
    - [`docs/ROADMAP.md`](docs/ROADMAP.md)
-4. Keep changes narrow. Do not commit unless the task explicitly asks for a
+5. Keep changes narrow. Do not commit unless the task explicitly asks for a
    commit. Never put secrets, private keys, passwords, host credentials, or
    device-specific evidence in the repository.
 
