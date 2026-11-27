@@ -83,6 +83,18 @@ final class MultiplexerControlTests: XCTestCase {
         }
     }
 
+    func testHerdrControlUsesRootLevelNamedSessionSelector() throws {
+        let control = try HerdrControl(sessionName: "review team")
+        XCTAssertEqual(
+            try control.command(for: .herdr(.workspaceList)),
+            "herdr --session 'review team' workspace list"
+        )
+        XCTAssertEqual(
+            try control.command(for: .herdr(.paneList(workspaceID: "wN"))),
+            "herdr --session 'review team' pane list --workspace 'wN'"
+        )
+    }
+
     func testDetachResolvesExactlyOneActualClientTTY() async throws {
         let recorder = Recorder()
         let executor = Executor(
@@ -298,7 +310,7 @@ final class MultiplexerControlTests: XCTestCase {
 
         XCTAssertEqual(
             try control.command(for: .herdr(.workspaceList)),
-            "herdr workspace list --format 'json'")
+            "herdr workspace list")
         XCTAssertEqual(
             try control.command(for: .herdr(.workspaceCreate(cwd: "/root/dir", label: "main"))),
             "herdr workspace create --cwd '/root/dir' --label 'main'")
@@ -307,10 +319,10 @@ final class MultiplexerControlTests: XCTestCase {
             "herdr tab create --label 'tab-1'")
         XCTAssertEqual(
             try control.command(for: .herdr(.paneList(workspaceID: nil))),
-            "herdr pane list --format 'json'")
+            "herdr pane list")
         XCTAssertEqual(
             try control.command(for: .herdr(.paneList(workspaceID: "ws-1"))),
-            "herdr pane list 'ws-1' --format 'json'")
+            "herdr pane list --workspace 'ws-1'")
         XCTAssertEqual(
             try control.command(for: .herdr(.paneSplit(paneID: "p1", direction: "right"))),
             "herdr pane split 'p1' --direction 'right'")
@@ -325,7 +337,7 @@ final class MultiplexerControlTests: XCTestCase {
             "herdr wait agent-status")
         XCTAssertEqual(
             try control.command(for: .herdr(.status)),
-            "herdr status --format 'json'")
+            "herdr status --json")
 
         XCTAssertThrowsError(
             try control.command(for: .tmux(.previousWindow(try TmuxSessionID("$1"))))
@@ -343,7 +355,7 @@ final class MultiplexerControlTests: XCTestCase {
         )
         _ = try await control.execute(.herdr(.status), using: executor)
         let commands = await recorder.all()
-        XCTAssertEqual(commands, ["herdr status --format 'json'"])
+        XCTAssertEqual(commands, ["herdr status --json"])
     }
 
     func testTmuxClientResolverEdgeCases() async throws {

@@ -852,6 +852,8 @@ public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable
     /// Deprecated compatibility field. New code uses lastUsedMultiplexerTarget.
     public var tmuxSessionID: String?
     public var lastUsedMultiplexerTarget: LastUsedMultiplexerTarget?
+    /// Optional named Herdr context. Missing values preserve the implicit default context.
+    public var herdrSessionName: String?
     public var timestamp: Date
 
     public init(
@@ -859,12 +861,14 @@ public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable
         sessionID: UUID = UUID(),
         tmuxSessionID: String? = nil,
         lastUsedMultiplexerTarget: LastUsedMultiplexerTarget? = nil,
+        herdrSessionName: String? = nil,
         timestamp: Date = Date()
     ) {
         self.hostID = hostID
         self.sessionID = sessionID
         self.tmuxSessionID = tmuxSessionID
         self.lastUsedMultiplexerTarget = lastUsedMultiplexerTarget
+        self.herdrSessionName = herdrSessionName
         self.timestamp = timestamp
     }
 }
@@ -909,6 +913,8 @@ public enum ConnectionStage: String, Codable, Sendable, CaseIterable {
 
 public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
     public var id: UUID
+    public var hostID: UUID?
+    public var sessionID: UUID?
     public var stage: ConnectionStage
     public var reason: String
     public var technicalDetail: String
@@ -917,6 +923,8 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
 
     public init(
         id: UUID = UUID(),
+        hostID: UUID? = nil,
+        sessionID: UUID? = nil,
         stage: ConnectionStage,
         reason: String,
         technicalDetail: String,
@@ -924,6 +932,8 @@ public struct ConnectionFailure: Codable, Sendable, Equatable, Identifiable {
         timestamp: Date = Date()
     ) {
         self.id = id
+        self.hostID = hostID
+        self.sessionID = sessionID
         self.stage = stage
         self.reason = reason
         self.technicalDetail = technicalDetail

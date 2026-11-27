@@ -193,6 +193,9 @@ public struct TransferProgress: Hashable, Sendable, Codable {
 
 public struct TransferTask: Identifiable, Hashable, Sendable, Codable {
     public let id: UUID
+    /// The SSH runtime that owns this transfer. Nil is retained for decoding
+    /// older queue records created before multi-session ownership.
+    public let ownerSessionID: UUID?
     public var direction: TransferDirection
     public var remotePath: RemotePath
     public var localURL: URL
@@ -210,6 +213,7 @@ public struct TransferTask: Identifiable, Hashable, Sendable, Codable {
 
     public init(
         id: UUID = UUID(),
+        ownerSessionID: UUID? = nil,
         direction: TransferDirection,
         remotePath: RemotePath,
         localURL: URL,
@@ -221,6 +225,7 @@ public struct TransferTask: Identifiable, Hashable, Sendable, Codable {
         updatedAt: Date = Date()
     ) {
         self.id = id
+        self.ownerSessionID = ownerSessionID
         self.direction = direction
         self.remotePath = remotePath
         self.localURL = localURL
@@ -303,18 +308,21 @@ public actor TransferQueueCoordinator {
 
     public init() {}
 
-    public func snapshot() -> TransferQueueState {
-        state
+    public func snapshot(ownerSessionID: UUID? = nil) -> TransferQueueState {
+        guard let ownerSessionID else { return state }
+        return TransferQueueState(tasks: state.tasks.filter { $0.ownerSessionID == ownerSessionID })
     }
 
     @discardableResult
     public func enqueue(
+        ownerSessionID: UUID? = nil,
         direction: TransferDirection,
         remotePath: RemotePath,
         localURL: URL,
         totalBytes: Int64 = 0
     ) -> TransferTask {
         let task = TransferTask(
+            ownerSessionID: ownerSessionID,
             direction: direction,
             remotePath: remotePath,
             localURL: localURL,
@@ -352,8 +360,10 @@ public actor TransferQueueCoordinator {
         taskCancels.removeValue(forKey: id)
     }
 
-    public func cancel(id: UUID) {
-        guard var task = state.task(withID: id) else { return }
+    public func cancel(id: UUID, ownerSessionID: UUID? = nil) {
+        guard var task = state.task(withID: id),
+            ownerSessionID == nil || task.ownerSessionID == ownerSessionID
+        else { return }
         task.state = .cancelled
         task.updatedAt = Date()
         state.update(task)
@@ -366,13 +376,33 @@ public actor TransferQueueCoordinator {
         taskCancels[id] = handler
     }
 
-    public func remove(id: UUID) {
+    public func remove(id: UUID, ownerSessionID: UUID? = nil) {
+        guard ownerSessionID == nil || state.task(withID: id)?.ownerSessionID == ownerSessionID else {
+            return
+        }
         state.remove(id: id)
         taskCancels.removeValue(forKey: id)
     }
 
-    public func clearTerminal() {
-        state.clearTerminal()
+    /// Cancels and removes the tasks owned by one SSH runtime. A nil owner discards
+    /// every task and is reserved for final teardown.
+    public func discardTasks(ownerSessionID: UUID? = nil) {
+        let discarded = state.tasks.filter {
+            ownerSessionID == nil || $0.ownerSessionID == ownerSessionID
+        }
+        let discardedIDs = Set(discarded.map(\.id))
+        for id in discardedIDs {
+            taskCancels.removeValue(forKey: id)?()
+        }
+        state.tasks.removeAll { discardedIDs.contains($0.id) }
+    }
+
+    public func clearTerminal(ownerSessionID: UUID? = nil) {
+        guard let ownerSessionID else {
+            state.clearTerminal()
+            return
+        }
+        state.tasks.removeAll { $0.ownerSessionID == ownerSessionID && $0.state.isTerminal }
     }
 }
 

@@ -334,7 +334,11 @@ public struct LiveSSHTransport: SSHTransport {
                 initialSize: initialSize
             )
         case .cloudflareAccess(let cfOptions):
-            let target = try await resolveTransportTarget(for: host)
+            // Resolve only non-secret endpoint metadata before the SSH host-key
+            // challenge. The client secret is loaded by performConnect after
+            // host-key validation and installed only in the connection redactor.
+            let target = try await Self.resolveTransportTarget(
+                for: host, credentialStore: nil)
             let effectiveHost = try ShhCore.Host(
                 id: host.id,
                 name: host.name,

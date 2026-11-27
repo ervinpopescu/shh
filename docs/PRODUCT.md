@@ -51,8 +51,11 @@ its simulator App Group snapshot and credentials are available.
   attach, auto-attach, remembered targets, and explicit command approval.
   Parsing supports the current pipe-delimited output and documented legacy
   forms.
-- **Herdr:** workspace creation, pane splitting, command dispatch, polling,
-  state parsing, output inspection, and remembered workspace targets.
+- **Herdr:** named persistent-session discovery and selection, workspace creation,
+  pane splitting, command dispatch, polling, state parsing, output inspection,
+  and remembered workspace targets. The default Herdr context omits `--session`;
+  named contexts use the root-level `--session` selector and retain opaque
+  workspace/pane IDs per SSH runtime.
 - **Deferred multiplexers:** Zellij, Byobu, and Screen are represented as
   unavailable UI choices and do not have live adapters in this repository.
 

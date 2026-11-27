@@ -112,10 +112,26 @@ public protocol HostTrustEvaluator: Sendable {
     func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision
 }
 public enum TerminalEvent: Sendable, Equatable { case bytes(Data); case closed; case error(TransportError) }
+/// A terminal transport with linearized admission and shutdown semantics.
+///
+/// `send` and `resize` atomically admit work before touching the transport.
+/// Once `close()` begins, new calls fail and already-admitted calls are drained
+/// before the implementation finishes its close barrier. `events()` called
+/// after close returns a finished stream. Implementations may quarantine an
+/// admitted operation when the underlying transport cannot prove completion by
+/// its finite shutdown deadline; callers must not treat that path as proof that
+/// the peer or an in-flight NIO operation stopped immediately.
 public protocol SSHConnection: Sendable {
+    /// Returns a stream whose terminal event is `.closed` or `.error` exactly
+    /// once. Calling this after shutdown returns an already-finished stream.
     func events() async -> AsyncThrowingStream<TerminalEvent, Error>
+    /// Fails if shutdown has started; admitted writes are drained by `close`.
     func send(_ data: Data) async throws
+    /// Fails if shutdown has started; admitted writes are drained by `close`.
     func resize(_ size: TerminalSize) async throws
+    /// Linearizes shutdown and is idempotent. Concurrent callers await the same
+    /// close barrier. A non-cooperative underlying transport is quarantined at
+    /// the implementation's finite deadline rather than awaited forever.
     func close() async
     /// Probes the connection to determine whether it is active and responsive.
     func testResponsiveness(timeout: TimeInterval) async -> Bool
@@ -144,37 +160,42 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
     private var herdrPaneOutputs: [String: String] = DemoSSHConnection.makeDefaultHerdrOutputs()
 
     public static func makeDefaultHerdrWorkspaces() -> [HerdrWorkspace] {
+        let workspaceID = "ws-main"
         let paneIdle = HerdrPane(
             id: "pane-idle",
             label: "worker-idle",
             agentState: .idle,
             currentCommand: nil,
-            lastActivity: Date(timeIntervalSince1970: 1700000000)
+            lastActivity: Date(timeIntervalSince1970: 1700000000),
+            workspaceID: workspaceID
         )
         let paneWorking = HerdrPane(
             id: "pane-working",
             label: "builder",
             agentState: .working,
             currentCommand: "swift build",
-            lastActivity: Date(timeIntervalSince1970: 1700000100)
+            lastActivity: Date(timeIntervalSince1970: 1700000100),
+            workspaceID: workspaceID
         )
         let paneBlocked = HerdrPane(
             id: "pane-blocked",
             label: "deployer",
             agentState: .blocked(reason: "Waiting for confirmation before database migration"),
             currentCommand: "db-migrate",
-            lastActivity: Date(timeIntervalSince1970: 1700000200)
+            lastActivity: Date(timeIntervalSince1970: 1700000200),
+            workspaceID: workspaceID
         )
         let paneCompleted = HerdrPane(
             id: "pane-completed",
             label: "tester",
             agentState: .completed(summary: "All 220 tests passed"),
             currentCommand: "swift test",
-            lastActivity: Date(timeIntervalSince1970: 1700000300)
+            lastActivity: Date(timeIntervalSince1970: 1700000300),
+            workspaceID: workspaceID
         )
 
         let defaultWorkspace = HerdrWorkspace(
-            id: "ws-main",
+            id: workspaceID,
             label: "demo-main",
             cwd: "/home/dev/workspace",
             panes: [paneIdle, paneWorking, paneBlocked, paneCompleted]
@@ -210,7 +231,11 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
                         label: old.label,
                         agentState: state,
                         currentCommand: currentCommand ?? old.currentCommand,
-                        lastActivity: Date()
+                        lastActivity: Date(),
+                        workspaceID: old.workspaceID,
+                        tabID: old.tabID,
+                        terminalID: old.terminalID,
+                        revision: old.revision
                     )
                 }
             }
@@ -300,7 +325,7 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
             result = SSHCommandResult(exitCode: 0, stdout: "Tab created\n", stderr: "")
         } else if trimmed.contains("herdr pane split") {
             let newPaneID = "pane-\(UUID().uuidString.prefix(6).lowercased())"
-            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date())
+            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date(), workspaceID: herdrWorkspaces.first?.id)
             if !herdrWorkspaces.isEmpty {
                 herdrWorkspaces[0] = HerdrWorkspace(
                     id: herdrWorkspaces[0].id,

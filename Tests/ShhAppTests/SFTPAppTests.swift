@@ -1,8 +1,9 @@
-import XCTest
-import SwiftUI
-@testable import Shh
 import ShhCore
 import ShhSSH
+import SwiftUI
+import XCTest
+
+@testable import Shh
 
 @MainActor
 final class SFTPAppTests: XCTestCase {
@@ -90,7 +91,9 @@ final class SFTPAppTests: XCTestCase {
         XCTAssertTrue(container.currentDirectoryFiles.contains { $0.name == "cached_test.txt" })
 
         // Clean up
-        if let created = container.currentDirectoryFiles.first(where: { $0.name == "cached_test.txt" }) {
+        if let created = container.currentDirectoryFiles.first(where: {
+            $0.name == "cached_test.txt"
+        }) {
             try await container.deleteFile(created)
         }
         XCTAssertFalse(container.currentDirectoryFiles.contains { $0.name == "cached_test.txt" })
@@ -120,21 +123,27 @@ final class SFTPAppTests: XCTestCase {
         container.sortField = .type
         container.sortAscending = true
         let sortedByType = container.sortedAndFilteredFiles
-        XCTAssertTrue(sortedByType.first?.isDirectory == true, "First item sorted by type must be a directory")
+        XCTAssertTrue(
+            sortedByType.first?.isDirectory == true, "First item sorted by type must be a directory"
+        )
 
         // Sort by Name ascending
         container.sortField = .name
         container.sortAscending = true
         let sortedByNameAsc = container.sortedAndFilteredFiles
         for i in 1..<sortedByNameAsc.count {
-            XCTAssertTrue(sortedByNameAsc[i - 1].name.localizedStandardCompare(sortedByNameAsc[i].name) != .orderedDescending)
+            XCTAssertTrue(
+                sortedByNameAsc[i - 1].name.localizedStandardCompare(sortedByNameAsc[i].name)
+                    != .orderedDescending)
         }
 
         // Sort by Name descending
         container.sortAscending = false
         let sortedByNameDesc = container.sortedAndFilteredFiles
         for i in 1..<sortedByNameDesc.count {
-            XCTAssertTrue(sortedByNameDesc[i - 1].name.localizedStandardCompare(sortedByNameDesc[i].name) != .orderedAscending)
+            XCTAssertTrue(
+                sortedByNameDesc[i - 1].name.localizedStandardCompare(sortedByNameDesc[i].name)
+                    != .orderedAscending)
         }
 
         // Sort by Size ascending
@@ -152,13 +161,16 @@ final class SFTPAppTests: XCTestCase {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
 
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhTestDL_\(UUID().uuidString)", isDirectory: true)
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhTestDL_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
         let localTarget = tempDir.appendingPathComponent("downloaded_notes.txt")
-        let task = await container.enqueueDownload(file: notesFile, destinationURL: localTarget, overwrite: true)
+        let task = await container.enqueueDownload(
+            file: notesFile, destinationURL: localTarget, overwrite: true)
         let enqueuedTask = try XCTUnwrap(task)
 
         // Wait for download to finish
@@ -178,7 +190,8 @@ final class SFTPAppTests: XCTestCase {
         XCTAssertTrue(text.contains("Milestone 6"))
 
         // Verify transfer queue summary
-        XCTAssertTrue(container.transferQueueState.completedTasks.contains { $0.id == enqueuedTask.id })
+        XCTAssertTrue(
+            container.transferQueueState.completedTasks.contains { $0.id == enqueuedTask.id })
     }
 
     // MARK: - 5. Upload Transfer with Progress & Completion
@@ -187,7 +200,8 @@ final class SFTPAppTests: XCTestCase {
         let (container, repo) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
 
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("ShhTestUP_\(UUID().uuidString)", isDirectory: true)
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "ShhTestUP_\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -218,7 +232,8 @@ final class SFTPAppTests: XCTestCase {
         XCTAssertEqual(String(data: remoteData, encoding: .utf8), content)
 
         // Verify directory listing refreshed
-        XCTAssertTrue(container.currentDirectoryFiles.contains { $0.name == "my_uploaded_file.txt" })
+        XCTAssertTrue(
+            container.currentDirectoryFiles.contains { $0.name == "my_uploaded_file.txt" })
     }
 
     // MARK: - 6. Transfer Cancellation and Retry
@@ -230,20 +245,24 @@ final class SFTPAppTests: XCTestCase {
         // Create a large file
         let largeData = Data(repeating: 0x42, count: 200_000)
         try await container.createFile(named: "large_cancel.bin", content: largeData)
-        let largeFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "large_cancel.bin" })
+        let largeFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "large_cancel.bin" })
 
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("cancel_\(UUID().uuidString).bin")
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "cancel_\(UUID().uuidString).bin")
         defer { try? FileManager.default.removeItem(at: tempURL) }
 
         // Start download
-        let task = await container.enqueueDownload(file: largeFile, destinationURL: tempURL, overwrite: true)
+        let task = await container.enqueueDownload(
+            file: largeFile, destinationURL: tempURL, overwrite: true)
         let downloadTask = try XCTUnwrap(task)
 
         // Cancel immediately
         await container.cancelTransfer(id: downloadTask.id)
 
         // Verify cancelled state
-        XCTAssertEqual(container.transferQueueState.task(withID: downloadTask.id)?.state, .cancelled)
+        XCTAssertEqual(
+            container.transferQueueState.task(withID: downloadTask.id)?.state, .cancelled)
 
         // Retry transfer
         await container.retryTransfer(id: downloadTask.id)
@@ -251,7 +270,9 @@ final class SFTPAppTests: XCTestCase {
         // Wait for retry completion
         var completed = false
         for _ in 0..<100 {
-            if container.transferQueueState.completedTasks.contains(where: { $0.remotePath == largeFile.path }) {
+            if container.transferQueueState.completedTasks.contains(where: {
+                $0.remotePath == largeFile.path
+            }) {
                 completed = true
                 break
             }
@@ -269,16 +290,19 @@ final class SFTPAppTests: XCTestCase {
     func testDownloadConflictResolution() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
-        let localDest = FileManager.default.temporaryDirectory.appendingPathComponent("conflict_notes_\(UUID().uuidString).txt")
+        let localDest = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "conflict_notes_\(UUID().uuidString).txt")
         try "Original local content".write(to: localDest, atomically: true, encoding: .utf8)
         defer { try? FileManager.default.removeItem(at: localDest) }
 
         // Case 1: Cancel resolution
         let cancelExpectation = expectation(description: "Download conflict cancelled")
         Task {
-            let task = await container.enqueueDownload(file: notesFile, destinationURL: localDest, overwrite: nil)
+            let task = await container.enqueueDownload(
+                file: notesFile, destinationURL: localDest, overwrite: nil)
             XCTAssertNil(task, "Task should be nil when cancelled")
             cancelExpectation.fulfill()
         }
@@ -301,7 +325,8 @@ final class SFTPAppTests: XCTestCase {
         // Case 2: Overwrite resolution
         let overwriteExpectation = expectation(description: "Download conflict overwritten")
         Task {
-            let task = await container.enqueueDownload(file: notesFile, destinationURL: localDest, overwrite: nil)
+            let task = await container.enqueueDownload(
+                file: notesFile, destinationURL: localDest, overwrite: nil)
             XCTAssertNotNil(task, "Task should be created when overwritten")
             overwriteExpectation.fulfill()
         }
@@ -318,7 +343,9 @@ final class SFTPAppTests: XCTestCase {
 
         // Wait for transfer completion
         for _ in 0..<50 {
-            if container.transferQueueState.completedTasks.contains(where: { $0.localURL == localDest }) {
+            if container.transferQueueState.completedTasks.contains(where: {
+                $0.localURL == localDest
+            }) {
                 break
             }
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -335,7 +362,8 @@ final class SFTPAppTests: XCTestCase {
         let (container, repo) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
 
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("UploadConflict_\(UUID().uuidString)")
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "UploadConflict_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -346,7 +374,8 @@ final class SFTPAppTests: XCTestCase {
         // Case 1: Cancel resolution
         let cancelExpectation = expectation(description: "Upload conflict cancelled")
         Task {
-            let task = await container.enqueueUpload(localURL: localNotes, destinationDirectory: RemotePath("/home/dev"), overwrite: nil)
+            let task = await container.enqueueUpload(
+                localURL: localNotes, destinationDirectory: RemotePath("/home/dev"), overwrite: nil)
             XCTAssertNil(task)
             cancelExpectation.fulfill()
         }
@@ -363,12 +392,14 @@ final class SFTPAppTests: XCTestCase {
 
         // Remote file unchanged
         let existingRemote = try await repo.readFile(at: RemotePath("/home/dev/notes.txt"))
-        XCTAssertTrue(String(data: existingRemote, encoding: .utf8)?.contains("Milestone 6") == true)
+        XCTAssertTrue(
+            String(data: existingRemote, encoding: .utf8)?.contains("Milestone 6") == true)
 
         // Case 2: Overwrite resolution
         let overwriteExpectation = expectation(description: "Upload conflict overwritten")
         Task {
-            let task = await container.enqueueUpload(localURL: localNotes, destinationDirectory: RemotePath("/home/dev"), overwrite: nil)
+            let task = await container.enqueueUpload(
+                localURL: localNotes, destinationDirectory: RemotePath("/home/dev"), overwrite: nil)
             XCTAssertNotNil(task)
             overwriteExpectation.fulfill()
         }
@@ -384,7 +415,9 @@ final class SFTPAppTests: XCTestCase {
 
         // Wait for transfer completion
         for _ in 0..<50 {
-            if container.transferQueueState.completedTasks.contains(where: { $0.remotePath.description == "/home/dev/notes.txt" }) {
+            if container.transferQueueState.completedTasks.contains(where: {
+                $0.remotePath.description == "/home/dev/notes.txt"
+            }) {
                 break
             }
             try await Task.sleep(nanoseconds: 20_000_000)
@@ -434,7 +467,8 @@ final class SFTPAppTests: XCTestCase {
         let pngData = try XCTUnwrap(img.pngData())
 
         try await container.createFile(named: "icon.png", content: pngData)
-        let imageFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "icon.png" })
+        let imageFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "icon.png" })
 
         await container.loadPreview(for: imageFile)
         XCTAssertEqual(container.previewFile?.name, "icon.png")
@@ -450,7 +484,8 @@ final class SFTPAppTests: XCTestCase {
         // 2. Binary fallback test
         let binaryBytes = Data([0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE, 0xFD, 0xFC])
         try await container.createFile(named: "data.bin", content: binaryBytes)
-        let binaryFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "data.bin" })
+        let binaryFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "data.bin" })
 
         await container.loadPreview(for: binaryFile)
         let binaryPreview = BinaryHexPreviewView(data: binaryBytes, file: binaryFile)
@@ -466,7 +501,8 @@ final class SFTPAppTests: XCTestCase {
     func testInAppTextFileEditorSaveAndUploadReplacement() async throws {
         let (container, repo) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         // Open editor
         try await container.openEditor(for: notesFile)
@@ -483,7 +519,8 @@ final class SFTPAppTests: XCTestCase {
 
         // Verify remote repository has updated content
         let readBack = try await repo.readFile(at: notesFile.path)
-        XCTAssertEqual(String(data: readBack, encoding: .utf8), "Edited via in-app SFTP editor\nLine 2\n")
+        XCTAssertEqual(
+            String(data: readBack, encoding: .utf8), "Edited via in-app SFTP editor\nLine 2\n")
 
         // Close editor
         container.closeEditor()
@@ -499,17 +536,20 @@ final class SFTPAppTests: XCTestCase {
 
         // 1. Create Directory
         try await container.createDirectory(named: "workspace")
-        XCTAssertTrue(container.currentDirectoryFiles.contains { $0.name == "workspace" && $0.isDirectory })
+        XCTAssertTrue(
+            container.currentDirectoryFiles.contains { $0.name == "workspace" && $0.isDirectory })
 
         // 2. Create File inside current directory
         try await container.createFile(named: "temp_doc.txt", content: Data("Doc content".utf8))
-        let createdDoc = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "temp_doc.txt" })
+        let createdDoc = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "temp_doc.txt" })
         XCTAssertTrue(createdDoc.isFile)
 
         // 3. Rename File
         try await container.renameFile(createdDoc, to: "renamed_doc.txt")
         XCTAssertFalse(container.currentDirectoryFiles.contains { $0.name == "temp_doc.txt" })
-        let renamedDoc = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "renamed_doc.txt" })
+        let renamedDoc = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "renamed_doc.txt" })
 
         // 4. Move File into workspace directory
         try await container.moveFile(renamedDoc, to: RemotePath("/home/dev/workspace"))
@@ -526,7 +566,8 @@ final class SFTPAppTests: XCTestCase {
 
         // 6. Delete empty Directory
         await container.navigateUp()
-        let dirToDelete = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "workspace" })
+        let dirToDelete = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "workspace" })
         try await container.deleteFile(dirToDelete)
         XCTAssertFalse(container.currentDirectoryFiles.contains { $0.name == "workspace" })
     }
@@ -597,7 +638,8 @@ final class SFTPAppTests: XCTestCase {
     func testDisconnectResetsSFTPStateAndCancelsTransfersAndGuardsIsolation() async throws {
         let (container, repo) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         // 1. Open preview and editor
         await container.loadPreview(for: notesFile)
@@ -640,9 +682,11 @@ final class SFTPAppTests: XCTestCase {
     func testAtomicDownloadPreservesExistingFileOnFailureOrCancellation() async throws {
         let (container, repo) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("atomic_test_\(UUID().uuidString)")
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "atomic_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -654,19 +698,26 @@ final class SFTPAppTests: XCTestCase {
         await repo.setSimulateTransferChunkDelay(0.5)
 
         // Start download with overwrite
-        let downloadTask = await container.enqueueDownload(file: notesFile, destinationURL: localTarget, overwrite: true)
+        let downloadTask = await container.enqueueDownload(
+            file: notesFile, destinationURL: localTarget, overwrite: true)
         let taskID = try XCTUnwrap(downloadTask?.id)
 
         // Verify initial state
-        XCTAssertTrue(FileManager.default.fileExists(atPath: localTarget.path), "Local file must exist before cancel")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: localTarget.path),
+            "Local file must exist before cancel")
 
         // Cancel before download finishes
         await container.cancelTransfer(id: taskID)
 
         // Verify local file is STILL intact and contains the original content!
-        XCTAssertTrue(FileManager.default.fileExists(atPath: localTarget.path), "Original file must not have been removed prematurely")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: localTarget.path),
+            "Original file must not have been removed prematurely")
         let contentAfterCancel = try String(contentsOf: localTarget, encoding: .utf8)
-        XCTAssertEqual(contentAfterCancel, originalContent, "Original file content must be preserved upon cancellation")
+        XCTAssertEqual(
+            contentAfterCancel, originalContent,
+            "Original file content must be preserved upon cancellation")
     }
 
     // MARK: - 17. Regression: Path Traversal Rejection in File Actions (Finding 3)
@@ -674,7 +725,8 @@ final class SFTPAppTests: XCTestCase {
     func testPathTraversalRejectionInFileActionsAndDownloads() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         // Create file with .. or .
         do {
@@ -737,7 +789,8 @@ final class SFTPAppTests: XCTestCase {
     func testDirectoryAncestryValidationInMoveFile() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let projectsDir = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "projects" })
+        let projectsDir = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "projects" })
 
         // Attempting to move /home/dev/projects into /home/dev/projects/shh (descendant)
         do {
@@ -761,10 +814,13 @@ final class SFTPAppTests: XCTestCase {
     func testConcurrentTransferConflictsQueueFIFOWitoutLeakingContinuations() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
-        let bashrcFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == ".bashrc" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let bashrcFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == ".bashrc" })
 
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("conflict_q_\(UUID().uuidString)")
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "conflict_q_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDir) }
 
@@ -816,7 +872,8 @@ final class SFTPAppTests: XCTestCase {
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
 
         // Find symlink current_project -> /home/dev/projects/shh
-        let symlink = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "current_project" })
+        let symlink = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "current_project" })
         XCTAssertTrue(symlink.isSymlink)
 
         // Open item (on tap)
@@ -838,7 +895,8 @@ final class SFTPAppTests: XCTestCase {
         try await repo.writeFile(data: binaryBytes, at: binaryPath)
 
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let binFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "corrupt.bin" })
+        let binFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "corrupt.bin" })
 
         do {
             try await container.openEditor(for: binFile)
@@ -861,7 +919,8 @@ final class SFTPAppTests: XCTestCase {
         try await repo.writeFile(data: sixMB, at: hugePath)
 
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let hugeFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "huge.txt" })
+        let hugeFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "huge.txt" })
 
         await container.loadPreview(for: hugeFile)
         XCTAssertNil(container.previewData)
@@ -873,7 +932,8 @@ final class SFTPAppTests: XCTestCase {
         try await repo.writeFile(data: threeMB, at: medPath)
 
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let medFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "medium.txt" })
+        let medFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "medium.txt" })
 
         do {
             try await container.openEditor(for: medFile)
@@ -889,7 +949,8 @@ final class SFTPAppTests: XCTestCase {
     func testTemporaryTransfersCleanup() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         // Download a file
         let task = await container.enqueueDownload(file: notesFile)
@@ -911,7 +972,8 @@ final class SFTPAppTests: XCTestCase {
     func testEditorTargetHostIsolationMismatchRejectsSave() async throws {
         let (container, _) = makeDemoContainer()
         await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
-        let notesFile = try XCTUnwrap(container.currentDirectoryFiles.first { $0.name == "notes.txt" })
+        let notesFile = try XCTUnwrap(
+            container.currentDirectoryFiles.first { $0.name == "notes.txt" })
 
         try await container.openEditor(for: notesFile)
         XCTAssertNotNil(container.activeEditingFile)
@@ -941,7 +1003,8 @@ final class SFTPAppTests: XCTestCase {
             stage: .authentication,
             reason: "Authentication rejected by remote server.",
             technicalDetail: "Server rejected public key authentication.",
-            recoveryAction: "Ensure your public key is added to ~/.ssh/authorized_keys on the remote server."
+            recoveryAction:
+                "Ensure your public key is added to ~/.ssh/authorized_keys on the remote server."
         )
 
         container.sftpRepository = nil
@@ -963,7 +1026,8 @@ final class SFTPAppTests: XCTestCase {
 
         // Verify failure state properties
         XCTAssertEqual(container.lastSFTPFailure?.stage, .authentication)
-        XCTAssertEqual(container.lastSFTPFailure?.reason, "Authentication rejected by remote server.")
+        XCTAssertEqual(
+            container.lastSFTPFailure?.reason, "Authentication rejected by remote server.")
         XCTAssertFalse(failure.copyableDiagnostics.isEmpty)
         XCTAssertTrue(failure.copyableDiagnostics.contains("Authentication"))
         XCTAssertFalse(failure.copyableDiagnostics.contains("password"))
@@ -1026,10 +1090,512 @@ final class SFTPAppTests: XCTestCase {
         XCTAssertNil(container.sftpErrorMessage)
         XCTAssertNil(container.lastSFTPFailure)
     }
+
+    func testNonCooperativeSendImageDoesNotPublishAfterSessionSelectionChanges() async throws {
+        let repository = NonCooperativeSendImageRepository()
+        let container = AppContainer(
+            transport: ControllableTransport(),
+            sftpRepository: repository
+        )
+        let hostA = try Host(name: "Image A", hostname: "image-a.invalid", username: "dev")
+        let hostB = try Host(name: "Image B", hostname: "image-b.invalid", username: "dev")
+        let imageData = try XCTUnwrap(
+            Data(
+                base64Encoded:
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+            ))
+
+        await container.connect(to: hostA)
+        container.beginSendImage(data: imageData)
+        await repository.waitForUploadStart()
+
+        await container.connect(to: hostB)
+        await repository.releaseUpload()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(container.activeHost?.id, hostB.id)
+        XCTAssertFalse(
+            container.transferQueueState.tasks.contains {
+                $0.localURL.path.contains("ShhImageUploads")
+            },
+            "Session A's non-cooperative image completion must not repopulate B's queue")
+        XCTAssertFalse(
+            container.sendImageState.isActive,
+            "Session A's completion must not leave a send-image operation active for B")
+    }
+
+    func testNonCooperativeTransferDoesNotPublishAfterSessionSelectionChanges() async throws {
+        let repository = NonCooperativeTransferRepository()
+        let container = AppContainer(
+            transport: ControllableTransport(),
+            sftpRepository: repository
+        )
+        let hostA = try Host(name: "Transfer A", hostname: "transfer-a.invalid", username: "dev")
+        let hostB = try Host(name: "Transfer B", hostname: "transfer-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let file = RemoteFile(
+            name: "delayed.txt", path: RemotePath("/home/dev/delayed.txt"), size: 16)
+        let taskResult = await container.enqueueDownload(
+            file: file,
+            destinationURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("stale-transfer.txt"),
+            overwrite: true
+        )
+        let task = try XCTUnwrap(taskResult)
+        await repository.waitForTransferStart()
+
+        await container.connect(to: hostB)
+        await repository.releaseTransfer()
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(container.activeHost?.id, hostB.id)
+        XCTAssertNil(
+            container.transferQueueState.task(withID: task.id),
+            "Session A's non-cooperative completion must not repopulate B's queue")
+    }
+
+    // MARK: - Per-session transfer ownership
+
+    func testCancellingOneSessionsTransferLeavesOtherSessionsTransferRunning() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Cancel A", hostname: "cancel-a.invalid", username: "dev")
+        let hostB = try Host(name: "Cancel B", hostname: "cancel-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let taskA = try await enqueueGatedDownload(
+            named: "cancel-a-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "cancel-b-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        // Session B is selected, yet the cancel targets A's runtime.
+        await container.cancelTransfer(id: taskA.id)
+
+        let queue = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(queue.task(withID: taskA.id)?.state, .cancelled)
+        XCTAssertEqual(queue.task(withID: taskB.id)?.state, .transferring)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        let taskBWork = try XCTUnwrap(runtimeB.transfers.activeTasks[taskB.id])
+        XCTAssertFalse(taskBWork.isCancelled, "Cancelling A must not cancel B's transfer work")
+
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    func testSelectionSwitchKeepsEachSessionsTransferQueueRunning() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Switch A", hostname: "switch-a.invalid", username: "dev")
+        let hostB = try Host(name: "Switch B", hostname: "switch-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "switch-a-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "switch-b-\(UUID().uuidString).bin", in: container, repository: repository)
+        await awaitTransferCondition("B's queue to be projected") {
+            container.transferQueueState.tasks.map(\.id) == [taskB.id]
+        }
+
+        container.selectSession(id: sessionAID)
+        await awaitTransferCondition("A's queue to be projected after switching") {
+            container.transferQueueState.tasks.map(\.id) == [taskA.id]
+        }
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        let afterSwitchToA = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(afterSwitchToA.task(withID: taskB.id)?.state, .transferring)
+        XCTAssertNotNil(runtimeB.transfers.activeTasks[taskB.id])
+
+        container.selectSession(id: sessionBID)
+        await awaitTransferCondition("B's queue to be projected after switching back") {
+            container.transferQueueState.tasks.map(\.id) == [taskB.id]
+        }
+        let afterSwitchToB = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(afterSwitchToB.task(withID: taskA.id)?.state, .transferring)
+
+        await repository.release(taskA.remotePath.description)
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("both transfers to complete") {
+            let queue = await container.transferCoordinator.snapshot()
+            return queue.task(withID: taskA.id)?.state == .completed
+                && queue.task(withID: taskB.id)?.state == .completed
+        }
+    }
+
+    func testClosingOneSessionClearsOnlyItsOwnTransfersAndStagingFiles() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Close A", hostname: "close-a.invalid", username: "dev")
+        let hostB = try Host(name: "Close B", hostname: "close-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "close-a-\(UUID().uuidString).bin", in: container, repository: repository)
+        try Data("staged A".utf8).write(to: taskA.localURL)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "close-b-\(UUID().uuidString).bin", in: container, repository: repository)
+        try Data("staged B".utf8).write(to: taskB.localURL)
+        defer { try? FileManager.default.removeItem(at: taskB.localURL) }
+
+        await container.closeSession(id: sessionAID)
+
+        XCTAssertNil(container.runtime(for: sessionAID))
+        let queue = await container.transferCoordinator.snapshot()
+        XCTAssertNil(queue.task(withID: taskA.id), "Closing A must discard only A's transfers")
+        XCTAssertEqual(queue.task(withID: taskB.id)?.state, .transferring)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        XCTAssertNotNil(runtimeB.transfers.activeTasks[taskB.id])
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: taskA.localURL.path),
+            "Closing A must remove A's staged file")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: taskB.localURL.path),
+            "Closing A must keep B's staged file")
+
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete after closing A") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    func testRetryReplaysOnlyTheOwningSessionsTransfer() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Retry A", hostname: "retry-a.invalid", username: "dev")
+        let hostB = try Host(name: "Retry B", hostname: "retry-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "retry-a-\(UUID().uuidString).bin", in: container, repository: repository)
+        await container.cancelTransfer(id: taskA.id)
+
+        await container.connect(to: hostB)
+        let taskB = try await enqueueGatedDownload(
+            named: "retry-b-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        // Retry is refused while B is selected because A's transfer is not B's.
+        await container.retryTransfer(id: taskA.id)
+        let whileBSelected = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(whileBSelected.task(withID: taskA.id)?.state, .cancelled)
+        XCTAssertEqual(
+            whileBSelected.tasks.filter { $0.ownerSessionID == sessionAID }.map(\.id),
+            [taskA.id])
+        XCTAssertEqual(whileBSelected.task(withID: taskB.id)?.state, .transferring)
+
+        await container.selectSessionAndBindAuxiliary(id: sessionAID)
+        await awaitTransferCondition("A's cancelled transfer to be projected") {
+            container.transferQueueState.task(withID: taskA.id)?.state == .cancelled
+        }
+        await repository.release(taskA.remotePath.description)
+        await container.retryTransfer(id: taskA.id)
+
+        let afterRetry = await container.transferCoordinator.snapshot()
+        XCTAssertNil(afterRetry.task(withID: taskA.id))
+        let retried = afterRetry.tasks.filter { $0.ownerSessionID == sessionAID }
+        XCTAssertEqual(retried.count, 1)
+        let retriedTask = try XCTUnwrap(retried.first)
+        XCTAssertNotEqual(retriedTask.id, taskA.id)
+        XCTAssertEqual(retriedTask.remotePath, taskA.remotePath)
+        XCTAssertEqual(afterRetry.task(withID: taskB.id)?.state, .transferring)
+
+        await awaitTransferCondition("retried transfer to complete") {
+            await container.transferCoordinator.snapshot().task(withID: retriedTask.id)?.state
+                == .completed
+        }
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete after retry") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    /// Yields until `condition` holds. The wait is bounded by attempts, not time, and
+    /// never sleeps, so a stuck transfer fails the test instead of hanging the run.
+    private func awaitTransferCondition(
+        _ description: String,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        for _ in 0..<10_000 {
+            if await condition() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for \(description)", file: file, line: line)
+    }
+
+    /// Enqueues a download whose remote read is held by `repository` and waits until
+    /// the transfer reports progress, so it is in flight before the caller continues.
+    /// Auxiliary SFTP binding for a non-demo repository completes asynchronously after
+    /// connect, so the selected session is bound and its repository awaited first.
+    private func enqueueGatedDownload(
+        named name: String,
+        in container: AppContainer,
+        repository: PathGatedDownloadRepository
+    ) async throws -> TransferTask {
+        let selectedID = try XCTUnwrap(container.selectedSessionID)
+        await container.selectSessionAndBindAuxiliary(id: selectedID)
+        await awaitTransferCondition("SFTP to bind for \(name)") {
+            container.sftpRepository != nil
+        }
+        let file = RemoteFile(name: name, path: RemotePath("/home/dev/\(name)"), size: 16)
+        let enqueued = await container.enqueueDownload(file: file, overwrite: true)
+        let task = try XCTUnwrap(enqueued)
+        await awaitTransferCondition("\(name) to be in flight") {
+            await container.transferCoordinator.snapshot().task(withID: task.id)?.state
+                == .transferring
+        }
+        return task
+    }
 }
 
 extension DemoSFTPRepository {
     func setSimulateTransferChunkDelay(_ delay: TimeInterval) {
         self.simulateTransferChunkDelay = delay
+    }
+}
+
+/// Serves downloads whose completion is held per remote path until the test releases
+/// that path. Each download reports progress before it waits.
+private actor PathGatedDownloadRepository: SFTPRepository {
+    private var gates: [String: PathTransferGate] = [:]
+
+    func release(_ path: String) async {
+        await gate(for: path).release()
+    }
+
+    private func gate(for path: String) -> PathTransferGate {
+        if let existing = gates[path] { return existing }
+        let created = PathTransferGate()
+        gates[path] = created
+        return created
+    }
+
+    func listDirectory(at path: RemotePath) async throws -> [RemoteFile] { [] }
+
+    func readFile(at path: RemotePath) async throws -> Data { Data() }
+
+    func download(
+        from remotePath: RemotePath,
+        to localURL: URL,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        progress?(TransferProgress(bytesTransferred: 1, totalBytes: 16))
+        try await gate(for: remotePath.description).wait()
+        progress?(TransferProgress(bytesTransferred: 16, totalBytes: 16))
+    }
+
+    func writeFile(
+        data: Data,
+        at remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func createDirectory(at path: RemotePath) async throws {}
+    func removeFile(at path: RemotePath) async throws {}
+    func removeDirectory(at path: RemotePath) async throws {}
+    func rename(from oldPath: RemotePath, to newPath: RemotePath) async throws {}
+
+    func fetchAttributes(at path: RemotePath) async throws -> RemoteFile {
+        RemoteFile(name: path.lastComponent, path: path)
+    }
+}
+
+/// A release gate for one download. A waiting download honours cancellation the way a
+/// real SFTP read does, so a cancelled transfer throws instead of completing later.
+private actor PathTransferGate {
+    private var isReleased = false
+    private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+    func wait() async throws {
+        guard !isReleased else { return }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // No suspension point precedes registration, so a cancellation hop
+                // enqueued by onCancel always finds this waiter.
+                waiters[id] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        let pending = Array(waiters.values)
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+}
+
+private actor TransferReleaseGate {
+    private var started = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        started = true
+        guard !released else { return }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    func waitForStart() async {
+        while !started {
+            await Task.yield()
+        }
+    }
+
+    func release() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+}
+
+private actor NonCooperativeSendImageRepository: SFTPRepository {
+    private let base = DemoSFTPRepository(seedDemoData: true)
+    private let gate = TransferReleaseGate()
+
+    func waitForUploadStart() async {
+        await gate.waitForStart()
+    }
+
+    func releaseUpload() async {
+        await gate.release()
+    }
+
+    func listDirectory(at path: RemotePath) async throws -> [RemoteFile] {
+        try await base.listDirectory(at: path)
+    }
+
+    func readFile(at path: RemotePath) async throws -> Data {
+        try await base.readFile(at: path)
+    }
+
+    func download(
+        from remotePath: RemotePath,
+        to localURL: URL,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        try await base.download(from: remotePath, to: localURL, progress: progress)
+    }
+
+    func writeFile(
+        data: Data,
+        at remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        try await base.writeFile(data: data, at: remotePath, progress: progress)
+    }
+
+    func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        await gate.wait()
+        try await base.upload(from: localURL, to: remotePath, progress: progress)
+    }
+
+    func createDirectory(at path: RemotePath) async throws {
+        try await base.createDirectory(at: path)
+    }
+
+    func removeFile(at path: RemotePath) async throws {
+        try await base.removeFile(at: path)
+    }
+
+    func removeDirectory(at path: RemotePath) async throws {
+        try await base.removeDirectory(at: path)
+    }
+
+    func rename(from oldPath: RemotePath, to newPath: RemotePath) async throws {
+        try await base.rename(from: oldPath, to: newPath)
+    }
+
+    func fetchAttributes(at path: RemotePath) async throws -> RemoteFile {
+        try await base.fetchAttributes(at: path)
+    }
+}
+
+private actor NonCooperativeTransferRepository: SFTPRepository {
+    private let gate = TransferReleaseGate()
+
+    func waitForTransferStart() async {
+        await gate.waitForStart()
+    }
+
+    func releaseTransfer() async {
+        await gate.release()
+    }
+
+    func listDirectory(at path: RemotePath) async throws -> [RemoteFile] { [] }
+
+    func readFile(at path: RemotePath) async throws -> Data { Data() }
+
+    func download(
+        from remotePath: RemotePath,
+        to localURL: URL,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        await gate.wait()
+        progress?(TransferProgress(bytesTransferred: 1, totalBytes: 16))
+        progress?(TransferProgress(bytesTransferred: 16, totalBytes: 16))
+    }
+
+    func writeFile(
+        data: Data,
+        at remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func createDirectory(at path: RemotePath) async throws {}
+    func removeFile(at path: RemotePath) async throws {}
+    func removeDirectory(at path: RemotePath) async throws {}
+    func rename(from oldPath: RemotePath, to newPath: RemotePath) async throws {}
+
+    func fetchAttributes(at path: RemotePath) async throws -> RemoteFile {
+        RemoteFile(name: path.lastComponent, path: path)
     }
 }

@@ -343,18 +343,21 @@ public struct HerdrControl: MultiplexerControl {
     public let kind: RemoteMultiplexer = .herdr
     public let capabilities: MultiplexerCapabilities = .herdr
     public let executable: String
-    public init(executable: String = "herdr") throws {
+    public let sessionName: String?
+    public init(executable: String = "herdr", sessionName: String? = nil) throws {
         _ = try executablePrefix(executable)
         self.executable = executable == "herdr" ? executable : ShellQuoting.quote(executable)
+        self.sessionName = sessionName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true
+            ? nil : sessionName?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     public func command(for action: MultiplexerControlAction) throws -> String {
         guard case .herdr(let action) = action else {
             throw MultiplexerControlError.unsupportedAction
         }
-        let binary = executable
+        let binary = executable + (sessionName.map { " --session \(ShellQuoting.quote($0))" } ?? "")
         switch action {
-        case .workspaceList: return "\(binary) workspace list --format 'json'"
+        case .workspaceList: return "\(binary) workspace list"
         case .workspaceCreate(let cwd, let label):
             return
                 "\(binary) workspace create --cwd \(ShellQuoting.quote(cwd)) --label \(ShellQuoting.quote(label))"
@@ -363,9 +366,9 @@ public struct HerdrControl: MultiplexerControl {
         case .paneList(let workspaceID):
             if let workspaceID {
                 return
-                    "\(binary) pane list \(ShellQuoting.quote(try validatedHerdrIdentifier(workspaceID))) --format 'json'"
+                    "\(binary) pane list --workspace \(ShellQuoting.quote(try validatedHerdrIdentifier(workspaceID)))"
             }
-            return "\(binary) pane list --format 'json'"
+            return "\(binary) pane list"
         case .paneSplit(let paneID, let direction):
             guard ["left", "right", "up", "down"].contains(direction.lowercased()) else {
                 throw MultiplexerControlError.unsupportedAction
@@ -387,7 +390,7 @@ public struct HerdrControl: MultiplexerControl {
                 result += " --status \(ShellQuoting.quote(try validatedHerdrIdentifier(status)))"
             }
             return result
-        case .status: return "\(binary) status --format 'json'"
+        case .status: return "\(binary) status --json"
         }
     }
 

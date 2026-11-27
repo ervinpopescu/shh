@@ -145,30 +145,44 @@ public struct HerdrPane: Identifiable, Equatable, Hashable, Sendable {
     public let agentState: HerdrAgentState
     public let currentCommand: String?
     public let lastActivity: Date?
+    public let workspaceID: String?
+    public let tabID: String?
+    public let terminalID: String?
+    public let revision: Int?
 
     public init(
         id: String,
         label: String,
         agentState: HerdrAgentState,
         currentCommand: String? = nil,
-        lastActivity: Date? = nil
+        lastActivity: Date? = nil,
+        workspaceID: String? = nil,
+        tabID: String? = nil,
+        terminalID: String? = nil,
+        revision: Int? = nil
     ) {
         self.id = id
         self.label = label
         self.agentState = agentState
         self.currentCommand = currentCommand
         self.lastActivity = lastActivity
+        self.workspaceID = workspaceID
+        self.tabID = tabID
+        self.terminalID = terminalID
+        self.revision = revision
     }
 }
 
 extension HerdrPane: Codable {
     private enum CodingKeys: String, CodingKey {
         case id
+        case paneID = "pane_id"
         case label
         case title
         case name
         case agentState
         case agent_state
+        case agentStatus = "agent_status"
         case state
         case status
         case currentCommand
@@ -177,11 +191,23 @@ extension HerdrPane: Codable {
         case lastActivity
         case last_activity
         case activity
+        case workspaceID = "workspace_id"
+        case tabID = "tab_id"
+        case terminalID = "terminal_id"
+        case revision
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try container.decode(String.self, forKey: .id)
+        guard let id = (try? container.decodeIfPresent(String.self, forKey: .id))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .paneID))
+        else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.id,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Missing pane ID")
+            )
+        }
+        self.id = id
 
         self.label = (try? container.decodeIfPresent(String.self, forKey: .label)) ??
                      (try? container.decodeIfPresent(String.self, forKey: .title)) ??
@@ -190,6 +216,8 @@ extension HerdrPane: Codable {
         if let state = try? container.decodeIfPresent(HerdrAgentState.self, forKey: .agentState) {
             self.agentState = state
         } else if let state = try? container.decodeIfPresent(HerdrAgentState.self, forKey: .agent_state) {
+            self.agentState = state
+        } else if let state = try? container.decodeIfPresent(HerdrAgentState.self, forKey: .agentStatus) {
             self.agentState = state
         } else if let state = try? container.decodeIfPresent(HerdrAgentState.self, forKey: .state) {
             self.agentState = state
@@ -221,6 +249,10 @@ extension HerdrPane: Codable {
         } else {
             self.lastActivity = nil
         }
+        self.workspaceID = try? container.decodeIfPresent(String.self, forKey: .workspaceID)
+        self.tabID = try? container.decodeIfPresent(String.self, forKey: .tabID)
+        self.terminalID = try? container.decodeIfPresent(String.self, forKey: .terminalID)
+        self.revision = try? container.decodeIfPresent(Int.self, forKey: .revision)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -233,6 +265,10 @@ extension HerdrPane: Codable {
             let iso = ISO8601DateFormatter().string(from: lastActivity)
             try container.encode(iso, forKey: .lastActivity)
         }
+        try container.encodeIfPresent(workspaceID, forKey: .workspaceID)
+        try container.encodeIfPresent(tabID, forKey: .tabID)
+        try container.encodeIfPresent(terminalID, forKey: .terminalID)
+        try container.encodeIfPresent(revision, forKey: .revision)
     }
 }
 
@@ -243,23 +279,36 @@ public struct HerdrWorkspace: Identifiable, Equatable, Hashable, Sendable {
     public var label: String
     public var cwd: String
     public var panes: [HerdrPane]
+    public var paneCount: Int
+    public var tabCount: Int
+    public var activeTabID: String?
+    public var agentState: HerdrAgentState?
 
     public init(
         id: String,
         label: String,
         cwd: String,
-        panes: [HerdrPane] = []
+        panes: [HerdrPane] = [],
+        paneCount: Int = 0,
+        tabCount: Int = 0,
+        activeTabID: String? = nil,
+        agentState: HerdrAgentState? = nil
     ) {
         self.id = id
         self.label = label
         self.cwd = cwd
         self.panes = panes
+        self.paneCount = paneCount == 0 ? panes.count : paneCount
+        self.tabCount = tabCount
+        self.activeTabID = activeTabID
+        self.agentState = agentState
     }
 }
 
 extension HerdrWorkspace: Codable {
     private enum CodingKeys: String, CodingKey {
         case id
+        case workspaceID = "workspace_id"
         case label
         case name
         case title
@@ -267,11 +316,23 @@ extension HerdrWorkspace: Codable {
         case workingDirectory = "working_directory"
         case path
         case panes
+        case paneCount = "pane_count"
+        case tabCount = "tab_count"
+        case activeTabID = "active_tab_id"
+        case agentStatus = "agent_status"
     }
 
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.id = try container.decode(String.self, forKey: .id)
+        guard let id = (try? container.decodeIfPresent(String.self, forKey: .id))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .workspaceID))
+        else {
+            throw DecodingError.keyNotFound(
+                CodingKeys.id,
+                DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Missing workspace ID")
+            )
+        }
+        self.id = id
         self.label = (try? container.decodeIfPresent(String.self, forKey: .label)) ??
                      (try? container.decodeIfPresent(String.self, forKey: .name)) ??
                      (try? container.decodeIfPresent(String.self, forKey: .title)) ?? ""
@@ -279,6 +340,10 @@ extension HerdrWorkspace: Codable {
                    (try? container.decodeIfPresent(String.self, forKey: .workingDirectory)) ??
                    (try? container.decodeIfPresent(String.self, forKey: .path)) ?? ""
         self.panes = (try? container.decodeIfPresent([HerdrPane].self, forKey: .panes)) ?? []
+        self.paneCount = (try? container.decodeIfPresent(Int.self, forKey: .paneCount)) ?? self.panes.count
+        self.tabCount = (try? container.decodeIfPresent(Int.self, forKey: .tabCount)) ?? 0
+        self.activeTabID = try? container.decodeIfPresent(String.self, forKey: .activeTabID)
+        self.agentState = try? container.decodeIfPresent(HerdrAgentState.self, forKey: .agentStatus)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -287,6 +352,10 @@ extension HerdrWorkspace: Codable {
         try container.encode(label, forKey: .label)
         try container.encode(cwd, forKey: .cwd)
         try container.encode(panes, forKey: .panes)
+        try container.encode(paneCount, forKey: .paneCount)
+        try container.encode(tabCount, forKey: .tabCount)
+        try container.encodeIfPresent(activeTabID, forKey: .activeTabID)
+        try container.encodeIfPresent(agentState, forKey: .agentStatus)
     }
 }
 
@@ -350,6 +419,61 @@ public enum HerdrAvailability: Equatable, Hashable, Sendable, Codable {
     }
 }
 
+// MARK: - Herdr Session Target
+
+/// Identifies one Herdr context without conflating it with Shh's SSH runtime.
+/// Herdr resource IDs remain opaque strings and are scoped to this context.
+public struct HerdrTargetContext: Codable, Equatable, Hashable, Sendable {
+    public let sshSessionID: UUID
+    public let herdrSessionName: String?
+    public let workspaceID: String?
+    public let paneID: String?
+
+    public init(
+        sshSessionID: UUID,
+        herdrSessionName: String? = nil,
+        workspaceID: String? = nil,
+        paneID: String? = nil
+    ) {
+        self.sshSessionID = sshSessionID
+        self.herdrSessionName = Self.validatedName(herdrSessionName)
+        self.workspaceID = Self.validatedID(workspaceID)
+        self.paneID = Self.validatedID(paneID)
+    }
+
+    private static func validatedName(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 256,
+              !trimmed.unicodeScalars.contains(where: { $0.value < 0x20 }) else { return nil }
+        return trimmed
+    }
+
+    private static func validatedID(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 256,
+              !trimmed.unicodeScalars.contains(where: { $0.properties.isWhitespace || $0.value < 0x20 }) else {
+            return nil
+        }
+        return trimmed
+    }
+}
+
+public struct HerdrSessionDescriptor: Codable, Equatable, Hashable, Sendable, Identifiable {
+    public let name: String
+    public let isDefault: Bool
+    public let isRunning: Bool
+
+    public var id: String { name }
+
+    public init(name: String, isDefault: Bool = false, isRunning: Bool = false) {
+        self.name = name
+        self.isDefault = isDefault
+        self.isRunning = isRunning
+    }
+}
+
 // MARK: - Herdr Command Templates
 
 public enum HerdrCommand: Hashable, Sendable {
@@ -364,10 +488,17 @@ public enum HerdrCommand: Hashable, Sendable {
     case workspaceList(format: String = "json")
     case paneList(workspace: String? = nil, format: String = "json")
     case status(format: String = "json")
+    case sessionList
     case version
 
     public static let defaultBinary: String = "herdr"
     public static let probe: String = "herdr --version"
+
+    public func renderedCommand(for context: HerdrTargetContext? = nil) -> String {
+        let command = renderedCommand
+        guard let context, let name = context.herdrSessionName else { return command }
+        return "herdr --session \(ShellQuoting.quote(name))" + command.dropFirst("herdr".count)
+    }
     public static var waitAgentStatus: HerdrCommand { .waitAgentStatus() }
 
     public static func remote(host: String) -> HerdrCommand {
@@ -431,15 +562,17 @@ public enum HerdrCommand: Hashable, Sendable {
             } else {
                 return "herdr wait agent-status"
             }
-        case .workspaceList(let format):
-            return "herdr workspace list --format \(ShellQuoting.quote(format))"
-        case .paneList(let workspace, let format):
+        case .workspaceList:
+            return "herdr workspace list"
+        case .paneList(let workspace, _):
             if let workspace = workspace, !workspace.isEmpty {
-                return "herdr pane list \(ShellQuoting.quote(workspace)) --format \(ShellQuoting.quote(format))"
+                return "herdr pane list --workspace \(ShellQuoting.quote(workspace))"
             }
-            return "herdr pane list --format \(ShellQuoting.quote(format))"
-        case .status(let format):
-            return "herdr status --format \(ShellQuoting.quote(format))"
+            return "herdr pane list"
+        case .status:
+            return "herdr status --json"
+        case .sessionList:
+            return "herdr session list --json"
         case .version:
             return "herdr --version"
         }
@@ -505,11 +638,67 @@ public enum HerdrOutputParser: Sendable {
         let panes: [HerdrPane]
     }
 
+    private struct CommandEnvelope<Result: Decodable>: Decodable {
+        let result: Result
+    }
+
+    private struct WorkspaceListResult: Decodable {
+        let workspaces: [HerdrWorkspace]
+    }
+
+    private struct PaneListResult: Decodable {
+        let panes: [HerdrPane]
+    }
+
+    private struct SessionListResult: Decodable {
+        let sessions: [SessionListRecord]
+    }
+
+    private struct SessionListRecord: Decodable {
+        let name: String
+        let `default`: Bool?
+        let running: Bool?
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case id
+            case `default`
+            case running
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            guard let decodedName = (try? container.decodeIfPresent(String.self, forKey: .name))
+                ?? (try? container.decodeIfPresent(String.self, forKey: .id))
+            else {
+                throw DecodingError.keyNotFound(
+                    CodingKeys.name,
+                    DecodingError.Context(codingPath: decoder.codingPath, debugDescription: "Missing session name")
+                )
+            }
+            name = decodedName
+            `default` = try container.decodeIfPresent(Bool.self, forKey: .default)
+            running = try container.decodeIfPresent(Bool.self, forKey: .running)
+        }
+    }
+
+    private struct SessionListEnvelope: Decodable {
+        let result: SessionListResultEnvelope
+    }
+
+    private struct SessionListResultEnvelope: Decodable {
+        let sessions: [SessionListRecord]
+    }
+
     private struct RecentUnwrappedWrapper: Decodable {
         let output: String?
         let text: String?
         let content: String?
         let lines: [String]?
+    }
+
+    private struct RecentUnwrappedEnvelope: Decodable {
+        let result: RecentUnwrappedWrapper
     }
 
     /// Strips ANSI escape sequences from text.
@@ -530,6 +719,9 @@ public enum HerdrOutputParser: Sendable {
 
         if let list = try? jsonDecoder.decode([HerdrWorkspace].self, from: data) {
             return list
+        }
+        if let envelope = try? jsonDecoder.decode(CommandEnvelope<WorkspaceListResult>.self, from: data) {
+            return envelope.result.workspaces
         }
         if let wrapped = try? jsonDecoder.decode(WorkspacesWrapper.self, from: data) {
             return wrapped.workspaces
@@ -567,6 +759,9 @@ public enum HerdrOutputParser: Sendable {
         if let list = try? jsonDecoder.decode([HerdrPane].self, from: data) {
             return list
         }
+        if let envelope = try? jsonDecoder.decode(CommandEnvelope<PaneListResult>.self, from: data) {
+            return envelope.result.panes
+        }
         if let wrapped = try? jsonDecoder.decode(PanesWrapper.self, from: data) {
             return wrapped.panes
         }
@@ -593,6 +788,25 @@ public enum HerdrOutputParser: Sendable {
         }
 
         throw HerdrParseError.invalidJSON("Could not decode pane from output")
+    }
+
+    public static func parseSessions(from output: String) throws -> [HerdrSessionDescriptor] {
+        let clean = stripANSIEscapes(output).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { throw HerdrParseError.emptyOutput }
+        let data = Data(clean.utf8)
+        if let records = try? jsonDecoder.decode([SessionListRecord].self, from: data) {
+            return records.map { HerdrSessionDescriptor(name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false) }
+        }
+        if let wrapped = try? jsonDecoder.decode(SessionListResult.self, from: data) {
+            return wrapped.sessions.map {
+                HerdrSessionDescriptor(
+                    name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false)
+            }
+        }
+        if let envelope = try? jsonDecoder.decode(SessionListEnvelope.self, from: data) {
+            return envelope.result.sessions.map { HerdrSessionDescriptor(name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false) }
+        }
+        throw HerdrParseError.invalidJSON("Could not decode Herdr sessions from output")
     }
 
     public static func parseAgentState(from output: String) throws -> HerdrAgentState {
@@ -654,6 +868,15 @@ public enum HerdrOutputParser: Sendable {
             if let text = wrapper.text { return text.replacingOccurrences(of: "\r\n", with: "\n") }
             if let content = wrapper.content { return content.replacingOccurrences(of: "\r\n", with: "\n") }
             if let lines = wrapper.lines { return lines.map { $0.replacingOccurrences(of: "\r\n", with: "\n") }.joined(separator: "\n") }
+        }
+        if trimmed.hasPrefix("{") ,
+           let data = trimmed.data(using: .utf8),
+           let envelope = try? JSONDecoder().decode(RecentUnwrappedEnvelope.self, from: data) {
+            let wrapper = envelope.result
+            if let out = wrapper.output { return out.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let text = wrapper.text { return text.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let content = wrapper.content { return content.replacingOccurrences(of: "\r\n", with: "\n") }
+            if let lines = wrapper.lines { return lines.joined(separator: "\n") }
         }
 
         return clean.replacingOccurrences(of: "\r\n", with: "\n")
