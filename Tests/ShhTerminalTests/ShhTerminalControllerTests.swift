@@ -739,7 +739,19 @@ final class ShhTerminalControllerTests: XCTestCase {
         let controller = ShhTerminalController(configuration: configuration)
         let representable = ShhTerminalView(controller: controller)
         let coordinator = representable.makeCoordinator()
+        let initialResizeExpectation = expectation(
+            description: "Initial attachment resize delivered"
+        )
+        var initialSize: TerminalSize?
+        controller.onResize = { size in
+            initialSize = size
+            initialResizeExpectation.fulfill()
+        }
+
         let hostView = representable.makeUIView(coordinator: coordinator)
+        await fulfillment(of: [initialResizeExpectation], timeout: 1.0)
+        XCTAssertEqual(initialSize, TerminalSize(columns: 80, rows: 24))
+
         let resizeExpectation = expectation(description: "Main-thread callback delivered")
         controller.onResize = { size in
             XCTAssertEqual(size, TerminalSize(columns: 132, rows: 43))
