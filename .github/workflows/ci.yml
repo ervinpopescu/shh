@@ -178,7 +178,10 @@ jobs:
           sudo xcode-select -s "$developer_dir"
           echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
-          XCODE_VER=$(xcodebuild -version | head -n 1 | tr ' ' '-')
+          XCODE_VER=$(
+            xcodebuild -version |
+              awk 'NR == 1 { gsub(/ /, "-"); print }'
+          )
           echo "XCODE_VERSION=$XCODE_VER" >> "$GITHUB_ENV"
 
       - name: Cache Build Artifacts and Dependencies
@@ -394,7 +397,10 @@ jobs:
           sudo xcode-select -s "$developer_dir"
           echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
-          XCODE_VER=$(xcodebuild -version | head -n 1 | tr ' ' '-')
+          XCODE_VER=$(
+            xcodebuild -version |
+              awk 'NR == 1 { gsub(/ /, "-"); print }'
+          )
           echo "XCODE_VERSION=$XCODE_VER" >> "$GITHUB_ENV"
 
       - name: Cache Build Artifacts and Dependencies
