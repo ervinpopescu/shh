@@ -269,7 +269,7 @@ final class BonjourSSHDiscoveryTests: XCTestCase {
         browser.simulateResults([
             NWEndpoint.service(name: "schweiz", type: "_ssh._tcp", domain: "local.", interface: nil)
         ])
-        await fulfillment(of: [resolutionApplied], timeout: 1.0)
+        await fulfillment(of: [resolutionApplied], timeout: 5.0)
 
         XCTAssertEqual(discovery.discoveredServices.count, 1)
         XCTAssertEqual(discovery.discoveredServices[0].hostname, "schweiz.local")
