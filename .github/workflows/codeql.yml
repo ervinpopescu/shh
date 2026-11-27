@@ -76,6 +76,7 @@ jobs:
           # supported lookup path for component toolchains; keep XcodeDefault
           # available for all other compiler and linker tools.
           toolchains="$metal_toolchain com.apple.dt.toolchain.XcodeDefault"
+          echo "METAL_TOOLCHAIN=$metal_toolchain" >> "$GITHUB_ENV"
           echo "TOOLCHAINS=$toolchains" >> "$GITHUB_ENV"
           export TOOLCHAINS="$toolchains"
 
@@ -121,6 +122,7 @@ jobs:
           xcodebuild build-for-testing \
             -project Shh.xcodeproj \
             -scheme ShhAppTests \
+            -toolchain "$METAL_TOOLCHAIN" \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build/DerivedData \
             -skipPackagePluginValidation \
