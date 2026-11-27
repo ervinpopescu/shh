@@ -15,7 +15,9 @@ struct SessionSwitcherBar: View {
                         session: session,
                         isSelected: container.selectedSessionID == session.id,
                         onSelect: {
-                            container.selectSession(id: session.id)
+                            Task {
+                                await container.selectSessionAndBindAuxiliary(id: session.id)
+                            }
                         },
                         onClose: {
                             Task {

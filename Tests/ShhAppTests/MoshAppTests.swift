@@ -1,13 +1,16 @@
-import SwiftUI
-import XCTest
-@testable import Shh
 import ShhCore
 import ShhSSH
 import ShhTerminal
+import SwiftUI
+import XCTest
+
+@testable import Shh
 
 // MARK: - Test Doubles for Mosh Integration Testing
 
-final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecuting, @unchecked Sendable {
+final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecuting,
+    @unchecked Sendable
+{
     private let lock = NSLock()
     let sessionInfo: MoshSessionInfo
     var moshState: MoshState
@@ -94,7 +97,11 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
     }
 
     func close() async {
-        let (stream, conns) = lock.withLock { () -> (AsyncThrowingStream<TerminalEvent, Error>.Continuation?, [AsyncStream<MoshState>.Continuation]) in
+        let (stream, conns) = lock.withLock {
+            () -> (
+                AsyncThrowingStream<TerminalEvent, Error>.Continuation?,
+                [AsyncStream<MoshState>.Continuation]
+            ) in
             isClosed = true
             sessionInfo.sessionKey.zeroize()
             let stream = streamContinuation
@@ -118,7 +125,9 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
         try await executeCommand(command, timeout: nil, maxOutputBytes: nil)
     }
 
-    func executeCommand(_ command: String, timeout: TimeInterval?, maxOutputBytes: Int?) async throws -> SSHCommandResult {
+    func executeCommand(_ command: String, timeout: TimeInterval?, maxOutputBytes: Int?)
+        async throws -> SSHCommandResult
+    {
         if let onExecuteCommand {
             return try await onExecuteCommand(command)
         }
@@ -127,7 +136,8 @@ final class ControllableMoshConnection: MoshSessionControlling, SSHCommandExecut
             return SSHCommandResult(exitCode: 0, stdout: "tmux 3.4\n")
         }
         if trimmed.contains("list-sessions") {
-            return SSHCommandResult(exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n")
+            return SSHCommandResult(
+                exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n")
         }
         if trimmed.contains("has-session") {
             return SSHCommandResult(exitCode: 0, stdout: "")
@@ -178,14 +188,16 @@ final class MoshAppTests: XCTestCase {
 
     private func makeContainer(
         moshTransport: any MoshTransport,
-        reachability: any ReachabilityMonitoring = MockReachabilityMonitor(isReachable: true, initialInterface: .wifi)
+        reachability: any ReachabilityMonitoring = MockReachabilityMonitor(
+            isReachable: true, initialInterface: .wifi)
     ) -> AppContainer {
         AppContainer(
             transport: ControllableTransport(),
             moshTransport: moshTransport,
             voiceRecorder: DemoAudioRecorder(),
             reachabilityMonitor: reachability,
-            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter),
             sftpRepository: DemoSFTPRepository(seedDemoData: true),
             portForwardingManager: DemoPortForwardingManager()
         )
@@ -275,7 +287,8 @@ final class MoshAppTests: XCTestCase {
         oldConnection.onStateUpdates = { await gate.wait() }
         oldConnection.onHandleNetworkRoaming = { _ in throw TransportError.connectionRefused }
         let replacement = ControllableMoshConnection(
-            sessionInfo: MoshSessionInfo(udpPort: 60022, sessionKey: "replacement-mosh-key", pid: 42102))
+            sessionInfo: MoshSessionInfo(
+                udpPort: 60022, sessionKey: "replacement-mosh-key", pid: 42102))
         let connects = CounterBox()
         let transport = ControllableMoshTransport()
         transport.onConnect = { _ in
@@ -300,6 +313,37 @@ final class MoshAppTests: XCTestCase {
         try await Task.sleep(nanoseconds: 30_000_000)
         XCTAssertEqual(container.moshSessionPort, 60022)
         XCTAssertEqual(container.moshState, .connected)
+    }
+
+    func testNonSelectedMoshRuntimeReceivesInterfaceChanges() async throws {
+        let connectionA = ControllableMoshConnection()
+        let connectionB = ControllableMoshConnection()
+        let moshTransport = ControllableMoshTransport()
+        moshTransport.onConnect = { host in
+            host.hostname == "mosh-a.invalid" ? connectionA : connectionB
+        }
+        let container = makeContainer(moshTransport: moshTransport)
+        let hostA = try Host(
+            name: "Mosh A", hostname: "mosh-a.invalid", username: "dev",
+            connection: .mosh(MoshOptions()))
+        let hostB = try Host(
+            name: "Mosh B", hostname: "mosh-b.invalid", username: "dev",
+            connection: .mosh(MoshOptions()))
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: sessionAID)
+
+        let roamingState = NetworkRoamingState(currentInterface: .cellular)
+        await container.handleNetworkInterfaceChange(.cellular, roamingState: roamingState)
+
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        XCTAssertEqual(connectionA.roamingTransitions.count, 1)
+        XCTAssertEqual(connectionB.roamingTransitions.count, 1)
+        XCTAssertEqual(runtimeB.networkRoamingState?.currentInterface, .cellular)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
     }
 
     func testMoshStatusFollowsSelectedSessionAcrossMultiSessionSwitching() async throws {
@@ -423,7 +467,9 @@ final class MoshAppTests: XCTestCase {
         // Verify that Mosh handled the roam in-place without re-issuing disruptive "tmux attach" into the running terminal!
         XCTAssertEqual(mockMosh.roamingTransitions.count, 1)
         XCTAssertEqual(container.activeTmuxSessionID, "$0")
-        XCTAssertEqual(mockMosh.sentData.count, initialSentDataCount, "No duplicate attach commands sent during in-place roaming")
+        XCTAssertEqual(
+            mockMosh.sentData.count, initialSentDataCount,
+            "No duplicate attach commands sent during in-place roaming")
         XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
@@ -476,7 +522,9 @@ final class MoshAppTests: XCTestCase {
         XCTAssertEqual(connectCounter.value, 2, "Second connection established via fast recovery")
         XCTAssertEqual(container.activeSession?.state, .connected)
         XCTAssertEqual(container.activeTmuxSessionID, "$0", "Tmux reattached cleanly")
-        XCTAssertEqual(container.terminalText, "", "Recovery must not retain or duplicate stale terminal output")
+        XCTAssertEqual(
+            container.terminalText, "",
+            "Recovery must not retain or duplicate stale terminal output")
     }
 
     private func eventually(
@@ -517,7 +565,10 @@ final class MoshAppTests: XCTestCase {
         container.herdrAvailability = .available(version: "herdr 0.1.0")
 
         reachability.transitionInterface(to: .cellular)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually {
+            mockMosh.roamingTransitions.count == 1
+                && container.activeHerdrWorkspaceID == "ws-12345"
+        }
 
         XCTAssertEqual(mockMosh.roamingTransitions.count, 1)
         XCTAssertEqual(container.activeHerdrWorkspaceID, "ws-12345")
@@ -550,8 +601,10 @@ final class MoshAppTests: XCTestCase {
         let redactedData = container.redacted(Data(rawLeak.utf8))
         let redactedString = String(decoding: redactedData, as: UTF8.self)
 
-        XCTAssertFalse(redactedString.contains(secretKey), "Raw session key must not appear unredacted")
-        XCTAssertTrue(redactedString.contains("[REDACTED]"), "Session key must be replaced by [REDACTED]")
+        XCTAssertFalse(
+            redactedString.contains(secretKey), "Raw session key must not appear unredacted")
+        XCTAssertTrue(
+            redactedString.contains("[REDACTED]"), "Session key must be replaced by [REDACTED]")
 
         // Description and DebugDescription of MoshSessionKey must also be redacted
         XCTAssertEqual(sessionInfo.sessionKey.description, "[REDACTED]")
@@ -575,7 +628,9 @@ final class MoshAppTests: XCTestCase {
         )
 
         // Initial connect in demo mode
-        let challenge = HostKeyChallenge(hostname: "demo.mosh.internal", port: 22, algorithm: "ssh-ed25519", fingerprint: "SHA256:demo-mosh-fingerprint")
+        let challenge = HostKeyChallenge(
+            hostname: "demo.mosh.internal", port: 22, algorithm: "ssh-ed25519",
+            fingerprint: "SHA256:demo-mosh-fingerprint")
         await container.trustStore.save(challenge)
         await container.connect(to: host)
 
@@ -615,7 +670,8 @@ final class MoshAppTests: XCTestCase {
     // MARK: - 9. Milestone 9 Review Regressions
 
     func testHostEditorPreservesSSHOptionsForMoshProfile() throws {
-        let originalSSH = SSHOptions(connectTimeoutSeconds: 42, keepAliveSeconds: 99, strictHostKeyChecking: .trustedOnly)
+        let originalSSH = SSHOptions(
+            connectTimeoutSeconds: 42, keepAliveSeconds: 99, strictHostKeyChecking: .trustedOnly)
         let moshOpts = MoshOptions(serverCommand: "mosh-server", sshOptions: originalSSH)
         let host = try Host(
             name: "Existing Mosh",
@@ -707,7 +763,9 @@ final class MoshAppTests: XCTestCase {
         try await eventually { mockMosh.roamingTransitions.count == 1 }
 
         // Workspaces should NOT be wiped during Mosh roaming
-        XCTAssertFalse(container.herdrWorkspaces.isEmpty, "Herdr workspaces must not be emptied during Mosh roaming")
+        XCTAssertFalse(
+            container.herdrWorkspaces.isEmpty,
+            "Herdr workspaces must not be emptied during Mosh roaming")
         XCTAssertEqual(container.herdrWorkspaces.first?.id, "ws-roam-test")
     }
 
@@ -748,7 +806,9 @@ final class MoshAppTests: XCTestCase {
         try await eventually { container.reconnectState.isReconnecting }
 
         // Reconnect coordinator should have started rather than being bypassed/frozen
-        XCTAssertTrue(container.reconnectState.isReconnecting, "Reconnect coordinator must be active, not frozen")
+        XCTAssertTrue(
+            container.reconnectState.isReconnecting,
+            "Reconnect coordinator must be active, not frozen")
 
         await container.cancelReconnect()
         XCTAssertEqual(container.reconnectState, .cancelled)
@@ -765,7 +825,8 @@ final class MoshAppTests: XCTestCase {
         mockMosh1.onExecuteCommand = { cmd in
             if cmd.contains("list-sessions") {
                 await listGate.wait()
-                return SSHCommandResult(exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000000\t1\n")
+                return SSHCommandResult(
+                    exitCode: 0, stdout: "$1\tother\t1\t1700000000\t1700000000\t1\n")
             }
             if cmd.contains("has-session") {
                 return SSHCommandResult(exitCode: 0, stdout: "")
@@ -778,7 +839,8 @@ final class MoshAppTests: XCTestCase {
                 return SSHCommandResult(exitCode: 0, stdout: "")
             }
             if cmd.contains("list-sessions") {
-                return SSHCommandResult(exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n")
+                return SSHCommandResult(
+                    exitCode: 0, stdout: "$0\tdefault\t1\t1700000000\t1700000000\t1\n")
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -822,7 +884,9 @@ final class MoshAppTests: XCTestCase {
 
         // Stale result must be discarded and must not overwrite recovered target $0
         XCTAssertTrue(staleResult.isEmpty, "Stale generation results must be discarded")
-        XCTAssertEqual(container.activeTmuxSessionID, "$0", "Active tmux session ID must not be wiped by stale generation")
+        XCTAssertEqual(
+            container.activeTmuxSessionID, "$0",
+            "Active tmux session ID must not be wiped by stale generation")
     }
 }
 

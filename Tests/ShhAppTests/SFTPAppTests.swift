@@ -1154,11 +1154,307 @@ final class SFTPAppTests: XCTestCase {
             container.transferQueueState.task(withID: task.id),
             "Session A's non-cooperative completion must not repopulate B's queue")
     }
+
+    // MARK: - Per-session transfer ownership
+
+    func testCancellingOneSessionsTransferLeavesOtherSessionsTransferRunning() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Cancel A", hostname: "cancel-a.invalid", username: "dev")
+        let hostB = try Host(name: "Cancel B", hostname: "cancel-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let taskA = try await enqueueGatedDownload(
+            named: "cancel-a-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "cancel-b-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        // Session B is selected, yet the cancel targets A's runtime.
+        await container.cancelTransfer(id: taskA.id)
+
+        let queue = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(queue.task(withID: taskA.id)?.state, .cancelled)
+        XCTAssertEqual(queue.task(withID: taskB.id)?.state, .transferring)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        let taskBWork = try XCTUnwrap(runtimeB.transfers.activeTasks[taskB.id])
+        XCTAssertFalse(taskBWork.isCancelled, "Cancelling A must not cancel B's transfer work")
+
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    func testSelectionSwitchKeepsEachSessionsTransferQueueRunning() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Switch A", hostname: "switch-a.invalid", username: "dev")
+        let hostB = try Host(name: "Switch B", hostname: "switch-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "switch-a-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "switch-b-\(UUID().uuidString).bin", in: container, repository: repository)
+        await awaitTransferCondition("B's queue to be projected") {
+            container.transferQueueState.tasks.map(\.id) == [taskB.id]
+        }
+
+        container.selectSession(id: sessionAID)
+        await awaitTransferCondition("A's queue to be projected after switching") {
+            container.transferQueueState.tasks.map(\.id) == [taskA.id]
+        }
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        let afterSwitchToA = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(afterSwitchToA.task(withID: taskB.id)?.state, .transferring)
+        XCTAssertNotNil(runtimeB.transfers.activeTasks[taskB.id])
+
+        container.selectSession(id: sessionBID)
+        await awaitTransferCondition("B's queue to be projected after switching back") {
+            container.transferQueueState.tasks.map(\.id) == [taskB.id]
+        }
+        let afterSwitchToB = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(afterSwitchToB.task(withID: taskA.id)?.state, .transferring)
+
+        await repository.release(taskA.remotePath.description)
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("both transfers to complete") {
+            let queue = await container.transferCoordinator.snapshot()
+            return queue.task(withID: taskA.id)?.state == .completed
+                && queue.task(withID: taskB.id)?.state == .completed
+        }
+    }
+
+    func testClosingOneSessionClearsOnlyItsOwnTransfersAndStagingFiles() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Close A", hostname: "close-a.invalid", username: "dev")
+        let hostB = try Host(name: "Close B", hostname: "close-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "close-a-\(UUID().uuidString).bin", in: container, repository: repository)
+        try Data("staged A".utf8).write(to: taskA.localURL)
+
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let taskB = try await enqueueGatedDownload(
+            named: "close-b-\(UUID().uuidString).bin", in: container, repository: repository)
+        try Data("staged B".utf8).write(to: taskB.localURL)
+        defer { try? FileManager.default.removeItem(at: taskB.localURL) }
+
+        await container.closeSession(id: sessionAID)
+
+        XCTAssertNil(container.runtime(for: sessionAID))
+        let queue = await container.transferCoordinator.snapshot()
+        XCTAssertNil(queue.task(withID: taskA.id), "Closing A must discard only A's transfers")
+        XCTAssertEqual(queue.task(withID: taskB.id)?.state, .transferring)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        XCTAssertNotNil(runtimeB.transfers.activeTasks[taskB.id])
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: taskA.localURL.path),
+            "Closing A must remove A's staged file")
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: taskB.localURL.path),
+            "Closing A must keep B's staged file")
+
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete after closing A") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    func testRetryReplaysOnlyTheOwningSessionsTransfer() async throws {
+        let repository = PathGatedDownloadRepository()
+        let container = AppContainer(transport: ControllableTransport(), sftpRepository: repository)
+        let hostA = try Host(name: "Retry A", hostname: "retry-a.invalid", username: "dev")
+        let hostB = try Host(name: "Retry B", hostname: "retry-b.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let taskA = try await enqueueGatedDownload(
+            named: "retry-a-\(UUID().uuidString).bin", in: container, repository: repository)
+        await container.cancelTransfer(id: taskA.id)
+
+        await container.connect(to: hostB)
+        let taskB = try await enqueueGatedDownload(
+            named: "retry-b-\(UUID().uuidString).bin", in: container, repository: repository)
+
+        // Retry is refused while B is selected because A's transfer is not B's.
+        await container.retryTransfer(id: taskA.id)
+        let whileBSelected = await container.transferCoordinator.snapshot()
+        XCTAssertEqual(whileBSelected.task(withID: taskA.id)?.state, .cancelled)
+        XCTAssertEqual(
+            whileBSelected.tasks.filter { $0.ownerSessionID == sessionAID }.map(\.id),
+            [taskA.id])
+        XCTAssertEqual(whileBSelected.task(withID: taskB.id)?.state, .transferring)
+
+        await container.selectSessionAndBindAuxiliary(id: sessionAID)
+        await awaitTransferCondition("A's cancelled transfer to be projected") {
+            container.transferQueueState.task(withID: taskA.id)?.state == .cancelled
+        }
+        await repository.release(taskA.remotePath.description)
+        await container.retryTransfer(id: taskA.id)
+
+        let afterRetry = await container.transferCoordinator.snapshot()
+        XCTAssertNil(afterRetry.task(withID: taskA.id))
+        let retried = afterRetry.tasks.filter { $0.ownerSessionID == sessionAID }
+        XCTAssertEqual(retried.count, 1)
+        let retriedTask = try XCTUnwrap(retried.first)
+        XCTAssertNotEqual(retriedTask.id, taskA.id)
+        XCTAssertEqual(retriedTask.remotePath, taskA.remotePath)
+        XCTAssertEqual(afterRetry.task(withID: taskB.id)?.state, .transferring)
+
+        await awaitTransferCondition("retried transfer to complete") {
+            await container.transferCoordinator.snapshot().task(withID: retriedTask.id)?.state
+                == .completed
+        }
+        await repository.release(taskB.remotePath.description)
+        await awaitTransferCondition("B's transfer to complete after retry") {
+            await container.transferCoordinator.snapshot().task(withID: taskB.id)?.state
+                == .completed
+        }
+    }
+
+    /// Yields until `condition` holds. The wait is bounded by attempts, not time, and
+    /// never sleeps, so a stuck transfer fails the test instead of hanging the run.
+    private func awaitTransferCondition(
+        _ description: String,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ condition: () async -> Bool
+    ) async {
+        for _ in 0..<10_000 {
+            if await condition() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for \(description)", file: file, line: line)
+    }
+
+    /// Enqueues a download whose remote read is held by `repository` and waits until
+    /// the transfer reports progress, so it is in flight before the caller continues.
+    /// Auxiliary SFTP binding for a non-demo repository completes asynchronously after
+    /// connect, so the selected session is bound and its repository awaited first.
+    private func enqueueGatedDownload(
+        named name: String,
+        in container: AppContainer,
+        repository: PathGatedDownloadRepository
+    ) async throws -> TransferTask {
+        let selectedID = try XCTUnwrap(container.selectedSessionID)
+        await container.selectSessionAndBindAuxiliary(id: selectedID)
+        await awaitTransferCondition("SFTP to bind for \(name)") {
+            container.sftpRepository != nil
+        }
+        let file = RemoteFile(name: name, path: RemotePath("/home/dev/\(name)"), size: 16)
+        let enqueued = await container.enqueueDownload(file: file, overwrite: true)
+        let task = try XCTUnwrap(enqueued)
+        await awaitTransferCondition("\(name) to be in flight") {
+            await container.transferCoordinator.snapshot().task(withID: task.id)?.state
+                == .transferring
+        }
+        return task
+    }
 }
 
 extension DemoSFTPRepository {
     func setSimulateTransferChunkDelay(_ delay: TimeInterval) {
         self.simulateTransferChunkDelay = delay
+    }
+}
+
+/// Serves downloads whose completion is held per remote path until the test releases
+/// that path. Each download reports progress before it waits.
+private actor PathGatedDownloadRepository: SFTPRepository {
+    private var gates: [String: PathTransferGate] = [:]
+
+    func release(_ path: String) async {
+        await gate(for: path).release()
+    }
+
+    private func gate(for path: String) -> PathTransferGate {
+        if let existing = gates[path] { return existing }
+        let created = PathTransferGate()
+        gates[path] = created
+        return created
+    }
+
+    func listDirectory(at path: RemotePath) async throws -> [RemoteFile] { [] }
+
+    func readFile(at path: RemotePath) async throws -> Data { Data() }
+
+    func download(
+        from remotePath: RemotePath,
+        to localURL: URL,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {
+        progress?(TransferProgress(bytesTransferred: 1, totalBytes: 16))
+        try await gate(for: remotePath.description).wait()
+        progress?(TransferProgress(bytesTransferred: 16, totalBytes: 16))
+    }
+
+    func writeFile(
+        data: Data,
+        at remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func upload(
+        from localURL: URL,
+        to remotePath: RemotePath,
+        progress: (@Sendable (TransferProgress) -> Void)?
+    ) async throws {}
+
+    func createDirectory(at path: RemotePath) async throws {}
+    func removeFile(at path: RemotePath) async throws {}
+    func removeDirectory(at path: RemotePath) async throws {}
+    func rename(from oldPath: RemotePath, to newPath: RemotePath) async throws {}
+
+    func fetchAttributes(at path: RemotePath) async throws -> RemoteFile {
+        RemoteFile(name: path.lastComponent, path: path)
+    }
+}
+
+/// A release gate for one download. A waiting download honours cancellation the way a
+/// real SFTP read does, so a cancelled transfer throws instead of completing later.
+private actor PathTransferGate {
+    private var isReleased = false
+    private var waiters: [UUID: CheckedContinuation<Void, Error>] = [:]
+
+    func wait() async throws {
+        guard !isReleased else { return }
+        let id = UUID()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // No suspension point precedes registration, so a cancellation hop
+                // enqueued by onCancel always finds this waiter.
+                waiters[id] = continuation
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
+        }
+    }
+
+    func release() {
+        isReleased = true
+        let pending = Array(waiters.values)
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    private func cancelWaiter(_ id: UUID) {
+        waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
     }
 }
 

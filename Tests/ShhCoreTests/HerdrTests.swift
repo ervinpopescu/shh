@@ -222,23 +222,88 @@ final class HerdrTests: XCTestCase {
         )
         XCTAssertEqual(
             HerdrCommand.workspaceList().renderedCommand,
-            "herdr workspace list --format 'json'"
+            "herdr workspace list"
         )
         XCTAssertEqual(
             HerdrCommand.paneList().renderedCommand,
-            "herdr pane list --format 'json'"
+            "herdr pane list"
         )
         XCTAssertEqual(
             HerdrCommand.paneList(workspace: "ws1").renderedCommand,
-            "herdr pane list 'ws1' --format 'json'"
+            "herdr pane list --workspace 'ws1'"
         )
         XCTAssertEqual(
             HerdrCommand.status().renderedCommand,
-            "herdr status --format 'json'"
+            "herdr status --json"
         )
         XCTAssertEqual(
             HerdrCommand.version.renderedCommand,
             "herdr --version"
+        )
+    }
+
+    func testNamedHerdrSessionCommandsUseRootSelectorAndDefaultOmitsIt() {
+        let sshID = UUID()
+        let named = HerdrTargetContext(sshSessionID: sshID, herdrSessionName: "build team")
+        XCTAssertEqual(
+            HerdrCommand.workspaceList().renderedCommand(for: named),
+            "herdr --session 'build team' workspace list"
+        )
+        XCTAssertEqual(
+            HerdrCommand.paneRun(pane: "w1:p1", command: "echo 'ok'").renderedCommand(for: named),
+            "herdr --session 'build team' pane run 'w1:p1' 'echo '\\''ok'\\'''"
+        )
+        XCTAssertEqual(
+            HerdrCommand.workspaceList().renderedCommand(for: HerdrTargetContext(sshSessionID: sshID)),
+            "herdr workspace list"
+        )
+    }
+
+    func testParseActualHerdrEnvelopeAndOpaqueSnakeCaseIDs() throws {
+        let json = """
+        {
+          "id":"cli:workspace:list",
+          "result":{"type":"workspace_list","workspaces":[
+            {"workspace_id":"wN","label":"main","number":1,"pane_count":2,
+             "tab_count":1,"active_tab_id":"wN:tN","agent_status":"idle"}
+          ]}
+        }
+        """
+        let workspaces = try HerdrOutputParser.parseWorkspaces(from: json)
+        XCTAssertEqual(
+            workspaces,
+            [
+                HerdrWorkspace(
+                    id: "wN", label: "main", cwd: "", paneCount: 2, tabCount: 1,
+                    activeTabID: "wN:tN", agentState: .idle
+                )
+            ]
+        )
+
+        let paneJSON = """
+        {
+          "id":"cli:pane:list",
+          "result":{"type":"pane_list","panes":[
+            {"pane_id":"wN:pN","workspace_id":"wN","agent_status":"working","tab_id":"wN:tN","terminal_id":"opaque"}
+          ]}
+        }
+        """
+        let panes = try HerdrOutputParser.parsePanes(from: paneJSON)
+        XCTAssertEqual(panes.first?.id, "wN:pN")
+        XCTAssertEqual(panes.first?.agentState, .working)
+        XCTAssertEqual(panes.first?.workspaceID, "wN")
+    }
+
+    func testParseNamedHerdrSessionsEnvelope() throws {
+        let json = """
+        {"id":"cli:session:list","result":{"sessions":[{"name":"default","default":true,"running":true},{"name":"review","default":false,"running":false}]}}
+        """
+        XCTAssertEqual(
+            try HerdrOutputParser.parseSessions(from: json),
+            [
+                HerdrSessionDescriptor(name: "default", isDefault: true, isRunning: true),
+                HerdrSessionDescriptor(name: "review")
+            ]
         )
     }
 
@@ -388,6 +453,12 @@ final class HerdrTests: XCTestCase {
         let linesWrapper = "{\"lines\": [\"First\\r\\nsubline\", \"Second\"]}"
         let parsedLines = HerdrOutputParser.parseRecentUnwrapped(from: linesWrapper)
         XCTAssertEqual(parsedLines, "First\nsubline\nSecond")
+
+        let envelope = "{\"id\":\"cli:pane:read\",\"result\":{\"output\":\"Nested\\r\\nline\\r\\n\"}}"
+        XCTAssertEqual(
+            HerdrOutputParser.parseRecentUnwrapped(from: envelope),
+            "Nested\nline\n"
+        )
     }
 
     func testHerdrParseErrorCases() {
@@ -415,7 +486,7 @@ final class HerdrTests: XCTestCase {
 
         XCTAssertEqual(policy.classify("herdr --version"), .safe)
         XCTAssertEqual(policy.classify("herdr -v"), .safe)
-        XCTAssertEqual(policy.classify("herdr workspace list --format json"), .safe)
+        XCTAssertEqual(policy.classify("herdr workspace list"), .safe)
         XCTAssertEqual(policy.classify("herdr workspace list"), .safe)
         XCTAssertEqual(policy.classify("herdr tab list"), .safe)
         XCTAssertEqual(policy.classify("herdr pane list"), .safe)
@@ -427,7 +498,7 @@ final class HerdrTests: XCTestCase {
         XCTAssertEqual(policy.classify("herdr status"), .safe)
 
         XCTAssertTrue(policy.canSend("herdr --version", approved: false))
-        XCTAssertTrue(policy.canSend("herdr workspace list --format json", approved: false))
+        XCTAssertTrue(policy.canSend("herdr workspace list", approved: false))
         XCTAssertTrue(policy.canSend("herdr pane read p1 --source recent-unwrapped", approved: false))
     }
 
@@ -510,7 +581,7 @@ final class HerdrTests: XCTestCase {
         XCTAssertEqual(avail, .available(version: "herdr 0.1.0"))
 
         // Workspaces list
-        let listResult = try await conn.executeCommand("herdr workspace list --format json")
+        let listResult = try await conn.executeCommand("herdr workspace list")
         XCTAssertEqual(listResult.exitCode, 0)
         let workspaces = try HerdrOutputParser.parseWorkspaces(from: listResult.stdout)
         XCTAssertFalse(workspaces.isEmpty)
@@ -533,7 +604,7 @@ final class HerdrTests: XCTestCase {
         let runResult = try await conn.executeCommand("herdr pane run pane-idle 'build-task'")
         XCTAssertEqual(runResult.exitCode, 0)
 
-        let workspacesAfterRun = try await conn.executeCommand("herdr workspace list --format json")
+        let workspacesAfterRun = try await conn.executeCommand("herdr workspace list")
         let updatedWorkspaces = try HerdrOutputParser.parseWorkspaces(from: workspacesAfterRun.stdout)
         let transitionedPane = updatedWorkspaces.flatMap(\.panes).first(where: { $0.id == "pane-idle" })
         XCTAssertEqual(transitionedPane?.agentState, .working)
@@ -544,7 +615,7 @@ final class HerdrTests: XCTestCase {
         let waitState = try HerdrOutputParser.parseAgentState(from: waitResult.stdout)
         XCTAssertTrue(waitState.isCompleted)
 
-        let workspacesAfterWait = try await conn.executeCommand("herdr workspace list --format json")
+        let workspacesAfterWait = try await conn.executeCommand("herdr workspace list")
         let finalWorkspaces = try HerdrOutputParser.parseWorkspaces(from: workspacesAfterWait.stdout)
         let finalPane = finalWorkspaces.flatMap(\.panes).first(where: { $0.id == "pane-idle" })
         XCTAssertEqual(finalPane?.agentState.statusName, "completed")

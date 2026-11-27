@@ -135,7 +135,9 @@ final class MultiSessionAppTests: XCTestCase {
 
     func testStaleSFTPListingCannotPublishAfterSelectionSwitch() async throws {
         let gate = MultiSessionGate()
-        let repository = DelayedSFTPRepository(gate: gate)
+        // Listing 1 (A's initial load) and listing 2 (A's stale request) are gated.
+        // B's own listing (3) is not, so it publishes before the stale one resumes.
+        let repository = DelayedSFTPRepository(gate: gate, gatedListingCount: 2)
         let connectionA = MockSSHConnection()
         let connectionB = MockSSHConnection()
         let transport = ControllableTransport()
@@ -150,18 +152,29 @@ final class MultiSessionAppTests: XCTestCase {
         await gate.waitForStart()
         XCTAssertTrue(container.isLoadingDirectory)
 
+        // A uses a distinct path so a stale publish is observable as a path change.
         let staleListing = Task { @MainActor in
-            await container.loadDirectory(at: RemotePath("/home/dev"), bypassCache: true)
+            await container.loadDirectory(at: RemotePath("/stale"), bypassCache: true)
         }
+        for _ in 0..<500 {
+            if await repository.listedDirectoryCount() >= 2 { break }
+            await Task.yield()
+        }
+        let staleListingStarted = await repository.listedDirectoryCount()
+        XCTAssertEqual(staleListingStarted, 2)
+
         await container.connect(to: hostB)
         XCTAssertEqual(container.selectedSessionID, container.openSessions.last?.id)
-        XCTAssertTrue(container.currentDirectoryFiles.isEmpty)
+        // B's per-runtime auxiliary binds and loads its own home listing (not gated).
+        for _ in 0..<500 where container.currentDirectoryFiles.isEmpty {
+            await Task.yield()
+        }
+        XCTAssertFalse(container.currentDirectoryFiles.isEmpty)
 
         await gate.open()
         await staleListing.value
-        try await Task.sleep(nanoseconds: 50_000_000)
 
-        XCTAssertTrue(container.currentDirectoryFiles.isEmpty)
+        XCTAssertNotEqual(container.currentPath, RemotePath("/stale"))
         XCTAssertEqual(container.currentPath, RemotePath("/home/dev"))
         XCTAssertNil(container.directoryErrorMessage)
     }
@@ -233,7 +246,8 @@ final class MultiSessionAppTests: XCTestCase {
         await container.connect(to: hostB)
         let sessionBID = try XCTUnwrap(container.selectedSessionID)
 
-        connectionB.emit(.closed)
+        // A clean close is not a recovery trigger (717d63c), so use a transport error.
+        connectionB.emit(.error(.connectionRefused))
         try await eventually {
             container.runtime(for: sessionBID)?.reconnectState.isReconnecting == true
         }
@@ -669,10 +683,10 @@ final class MultiSessionAppTests: XCTestCase {
 
         let opening = Task { @MainActor in await container.connect(to: host) }
         await gate.waitForStart()
-        XCTAssertNotNil(container.pendingConnectingSession)
+        XCTAssertEqual(container.pendingConnectingSessions.values.map(\.hostID), [host.id])
 
         await container.disconnect()
-        XCTAssertNil(container.pendingConnectingSession)
+        XCTAssertTrue(container.pendingConnectingSessions.isEmpty)
         XCTAssertNil(container.selectedSessionID)
         XCTAssertNil(container.activeHost)
         XCTAssertEqual(container.activeSession?.state, .disconnected)
@@ -718,7 +732,7 @@ final class MultiSessionAppTests: XCTestCase {
         await container.disconnect()
         XCTAssertEqual(container.selectedSessionID, sessionAID)
         XCTAssertEqual(container.runtime(for: sessionAID)?.session.state, .disconnected)
-        XCTAssertEqual(container.pendingConnectingSession?.hostID, hostB.id)
+        XCTAssertEqual(container.pendingConnectingSessions.values.map(\.hostID), [hostB.id])
 
         await gate.open()
         await opening.value
@@ -804,11 +818,9 @@ final class MultiSessionAppTests: XCTestCase {
         let connectionA = ControllableMoshConnection()
         let connectionB = ControllableMoshConnection()
         let gate = MultiSessionGate()
-        let bConnects = CounterBox()
         let moshTransport = ControllableMoshTransport()
         moshTransport.onConnect = { host in
             if host.hostname == "beta.invalid" {
-                _ = bConnects.increment()
                 return connectionB
             }
             return connectionA
@@ -830,7 +842,6 @@ final class MultiSessionAppTests: XCTestCase {
         await container.connect(to: hostB)
         let sessionBID = try XCTUnwrap(container.selectedSessionID)
         container.selectSession(id: sessionAID)
-
         let roaming = Task { @MainActor in
             await container.handleNetworkInterfaceChange(
                 .cellular,
@@ -844,8 +855,7 @@ final class MultiSessionAppTests: XCTestCase {
 
         XCTAssertEqual(container.selectedSessionID, sessionBID)
         XCTAssertEqual(container.runtime(for: sessionBID)?.session.state, .connected)
-        XCTAssertEqual(connectionB.roamingTransitions.count, 0)
-        XCTAssertEqual(bConnects.value, 1, "B must not be reconnected by A's roaming failure")
+        XCTAssertEqual(connectionB.roamingTransitions.count, 1)
     }
 
     func testDelayedMoshRoamingDoesNotPublishAfterExplicitDisconnect() async throws {
@@ -961,6 +971,299 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertNotEqual(sessionAID, sessionBID)
     }
 
+    func testNonSelectedReconnectRestoresOwnerTmuxTargetWithoutChangingSelectedProjection()
+        async throws
+    {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let bConnections = ConnectionSequence([connectionB, replacementB])
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? connectionA : await bConnections.next()
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
+        let hostA = try Host(
+            name: "Alpha Host", hostname: "alpha.invalid", username: "dev", autoAttachTmux: true)
+        let hostB = try Host(
+            name: "Beta Host", hostname: "beta.invalid", username: "dev", autoAttachTmux: true)
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB, restoringTmuxSessionID: "$0")
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: sessionAID)
+        XCTAssertNil(container.activeTmuxSessionID)
+
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+        try await eventually {
+            connectionB.sentData.contains {
+                String(decoding: $0, as: UTF8.self).contains("attach-session")
+            }
+        }
+        connectionB.emit(.error(.connectionRefused))
+        try await eventually(timeoutNanoseconds: 5_000_000_000) {
+            runtimeB.session.state == .connected
+                && (runtimeB.connection as AnyObject) === (replacementB as AnyObject)
+                && replacementB.sentData.contains {
+                    String(decoding: $0, as: UTF8.self).contains("attach-session")
+                }
+        }
+
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertNil(container.activeTmuxSessionID)
+        XCTAssertTrue(
+            replacementB.sentData.contains {
+                String(decoding: $0, as: UTF8.self).contains("attach-session")
+            },
+            "A non-selected reconnect must attach its own remembered tmux target")
+    }
+
+    func testSameHostReconnectDoesNotInheritAnotherRuntimeRestorationMetadata() async throws {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let ownedReplacementB = MockSSHConnection()
+        let connections = ConnectionSequence([connectionA, connectionB, replacementB, ownedReplacementB])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await connections.next() }
+        let store = ControlledSessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
+        let host = try Host(
+            name: "Shared Host", hostname: "shared.invalid", username: "dev", autoAttachTmux: true)
+        let sessionAID = UUID()
+
+        // A is the initial restored runtime and owns the persisted target.
+        await store.set(
+            SessionRestorationMetadata(
+                hostID: host.id,
+                sessionID: sessionAID,
+                lastUsedMultiplexerTarget: .tmux(sessionID: "$0")))
+        await container.connect(to: host, sessionID: sessionAID)
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+
+        // B is a second runtime for the same host and has no owner-scoped record.
+        await container.connect(to: host)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        XCTAssertNotEqual(sessionAID, sessionBID)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+
+        // Use the real reconnect path and await its completion so the negative
+        // assertion cannot pass before automatic tmux setup runs.
+        try await container.performReconnect(to: host, attempt: 1, ownerSessionID: sessionBID)
+        XCTAssertTrue((runtimeB.connection as AnyObject) === (replacementB as AnyObject))
+        XCTAssertFalse(
+            replacementB.sentData.contains {
+                String(decoding: $0, as: UTF8.self).contains("attach-session")
+                    && String(decoding: $0, as: UTF8.self).contains("'$0'")
+            },
+            "B must not attach A's remembered tmux target")
+
+        // Positive control: once the persisted record belongs to B, B's next
+        // replacement must attach B's own target through the same path.
+        await store.set(
+            SessionRestorationMetadata(
+                hostID: host.id,
+                sessionID: sessionBID,
+                lastUsedMultiplexerTarget: .tmux(sessionID: "$1")))
+        try await container.performReconnect(to: host, attempt: 1, ownerSessionID: sessionBID)
+        XCTAssertTrue((runtimeB.connection as AnyObject) === (ownedReplacementB as AnyObject))
+        try await eventually {
+            ownedReplacementB.sentData.contains {
+                String(decoding: $0, as: UTF8.self).contains("attach-session")
+                    && String(decoding: $0, as: UTF8.self).contains("'$1'")
+            }
+        }
+    }
+
+    func testForegroundRetriesPendingAdmissionWhileAnotherRuntimeConnected() async throws {
+        let connectionA = MockSSHConnection()
+        let staleConnectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let admissionGate = MultiSessionGate()
+        let connectionsB = ConnectionSequence([staleConnectionB, replacementB])
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            guard host.hostname == "beta.invalid" else { return connectionA }
+            let connection = await connectionsB.next()
+            if (connection as AnyObject) === (staleConnectionB as AnyObject) {
+                await admissionGate.wait()
+            }
+            return connection
+        }
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+        let catalog = InMemoryCatalog(
+            snapshot: CatalogSnapshot(hosts: [hostA, hostB], identities: []))
+        let container = AppContainer(
+            catalog: catalog,
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let openingB = Task { @MainActor in await container.connect(to: hostB) }
+        try await eventually {
+            container.pendingConnectingSessions.values.contains { $0.hostID == hostB.id }
+        }
+
+        container.handleScenePhaseChange(.background)
+        await admissionGate.open()
+        await openingB.value
+        try await eventually { staleConnectionB.isClosed }
+
+        container.handleScenePhaseChange(.active)
+
+        try await eventually(timeoutNanoseconds: 5_000_000_000) {
+            guard let sessionBID = container.openSessions.first(where: { $0.hostID == hostB.id })?.id,
+                let runtimeB = container.runtime(for: sessionBID)
+            else { return false }
+            return runtimeB.session.state == .connected
+                && (runtimeB.connection as AnyObject) === (replacementB as AnyObject)
+        }
+        XCTAssertEqual(container.runtime(for: sessionAID)?.session.state, .connected)
+    }
+
+    func testForegroundRetrySurvivesStaleAdmissionCloseCompletion() async throws {
+        let connectionA = MockSSHConnection()
+        let staleConnectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let admissionGate = MultiSessionGate()
+        let closeGate = MultiSessionGate()
+        let replacementTransportGate = MultiSessionGate()
+        staleConnectionB.onClose = { await closeGate.wait() }
+        let connectionsB = ConnectionSequence([staleConnectionB, replacementB])
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            guard host.hostname == "beta.invalid" else { return connectionA }
+            let connection = await connectionsB.next()
+            if (connection as AnyObject) === (staleConnectionB as AnyObject) {
+                await admissionGate.wait()
+            } else {
+                await replacementTransportGate.wait()
+            }
+            return connection
+        }
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+        let catalog = InMemoryCatalog(
+            snapshot: CatalogSnapshot(hosts: [hostA, hostB], identities: []))
+        let container = AppContainer(
+            catalog: catalog,
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        let openingB = Task { @MainActor in await container.connect(to: hostB) }
+        try await eventually {
+            container.pendingConnectingSessions.values.contains { $0.hostID == hostB.id }
+        }
+
+        container.handleScenePhaseChange(.background)
+        await admissionGate.open()
+        await closeGate.waitForStart()
+
+        container.handleScenePhaseChange(.active)
+        await replacementTransportGate.waitForStart()
+        await closeGate.open()
+        await openingB.value
+        await replacementTransportGate.open()
+
+        try await eventually(timeoutNanoseconds: 5_000_000_000) {
+            guard let sessionBID = container.openSessions.first(where: { $0.hostID == hostB.id })?.id,
+                let runtimeB = container.runtime(for: sessionBID)
+            else { return false }
+            return runtimeB.session.state == .connected
+                && (runtimeB.connection as AnyObject) === (replacementB as AnyObject)
+        }
+        XCTAssertEqual(container.runtime(for: sessionAID)?.session.state, .connected)
+    }
+
+    func testClosingSessionRemovesReconnectCoordinatorAndIgnoresLateCallback()
+        async throws
+    {
+        let recoveryGate = MultiSessionGate()
+        let original = MockSSHConnection()
+        let replacement = MockSSHConnection()
+        let connections = ConnectionSequence([original, replacement])
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in await connections.next() }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() }, jitter: ReconnectCoordinator.zeroJitter))
+        let host = try Host(name: "Coordinator Host", hostname: "coordinator.invalid", username: "dev")
+
+        await container.connect(to: host)
+        let sessionID = try XCTUnwrap(container.selectedSessionID)
+        original.emit(.error(.connectionRefused))
+        try await eventually { container.runtime(for: sessionID)?.reconnectState.isReconnecting == true }
+        XCTAssertTrue(container.reconnectCoordinatorSessionIDs.contains(sessionID))
+
+        await container.closeSession(id: sessionID)
+        XCTAssertNil(container.runtime(for: sessionID))
+        XCTAssertFalse(container.reconnectCoordinatorSessionIDs.contains(sessionID))
+
+        original.emit(.error(.connectionRefused))
+        await recoveryGate.open()
+        try await eventually { !container.reconnectCoordinatorSessionIDs.contains(sessionID) }
+    }
+
+    func testOpeningRuntimeDoesNotCancelAnotherRuntimeReconnect()
+        async throws
+    {
+        let connectionA = MockSSHConnection()
+        let replacementA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let aConnections = ConnectionSequence([connectionA, replacementA])
+        let recoveryGate = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? await aConnections.next() : connectionB
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() },
+                jitter: ReconnectCoordinator.zeroJitter))
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        connectionA.emit(.error(.connectionRefused))
+        try await eventually {
+            container.runtime(for: sessionAID)?.reconnectState.isReconnecting == true
+        }
+
+        await container.connect(to: hostB)
+        XCTAssertEqual(container.openSessions.count, 2)
+        XCTAssertTrue(container.runtime(for: sessionAID)?.reconnectState.isReconnecting == true)
+
+        await recoveryGate.open()
+        try await eventually {
+            container.runtime(for: sessionAID)?.session.state == .connected
+                && container.runtime(for: sessionAID)?.reconnectState == .connected
+        }
+        XCTAssertTrue((container.runtime(for: sessionAID)?.connection as AnyObject) === replacementA)
+    }
+
     func testReconnectPrefersOwnerTmuxTargetAfterImmediateAndABAReturn() async throws {
         let connectionA1 = MockSSHConnection()
         let connectionA2 = MockSSHConnection()
@@ -975,6 +1278,7 @@ final class MultiSessionAppTests: XCTestCase {
         }
         let container = AppContainer(
             transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
             reconnectCoordinator: ReconnectCoordinator(
                 clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
         let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
@@ -1021,6 +1325,7 @@ final class MultiSessionAppTests: XCTestCase {
         }
         let container = AppContainer(
             transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
             reconnectCoordinator: ReconnectCoordinator(
                 clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter))
         let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
@@ -1046,6 +1351,10 @@ final class MultiSessionAppTests: XCTestCase {
                     stdout:
                         "[{\"id\":\"workspace-alpha\",\"label\":\"Alpha\",\"cwd\":\"/\",\"panes\":[]}]",
                     stderr: "")
+            }
+            if command.contains("pane list") {
+                // Refresh parses pane output after workspaces; an empty reply is a parse error.
+                return SSHCommandResult(exitCode: 0, stdout: "[]", stderr: "")
             }
             return SSHCommandResult(exitCode: 0, stdout: "", stderr: "")
         }
@@ -1343,6 +1652,90 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertEqual(container.openSessions.count, 1)
         XCTAssertEqual(container.selectedSessionID, sessionBID)
         XCTAssertEqual(container.activeHost?.name, "Beta Server")
+    }
+
+    func testTwoSessionsConnectConcurrentlyWhileBothAdmissionsAreInFlight() async throws {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let gateA = MultiSessionGate()
+        let gateB = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            if host.hostname == "alpha.invalid" {
+                await gateA.wait()
+                return connectionA
+            }
+            await gateB.wait()
+            return connectionB
+        }
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        let openingA = Task { @MainActor in await container.connect(to: hostA) }
+        await gateA.waitForStart()
+        let openingB = Task { @MainActor in await container.connect(to: hostB) }
+        await gateB.waitForStart()
+
+        // Both transport attempts are suspended at once. Neither admission may
+        // reject, overwrite, or cancel the other.
+        XCTAssertEqual(
+            Set(container.pendingConnectingSessions.values.map(\.hostID)), [hostA.id, hostB.id])
+        XCTAssertTrue(container.isConnecting(hostID: hostA.id))
+        XCTAssertTrue(container.isConnecting(hostID: hostB.id))
+        XCTAssertTrue(container.isConnectingSession)
+
+        await gateB.open()
+        await openingB.value
+        let sessionBID = try XCTUnwrap(container.openSessions.first { $0.hostID == hostB.id }?.id)
+        XCTAssertEqual(container.runtime(for: sessionBID)?.session.state, .connected)
+        XCTAssertEqual(container.pendingConnectingSessions.values.map(\.hostID), [hostA.id])
+
+        await gateA.open()
+        await openingA.value
+        let sessionAID = try XCTUnwrap(container.openSessions.first { $0.hostID == hostA.id }?.id)
+        XCTAssertEqual(container.runtime(for: sessionAID)?.session.state, .connected)
+        XCTAssertEqual(container.openSessions.count, 2)
+        XCTAssertTrue(container.pendingConnectingSessions.isEmpty)
+        XCTAssertFalse(container.isConnectingSession)
+    }
+
+    func testPendingAdmissionsCountTowardMaximumSessions() async throws {
+        let gate = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in
+            await gate.wait()
+            return MockSSHConnection()
+        }
+        let container = AppContainer(transport: transport)
+        var openings: [Task<Void, Never>] = []
+        for index in 1...AppContainer.maximumConcurrentSessions {
+            let host = try Host(
+                name: "Host \(index)", hostname: "host\(index).invalid", username: "dev")
+            openings.append(Task { @MainActor in await container.connect(to: host) })
+        }
+        // Wait for every attempt to reach admission. No session is connected yet,
+        // so the cap must be enforced against in-flight admissions.
+        try await eventually {
+            container.pendingConnectingSessions.count == AppContainer.maximumConcurrentSessions
+        }
+
+        let overflowHost = try Host(
+            name: "Overflow Host", hostname: "overflow.invalid", username: "dev")
+        await container.connect(to: overflowHost)
+
+        XCTAssertTrue(
+            container.lastConnectionFailure?.reason.contains("Maximum concurrent sessions") == true)
+        XCTAssertEqual(
+            container.pendingConnectingSessions.count, AppContainer.maximumConcurrentSessions)
+        XCTAssertFalse(container.isConnecting(hostID: overflowHost.id))
+
+        await gate.open()
+        for opening in openings {
+            await opening.value
+        }
+        XCTAssertEqual(container.openSessions.count, AppContainer.maximumConcurrentSessions)
+        XCTAssertTrue(container.pendingConnectingSessions.isEmpty)
     }
 
     func testSecondSessionConnectionFailurePreservesFirstSessionProjections() async throws {
@@ -1666,13 +2059,13 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertEqual(container.activeSession?.state, .connected)
 
         container.handleScenePhaseChange(.active)
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(runtimeB.session.state, .disconnected)
-        XCTAssertEqual(runtimeB.reconnectState, .cancelled)
-
-        container.selectSession(id: sessionBID)
-        XCTAssertEqual(container.reconnectState, .cancelled)
-        XCTAssertEqual(container.activeSession?.id, sessionBID)
+        try await eventually {
+            runtimeB.session.state == .connected
+                && runtimeB.reconnectState == .connected
+        }
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.id, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
     }
 
     func testCancelReconnectDisconnectsCapturedRuntimeAfterSelectionSwitch() async throws {
@@ -1685,6 +2078,7 @@ final class MultiSessionAppTests: XCTestCase {
         }
         let container = AppContainer(
             transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
             reconnectCoordinator: ReconnectCoordinator(
                 clock: { _ in await recoveryGate.wait() },
                 jitter: ReconnectCoordinator.zeroJitter))
@@ -1697,8 +2091,12 @@ final class MultiSessionAppTests: XCTestCase {
         let sessionBID = try XCTUnwrap(container.selectedSessionID)
         container.selectSession(id: sessionAID)
 
-        connectionA.emit(.closed)
-        await recoveryGate.waitForStart()
+        // A clean close is deliberately not a recovery trigger (717d63c), so the
+        // drop is a transport error. The bounded wait fails fast if recovery never starts.
+        connectionA.emit(.error(.connectionRefused))
+        try await eventually {
+            container.runtime(for: sessionAID)?.reconnectState.isReconnecting == true
+        }
         let cancelling = Task { @MainActor in
             await container.cancelReconnect()
         }
@@ -1711,6 +2109,140 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertTrue(connectionA.isClosed, "Captured recovery runtime A must be disconnected")
         XCTAssertEqual(container.runtime(for: sessionAID)?.session.state, .disconnected)
         XCTAssertEqual(container.runtime(for: sessionBID)?.session.state, .connected)
+        await recoveryGate.open()
+    }
+
+    func testSimultaneousDropsRecoverEachRuntimeIndependently() async throws {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let replacementA = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let aConnections = ConnectionSequence([connectionA, replacementA])
+        let bConnections = ConnectionSequence([connectionB, replacementB])
+        let recoveryGate = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid"
+                ? await aConnections.next() : await bConnections.next()
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() },
+                jitter: ReconnectCoordinator.zeroJitter))
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: sessionAID)
+        let runtimeA = try XCTUnwrap(container.runtime(for: sessionAID))
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+
+        // Both runtimes drop while both owners are still in backoff.
+        connectionA.emit(.error(.connectionRefused))
+        connectionB.emit(.error(.connectionRefused))
+        try await eventually {
+            runtimeA.reconnectState.isReconnecting && runtimeB.reconnectState.isReconnecting
+        }
+
+        await recoveryGate.open()
+        try await eventually {
+            runtimeA.session.state == .connected && runtimeB.session.state == .connected
+        }
+        XCTAssertTrue((runtimeA.connection as AnyObject) === replacementA)
+        XCTAssertTrue((runtimeB.connection as AnyObject) === replacementB)
+    }
+
+    func testNonSelectedDropRecoversWhileAnotherSessionIsSelected() async throws {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let bConnections = ConnectionSequence([connectionB, replacementB])
+        let recoveryGate = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? connectionA : await bConnections.next()
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() },
+                jitter: ReconnectCoordinator.zeroJitter))
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: sessionAID)
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+
+        // B drops while A stays selected. Selection must not gate B's recovery.
+        connectionB.emit(.error(.connectionRefused))
+        try await eventually { runtimeB.reconnectState.isReconnecting }
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+
+        await recoveryGate.open()
+        try await eventually { runtimeB.session.state == .connected }
+        XCTAssertEqual(container.selectedSessionID, sessionAID)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertFalse(connectionA.isClosed)
+        XCTAssertTrue((runtimeB.connection as AnyObject) === replacementB)
+    }
+
+    func testCancellingOneOwnerReconnectLeavesOtherRecoveryRunning() async throws {
+        let connectionA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let replacementB = MockSSHConnection()
+        let bConnections = ConnectionSequence([connectionB, replacementB])
+        let recoveryGate = MultiSessionGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? connectionA : await bConnections.next()
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() },
+                jitter: ReconnectCoordinator.zeroJitter))
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        container.selectSession(id: sessionAID)
+        let runtimeA = try XCTUnwrap(container.runtime(for: sessionAID))
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
+
+        connectionA.emit(.error(.connectionRefused))
+        connectionB.emit(.error(.connectionRefused))
+        try await eventually {
+            runtimeA.reconnectState.isReconnecting && runtimeB.reconnectState.isReconnecting
+        }
+
+        // The selected owner A is cancelled; B's coordinator and backoff must survive.
+        await container.cancelReconnect()
+        XCTAssertEqual(runtimeA.reconnectState, .cancelled)
+        XCTAssertTrue(connectionA.isClosed)
+        XCTAssertTrue(runtimeB.reconnectState.isReconnecting)
+        XCTAssertFalse(replacementB.isClosed)
+
+        await recoveryGate.open()
+        try await eventually { runtimeB.session.state == .connected }
+        XCTAssertTrue((runtimeB.connection as AnyObject) === replacementB)
+        // A stayed cancelled: its released backoff must not dial a replacement.
+        XCTAssertEqual(runtimeA.reconnectState, .cancelled)
+        XCTAssertEqual(runtimeA.session.state, .disconnected)
     }
 
     func testNonSelectedDropCanBeSelectedAndRetriedWithoutDisturbingHealthySession() async throws {
@@ -1787,16 +2319,17 @@ final class MultiSessionAppTests: XCTestCase {
         let closingB = Task { @MainActor in
             await container.closeSession(id: try! XCTUnwrap(container.selectedSessionID))
         }
-        await manager.waitForBlockedStart()
+        let startBlocked = await manager.waitForBlockedStart()
+        XCTAssertTrue(startBlocked, "Closing B must rebind A and reach the forwarding start")
 
         // A new connection supersedes the awaited rebind for A.
         await container.connect(to: hostC)
         await manager.releaseBlockedStart()
         await closingB.value
 
-        let stopAllCallCount = await manager.stopAllCallCount()
+        let stopForwardingCallCount = await manager.stopForwardingCallCount()
         XCTAssertGreaterThanOrEqual(
-            stopAllCallCount, 2,
+            stopForwardingCallCount, 1,
             "Stale forwarding starts must be torn down after a newer connect")
         XCTAssertTrue(container.forwardingSessions.isEmpty)
     }
@@ -1859,13 +2392,12 @@ final class MultiSessionAppTests: XCTestCase {
         let hostB = try Host(name: "Reuse Beta", hostname: "reuse-beta.invalid", username: "dev")
 
         await container.connect(to: hostA)
-        await manager.blockNextStopAll()
-        let openingB = Task { @MainActor in
-            await container.connect(to: hostB)
-        }
-        await manager.waitForBlockedStopAll()
-        await manager.releaseBlockedStopAll()
-        await openingB.value
+        await container.connect(to: hostB)
+
+        let activeWhileBIsOpen = await manager.activeSessions()
+        XCTAssertTrue(
+            activeWhileBIsOpen.contains { $0.ruleID == rule.id && $0.status == .active },
+            "Opening B must not stop A's tunnel on a shared manager")
 
         let closingB = Task { @MainActor in
             await container.closeSession(id: try! XCTUnwrap(container.selectedSessionID))
@@ -1903,7 +2435,7 @@ final class MultiSessionAppTests: XCTestCase {
             "Existing secondary pane must be closed before opening a second session")
     }
 
-    func testAuxiliaryFeaturesDisabledWhenMultipleSessionsOpen() async throws {
+    func testAuxiliaryProjectionFollowsSelectedSessionAcrossMultipleSessions() async throws {
         let transport = ControllableTransport()
         let forwardingManager = DemoPortForwardingManager()
         let sftpRepository = DemoSFTPRepository(seedDemoData: true)
@@ -1935,13 +2467,18 @@ final class MultiSessionAppTests: XCTestCase {
         await container.connect(to: hostB)
         XCTAssertEqual(container.openSessions.count, 2)
         XCTAssertTrue(container.openSessions.count > 1)
+        // B has no rules, so A's rule must not be projected for B even though
+        // the injected manager is shared and reports A's live rule.
         XCTAssertTrue(container.forwardingSessions.isEmpty)
-        XCTAssertTrue(container.currentDirectoryFiles.isEmpty)
+        // Opening B does not wipe A's tmux target; B starts without one.
+        XCTAssertEqual(container.activeHost?.id, hostB.id)
         XCTAssertNil(container.activeTmuxSessionID)
 
         await container.closeSession(id: try XCTUnwrap(container.activeSession?.id))
         XCTAssertEqual(container.openSessions.count, 1)
         XCTAssertEqual(container.activeHost?.id, hostA.id)
+        // Closing B restores A's own tmux target projection.
+        XCTAssertEqual(container.activeTmuxSessionID, "$0")
         let deadline = DispatchTime.now().uptimeNanoseconds + 1_000_000_000
         while container.forwardingSessions.first?.status != .active,
             DispatchTime.now().uptimeNanoseconds < deadline
@@ -2141,12 +2678,18 @@ final class MultiSessionAppTests: XCTestCase {
     {
         let mockA = MockSSHConnection()
         let mockB = MockSSHConnection()
+        let recoveryGate = MultiSessionGate()
         let transport = ControllableTransport()
         transport.onConnect = { host in
             host.hostname == "alpha.invalid" ? mockA : mockB
         }
 
-        let container = AppContainer(transport: transport)
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(
+                clock: { _ in await recoveryGate.wait() },
+                jitter: ReconnectCoordinator.zeroJitter))
         let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
         let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
 
@@ -2163,9 +2706,11 @@ final class MultiSessionAppTests: XCTestCase {
         let initialTmuxGen = container.tmuxRefreshGeneration
         let initialHerdrGen = container.herdrRefreshGeneration
 
-        // Background session B encounters a transport error
+        // Background session B encounters a transport error. Wait (bounded) for its
+        // own recovery admission so the assertions below observe the processed drop.
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
         mockB.emit(.error(.connectionRefused))
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await eventually { runtimeB.reconnectState.isReconnecting }
 
         // Session A must remain connected and unperturbed
         XCTAssertEqual(container.selectedSessionID, sessionAID)
@@ -2181,9 +2726,14 @@ final class MultiSessionAppTests: XCTestCase {
             container.hasObservedTransportError,
             "Background session error must not set container-global observed transport error")
 
-        // Session B is updated to failed/disconnected
-        let runtimeB = try XCTUnwrap(container.runtime(for: sessionBID))
-        XCTAssertEqual(runtimeB.session.state, .failed)
+        // A non-selected drop now owns its own recovery (P1), so B is no longer
+        // parked in .failed. Its backoff is gated, which keeps the run deterministic.
+        XCTAssertEqual(runtimeB.session.state, .connecting)
+        XCTAssertFalse(mockA.isClosed)
+
+        container.selectSession(id: sessionBID)
+        await container.cancelReconnect()
+        await recoveryGate.open()
     }
 
     func testClosingFinalSessionTearsDownAuxiliaryResources() async throws {
@@ -2329,10 +2879,19 @@ private actor DelayedSFTPRepository: SFTPRepository {
     private let gate: MultiSessionGate
     private var readGate: MultiSessionGate?
     private var readFailure = false
+    private var listingCount = 0
+    private let gatedListingCount: Int
 
-    init(gate: MultiSessionGate) {
+    /// Only the first `gatedListingCount` listings wait on `gate`; later listings
+    /// complete immediately so a test can order one listing before another.
+    init(gate: MultiSessionGate, gatedListingCount: Int = Int.max) {
         self.base = DemoSFTPRepository(seedDemoData: true)
         self.gate = gate
+        self.gatedListingCount = gatedListingCount
+    }
+
+    func listedDirectoryCount() -> Int {
+        listingCount
     }
 
     func delayRead(failing: Bool = false) {
@@ -2349,7 +2908,10 @@ private actor DelayedSFTPRepository: SFTPRepository {
     }
 
     func listDirectory(at path: RemotePath) async throws -> [RemoteFile] {
-        await gate.wait()
+        listingCount += 1
+        if listingCount <= gatedListingCount {
+            await gate.wait()
+        }
         return try await base.listDirectory(at: path)
     }
 
@@ -2579,16 +3141,20 @@ private actor InterleavingForwardingManager: PortForwardingManaging {
     private var startCalls = 0
     private var isReleased = false
     private var stopAllCalls = 0
+    private var stopForwardingCalls = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     func blockNextStart() {
         blockNext = true
     }
 
-    func waitForBlockedStart() async {
-        while !blocked {
+    /// Bounded: returns false when the expected start never reaches the manager,
+    /// so a missing call fails the test instead of spinning forever.
+    func waitForBlockedStart(maximumYields: Int = 10_000) async -> Bool {
+        for _ in 0..<maximumYields where !blocked {
             await Task.yield()
         }
+        return blocked
     }
 
     func releaseBlockedStart() {
@@ -2601,6 +3167,10 @@ private actor InterleavingForwardingManager: PortForwardingManaging {
 
     func stopAllCallCount() -> Int {
         stopAllCalls
+    }
+
+    func stopForwardingCallCount() -> Int {
+        stopForwardingCalls
     }
 
     func startCallCount() -> Int {
@@ -2621,7 +3191,9 @@ private actor InterleavingForwardingManager: PortForwardingManaging {
         return ForwardingSessionState(ruleID: rule.id, rule: rule, status: .active)
     }
 
-    func stopForwarding(ruleID: UUID) async throws {}
+    func stopForwarding(ruleID: UUID) async throws {
+        stopForwardingCalls += 1
+    }
 
     func stopAll() async {
         stopAllCalls += 1
@@ -2633,6 +3205,24 @@ private actor InterleavingForwardingManager: PortForwardingManaging {
 
     func sessionStatesStream() async -> AsyncStream<[ForwardingSessionState]> {
         AsyncStream { continuation in continuation.finish() }
+    }
+}
+
+private actor ControlledSessionRestorationStore: SessionRestorationStore {
+    private var metadata: SessionRestorationMetadata?
+
+    func set(_ metadata: SessionRestorationMetadata) {
+        self.metadata = metadata
+    }
+
+    func save(_ metadata: SessionRestorationMetadata) async throws {}
+
+    func load() async throws -> SessionRestorationMetadata? {
+        metadata
+    }
+
+    func clear() async throws {
+        metadata = nil
     }
 }
 
@@ -2649,10 +3239,10 @@ private actor MultiSessionGate {
         }
     }
 
-    func waitForStart() async {
-        while !started {
-            await Task.yield()
-        }
+    func waitForStart(timeoutNanoseconds: UInt64 = 1_000_000_000) async {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while !started && DispatchTime.now().uptimeNanoseconds < deadline { await Task.yield() }
+        if !started { XCTFail("Multi-session gate did not start before timeout") }
     }
 
     func open() {

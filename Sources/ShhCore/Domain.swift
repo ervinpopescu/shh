@@ -852,6 +852,8 @@ public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable
     /// Deprecated compatibility field. New code uses lastUsedMultiplexerTarget.
     public var tmuxSessionID: String?
     public var lastUsedMultiplexerTarget: LastUsedMultiplexerTarget?
+    /// Optional named Herdr context. Missing values preserve the implicit default context.
+    public var herdrSessionName: String?
     public var timestamp: Date
 
     public init(
@@ -859,12 +861,14 @@ public struct SessionRestorationMetadata: Codable, Equatable, Hashable, Sendable
         sessionID: UUID = UUID(),
         tmuxSessionID: String? = nil,
         lastUsedMultiplexerTarget: LastUsedMultiplexerTarget? = nil,
+        herdrSessionName: String? = nil,
         timestamp: Date = Date()
     ) {
         self.hostID = hostID
         self.sessionID = sessionID
         self.tmuxSessionID = tmuxSessionID
         self.lastUsedMultiplexerTarget = lastUsedMultiplexerTarget
+        self.herdrSessionName = herdrSessionName
         self.timestamp = timestamp
     }
 }

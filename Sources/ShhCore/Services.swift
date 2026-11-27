@@ -160,37 +160,42 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
     private var herdrPaneOutputs: [String: String] = DemoSSHConnection.makeDefaultHerdrOutputs()
 
     public static func makeDefaultHerdrWorkspaces() -> [HerdrWorkspace] {
+        let workspaceID = "ws-main"
         let paneIdle = HerdrPane(
             id: "pane-idle",
             label: "worker-idle",
             agentState: .idle,
             currentCommand: nil,
-            lastActivity: Date(timeIntervalSince1970: 1700000000)
+            lastActivity: Date(timeIntervalSince1970: 1700000000),
+            workspaceID: workspaceID
         )
         let paneWorking = HerdrPane(
             id: "pane-working",
             label: "builder",
             agentState: .working,
             currentCommand: "swift build",
-            lastActivity: Date(timeIntervalSince1970: 1700000100)
+            lastActivity: Date(timeIntervalSince1970: 1700000100),
+            workspaceID: workspaceID
         )
         let paneBlocked = HerdrPane(
             id: "pane-blocked",
             label: "deployer",
             agentState: .blocked(reason: "Waiting for confirmation before database migration"),
             currentCommand: "db-migrate",
-            lastActivity: Date(timeIntervalSince1970: 1700000200)
+            lastActivity: Date(timeIntervalSince1970: 1700000200),
+            workspaceID: workspaceID
         )
         let paneCompleted = HerdrPane(
             id: "pane-completed",
             label: "tester",
             agentState: .completed(summary: "All 220 tests passed"),
             currentCommand: "swift test",
-            lastActivity: Date(timeIntervalSince1970: 1700000300)
+            lastActivity: Date(timeIntervalSince1970: 1700000300),
+            workspaceID: workspaceID
         )
 
         let defaultWorkspace = HerdrWorkspace(
-            id: "ws-main",
+            id: workspaceID,
             label: "demo-main",
             cwd: "/home/dev/workspace",
             panes: [paneIdle, paneWorking, paneBlocked, paneCompleted]
@@ -226,7 +231,11 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
                         label: old.label,
                         agentState: state,
                         currentCommand: currentCommand ?? old.currentCommand,
-                        lastActivity: Date()
+                        lastActivity: Date(),
+                        workspaceID: old.workspaceID,
+                        tabID: old.tabID,
+                        terminalID: old.terminalID,
+                        revision: old.revision
                     )
                 }
             }
@@ -316,7 +325,7 @@ public actor DemoSSHConnection: SSHConnection, SSHCommandExecuting {
             result = SSHCommandResult(exitCode: 0, stdout: "Tab created\n", stderr: "")
         } else if trimmed.contains("herdr pane split") {
             let newPaneID = "pane-\(UUID().uuidString.prefix(6).lowercased())"
-            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date())
+            let newPane = HerdrPane(id: newPaneID, label: "split-pane", agentState: .idle, currentCommand: nil, lastActivity: Date(), workspaceID: herdrWorkspaces.first?.id)
             if !herdrWorkspaces.isEmpty {
                 herdrWorkspaces[0] = HerdrWorkspace(
                     id: herdrWorkspaces[0].id,

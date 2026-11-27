@@ -18,10 +18,41 @@ extension LiveSSHConnection: SessionRuntimeRedactorInstallingConnection {}
 
 /// Owns the state and callback lifetime for one interactive SSH terminal.
 ///
-/// This is the first migration seam for multi-session support. AppContainer still
-/// owns the selected-session projections and the SFTP, forwarding, Mosh, voice,
-/// tmux, and Herdr adapters. Those adapters intentionally remain single-session
-/// until their connection ownership is moved to this runtime as follow-up work.
+/// State owned by one SSH runtime for one Herdr persistent-session context.
+@MainActor
+final class HerdrRuntimeState {
+    var sessionName: String?
+    var sessions: [HerdrSessionDescriptor] = []
+    var availability: HerdrAvailability = .unavailable(reason: "Not connected")
+    var workspaces: [HerdrWorkspace] = []
+    var activeWorkspaceID: String?
+    var error: String?
+    var isProbing = false
+    var isPolling = false
+    /// Changes whenever the named Herdr context changes, including A-B-A.
+    var contextGeneration: UInt64 = 0
+    var refreshGeneration: Int = 0
+    var pollingGeneration: Int = 0
+    var pollingTask: Task<Void, Never>?
+
+    init(sessionName: String? = nil) {
+        self.sessionName = sessionName
+    }
+}
+
+/// State owned by one SSH runtime for its file transfers. The queue records are
+/// tagged with the owning session in TransferQueueCoordinator.
+@MainActor
+final class TransferRuntimeState {
+    /// Advances when this runtime's transfer work is torn down. In-flight work
+    /// compares it to its captured value to detect that its owner was disconnected
+    /// or closed.
+    var generation: UInt64 = 0
+    var activeTasks: [UUID: Task<Void, Never>] = [:]
+}
+
+/// This runtime owns terminal and Herdr state. AppContainer projects the
+/// selected runtime's values for existing SwiftUI callers.
 @MainActor
 final class SessionRuntime {
     struct CallbackToken: Equatable, Sendable {
@@ -38,6 +69,8 @@ final class SessionRuntime {
 
     let host: Host
     let terminalController: ShhTerminalController
+    let herdr = HerdrRuntimeState()
+    let transfers = TransferRuntimeState()
     private(set) var session: TerminalSession
     private(set) var connection: any SSHConnection
     private(set) var redactor: Redactor
@@ -148,6 +181,15 @@ final class SessionRuntime {
         )
         moshState = state
         networkRoamingState = roamingState
+    }
+
+    func updateMoshState(_ state: MoshState, roamingState: NetworkRoamingState? = nil) {
+        moshState = state
+        if let roamingState {
+            networkRoamingState = roamingState
+        } else if case .roaming(let roaming) = state {
+            networkRoamingState = roaming
+        }
     }
 
     func clearMoshProjection() {

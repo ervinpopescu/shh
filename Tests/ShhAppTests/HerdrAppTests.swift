@@ -3,12 +3,38 @@ import XCTest
 @testable import Shh
 import ShhCore
 import ShhTerminal
+private actor HerdrCommandRecorder {
+    private var values = [String]()
+    func append(_ value: String) { values.append(value) }
+    func contains(_ value: String) -> Bool { values.contains(value) }
+}
 
+private actor HerdrResponseGate {
+    private var isOpen = false
+    private var delayNextResponse = false
+    private var hasEntered = false
+    private var continuations: [CheckedContinuation<Void, Never>] = []
+    private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func delayNext() { isOpen = false; hasEntered = false; delayNextResponse = true }
+    func waitForEntry(timeoutNanoseconds: UInt64 = 1_000_000_000) async {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while !hasEntered && DispatchTime.now().uptimeNanoseconds < deadline { await Task.yield() }
+        if !hasEntered { XCTFail("Herdr response gate did not receive the expected entry before timeout") }
+    }
+    func waitIfDelayed() async {
+        guard delayNextResponse else { return }
+        delayNextResponse = false; if isOpen { return }; hasEntered = true
+        entryWaiters.forEach { $0.resume() }; entryWaiters.removeAll()
+        await withCheckedContinuation { continuations.append($0) }
+    }
+    func release() {
+        isOpen = true; continuations.forEach { $0.resume() }; continuations.removeAll()
+    }
+}
 @MainActor
 final class HerdrAppTests: XCTestCase {
-
     // MARK: - 1. Herdr Probe & Discovery
-
     func testHerdrProbeSuccess() async throws {
         let mock = MockSSHConnection()
         let transport = ControllableTransport()
@@ -35,6 +61,205 @@ final class HerdrAppTests: XCTestCase {
         XCTAssertTrue(availability.isAvailable)
         XCTAssertEqual(availability.version, "herdr 0.1.0")
         XCTAssertEqual(container.herdrAvailability, .available(version: "herdr 0.1.0"))
+    }
+
+    func testNamedHerdrSessionSelectionRoutesRootSelector() async throws {
+        let mock = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let store = InMemorySessionRestorationStore()
+        let container = AppContainer(
+            transport: transport,
+            restorationStore: store,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "Named Herdr Host", hostname: "named-herdr.test", username: "user")
+        await container.connect(to: host)
+        let commands = HerdrCommandRecorder()
+        mock.onExecuteCommand = { command in
+            await commands.append(command)
+            if command == HerdrCommand.sessionList.renderedCommand {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:session:list","result":{"sessions":[{"name":"review","default":false,"running":true}]}}"#
+                )
+            }
+            if command == "herdr --session 'review' --version" {
+                return SSHCommandResult(exitCode: 0, stdout: "herdr 0.9.5\n")
+            }
+            if command == "herdr --session 'review' workspace list" {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:workspace:list","result":{"workspaces":[{"workspace_id":"wN","label":"review","pane_count":1}]}}"#
+                )
+            }
+            if command == "herdr --session 'review' pane list" {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:pane:list","result":{"panes":[{"pane_id":"pN","workspace_id":"wN","label":"agent","agent_status":"idle"}]}}"#
+                )
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let listedSessions = await container.listHerdrSessions().map(\.name)
+        XCTAssertEqual(listedSessions, ["review"])
+        let selectedSession = await container.selectHerdrSession(name: "review")
+        XCTAssertTrue(selectedSession)
+        XCTAssertEqual(container.activeHerdrSessionName, "review")
+        let sawVersionCommand = await commands.contains("herdr --session 'review' --version")
+        let sawWorkspaceCommand = await commands.contains("herdr --session 'review' workspace list")
+        XCTAssertTrue(sawVersionCommand)
+        XCTAssertTrue(sawWorkspaceCommand)
+        XCTAssertEqual(container.herdrWorkspaces.first?.id, "wN")
+        let contextOnlyMetadata = try await store.load()
+        XCTAssertEqual(contextOnlyMetadata?.herdrSessionName, "review")
+        XCTAssertNil(contextOnlyMetadata?.lastUsedMultiplexerTarget)
+        let selectedWorkspace = await container.selectHerdrWorkspace(id: "wN")
+        XCTAssertTrue(selectedWorkspace)
+        let workspaceMetadata = try await store.load()
+        XCTAssertEqual(workspaceMetadata?.herdrSessionName, "review")
+        XCTAssertEqual(workspaceMetadata?.lastUsedMultiplexerTarget, .herdr(workspaceID: "wN"))
+    }
+
+    func testHerdrABASwitchRejectsDelayedPaneOutputFromOriginalContext() async throws {
+        let mock = MockSSHConnection()
+        let gate = HerdrResponseGate()
+        let transport = ControllableTransport()
+        transport.onConnect = { _ in mock }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true),
+            reconnectCoordinator: ReconnectCoordinator(clock: { _ in }, jitter: ReconnectCoordinator.zeroJitter)
+        )
+        let host = try Host(name: "A-B-A Herdr Host", hostname: "aba-herdr.test", username: "user")
+        await container.connect(to: host)
+        mock.onExecuteCommand = { command in
+            if command == HerdrCommand.sessionList.renderedCommand {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:session:list","result":{"sessions":[{"name":"A","default":false,"running":true},{"name":"B","default":false,"running":true}]}}"#
+                )
+            }
+            if command.contains("--version") {
+                return SSHCommandResult(exitCode: 0, stdout: "herdr 0.9.5\n")
+            }
+            if command.contains("workspace list") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:workspace:list","result":{"workspaces":[{"workspace_id":"same-workspace","label":"same","pane_count":1}]}}"#
+                )
+            }
+            if command.contains("pane list") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:pane:list","result":{"panes":[{"pane_id":"same-pane","workspace_id":"same-workspace","label":"agent","agent_status":"working"}]}}"#
+                )
+            }
+            if command.contains("pane read") {
+                await gate.waitIfDelayed()
+                return SSHCommandResult(exitCode: 0, stdout: "stale output\n")
+            }
+            if command.contains("pane run") {
+                await gate.waitIfDelayed()
+                return SSHCommandResult(exitCode: 1, stdout: "", stderr: "stale error")
+            }
+            return SSHCommandResult(exitCode: 0, stdout: "")
+        }
+
+        let sessionCount = await container.listHerdrSessions().count
+        XCTAssertEqual(sessionCount, 2)
+        let selectedA = await container.selectHerdrSession(name: "A")
+        XCTAssertTrue(selectedA)
+        let pane = try XCTUnwrap(container.herdrWorkspaces.first?.panes.first)
+        let target = try XCTUnwrap(container.herdrPaneTarget(for: pane))
+        await gate.delayNext()
+        let pendingRead = Task { @MainActor in
+            try await container.readHerdrPaneOutput(
+                paneID: target.pane.id, context: target.context)
+        }
+        await gate.waitForEntry()
+        let selectedB = await container.selectHerdrSession(name: "B")
+        let selectedAAgain = await container.selectHerdrSession(name: "A")
+        XCTAssertTrue(selectedB)
+        XCTAssertTrue(selectedAAgain)
+        await gate.release()
+        do {
+            _ = try await pendingRead.value
+            XCTFail("A-B-A context switch must reject delayed output")
+        } catch {
+            XCTAssertTrue(error is HerdrParseError)
+        }
+
+        let selectedAForCommand = await container.selectHerdrSession(name: "A")
+        XCTAssertTrue(selectedAForCommand)
+        let currentPane = try XCTUnwrap(container.herdrWorkspaces.first?.panes.first)
+        let currentTarget = try XCTUnwrap(container.herdrPaneTarget(for: currentPane))
+        await gate.delayNext()
+        let pendingError = Task { @MainActor in
+            await container.runHerdrPaneCommand(
+                paneID: currentTarget.pane.id,
+                command: "echo test",
+                approved: true,
+                context: currentTarget.context
+            )
+        }
+        await gate.waitForEntry()
+        let selectedBForCommand = await container.selectHerdrSession(name: "B")
+        XCTAssertTrue(selectedBForCommand)
+        await gate.release()
+        let errorResult = await pendingError.value
+        XCTAssertFalse(errorResult.success)
+        XCTAssertEqual(errorResult.error, "Herdr context changed")
+    }
+
+    func testHerdrTwoSSHRuntimesKeepReusedOpaqueIDsIsolated() async throws {
+        let mockA = MockSSHConnection()
+        let mockB = MockSSHConnection()
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "herdr-a.test" ? mockA : mockB
+        }
+        let container = AppContainer(transport: transport)
+        let hostA = try Host(name: "Herdr A", hostname: "herdr-a.test", username: "user")
+        let hostB = try Host(name: "Herdr B", hostname: "herdr-b.test", username: "user")
+        let handler: @Sendable (String, String) async -> SSHCommandResult = { command, label in
+            if command.contains("--version") {
+                return SSHCommandResult(exitCode: 0, stdout: "herdr 0.9.5\n")
+            }
+            if command.contains("workspace list") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:workspace:list","result":{"workspaces":[{"workspace_id":"same-workspace","label":"LABEL","pane_count":1}]}}"#.replacingOccurrences(of: "LABEL", with: label)
+                )
+            }
+            if command.contains("pane list") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"{"id":"cli:pane:list","result":{"panes":[{"pane_id":"same-pane","workspace_id":"same-workspace","label":"agent","agent_status":"idle"}]}}"#
+                )
+            }
+            return SSHCommandResult(exitCode: 0, stdout: label)
+        }
+        mockA.onExecuteCommand = { command in await handler(command, "A") }
+        mockB.onExecuteCommand = { command in await handler(command, "B") }
+
+        await container.connect(to: hostA)
+        let sessionA = try XCTUnwrap(container.selectedSessionID)
+        await container.refreshHerdrState()
+        await container.connect(to: hostB)
+        let sessionB = try XCTUnwrap(container.selectedSessionID)
+        await container.refreshHerdrState()
+
+        let runtimeA = try XCTUnwrap(container.runtime(for: sessionA))
+        let runtimeB = try XCTUnwrap(container.runtime(for: sessionB))
+        XCTAssertEqual(runtimeA.herdr.workspaces.first?.id, "same-workspace")
+        XCTAssertEqual(runtimeB.herdr.workspaces.first?.id, "same-workspace")
+        XCTAssertNotEqual(ObjectIdentifier(runtimeA.connection as AnyObject), ObjectIdentifier(runtimeB.connection as AnyObject))
+        container.selectSession(id: sessionA)
+        XCTAssertEqual(container.herdrWorkspaces.first?.panes.first?.id, "same-pane")
+        XCTAssertEqual(container.herdrWorkspaces.first?.label, "A")
     }
 
     func testHerdrProbeFailureWhenNotInstalled() async throws {
@@ -140,6 +365,19 @@ final class HerdrAppTests: XCTestCase {
             if cmd.contains("herdr workspace list") {
                 return SSHCommandResult(exitCode: 0, stdout: workspacesJSON)
             }
+            if cmd.contains("herdr pane list") {
+                return SSHCommandResult(
+                    exitCode: 0,
+                    stdout: #"""
+                    {"id":"cli:pane:list","result":{"panes":[
+                      {"pane_id":"pane-idle","workspace_id":"ws-main","label":"Idle Worker","agent_status":"idle"},
+                      {"pane_id":"pane-working","workspace_id":"ws-main","label":"Build Worker","agent_status":"working","current_command":"npm run build"},
+                      {"pane_id":"pane-blocked","workspace_id":"ws-main","label":"Migration Worker","agent_status":{"status":"blocked","reason":"Requires database approval"}},
+                      {"pane_id":"pane-completed","workspace_id":"ws-main","label":"Test Worker","agent_status":{"status":"completed","summary":"All 50 unit tests passed"}}
+                    ]}}
+                    """#
+                )
+            }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
 
@@ -201,6 +439,9 @@ final class HerdrAppTests: XCTestCase {
             }
             if cmd.contains("herdr workspace list") {
                 return SSHCommandResult(exitCode: 0, stdout: workspacesJSON)
+            }
+            if cmd.contains("herdr pane list") {
+                return SSHCommandResult(exitCode: 0, stdout: #"{"id":"cli:pane:list","result":{"panes":[{"pane_id":"p-1","workspace_id":"ws-1","label":"Worker","agent_status":"idle"}]}}"#)
             }
             return SSHCommandResult(exitCode: 0, stdout: "")
         }
@@ -368,7 +609,7 @@ final class HerdrAppTests: XCTestCase {
         }
         let tracker = ExecutionTracker()
 
-        mock.onExecuteCommand = { cmd in
+        mock.onExecuteCommand = { _ in
             tracker.commandExecuted = true
             return SSHCommandResult(exitCode: 0, stdout: "")
         }

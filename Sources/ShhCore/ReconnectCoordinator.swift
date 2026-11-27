@@ -77,6 +77,17 @@ public actor ReconnectCoordinator {
         self.stateChangeHandler = handler
     }
 
+    /// Creates an independent coordinator with the same retry policy. Each SSH
+    /// runtime must own its own actor so starting recovery for one runtime
+    /// cannot cancel another runtime's backoff or generation.
+    public func makeSibling() -> ReconnectCoordinator {
+        ReconnectCoordinator(
+            maxAttempts: maxAttemptsLimit,
+            clock: clock,
+            jitter: jitter
+        )
+    }
+
     /// Installs a state observer that also receives the coordinator generation.
     /// Consumers that launch asynchronous UI work can reject notifications from
     /// a cancelled recovery run after a newer run has started.

@@ -432,7 +432,7 @@ struct HostDetailView: View {
     }
 
     private var isConnectDisabled: Bool {
-        container.isConnectingSession
+        container.isConnecting(hostID: host.id)
             || container.openSessions.count >= AppContainer.maximumConcurrentSessions
     }
 
@@ -1337,7 +1337,6 @@ struct SessionView: View {
     @State private var blockedCommand = ""
     @State private var showMultiplexer = false
     @State private var showVoice = false
-    @State private var showNewSessionSheet = false
     @State private var isCommandDrawerExpanded = false
     @State private var isSearchPresented = false
     @State private var searchQuery = ""
@@ -1613,40 +1612,6 @@ struct SessionView: View {
             }
 
             ToolbarItemGroup(placement: .primaryAction) {
-                Menu {
-                    Section("Open Sessions (\(container.openSessions.count))") {
-                        ForEach(container.openSessions) { session in
-                            let isCurrent = container.selectedSessionID == session.id
-                            let name = container.host(for: session.id)?.name ?? "Terminal"
-                            Button(action: {
-                                container.selectSession(id: session.id)
-                            }) {
-                                if isCurrent {
-                                    Label("\(name) (Active)", systemImage: "checkmark")
-                                } else {
-                                    Text(name)
-                                }
-                            }
-                            .accessibilityIdentifier("session-switcher-item-\(session.id)")
-                        }
-                    }
-
-                    Divider()
-
-                    Button(action: {
-                        showNewSessionSheet = true
-                    }) {
-                        Label("New Session...", systemImage: "plus")
-                    }
-                    .accessibilityIdentifier("session-switcher-new-session-button")
-                    .disabled(
-                        container.openSessions.count >= AppContainer.maximumConcurrentSessions)
-                } label: {
-                    Image(systemName: "rectangle.stack")
-                }
-                .accessibilityLabel("Session switcher, \(container.openSessions.count) open")
-                .accessibilityIdentifier("session-switcher-toolbar-button")
-
                 if horizontalSizeClass != .compact {
                     Button(action: {
                         isSearchPresented.toggle()
@@ -1905,11 +1870,6 @@ struct SessionView: View {
         }
         .sheet(isPresented: $showTelemetry) {
             ServerTelemetrySheet().environmentObject(container).presentationDetents([.medium])
-        }
-        .sheet(isPresented: $showNewSessionSheet) {
-            NewSessionHostPickerSheet().environmentObject(container).presentationDetents([
-                .medium, .large,
-            ])
         }
         .sheet(isPresented: $showSendImage) {
             SendImageView().environmentObject(container).presentationDetents([.medium, .large])
@@ -3619,6 +3579,17 @@ struct HerdrOutputSheet: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
     let pane: HerdrPane
+    let context: HerdrOperationContext?
+    init(pane: HerdrPane) {
+        self.pane = pane
+        self.context = nil
+    }
+
+    init(target: HerdrPaneTarget) {
+        self.pane = target.pane
+        self.context = target.context
+    }
+
     @State private var output: String = ""
     @State private var isLoading: Bool = true
     @State private var errorMessage: String? = nil
@@ -3720,7 +3691,8 @@ struct HerdrOutputSheet: View {
         isLoading = true
         errorMessage = nil
         do {
-            output = try await container.readHerdrPaneOutput(paneID: pane.id)
+            output = try await container.readHerdrPaneOutput(
+                paneID: pane.id, context: context)
             isLoading = false
         } catch {
             errorMessage = error.localizedDescription
@@ -3733,6 +3705,17 @@ struct HerdrSendCommandSheet: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
     let pane: HerdrPane
+    let context: HerdrOperationContext?
+    init(pane: HerdrPane) {
+        self.pane = pane
+        self.context = nil
+    }
+
+    init(target: HerdrPaneTarget) {
+        self.pane = target.pane
+        self.context = target.context
+    }
+
     @State private var command: String = ""
     @State private var isExecuting: Bool = false
     @State private var executionError: String? = nil
@@ -3740,7 +3723,11 @@ struct HerdrSendCommandSheet: View {
     private var commandRisk: CommandRisk {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return .safe }
-        let rendered = HerdrCommand.paneRun(pane: pane.id, command: trimmed).renderedCommand
+        let targetContext = context.map {
+            HerdrTargetContext(sshSessionID: $0.sessionID, herdrSessionName: $0.herdrSessionName)
+        }
+        let rendered = HerdrCommand.paneRun(pane: pane.id, command: trimmed)
+            .renderedCommand(for: targetContext)
         return CommandPolicy().classify(rendered)
     }
 
@@ -3874,7 +3861,7 @@ struct HerdrSendCommandSheet: View {
         isExecuting = true
         executionError = nil
         let result = await container.runHerdrPaneCommand(
-            paneID: pane.id, command: trimmed, approved: true)
+            paneID: pane.id, command: trimmed, approved: true, context: context)
         isExecuting = false
         if result.success {
             dismiss()
@@ -3887,6 +3874,12 @@ struct HerdrSendCommandSheet: View {
 struct HerdrCreateWorkspaceSheet: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
+    let context: HerdrOperationContext?
+
+    init(context: HerdrOperationContext? = nil) {
+        self.context = context
+    }
+
     @State private var label: String = ""
     @State private var cwd: String = "."
     @State private var isCreating: Bool = false
@@ -3977,7 +3970,8 @@ struct HerdrCreateWorkspaceSheet: View {
     private func createWorkspace() async {
         isCreating = true
         errorMessage = nil
-        let result = await container.createHerdrWorkspace(label: label, cwd: cwd)
+        let result = await container.createHerdrWorkspace(
+            label: label, cwd: cwd, context: context)
         isCreating = false
         if result.success {
             dismiss()
@@ -3992,9 +3986,10 @@ struct HerdrAgentCardsView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     var isStandalone: Bool = false
 
-    @State private var selectedOutputPane: HerdrPane?
-    @State private var selectedCommandPane: HerdrPane?
+    @State private var selectedOutputPane: HerdrPaneTarget?
+    @State private var selectedCommandPane: HerdrPaneTarget?
     @State private var showCreateWorkspace: Bool = false
+    @State private var createWorkspaceContext: HerdrOperationContext?
 
     var body: some View {
         if isStandalone {
@@ -4005,47 +4000,67 @@ struct HerdrAgentCardsView: View {
                 .navigationTitle("Herdr Agents")
                 .navigationBarTitleDisplayMode(.inline)
             }
-            .sheet(item: $selectedOutputPane) { pane in
-                HerdrOutputSheet(pane: pane)
+            .sheet(item: $selectedOutputPane) { target in
+                HerdrOutputSheet(target: target)
                     .environmentObject(container)
             }
-            .sheet(item: $selectedCommandPane) { pane in
-                HerdrSendCommandSheet(pane: pane)
+            .sheet(item: $selectedCommandPane) { target in
+                HerdrSendCommandSheet(target: target)
                     .environmentObject(container)
             }
             .sheet(isPresented: $showCreateWorkspace) {
-                HerdrCreateWorkspaceSheet()
+                HerdrCreateWorkspaceSheet(context: createWorkspaceContext)
                     .environmentObject(container)
             }
             .onAppear {
                 if container.activeSession?.state == .connected {
+                    Task {
+                        _ = await container.listHerdrSessions()
+                        await container.refreshHerdrState()
+                    }
                     container.startHerdrPolling()
                 }
             }
             .onDisappear {
                 container.stopHerdrPolling()
             }
+            .onChange(of: container.activeHerdrContextKey) { _, _ in
+                selectedOutputPane = nil
+                selectedCommandPane = nil
+                showCreateWorkspace = false
+                createWorkspaceContext = nil
+            }
         } else {
             cardsContent
-                .sheet(item: $selectedOutputPane) { pane in
-                    HerdrOutputSheet(pane: pane)
+                .sheet(item: $selectedOutputPane) { target in
+                    HerdrOutputSheet(target: target)
                         .environmentObject(container)
                 }
-                .sheet(item: $selectedCommandPane) { pane in
-                    HerdrSendCommandSheet(pane: pane)
+                .sheet(item: $selectedCommandPane) { target in
+                    HerdrSendCommandSheet(target: target)
                         .environmentObject(container)
                 }
                 .sheet(isPresented: $showCreateWorkspace) {
-                    HerdrCreateWorkspaceSheet()
+                    HerdrCreateWorkspaceSheet(context: createWorkspaceContext)
                         .environmentObject(container)
                 }
                 .onAppear {
                     if container.activeSession?.state == .connected {
+                        Task {
+                            _ = await container.listHerdrSessions()
+                            await container.refreshHerdrState()
+                        }
                         container.startHerdrPolling()
                     }
                 }
                 .onDisappear {
                     container.stopHerdrPolling()
+                }
+                .onChange(of: container.activeHerdrContextKey) { _, _ in
+                    selectedOutputPane = nil
+                    selectedCommandPane = nil
+                    showCreateWorkspace = false
+                    createWorkspaceContext = nil
                 }
         }
     }
@@ -4067,6 +4082,30 @@ struct HerdrAgentCardsView: View {
                     .font(.caption.bold())
                 }
             }
+        }
+
+        // Named persistent Herdr contexts are distinct from Shh SSH sessions.
+        Section("Herdr Session") {
+            Menu {
+                Button("Default") {
+                    Task { _ = await container.selectHerdrSession(name: nil) }
+                }
+                ForEach(container.herdrSessions.filter { !$0.isDefault }) { session in
+                    Button(session.name) {
+                        Task { _ = await container.selectHerdrSession(name: session.name) }
+                    }
+                }
+                Divider()
+                Button("Refresh Sessions") {
+                    Task { _ = await container.listHerdrSessions() }
+                }
+            } label: {
+                Label(
+                    container.activeHerdrSessionName.map { "Session: \($0)" } ?? "Default session",
+                    systemImage: "rectangle.stack"
+                )
+            }
+            .accessibilityIdentifier("herdr-session-selector")
         }
 
         // Live Status & Version
@@ -4155,7 +4194,10 @@ struct HerdrAgentCardsView: View {
                     Text("Workspaces")
                         .font(.headline)
                     Spacer()
-                    Button(action: { showCreateWorkspace = true }) {
+                    Button(action: {
+                        createWorkspaceContext = container.selectedHerdrOperationContext
+                        showCreateWorkspace = true
+                    }) {
                         Label("New Workspace", systemImage: "plus")
                             .font(.caption.bold())
                     }
@@ -4172,6 +4214,7 @@ struct HerdrAgentCardsView: View {
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                         Button("Create Workspace") {
+                            createWorkspaceContext = container.selectedHerdrOperationContext
                             showCreateWorkspace = true
                         }
                         .buttonStyle(.borderedProminent)
@@ -4237,11 +4280,23 @@ struct HerdrAgentCardsView: View {
                                     ForEach(workspace.panes) { pane in
                                         HerdrAgentCardView(
                                             pane: pane,
-                                            onReadOutput: { selectedOutputPane = pane },
-                                            onSendCommand: { selectedCommandPane = pane },
+                                            onReadOutput: {
+                                                selectedOutputPane = container.herdrPaneTarget(
+                                                    for: pane)
+                                            },
+                                            onSendCommand: {
+                                                selectedCommandPane = container.herdrPaneTarget(
+                                                    for: pane)
+                                            },
                                             onSplitPane: {
+                                                guard
+                                                    let target = container.herdrPaneTarget(
+                                                        for: pane)
+                                                else { return }
                                                 Task {
-                                                    await container.splitHerdrPane(paneID: pane.id)
+                                                    await container.splitHerdrPane(
+                                                        paneID: target.pane.id,
+                                                        context: target.context)
                                                 }
                                             }
                                         )
@@ -4252,11 +4307,23 @@ struct HerdrAgentCardsView: View {
                                     ForEach(workspace.panes) { pane in
                                         HerdrAgentCardView(
                                             pane: pane,
-                                            onReadOutput: { selectedOutputPane = pane },
-                                            onSendCommand: { selectedCommandPane = pane },
+                                            onReadOutput: {
+                                                selectedOutputPane = container.herdrPaneTarget(
+                                                    for: pane)
+                                            },
+                                            onSendCommand: {
+                                                selectedCommandPane = container.herdrPaneTarget(
+                                                    for: pane)
+                                            },
                                             onSplitPane: {
+                                                guard
+                                                    let target = container.herdrPaneTarget(
+                                                        for: pane)
+                                                else { return }
                                                 Task {
-                                                    await container.splitHerdrPane(paneID: pane.id)
+                                                    await container.splitHerdrPane(
+                                                        paneID: target.pane.id,
+                                                        context: target.context)
                                                 }
                                             }
                                         )
