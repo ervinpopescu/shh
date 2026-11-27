@@ -22,7 +22,6 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 10
     outputs:
-      run_full_suite: ${{ steps.classify.outputs.run_full_suite }}
       is_docs_only: ${{ steps.classify.outputs.is_docs_only }}
 
     steps:
@@ -31,6 +30,9 @@ jobs:
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
+
+      - name: Verify Required CI Context Configuration
+        run: Tests/verify-ci-required-contexts.sh
 
       - name: Classify Changes and Validate Documentation
         id: classify
@@ -44,7 +46,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          RUN_FULL_SUITE=true
           IS_DOCS_ONLY=false
           BASE=""
           HEAD=""
@@ -99,7 +100,6 @@ jobs:
               done <<< "$CHANGED_FILES"
 
               if [ "$ALL_DOCS" = "true" ]; then
-                RUN_FULL_SUITE=false
                 IS_DOCS_ONLY=true
               fi
             fi
@@ -128,13 +128,11 @@ jobs:
               "config, or fail-closed diff)."
           fi
 
-          echo "run_full_suite=$RUN_FULL_SUITE" >> "$GITHUB_OUTPUT"
           echo "is_docs_only=$IS_DOCS_ONLY" >> "$GITHUB_OUTPUT"
 
   core-build-and-test:
     name: Build and Core Tests
     needs: fast-lane
-    if: needs.fast-lane.outputs.run_full_suite == 'true'
     runs-on: macos-26
     timeout-minutes: 30
 
@@ -339,7 +337,6 @@ jobs:
   simulator-tests:
     name: ${{ matrix.name }}
     needs: fast-lane
-    if: needs.fast-lane.outputs.run_full_suite == 'true'
     runs-on: macos-26
     timeout-minutes: 30
     strategy:
