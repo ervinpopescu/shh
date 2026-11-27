@@ -56,6 +56,11 @@ jobs:
           echo "DEVELOPER_DIR=$developer_dir" >> "$GITHUB_ENV"
           xcodebuild -version
 
+      - name: Install Metal Toolchain
+        # Xcode 26 ships the Metal toolchain as a separate component. The
+        # generic-iOS test build compiles Metal shaders, so fetch it first.
+        run: xcodebuild -downloadComponent MetalToolchain
+
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then
