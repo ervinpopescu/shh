@@ -307,6 +307,14 @@ final class HerdrTests: XCTestCase {
         )
     }
 
+    func testParseNamedHerdrSessionsDirectResultUsesDefaultAndRunningFields() throws {
+        let json = #"{"sessions":[{"name":"review","default":false,"running":true}]}"#
+        XCTAssertEqual(
+            try HerdrOutputParser.parseSessions(from: json),
+            [HerdrSessionDescriptor(name: "review", isDefault: false, isRunning: true)]
+        )
+    }
+
     func testHerdrCommandQuotingSafety() {
         let maliciousLabel = "test'; rm -rf /; echo '"
         let command = HerdrCommand.workspaceCreate(cwd: "/home", label: maliciousLabel)

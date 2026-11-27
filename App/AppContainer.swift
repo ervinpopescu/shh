@@ -1094,7 +1094,11 @@ final class AppContainer: ObservableObject {
             else { return }
             self.transferQueueState = await self.transferCoordinator.snapshot(ownerSessionID: id)
         }
-        advanceHerdrContext(for: runtime)
+        if isSelectionChange {
+            advanceHerdrContext(for: runtime)
+        } else {
+            projectHerdrState(from: runtime)
+        }
         activeSession = runtime.session
         activeHost = runtime.host
         terminalText = runtime.terminalText
@@ -1712,15 +1716,7 @@ final class AppContainer: ObservableObject {
             selectedRuntime.session.state != .connected,
             selectedRuntime.session.state != .connecting
         {
-            sessionRuntimes.removeValue(forKey: selectedSessionID)
-            sessionOrder.removeAll { $0 == selectedSessionID }
-            explicitlyDisconnectedSessionIDs.remove(selectedSessionID)
-            pendingForegroundRecoverySessionIDs.remove(selectedSessionID)
-            deferredInterfaceRecoverySessionIDs.remove(selectedSessionID)
-            self.selectedSessionID = nil
-            activeSession = nil
-            activeHost = nil
-            updateOpenSessions()
+            await closeSession(id: selectedSessionID)
         }
         let admittedSessionIDs = Set(sessionRuntimes.keys).union(pendingConnectingSessions.keys)
         guard admittedSessionIDs.count < Self.maximumConcurrentSessions else {

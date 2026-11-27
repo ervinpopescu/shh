@@ -1533,6 +1533,39 @@ final class MultiSessionAppTests: XCTestCase {
         XCTAssertFalse(runtimeB.terminalText.contains("reconnected-alpha-output"))
     }
 
+    func testRetryingFailedSelectedSessionUsesOwnerScopedTeardown() async throws {
+        let originalA = MockSSHConnection()
+        let replacementA = MockSSHConnection()
+        let connectionB = MockSSHConnection()
+        let aConnections = ConnectionSequence([originalA, replacementA])
+        let transport = ControllableTransport()
+        transport.onConnect = { host in
+            host.hostname == "alpha.invalid" ? await aConnections.next() : connectionB
+        }
+        let container = AppContainer(
+            transport: transport,
+            reachabilityMonitor: MockReachabilityMonitor(isReachable: true)
+        )
+        let hostA = try Host(name: "Alpha Host", hostname: "alpha.invalid", username: "dev")
+        let hostB = try Host(name: "Beta Host", hostname: "beta.invalid", username: "dev")
+
+        await container.connect(to: hostA)
+        let sessionAID = try XCTUnwrap(container.selectedSessionID)
+        await container.connect(to: hostB)
+        let sessionBID = try XCTUnwrap(container.selectedSessionID)
+        let runtimeA = try XCTUnwrap(container.runtime(for: sessionAID))
+        runtimeA.updateSessionState(.failed)
+        container.selectSession(id: sessionAID)
+
+        await container.connect(to: hostA)
+
+        XCTAssertTrue(originalA.isClosed, "Retry must close the failed runtime's transport")
+        XCTAssertFalse(connectionB.isClosed, "Retry must not close another runtime")
+        XCTAssertEqual(container.runtime(for: sessionBID)?.session.state, .connected)
+        XCTAssertEqual(container.activeSession?.state, .connected)
+        XCTAssertTrue((container.connection as AnyObject) === (replacementA as AnyObject))
+    }
+
     func testResourceExhaustionGuardPreventsExceedingMaximumSessions() async throws {
         let transport = ControllableTransport()
         let container = AppContainer(transport: transport)

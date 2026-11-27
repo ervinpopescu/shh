@@ -651,7 +651,7 @@ public enum HerdrOutputParser: Sendable {
     }
 
     private struct SessionListResult: Decodable {
-        let sessions: [HerdrSessionDescriptor]
+        let sessions: [SessionListRecord]
     }
 
     private struct SessionListRecord: Decodable {
@@ -798,7 +798,10 @@ public enum HerdrOutputParser: Sendable {
             return records.map { HerdrSessionDescriptor(name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false) }
         }
         if let wrapped = try? jsonDecoder.decode(SessionListResult.self, from: data) {
-            return wrapped.sessions
+            return wrapped.sessions.map {
+                HerdrSessionDescriptor(
+                    name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false)
+            }
         }
         if let envelope = try? jsonDecoder.decode(SessionListEnvelope.self, from: data) {
             return envelope.result.sessions.map { HerdrSessionDescriptor(name: $0.name, isDefault: $0.default ?? false, isRunning: $0.running ?? false) }
