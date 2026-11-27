@@ -61,6 +61,41 @@ jobs:
         # generic-iOS test build compiles Metal shaders, so fetch it first.
         run: xcodebuild -downloadComponent MetalToolchain
 
+      - name: Activate Metal Toolchain
+        run: |
+          set -euo pipefail
+          component_info=$(xcodebuild -showComponent MetalToolchain -json)
+          metal_toolchain=$(printf '%s' "$component_info" |
+            plutil -extract toolchainIdentifier raw -o - -)
+          if [ -z "$metal_toolchain" ]; then
+            echo "Error: Metal toolchain is installed but has no identifier" >&2
+            exit 1
+          fi
+
+          # The downloaded component is not in XcodeDefault. TOOLCHAINS is the
+          # supported lookup path for component toolchains; keep XcodeDefault
+          # available for all other compiler and linker tools.
+          toolchains="$metal_toolchain com.apple.dt.toolchain.XcodeDefault"
+          echo "TOOLCHAINS=$toolchains" >> "$GITHUB_ENV"
+          export TOOLCHAINS="$toolchains"
+
+          echo "Activated Metal toolchain: $metal_toolchain"
+          metal_path=$(xcrun --no-cache --find metal)
+          echo "Metal compiler: $metal_path"
+          xcrun --no-cache metal --version
+
+          probe_dir=$(mktemp -d)
+          trap 'rm -rf "$probe_dir"' EXIT
+          cat > "$probe_dir/probe.metal" <<'EOF'
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void probe() {}
+          EOF
+          xcrun --no-cache metal -c -o "$probe_dir/probe.air" \
+            "$probe_dir/probe.metal"
+          test -s "$probe_dir/probe.air"
+          echo "Metal compiler probe succeeded"
+
       - name: Install XcodeGen
         run: |
           if ! command -v xcodegen >/dev/null 2>&1; then
