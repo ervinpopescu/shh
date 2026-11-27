@@ -106,6 +106,186 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
+      - name: Run hosted Metal selection diagnostic
+        run: |
+          set -euo pipefail
+          diagnostic_dir=tmp/hosted-metal-diagnostic
+          probe_dir="$diagnostic_dir/project"
+          rm -rf "$diagnostic_dir"
+          mkdir -p "$probe_dir"
+
+          cat > "$probe_dir/project.yml" <<'EOF'
+          name: MetalProbe
+          targets:
+            MetalProbe:
+              type: application
+              platform: iOS
+              deploymentTarget: "17.0"
+              sources:
+                - main.swift
+                - shader.metal
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.example.metalprobe
+                  GENERATE_INFOPLIST_FILE: YES
+                  CODE_SIGNING_ALLOWED: NO
+                  CODE_SIGNING_REQUIRED: NO
+          EOF
+          cat > "$probe_dir/main.swift" <<'EOF'
+          import Foundation
+          print("metal diagnostic probe")
+          EOF
+          cat > "$probe_dir/shader.metal" <<'EOF'
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void probe() {}
+          EOF
+
+          (
+            cd "$probe_dir" || exit 1
+            xcodegen generate --spec project.yml
+          )
+
+          component_info=$(xcodebuild -showComponent MetalToolchain -json)
+          printf '%s\n' "$component_info" > "$diagnostic_dir/component.json"
+          xcodebuild -version > "$diagnostic_dir/xcode-version.txt" 2>&1
+          set +e
+          metal_path=$(xcrun --no-cache --find metal 2>&1)
+          metal_status=$?
+          set -e
+          {
+            echo "component JSON:"
+            cat "$diagnostic_dir/component.json"
+            echo "xcode version:"
+            cat "$diagnostic_dir/xcode-version.txt"
+            echo "active resolved compiler (exit $metal_status): $metal_path"
+            echo "METAL_TOOLCHAIN=$METAL_TOOLCHAIN"
+            echo "TOOLCHAINS=${TOOLCHAINS:-<unset>}"
+          } | tee "$diagnostic_dir/pre-codeql-summary.txt"
+
+          cat > "$diagnostic_dir/run-probe.sh" <<'EOF'
+          #!/bin/bash
+          set -uo pipefail
+
+          phase=${1:?diagnostic phase is required}
+          root=$(cd "$(dirname "$0")" && pwd)
+          project_dir="$root/project"
+          toolchain=${METAL_TOOLCHAIN:?METAL_TOOLCHAIN is required}
+          summary="$root/${phase}-summary.txt"
+          : > "$summary"
+
+          xcodebuild -version > "$root/${phase}-xcode-version.txt" 2>&1
+
+          run_variant() {
+            name=$1
+            log="$root/${phase}-${name}.log"
+            settings="$root/${phase}-${name}-settings.log"
+            derived_data="$root/${phase}-${name}-derived-data"
+            rm -rf "$derived_data"
+
+            common_args=(
+              -project "$project_dir/MetalProbe.xcodeproj"
+              -scheme MetalProbe
+              -configuration Debug
+              -destination 'generic/platform=iOS'
+              -derivedDataPath "$derived_data"
+              -skipPackagePluginValidation
+              CODE_SIGNING_ALLOWED=NO
+              CODE_SIGN_IDENTITY=
+              CODE_SIGNING_REQUIRED=NO
+            )
+            settings_args=(
+              -project "$project_dir/MetalProbe.xcodeproj"
+              -scheme MetalProbe
+              -configuration Debug
+              -destination 'generic/platform=iOS'
+            )
+
+            case "$name" in
+              default)
+                env -u TOOLCHAINS -u METAL_TOOLCHAIN \
+                  xcodebuild "${common_args[@]}" build > "$log" 2>&1
+                ;;
+              env-only)
+                env -u METAL_TOOLCHAIN TOOLCHAINS="$toolchain" \
+                  xcodebuild "${common_args[@]}" build > "$log" 2>&1
+                ;;
+              current-toolchain)
+                xcodebuild "${common_args[@]}" -toolchain "$toolchain" \
+                  build > "$log" 2>&1
+                ;;
+            esac
+            build_status=$?
+
+            case "$name" in
+              default)
+                env -u TOOLCHAINS -u METAL_TOOLCHAIN \
+                  xcodebuild -showBuildSettings "${settings_args[@]}" \
+                  > "$settings" 2>&1
+                ;;
+              env-only)
+                env -u METAL_TOOLCHAIN TOOLCHAINS="$toolchain" \
+                  xcodebuild -showBuildSettings "${settings_args[@]}" \
+                  > "$settings" 2>&1
+                ;;
+              current-toolchain)
+                xcodebuild -showBuildSettings "${settings_args[@]}" \
+                  -toolchain "$toolchain" > "$settings" 2>&1
+                ;;
+            esac
+            settings_status=$?
+
+            {
+              echo "variant=$name"
+              echo "build_exit=$build_status"
+              echo "settings_exit=$settings_status"
+              echo "resolved CompileMetalFile/compiler lines:"
+              grep -E 'CompileMetalFile|(^|/)metal([[:space:]]|$)' "$log" |
+                tail -n 12 | cut -c1-2000 || true
+              echo "TOOLCHAIN_DIR settings:"
+              grep -E '(^|[[:space:]])(DT_)?TOOLCHAIN_DIR[[:space:]]*=' \
+                "$settings" || true
+            } >> "$summary"
+          }
+
+          resolve_compiler() {
+            name=$1
+            output="$root/${phase}-${name}-resolved-compiler.txt"
+            case "$name" in
+              default)
+                env -u TOOLCHAINS -u METAL_TOOLCHAIN \
+                  xcrun --no-cache --find metal > "$output" 2>&1
+                ;;
+              env-only)
+                env -u METAL_TOOLCHAIN TOOLCHAINS="$toolchain" \
+                  xcrun --no-cache --find metal > "$output" 2>&1
+                ;;
+              current-toolchain)
+                xcrun --no-cache --find metal > "$output" 2>&1
+                ;;
+            esac
+            resolve_status=$?
+            printf 'resolved_compiler_%s_exit=%s\n' "$name" \
+              "$resolve_status" >> "$summary"
+            printf 'resolved_compiler_%s=%s\n' "$name" \
+              "$(tr '\n' ' ' < "$output" | cut -c1-2000)" >> "$summary"
+          }
+
+          for variant in default env-only current-toolchain; do
+            resolve_compiler "$variant"
+            run_variant "$variant"
+          done
+
+          {
+            echo "phase=$phase"
+            echo "xcode version:"
+            cat "$root/${phase}-xcode-version.txt"
+            cat "$summary"
+          } | tee "$root/${phase}-report.txt"
+          EOF
+          chmod +x "$diagnostic_dir/run-probe.sh"
+          "$diagnostic_dir/run-probe.sh" pre-codeql
+
       - name: Initialize CodeQL
         # v3
         uses: github/codeql-action/init@1190a975f95ce23525efb6a3fc21ea29567c1b52
@@ -113,6 +293,11 @@ jobs:
           languages: swift
           build-mode: manual
           config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Run Metal diagnostic under CodeQL tracing
+        run: |
+          set -uo pipefail
+          tmp/hosted-metal-diagnostic/run-probe.sh post-codeql
 
       - name: Build Swift targets
         run: |
@@ -136,3 +321,16 @@ jobs:
           github/codeql-action/analyze@1190a975f95ce23525efb6a3fc21ea29567c1b52
         with:
           category: /language:swift
+
+      - name: Upload hosted Metal diagnostic artifacts
+        if: always()
+        # v4.6.1
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1
+        with:
+          name: codeql-hosted-metal-diagnostic
+          path: |
+            tmp/hosted-metal-diagnostic/*.json
+            tmp/hosted-metal-diagnostic/*.log
+            tmp/hosted-metal-diagnostic/*.txt
+          if-no-files-found: ignore
+          retention-days: 7
