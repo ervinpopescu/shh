@@ -153,4 +153,8 @@ Xcode 26 application.
 - Least-privilege permissions (`contents: read`) and concurrency
   cancellation.
 - Automated CodeQL Swift static analysis using the extended security
-  query suite on pushes, pull requests, and scheduled runs.
+  query suite on pushes, pull requests, and scheduled runs. The CodeQL job
+  retains the separate Metal component installation and full traced build, but
+  is currently blocked after initialization by the upstream macOS 26/Xcode 26
+  Metal lookup bug ([CodeQL #3978](https://github.com/github/codeql-action/issues/3978));
+  analysis is not disabled or narrowed to hide this external failure.
