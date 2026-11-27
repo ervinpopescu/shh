@@ -150,6 +150,10 @@ Xcode 26 application.
 - Ad-hoc signed simulator test builds.
 - Bounded test execution with log capture and xcresult artifact
   upload on failure.
+- Pull request fast-lane documentation validation remains available for
+  docs-only changes, but the core build and both simulator matrix entries
+  always run. This preserves the exact required status contexts rather than
+  allowing a docs-only short-circuit to hide them.
 - Least-privilege permissions (`contents: read`) and concurrency
   cancellation.
 - Automated CodeQL Swift static analysis using the extended security
