@@ -1,3 +1,5 @@
+// swiftlint:disable file_length
+
 import ShhCore
 import ShhSSH
 import ShhTerminal
@@ -116,7 +118,13 @@ struct HostListView: View {
             _showingEditor = State(initialValue: true)
         }
     }
-    private var filtered: [Host] { hosts.filter { (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search) || $0.address.localizedCaseInsensitiveContains(search)) && (!healthyOnly || $0.health == .healthy) } }
+    private var filtered: [Host] {
+        hosts.filter {
+            (search.isEmpty || $0.name.localizedCaseInsensitiveContains(search)
+                || $0.address.localizedCaseInsensitiveContains(search))
+                && (!healthyOnly || $0.health == .healthy)
+        }
+    }
     var body: some View {
         List {
             if let discoveryMessage = container.bonjourDiscovery.state.message {
@@ -386,9 +394,19 @@ struct HostDetailView: View {
         }
         .sheet(isPresented: $showEditor) { HostEditorView(existing: host).environmentObject(container) }
         .sheet(isPresented: $showPortForwarding) { PortForwardingSheet().environmentObject(container) }
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             if let session = container.activeSession, session.hostID == host.id {
-                NavigationLink("Open session", destination: SessionView()).buttonStyle(.borderedProminent).padding()
+                HStack(spacing: 0) {
+                    Spacer(minLength: 0)
+                    NavigationLink("Open session", destination: SessionView())
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.large)
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(Color(uiColor: .systemBackground))
+                .overlay(alignment: .top) { Divider() }
             }
         }
     }
@@ -546,6 +564,7 @@ struct BastionHopItem: Identifiable, Equatable {
     }
 }
 
+// swiftlint:disable:next type_body_length
 struct HostEditorView: View {
     @EnvironmentObject private var container: AppContainer
     @Environment(\.dismiss) private var dismiss
@@ -597,10 +616,10 @@ struct HostEditorView: View {
         _hostname = State(initialValue: prefillService?.hostname ?? existing?.hostname ?? "")
         _username = State(initialValue: existing?.username ?? "")
         let portValue: Int
-        if let p = prefillService?.port {
-            portValue = Int(p)
-        } else if let p = existing?.port {
-            portValue = Int(p)
+        if let discoveredPort = prefillService?.port {
+            portValue = Int(discoveredPort)
+        } else if let existingPort = existing?.port {
+            portValue = Int(existingPort)
         } else {
             portValue = 22
         }
@@ -1257,7 +1276,19 @@ struct HostEditorView: View {
 
 struct SessionDashboardView: View {
     @EnvironmentObject private var container: AppContainer
-    var body: some View { Group { if container.activeSession != nil { SessionView() } else { ContentUnavailableView("No active sessions", systemImage: "rectangle.split.2x1", description: Text("Connect a host to create a foreground session.")) } }.navigationTitle("Sessions").navigationBarTitleDisplayMode(.inline) }
+    var body: some View {
+        Group {
+            if container.activeSession != nil {
+                SessionView()
+            } else {
+                ContentUnavailableView(
+                    "No active sessions", systemImage: "rectangle.split.2x1",
+                    description: Text("Connect a host to create a foreground session."))
+            }
+        }
+        .navigationTitle("Sessions")
+        .navigationBarTitleDisplayMode(.inline)
+    }
 }
 
 struct PendingCommand: Identifiable {
@@ -1265,6 +1296,18 @@ struct PendingCommand: Identifiable {
     let command: String
 }
 
+private struct SessionNavigationChromeModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content
+            .toolbarColorScheme(colorScheme, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
+            .toolbarBackground(Color(uiColor: .systemBackground), for: .navigationBar)
+    }
+}
+
+// swiftlint:disable:next type_body_length
 struct SessionView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @EnvironmentObject private var container: AppContainer
@@ -1401,46 +1444,29 @@ struct SessionView: View {
                         onAction: handleDialAction,
                         onDismiss: dismissCommandDial,
                         haptics: container.commandDialPreferences.hapticsEnabled
-                            ? SystemDialHaptics() : NoopDialHaptics()
+                            ? SystemDialHaptics() : NoopDialHaptics(),
+                        // This ZStack is inside SessionView's safe-area-respecting VStack,
+                        // above the accessory bar and drawer, so its parent-local occlusion
+                        // contract is zero rather than a second window-safe-area reservation.
+                        surfaceLocalSafeAreaInsets: EdgeInsets()
                     )
+                } else {
+                    CommandDialTrigger(
+                        isOpen: $isCommandDialOpen,
+                        size: container.commandDialPreferences.size,
+                        placement: container.commandDialPreferences.placement,
+                        onOpen: openCommandDial,
+                        onClose: dismissCommandDial,
+                        onDrag: { commandDialTriggerDrag = $0 }
+                    )
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 12)
                 }
-            }
-            .overlay(
-                alignment: container.commandDialPreferences.placement == .leading
-                    ? .bottomLeading : .bottomTrailing
-            ) {
-                // The trigger lives in the accessory region below, so the closed
-                // dial never participates in terminal hit testing.
-                EmptyView()
             }
 
             // Extra-key accessory bar (always accessible above drawer)
-            HStack(spacing: 6) {
-                if container.commandDialPreferences.placement == .leading {
-                    CommandDialTrigger(
-                        isOpen: $isCommandDialOpen,
-                        size: container.commandDialPreferences.size,
-                        placement: container.commandDialPreferences.placement,
-                        onOpen: openCommandDial,
-                        onClose: dismissCommandDial,
-                        onDrag: { commandDialTriggerDrag = $0 }
-                    )
-                    .padding(.leading, 6)
-                }
-                TerminalAccessoryBar(controller: container.terminalController)
-                if container.commandDialPreferences.placement == .trailing {
-                    CommandDialTrigger(
-                        isOpen: $isCommandDialOpen,
-                        size: container.commandDialPreferences.size,
-                        placement: container.commandDialPreferences.placement,
-                        onOpen: openCommandDial,
-                        onClose: dismissCommandDial,
-                        onDrag: { commandDialTriggerDrag = $0 }
-                    )
-                    .padding(.trailing, 6)
-                }
-            }
-            .background(Color(.systemGray6))
+            TerminalAccessoryBar(controller: container.terminalController)
+                .background(Color(.systemGray6))
             Divider()
 
             // Collapsible Validated-Command Drawer
@@ -1448,6 +1474,7 @@ struct SessionView: View {
         }
         .navigationTitle(container.terminalController.title.isEmpty ? "Terminal" : container.terminalController.title)
         .navigationBarTitleDisplayMode(.inline)
+        .modifier(SessionNavigationChromeModifier())
         .toolbar(isZenMode ? .hidden : .visible, for: .navigationBar)
         .navigationBarHidden(isZenMode)
         .toolbar {
@@ -2335,8 +2362,17 @@ struct SessionView: View {
             commandDialNavigation.clearSelection()
         case .snippet(let id):
             guard let snippet = dialSnippets.first(where: { $0.id == id }) else { return }
-            submit(snippet.body)
-            dismissCommandDial()
+            switch policy.classify(snippet.body) {
+            case .safe:
+                insertPinnedLiteral(snippet.body)
+                dismissCommandDial()
+            case .reviewRequired:
+                pendingSnippet = snippet
+                dismissCommandDial()
+            case .blocked:
+                blockedCommand = snippet.body
+                dismissCommandDial()
+            }
         case .voice:
             container.resetVoiceState()
             dismissCommandDial()
@@ -3988,17 +4024,67 @@ struct HerdrAgentCardsView: View {
 struct SnippetsView: View {
     @EnvironmentObject private var container: AppContainer
     @State private var snippets: [Snippet] = []
-    var body: some View { List(snippets) { snippet in NavigationLink { SnippetEditor(snippet: snippet) } label: { VStack(alignment: .leading) { Text(snippet.name); Text(snippet.body).font(.caption.monospaced()).foregroundStyle(.secondary) } } }.navigationTitle("Snippets").navigationBarTitleDisplayMode(.inline).task { snippets = (try? await container.catalog.snippets()) ?? [] } }
+    var body: some View {
+        List(snippets) { snippet in
+            NavigationLink { SnippetEditor(snippet: snippet) } label: {
+                VStack(alignment: .leading) {
+                    Text(snippet.name)
+                    Text(snippet.body)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .navigationTitle("Snippets")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { snippets = (try? await container.catalog.snippets()) ?? [] }
+    }
 }
 struct SnippetEditor: View {
     @EnvironmentObject private var container: AppContainer
     let snippet: Snippet
     @State private var bodyText: String
     @State private var showApproval = false
-    init(snippet: Snippet) { self.snippet = snippet; _bodyText = State(initialValue: snippet.body) }
-    var body: some View { Form { TextField("Name", text: .constant(snippet.name)).autocorrectionDisabled().textInputAutocapitalization(.never); TextEditor(text: $bodyText).frame(minHeight: 160).autocorrectionDisabled().textInputAutocapitalization(.never); Text("Run always shows this exact text and requires approval.").font(.caption).foregroundStyle(.secondary); Button("Run with approval", systemImage: "play.fill") { showApproval = true }.disabled(bodyText.isEmpty) }.navigationTitle("Snippet").navigationBarTitleDisplayMode(.inline).sheet(isPresented: $showApproval) { ApprovalSheet(command: bodyText).environmentObject(container) } }
+    init(snippet: Snippet) {
+        self.snippet = snippet
+        _bodyText = State(initialValue: snippet.body)
+    }
+
+    var body: some View {
+        Form {
+            TextField("Name", text: .constant(snippet.name))
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            TextEditor(text: $bodyText)
+                .frame(minHeight: 160)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            Text("Run always shows this exact text and requires approval.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button("Run with approval", systemImage: "play.fill") {
+                showApproval = true
+            }
+            .disabled(bodyText.isEmpty)
+        }
+        .navigationTitle("Snippet")
+        .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: $showApproval) {
+            ApprovalSheet(command: bodyText).environmentObject(container)
+        }
+    }
 }
-struct MonitoringView: View { var body: some View { List { Label("Health checks are opt-in", systemImage: "heart.text.square"); Label("Unknown is not authentication success", systemImage: "info.circle"); Label("Live monitoring is foreground-only", systemImage: "iphone") }.navigationTitle("Monitoring").navigationBarTitleDisplayMode(.inline) } }
+struct MonitoringView: View {
+    var body: some View {
+        List {
+            Label("Health checks are opt-in", systemImage: "heart.text.square")
+            Label("Unknown is not authentication success", systemImage: "info.circle")
+            Label("Live monitoring is foreground-only", systemImage: "iphone")
+        }
+        .navigationTitle("Monitoring")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
 struct TerminalThemePickerView: View {
     @EnvironmentObject private var container: AppContainer
 
@@ -4273,7 +4359,12 @@ struct SettingsView: View {
                 Label("Keychain accessibility: when unlocked, this device only", systemImage: "key.fill")
             }
             Section("Capabilities") {
-                Text("Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, and encrypted vault backup active. On-device WhisperKit and Apple Speech voice active. Full Mosh SSP encryption and physical device TestFlight validation pending.")
+                Text(
+                    "Live SSH, ProxyJump, forwarding, SFTP, Mosh UDP roaming, File Provider, "
+                        + "and encrypted vault backup active. On-device WhisperKit and Apple "
+                        + "Speech voice active. Full Mosh SSP encryption and physical device "
+                        + "TestFlight validation pending."
+                )
                     .font(.caption)
             }
             Section("Live Activities") {

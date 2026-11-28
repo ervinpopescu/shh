@@ -41,10 +41,14 @@ public struct CommandDialDrag: Equatable, Sendable {
             let parent = nodes.first(where: { $0.id == parentID }),
             !parent.children.isEmpty
         else { return }
-        let childRing = DialRadialLayout.corner(
-            center: outer.center, radius: outer.orbitRadius,
-            itemRadius: outer.itemRadius, count: parent.children.count,
-            placement: outer.startAngle < 0 ? .leading : .trailing)
+        let childRing = DialRadialLayout(
+            center: outer.center,
+            orbitRadius: outer.orbitRadius,
+            itemRadius: outer.itemRadius,
+            itemSize: outer.itemSize,
+            startAngle: outer.startAngle,
+            endAngle: outer.endAngle,
+            count: parent.children.count)
         let projected = CGPoint(
             x: outer.center.x + dx / distance * outer.orbitRadius,
             y: outer.center.y + dy / distance * outer.orbitRadius)
@@ -69,12 +73,16 @@ public struct CommandDialDrag: Equatable, Sendable {
             return nil
         }
         if distance >= boundary {
-            guard abs(distance - outer.orbitRadius) <= outer.itemRadius * 1.4,
-                let child = parent.children.first(where: { $0.id == childID }), child.isEnabled
+            guard let childIndex = outer.index(at: point),
+                parent.children.indices.contains(childIndex)
             else { return nil }
+            let child = parent.children[childIndex]
+            guard child.isEnabled else { return nil }
             return child
         }
-        guard abs(distance - inner.orbitRadius) <= inner.itemRadius * 1.4 else { return nil }
+        guard let parentIndex = inner.index(at: point), nodes.indices.contains(parentIndex),
+            nodes[parentIndex].id == parent.id
+        else { return nil }
         return parent
     }
 }

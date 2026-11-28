@@ -158,6 +158,20 @@ targets:
         GCC_TREAT_WARNINGS_AS_ERRORS: YES
         SUPPORTED_PLATFORMS: iphoneos iphonesimulator
         GENERATE_INFOPLIST_FILE: YES
+  ShhCommandDialUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Tests/ShhCommandDialUITests]
+    dependencies:
+      - target: Shh
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ervinpopescu.shh.commanddial.uitests
+        SWIFT_VERSION: "5.9"
+        SWIFT_TREAT_WARNINGS_AS_ERRORS: YES
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        GENERATE_INFOPLIST_FILE: YES
   ShhLiveActivity:
     type: app-extension
     platform: iOS
@@ -200,3 +214,11 @@ targets:
         CODE_SIGNING_ALLOWED: YES
         CODE_SIGNING_REQUIRED: YES
         INFOPLIST_FILE: FileProviderExtension/Info.plist
+schemes:
+  ShhCommandDialUITests:
+    build:
+      targets:
+        ShhCommandDialUITests: all
+    test:
+      targets:
+        - name: ShhCommandDialUITests

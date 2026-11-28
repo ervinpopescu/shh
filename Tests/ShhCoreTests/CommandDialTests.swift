@@ -2,10 +2,12 @@ import XCTest
 
 @testable import ShhCore
 
+// swiftlint:disable:next type_body_length
 final class CommandDialTests: XCTestCase {
     func testHierarchyUsesSparseIntentOrientedRootsAndStableLeafIDs() throws {
         let model = CommandDialModel()
-        XCTAssertEqual(model.roots.map(\.id), ["root.input", "root.session", "root.share"])
+        XCTAssertEqual(
+            model.roots.map(\.id), ["root.input", "root.session", "root.saved", "root.share"])
 
         let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
         XCTAssertEqual(
@@ -57,6 +59,34 @@ final class CommandDialTests: XCTestCase {
         XCTAssertEqual(state.activate(keyboard), .dispatch(.keyboard))
         XCTAssertEqual(state.activate(navigate), .ignored)
         XCTAssertEqual(state.path, ["root.input"])
+    }
+
+    func testSavedRootAvailabilityFollowsEnabledChildrenAcrossConnectionState() throws {
+        let emptySaved = try XCTUnwrap(
+            CommandDialModel(connected: true).roots.first { $0.id == "root.saved" })
+        XCTAssertEqual(emptySaved.availability, .unavailable(reason: "No saved commands"))
+
+        let snippet = DialSnippetDescriptor(
+            id: UUID(), name: "Saved command", preview: "echo hello")
+        let disconnected = CommandDialModel(snippets: [snippet], connected: false)
+        let unavailableSaved = try XCTUnwrap(
+            disconnected.roots.first { $0.id == "root.saved" })
+
+        XCTAssertFalse(unavailableSaved.children.contains(where: \.isEnabled))
+        XCTAssertEqual(
+            unavailableSaved.availability, .unavailable(reason: "Connect to a host"))
+        var disconnectedNavigation = CommandDialNavigation(isOpen: true)
+        XCTAssertEqual(disconnectedNavigation.activate(unavailableSaved), .ignored)
+        XCTAssertTrue(disconnectedNavigation.path.isEmpty)
+
+        let connected = CommandDialModel(snippets: [snippet], connected: true)
+        let availableSaved = try XCTUnwrap(connected.roots.first { $0.id == "root.saved" })
+        XCTAssertTrue(availableSaved.children.contains(where: \.isEnabled))
+        XCTAssertTrue(availableSaved.isEnabled)
+        var connectedNavigation = CommandDialNavigation(isOpen: true)
+        XCTAssertEqual(
+            connectedNavigation.activate(availableSaved), .navigated(nodeID: "root.saved"))
+        XCTAssertEqual(connectedNavigation.path, ["root.saved"])
     }
 
     func testRadialLayoutPlacesItemsOnOneOrbitAndMapsPolarSectors() throws {
@@ -120,13 +150,16 @@ final class CommandDialTests: XCTestCase {
         drag.update(at: parentPoint, inner: inner, outer: outer, nodes: model.roots)
         XCTAssertEqual(drag.parentID, input.id)
         XCTAssertNil(drag.childID)
-        XCTAssertEqual(drag.releasedNode(at: parentPoint, inner: inner, outer: outer, nodes: model.roots)?.id, input.id)
+        XCTAssertEqual(
+            drag.releasedNode(at: parentPoint, inner: inner, outer: outer, nodes: model.roots)?.id,
+            input.id)
 
         let childPoint = try XCTUnwrap(outer.point(at: 1))
         drag.update(at: childPoint, inner: inner, outer: outer, nodes: model.roots)
         XCTAssertEqual(drag.childID, "input.keyboard")
-        let child = try XCTUnwrap(drag.releasedNode(
-            at: childPoint, inner: inner, outer: outer, nodes: model.roots))
+        let child = try XCTUnwrap(
+            drag.releasedNode(
+                at: childPoint, inner: inner, outer: outer, nodes: model.roots))
         var navigation = CommandDialNavigation(isOpen: true)
         XCTAssertTrue(navigation.path.isEmpty)
         XCTAssertEqual(navigation.activate(child), .dispatch(.keyboard))
@@ -149,16 +182,19 @@ final class CommandDialTests: XCTestCase {
         XCTAssertNil(drag.childID)
         let beyond = CGPoint(x: inner.center.x - 245, y: inner.center.y)
         drag.update(at: beyond, inner: inner, outer: outer, nodes: input.children)
-        XCTAssertNil(drag.releasedNode(at: beyond, inner: inner, outer: outer, nodes: input.children))
+        XCTAssertNil(
+            drag.releasedNode(at: beyond, inner: inner, outer: outer, nodes: input.children))
         drag.update(at: inner.center, inner: inner, outer: outer, nodes: input.children)
         XCTAssertTrue(drag.returnedToCenter)
-        XCTAssertNil(drag.releasedNode(at: inner.center, inner: inner, outer: outer, nodes: input.children))
+        XCTAssertNil(
+            drag.releasedNode(at: inner.center, inner: inner, outer: outer, nodes: input.children))
         var navigation = CommandDialNavigation(isOpen: true)
         navigation.enter(input)
         navigation.back()
         XCTAssertTrue(navigation.path.isEmpty)
         XCTAssertEqual(
-            CommandDialDrag().releasedNode(at: leafPoint, inner: inner, outer: outer, nodes: input.children)?.id,
+            CommandDialDrag().releasedNode(
+                at: leafPoint, inner: inner, outer: outer, nodes: input.children)?.id,
             nil)
     }
 
@@ -175,6 +211,23 @@ final class CommandDialTests: XCTestCase {
         navigation.back()
         XCTAssertTrue(navigation.path.isEmpty)
         XCTAssertTrue(navigation.isOpen)
+    }
+
+    func testNestedGroupActivationKeepsParentBeforeSiblingNavigation() throws {
+        let model = CommandDialModel()
+        var navigation = CommandDialNavigation(isOpen: true)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let navigate = try XCTUnwrap(input.children.first { $0.id == "input.navigate" })
+        let keyboard = try XCTUnwrap(input.children.first { $0.id == "input.keyboard" })
+
+        XCTAssertEqual(navigation.activate(input), .navigated(nodeID: input.id))
+        XCTAssertEqual(navigation.activate(navigate), .navigated(nodeID: navigate.id))
+        XCTAssertEqual(navigation.path, [input.id, navigate.id])
+
+        navigation.back()
+        XCTAssertEqual(navigation.path, [input.id])
+        XCTAssertEqual(navigation.activate(keyboard), .dispatch(.keyboard))
+        XCTAssertEqual(navigation.path, [input.id])
     }
 
     func testCornerGeometryMirrorsPlacementAndInsetsSparsePages() throws {
@@ -226,11 +279,13 @@ final class CommandDialTests: XCTestCase {
         let literalNodes = descendants(of: model.roots).filter { $0.id.hasPrefix("literal.") }
         XCTAssertEqual(literalNodes.map(\.title), (0..<12).map { "echo \($0)" })
 
-        let quickText = node(id: "run.quick-text", in: model)
+        let quickText = node(id: "saved.quick-text", in: model)
         XCTAssertNotNil(quickText)
         XCTAssertLessThanOrEqual(quickText?.children.count ?? .max, 4)
         XCTAssertTrue(
-            descendants(of: quickText?.children ?? []).contains { $0.id == "run.quick-text.more.1" }
+            descendants(of: quickText?.children ?? []).contains {
+                $0.id == "saved.quick-text.more.1"
+            }
         )
     }
 
@@ -342,6 +397,63 @@ final class CommandDialTests: XCTestCase {
         haptics.emit(.open)
     }
 
+    func testRadialHitTestingMatchesVisibleCardExtents() throws {
+        let layout = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: CGSize(width: 112, height: 74),
+            count: 3,
+            placement: .trailing
+        )
+        let card = try XCTUnwrap(layout.point(at: 1))
+        XCTAssertEqual(layout.index(at: CGPoint(x: card.x + 54, y: card.y + 32)), 1)
+        XCTAssertNil(layout.index(at: CGPoint(x: card.x + 70, y: card.y + 50)))
+    }
+
+    func testLeadingDragUsesTheSameChildArcAsTheVisibleLayout() throws {
+        let model = CommandDialModel(connected: true)
+        let inner = DialRadialLayout.corner(
+            center: CGPoint(x: 72, y: 700), radius: 145, itemRadius: 38,
+            count: model.roots.count, placement: .leading)
+        let input = try XCTUnwrap(model.roots.first { $0.id == "root.input" })
+        let outer = DialRadialLayout.corner(
+            center: inner.center, radius: 245, itemRadius: 38,
+            count: input.children.count, placement: .leading)
+        var drag = CommandDialDrag()
+        drag.update(
+            at: try XCTUnwrap(inner.point(at: 0)), inner: inner, outer: outer, nodes: model.roots)
+        let childPoint = try XCTUnwrap(outer.point(at: 1))
+        drag.update(at: childPoint, inner: inner, outer: outer, nodes: model.roots)
+        XCTAssertEqual(drag.childID, "input.keyboard")
+        XCTAssertEqual(
+            drag.releasedNode(at: childPoint, inner: inner, outer: outer, nodes: model.roots)?.id,
+            "input.keyboard")
+    }
+
+    func testRadialLayoutDefaultsAndCornerCardSize() {
+        let defaultSize = DialRadialLayout(
+            center: .zero,
+            orbitRadius: 50,
+            itemRadius: 10,
+            startAngle: 0,
+            endAngle: .pi,
+            count: 1
+        )
+        XCTAssertEqual(defaultSize.itemSize, CGSize(width: 20, height: 20))
+
+        let customSize = CGSize(width: 112, height: 74)
+        let corner = DialRadialLayout.corner(
+            center: CGPoint(x: 200, y: 500),
+            radius: 140,
+            itemRadius: 38,
+            itemSize: customSize,
+            count: 3,
+            placement: .trailing
+        )
+        XCTAssertEqual(corner.itemSize, customSize)
+    }
+
     func testRadialLayoutEdgeCases() {
         let layout = DialRadialLayout(
             center: CGPoint(x: 100, y: 100),
@@ -377,6 +489,129 @@ final class CommandDialTests: XCTestCase {
         )
         XCTAssertTrue(empty.positions.isEmpty)
         XCTAssertNil(empty.index(at: .zero))
+    }
+
+    func testInwardFanKeepsSelectedHubAndCardsInsideCompactViewport() throws {
+        let selected = CGPoint(x: 330, y: 380)
+        let layout = DialRadialLayout.inwardFan(
+            center: selected,
+            preferredRadius: 132,
+            itemRadius: 35,
+            itemSize: CGSize(width: 108, height: 70),
+            count: 4,
+            placement: .trailing,
+            bounds: CGSize(width: 393, height: 520),
+            safeAreaInsets: DialLayoutInsets(top: 12, bottom: 8))
+
+        XCTAssertEqual(layout.center, selected)
+        XCTAssertEqual(layout.positions.count, 4)
+        for point in layout.positions {
+            XCTAssertGreaterThanOrEqual(point.x, 54)
+            XCTAssertLessThanOrEqual(point.x, 339)
+            XCTAssertGreaterThanOrEqual(point.y, 47)
+            XCTAssertLessThanOrEqual(point.y, 477)
+        }
+    }
+
+    func testCornerFittingKeepsRootTargetsInsideNarrowPhone() {
+        let layout = DialRadialLayout.cornerFitting(
+            center: CGPoint(x: 346, y: 485), preferredRadius: 190, minimumRadius: 84,
+            itemRadius: 35, itemSize: CGSize(width: 108, height: 70), count: 4,
+            placement: .trailing, bounds: CGSize(width: 393, height: 520))
+        XCTAssertTrue(
+            layout.positions.allSatisfy { point in
+                point.x >= 54 && point.x <= 339 && point.y >= 35 && point.y <= 485
+            })
+        XCTAssertLessThanOrEqual(layout.orbitRadius, 190)
+    }
+
+    func testCompactRadialOverlapUsesActualRectanglesForMeasuredPhone() throws {
+        let viewport = CGSize(width: 568, height: 212)
+        let insets = DialLayoutInsets(top: 50)
+        let root = DialRadialLayout.cornerFitting(
+            center: CGPoint(x: 521, y: 161), preferredRadius: 112, minimumRadius: 0,
+            itemRadius: 35, itemSize: CGSize(width: 108, height: 70), count: 4,
+            placement: .trailing, bounds: viewport, safeAreaInsets: insets,
+            requireSeparatedTargets: true)
+        let parent = try XCTUnwrap(root.point(at: 0))
+        XCTAssertEqual(parent.x, 431.80943021034443, accuracy: 0.000001)
+        XCTAssertEqual(parent.y, 161, accuracy: 0.000001)
+
+        let child = DialRadialLayout.inwardFan(
+            center: parent, preferredRadius: 78, itemRadius: 35,
+            itemSize: CGSize(width: 44, height: 44), count: 4, placement: .trailing,
+            bounds: viewport, safeAreaInsets: insets, requireSeparatedTargets: true)
+
+        XCTAssertGreaterThanOrEqual(child.itemSize.width, 44)
+        XCTAssertGreaterThanOrEqual(child.itemSize.height, 44)
+        XCTAssertTrue(child.fits(in: viewport, safeAreaInsets: insets, hubRadius: 35))
+        XCTAssertTrue(child.hasSeparatedTargets(hubRadius: 35))
+        for first in child.positions.indices {
+            for second in child.positions.indices where second > first {
+                let firstRect = try XCTUnwrap(child.targetRect(at: first))
+                let secondRect = try XCTUnwrap(child.targetRect(at: second))
+                XCTAssertFalse(firstRect.intersects(secondRect))
+            }
+        }
+    }
+
+    func testBoundedRadialGeometryCoversCompactAndPadViewports() throws {
+        XCTAssertEqual(DialRadialLayout.maximumGeometryCandidates, 12)
+        let viewports: [(CGSize, CGFloat)] = [
+            (CGSize(width: 393, height: 500), 0),
+            (CGSize(width: 393, height: 500), 59),
+            (CGSize(width: 568, height: 212), 0),
+            (CGSize(width: 568, height: 212), 59),
+            (CGSize(width: 1024, height: 768), 0),
+        ]
+
+        for (bounds, topInset) in viewports {
+            let insets = DialLayoutInsets(top: topInset, bottom: 8)
+            let root = DialRadialLayout.cornerFitting(
+                center: CGPoint(x: bounds.width - 47, y: bounds.height - 51),
+                preferredRadius: min(190, bounds.height * 0.27), minimumRadius: 0,
+                itemRadius: 35, itemSize: CGSize(width: 44, height: 44), count: 4,
+                placement: .trailing, bounds: bounds, safeAreaInsets: insets,
+                requireSeparatedTargets: true)
+            let child = DialRadialLayout.inwardFan(
+                center: root.center, preferredRadius: min(142, bounds.height * 0.2),
+                itemRadius: 35, itemSize: CGSize(width: 44, height: 44), count: 3,
+                placement: .trailing, bounds: bounds, safeAreaInsets: insets,
+                requireSeparatedTargets: true)
+
+            for layout in [root, child] {
+                XCTAssertGreaterThanOrEqual(layout.itemSize.width, 44)
+                XCTAssertGreaterThanOrEqual(layout.itemSize.height, 44)
+                XCTAssertTrue(
+                    layout.fits(
+                        in: bounds, safeAreaInsets: insets, hubRadius: 35,
+                        requireSeparatedTargets: false),
+                    "targets must stay in the measured viewport: \(bounds), top \(topInset)")
+                if !layout.hasSeparatedTargets(hubRadius: 35) {
+                    XCTAssertTrue(
+                        layout.fits(
+                            in: bounds, safeAreaInsets: insets, hubRadius: 35,
+                            requireSeparatedTargets: false),
+                        "overlap fallback must still be deterministic and visible")
+                }
+            }
+        }
+    }
+
+    func testSessionFocusHierarchyUsesTypedMultiplexerActions() throws {
+        let sessionID = try TmuxSessionID("$5")
+        let controls = CommandDialMultiplexerMenu.nodes(
+            tmuxSessionID: sessionID, capabilities: .tmux)
+        let model = CommandDialModel(multiplexerChildren: controls)
+        let session = try XCTUnwrap(model.roots.first { $0.id == "root.session" })
+        let current = try XCTUnwrap(session.children.first { $0.id == "session.current" })
+        let focus = try XCTUnwrap(current.children.first { $0.id == "session.current.focus" })
+        XCTAssertEqual(focus.title, "Focus")
+        XCTAssertTrue(
+            focus.children.allSatisfy { node in
+                if case .multiplexerControl = node.action { return true }
+                return false
+            })
     }
 
     private func node(id: String, in model: CommandDialModel) -> DialNode? {
