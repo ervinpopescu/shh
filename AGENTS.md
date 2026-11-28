@@ -23,10 +23,12 @@ The repository has two build surfaces:
   File Provider extension, and app-test targets. `Shh.xcodeproj` is generated
   and ignored by Git; do not edit it by hand.
 
-The normal development host is macOS with Xcode, because the app and extension
-are iOS targets. CI runs on `macos-26`, selects the newest installed Xcode 26,
-and builds unsigned generic iOS targets plus iPhone and iPad simulator tests.
-The app deployment target remains iOS 17.
+The normal development host is macOS with Xcode 26 or newer, because the app
+and extension are iOS targets and SwiftTerm 1.99 declares SwiftPM
+tools-version 6.2. The root package remains at tools-version 5.10. CI runs on
+`macos-26`, selects the newest installed Xcode 26, and builds unsigned generic
+iOS targets plus iPhone and iPad simulator tests. The app deployment target
+remains iOS 17.
 `project.yml` records an Xcode 15.4 project-generation preference, so use the
 installed Xcode selected by `DEVELOPER_DIR` for the actual build.
 

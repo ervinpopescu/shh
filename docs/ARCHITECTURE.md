@@ -140,7 +140,9 @@ extensions.
 GitHub Actions runs on `macos-26` runners with Xcode 26. The iOS
 deployment target remains 17.0, and the runner provides iOS 26 simulators for
 its iPhone and iPad simulator tests. Workflows select the newest installed
-Xcode 26 application.
+Xcode 26 application. SwiftTerm 1.99 declares SwiftPM tools-version 6.2,
+which sets Xcode 26 or newer as the minimum developer toolchain; the root
+package remains at tools-version 5.10.
 
 - Automated package resolution and test verification (`swift test`).
 - Project generation via cached XcodeGen (`xcodegen generate`).
