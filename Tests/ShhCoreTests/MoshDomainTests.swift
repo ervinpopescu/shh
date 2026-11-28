@@ -1,4 +1,5 @@
 import XCTest
+
 @testable import ShhCore
 
 final class MoshDomainTests: XCTestCase {
@@ -42,7 +43,8 @@ final class MoshDomainTests: XCTestCase {
             serverCommand: "/usr/local/bin/mosh-server",
             portRange: MoshPortRange(start: 60000, end: 60500),
             predictionMode: .always,
-            sshOptions: SSHOptions(connectTimeoutSeconds: 30, keepAliveSeconds: 120, compression: true)
+            sshOptions: SSHOptions(
+                connectTimeoutSeconds: 30, keepAliveSeconds: 120, compression: true)
         )
 
         let encoder = JSONEncoder()
@@ -185,7 +187,8 @@ final class MoshDomainTests: XCTestCase {
         XCTAssertTrue(connected.isConnected)
         XCTAssertFalse(connected.isBootstrapping)
 
-        let roamingState = NetworkRoamingState(previousInterface: .wifi, currentInterface: .cellular)
+        let roamingState = NetworkRoamingState(
+            previousInterface: .wifi, currentInterface: .cellular)
         let roaming = MoshState.roaming(roamingState)
         XCTAssertTrue(roaming.isRoaming)
         XCTAssertEqual(roaming.roamingState?.previousInterface, .wifi)
@@ -269,7 +272,8 @@ final class MoshDomainTests: XCTestCase {
 
     func testDemoMoshStateObserverTerminatesAndCleansUp() async throws {
         let connection = DemoMoshConnection(
-            sessionInfo: MoshSessionInfo(udpPort: 60002, sessionKey: "state-observer-key", pid: 9999),
+            sessionInfo: MoshSessionInfo(
+                udpPort: 60002, sessionKey: "state-observer-key", pid: 9999),
             options: MoshOptions(portRange: MoshPortRange(port: 60002)),
             remoteHostname: "demo.mosh.internal"
         )
@@ -277,7 +281,7 @@ final class MoshDomainTests: XCTestCase {
         await connection.start()
         let updates = await connection.moshStateUpdates()
         let consumer = Task {
-            for await _ in updates { }
+            for await _ in updates {}
         }
         consumer.cancel()
         await consumer.value
@@ -285,12 +289,41 @@ final class MoshDomainTests: XCTestCase {
         await connection.close()
     }
 
+    func testDemoMoshEventsTerminationClosesConnection() async throws {
+        let connection = DemoMoshConnection(
+            sessionInfo: MoshSessionInfo(udpPort: 60002, sessionKey: "demo-secret-key-12345")
+        )
+        let stream = await connection.events()
+        let stateUpdates = await connection.moshStateUpdates()
+        var stateIterator = stateUpdates.makeAsyncIterator()
+        let initialState = await stateIterator.next()
+        XCTAssertEqual(initialState, .connected)
+
+        let (consumerStarted, consumerStartedContinuation) = AsyncStream<Void>.makeStream()
+        let consumer = Task {
+            var iterator = stream.makeAsyncIterator()
+            _ = try? await iterator.next()
+            consumerStartedContinuation.yield(())
+            _ = try? await iterator.next()
+        }
+
+        var consumerStartedIterator = consumerStarted.makeAsyncIterator()
+        _ = await consumerStartedIterator.next()
+        consumer.cancel()
+        _ = await consumer.value
+
+        let finalState = await stateIterator.next()
+        XCTAssertEqual(finalState, .disconnected(reason: "Closed"))
+    }
+
     // MARK: - DemoMoshTransport Tests
 
     func testDemoMoshTransportConnectsWithTrustEvaluator() async throws {
         struct AlwaysTrustEvaluator: HostTrustEvaluator {
             func status(for challenge: HostKeyChallenge) async -> TrustStatus { .trusted }
-            func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision { .trustPermanently }
+            func evaluate(_ challenge: HostKeyChallenge) async -> TrustDecision {
+                .trustPermanently
+            }
         }
 
         let transport = DemoMoshTransport()
@@ -357,7 +390,8 @@ final class MoshDomainTests: XCTestCase {
         )
 
         do {
-            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: RejectEvaluator())
+            _ = try await transport.connect(
+                host: host, identity: nil, trustEvaluator: RejectEvaluator())
             XCTFail("Expected hostKeyApprovalRequired")
         } catch let error as TransportError {
             guard case .hostKeyApprovalRequired(let challenge) = error else {
@@ -380,11 +414,13 @@ final class MoshDomainTests: XCTestCase {
             hostname: "mosh.demo.local",
             port: 22,
             username: "demo",
-            connection: .mosh(MoshOptions(sshOptions: SSHOptions(strictHostKeyChecking: .trustedOnly)))
+            connection: .mosh(
+                MoshOptions(sshOptions: SSHOptions(strictHostKeyChecking: .trustedOnly)))
         )
 
         do {
-            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: RejectEvaluator())
+            _ = try await transport.connect(
+                host: host, identity: nil, trustEvaluator: RejectEvaluator())
             XCTFail("Expected remoteFailure")
         } catch let error as TransportError {
             guard case .remoteFailure(let reason) = error else {
@@ -413,7 +449,8 @@ final class MoshDomainTests: XCTestCase {
         )
 
         do {
-            _ = try await transport.connect(host: host, identity: nil, trustEvaluator: ChangedEvaluator())
+            _ = try await transport.connect(
+                host: host, identity: nil, trustEvaluator: ChangedEvaluator())
             XCTFail("Expected hostKeyChanged")
         } catch let error as TransportError {
             guard case .hostKeyChanged(let old, let new) = error else {
